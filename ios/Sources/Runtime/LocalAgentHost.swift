@@ -600,7 +600,7 @@ public final class LocalAgentHost: ObservableObject {
                       bots.contains(where: { $0.id == id }) else { continue }
                 let response = try await rpc.request("session.history", params: ["sessionId": id], timeoutSeconds: 30)
                 let records = response["messages"] as? [[String: Any]] ?? []
-                let persisted = records.compactMap { record in
+                let persisted = records.compactMap { record -> ChatMessageItem? in
                     guard let role = record["role"] as? String,
                           let content = record["content"] as? String else { return nil }
                     var message = ChatMessageItem(
