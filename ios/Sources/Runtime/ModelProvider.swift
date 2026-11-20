@@ -126,6 +126,24 @@ struct ProviderMessage: Codable, Equatable {
 struct ServerSentEvents {
     private var lines: [String] = []
     private var bytes = 0
+    private var lineBytes: [UInt8] = []
+    private var skipLineFeed = false
+    private var firstLine = true
+
+    mutating func append(byte: UInt8) throws -> String? {
+        defer { skipLineFeed = byte == 13 }
+        if byte == 10 && skipLineFeed { return nil }
+        if byte == 10 || byte == 13 {
+            var line = String(decoding: lineBytes, as: UTF8.self)
+            lineBytes.removeAll(keepingCapacity: true)
+            if firstLine && line.first == "\u{FEFF}" { line.removeFirst() }
+            firstLine = false
+            return try append(line)
+        }
+        guard lineBytes.count < 1_500_000 else { throw ModelProviderError.responseTooLarge }
+        lineBytes.append(byte)
+        return nil
+    }
 
     mutating func append(_ line: String) throws -> String? {
         if line.isEmpty { return finish() }

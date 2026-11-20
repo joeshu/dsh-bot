@@ -234,8 +234,7 @@ public struct PrivateBotLockOverlay: View {
                 }
             }
         } else {
-            // Simulator or device without passcode enrolled
-            onUnlock()
+            authError = "请先在设备设置中启用锁屏密码。"
         }
     }
 }

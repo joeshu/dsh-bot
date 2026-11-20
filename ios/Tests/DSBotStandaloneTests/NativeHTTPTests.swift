@@ -98,6 +98,61 @@ final class NativeHTTPTests: XCTestCase {
         await fulfillment(of: [finished], timeout: 5)
     }
 
+    func testToolRejectionKeepsReasoningAndPreventsTheWrite() async throws {
+        let session = FixtureURLProtocol.session { request in
+            let body = try Self.json(request)
+            let history = try XCTUnwrap(body["messages"] as? [[String: Any]])
+            if history.last?["role"] as? String == "tool" {
+                XCTAssertEqual(history.dropLast().last?["reasoning_content"] as? String, "Save after consent")
+                XCTAssertEqual(history.last?["tool_call_id"] as? String, "call_1")
+                XCTAssertTrue((history.last?["content"] as? String)?.contains("did not approve") == true)
+                return try Self.completion(delta: ["content": "Kept private"], finish: "stop")
+            }
+            return try Self.completion(delta: [
+                "reasoning_content": "Save after consent",
+                "tool_calls": [["index": 0, "id": "call_1", "type": "function", "function": [
+                    "name": "memory_save", "arguments": #"{"title":"Private","content":"Note"}"#
+                ]]]
+            ], finish: "tool_calls")
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let channel = IPCChannel(transport: LocalAgentTransport(root: root, session: session, modelKey: { _ in "fixture" }))
+        defer { Task { await channel.close() } }
+        let finished = expectation(description: "finished after denial")
+        _ = await channel.onNotification { method, params in
+            switch method {
+            case "approval.request":
+                XCTAssertEqual(params["tool"] as? String, "memory_save")
+                Task {
+                    let response = try await channel.request("approval.respond", params: [
+                        "turnId": "tool-turn", "sessionId": "bot", "approved": false,
+                        "approvalId": params["approvalId"] as? String ?? ""
+                    ])
+                    XCTAssertEqual(response["found"] as? Bool, true)
+                }
+            case "chat.done":
+                XCTAssertEqual(params["status"] as? String, "completed")
+                XCTAssertEqual((params["transcript"] as? [[String: Any]])?.count, 3)
+                finished.fulfill()
+            default: break
+            }
+        }
+        _ = try await channel.request("chat.send", params: [
+            "turnId": "tool-turn", "sessionId": "bot", "model": ModelProvider.thinkingModel,
+            "history": [["role": "user", "content": "Remember this"]]
+        ])
+        await fulfillment(of: [finished], timeout: 8)
+        let journal = try await channel.request("memory.journal", params: ["botId": "bot"])
+        XCTAssertEqual((journal["records"] as? [[String: Any]])?.count, 0)
+    }
+
+    private static func completion(delta: [String: Any], finish: String) throws -> FixtureURLProtocol.Reply {
+        let body = try JSONSerialization.data(withJSONObject: ["choices": [["delta": delta, "finish_reason": finish]]])
+        return .init(headers: ["Content-Type": "text/event-stream"],
+                     body: Data(("data: " + String(decoding: body, as: UTF8.self) + "\r\n\r\ndata: [DONE]\r\n\r\n").utf8))
+    }
+
     private static func reply(id: String, result: [String: Any], extra: [String: String] = [:]) throws -> FixtureURLProtocol.Reply {
         let data = try JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": id, "result": result])
         return .init(headers: ["Content-Type": "application/json"].merging(extra) { _, value in value }, body: data)

@@ -7,11 +7,6 @@ actor LocalAgentStore {
         var groupTodos: [String: [TodoItem]] = [:]
         var groupGoals: [String: String] = [:]
         var connectors: [ConnectorItem] = []
-        var activeIndexSourceId: String? = nil
-        var registryUrl: String = "https://registry.npmmirror.com"
-        var customIndexSources: [CustomIndexSource] = []
-        var experimentalFlags: [String: Bool] = [:]
-        var installedPlugins: [InstalledPluginItem] = []
         var totalTokens: Int = 0
         var cachedInputTokens: Int = 0
         var totalInputTokens: Int = 0
@@ -19,8 +14,6 @@ actor LocalAgentStore {
 
     struct TodoItem: Codable { let id: String; let text: String; var done: Bool }
     struct ConnectorItem: Codable { let id: String; let type: String; let name: String; let endpoint: String }
-    struct CustomIndexSource: Codable { let id: String; let name: String; let host: String; let url: String }
-    struct InstalledPluginItem: Codable { let name: String; let version: String; let description: String; var enabled: Bool }
 
     private let stateURL: URL
     private var state: PersistedState
@@ -55,9 +48,13 @@ actor LocalAgentStore {
     }
 
     func recordUsage(input: Int, cached: Int, output: Int) throws {
-        state.totalInputTokens += input
-        state.cachedInputTokens += cached
-        state.totalTokens += input + output
+        func adding(_ value: Int, _ increment: Int) -> Int {
+            let (total, overflow) = max(0, value).addingReportingOverflow(max(0, increment))
+            return overflow ? Int.max : total
+        }
+        state.totalInputTokens = adding(state.totalInputTokens, input)
+        state.cachedInputTokens = adding(state.cachedInputTokens, min(input, cached))
+        state.totalTokens = adding(adding(state.totalTokens, input), output)
         try save()
     }
 
@@ -373,7 +370,7 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
         case "connectors.delete":
             let id = params["id"] as? String ?? ""
             try await store.deleteConnector(id: id)
-            try keychain.deleteSecret(account: "connector:\(id)")
+            _ = try keychain.deleteSecret(account: "connector:\(id)")
             return ["removed": true]
         case "usage.summary": return await store.usageSummary()
         case "approval.respond":
@@ -383,7 +380,7 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
         case "tools.jsEval":
             let result = await js.evaluate(params["script"] as? String ?? "")
             return ["ok": result.ok, "value": result.value, "logs": result.logs, "error": result.error ?? ""]
-        case "device.status": return device.deviceStatus()
+        case "device.status": return await device.deviceStatus()
         case "mcp.listTools":
             guard let connector = await store.connector(id: params["connectorId"] as? String ?? ""), connector.type == "remote-mcp" else {
                 throw IPCFrameError.remoteError(code: -32602, message: "连接器已移除。")
@@ -414,7 +411,12 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
         var status = "error"
         defer {
             terminal["status"] = status
-            let frame = try? IPCFrameCodec.encode(["jsonrpc": "2.0", "method": "chat.done", "params": terminal])
+            let frame = (try? IPCFrameCodec.encode(["jsonrpc": "2.0", "method": "chat.done", "params": terminal]))
+                ?? (try? IPCFrameCodec.encode([
+                    "jsonrpc": "2.0", "method": "chat.done",
+                    "params": ["turnId": turnId, "sessionId": sessionId, "status": "incomplete",
+                               "error": "回复超出本机保存上限。"]
+                ]))
             io.async {
                 self.turnTasks.removeValue(forKey: turnId)
                 if let frame { self.receiver?(frame) }
@@ -525,9 +527,9 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
 
             var events = ServerSentEvents()
             var round = CompletionRound()
-            for try await line in response.0.lines {
+            for try await byte in response.0 {
                 try Task.checkCancellation()
-                guard let event = try events.append(line) else { continue }
+                guard let event = try events.append(byte: byte) else { continue }
                 let delta = try round.consume(event)
                 if !delta.content.isEmpty || !delta.reasoning.isEmpty {
                     emit("chat.delta", ["sessionId": sessionId, "turnId": turnId, "content": delta.content, "reasoning": delta.reasoning])
@@ -597,7 +599,8 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
                 _ = try await store.addGroupTodo(groupId: sessionId, text: text("text"))
                 return "Todo added."
             case "device_status":
-                return String(decoding: try JSONSerialization.data(withJSONObject: device.deviceStatus()), as: UTF8.self)
+                let status = await device.deviceStatus()
+                return String(decoding: try JSONSerialization.data(withJSONObject: status), as: UTF8.self)
             case "remote_mcp_call":
                 guard let connector, await store.connector(id: connector.id)?.endpoint == connector.endpoint else { return "Connector changed." }
                 return try await mcp.callTool(endpoint: connector.endpoint, name: text("toolName"),

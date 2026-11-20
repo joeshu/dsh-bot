@@ -30,10 +30,12 @@ final class NativeRuntimeTests: XCTestCase {
 
     func testParserHandlesMultilineSSEAndKeepAlives() throws {
         var events = ServerSentEvents()
-        XCTAssertNil(try events.append(": keep alive"))
-        XCTAssertNil(try events.append(#"data: {"choices":[{"delta":{"reasoning_content":"思考","#))
-        XCTAssertNil(try events.append(#"data: "content":"回答"},"finish_reason":"stop"}]}"#))
-        let event = try XCTUnwrap(events.append(""))
+        let sample = "\u{FEFF}: keep alive\r\n"
+            + #"data: {"choices":[{"delta":{"reasoning_content":"思考","# + "\r\n"
+            + #"data: "content":"回答"},"finish_reason":"stop"}]}"# + "\r\n\r\n"
+        let payloads = try sample.utf8.compactMap { try events.append(byte: $0) }
+        let event = try XCTUnwrap(payloads.first)
+        XCTAssertEqual(payloads.count, 1)
         var round = CompletionRound()
         let delta = try round.consume(event)
         XCTAssertEqual(delta.content, "回答")
@@ -124,6 +126,8 @@ final class NativeRuntimeTests: XCTestCase {
         XCTAssertTrue(timedOut.error?.contains("超时") == true)
         let memory = await runtime.evaluate("let chunks = []; for (;;) chunks.push(new Array(100000).fill(1))")
         XCTAssertFalse(memory.ok)
+        let wait = await runtime.evaluate("Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0)", timeoutMilliseconds: 100)
+        XCTAssertFalse(wait.ok)
         let isolated = await runtime.evaluate("typeof fetch + ',' + typeof require + ',' + typeof process")
         XCTAssertEqual(isolated.value, "undefined,undefined,undefined")
     }

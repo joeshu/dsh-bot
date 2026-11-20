@@ -74,6 +74,7 @@ DSBotJavaScriptResult dsbot_evaluate_javascript(const char *script, size_t lengt
         result.error = strdup("无法初始化 JavaScript。");
         return result;
     }
+    JS_SetCanBlock(runtime, false);
     JS_SetMemoryLimit(runtime, 16 * 1024 * 1024);
     JS_SetMaxStackSize(runtime, 256 * 1024);
     JSContext *context = JS_NewContext(runtime);

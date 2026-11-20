@@ -97,7 +97,11 @@ public actor RemoteMCPClient {
         }
         handshakes[connection] = task
         defer { handshakes.removeValue(forKey: connection) }
-        let sessionID = try await task.value
+        let sessionID = try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
         connections[connection] = sessionID
         return sessionID
     }
@@ -129,9 +133,9 @@ public actor RemoteMCPClient {
 
         if http.mimeType == "text/event-stream" {
             var events = ServerSentEvents()
-            for try await line in bytes.lines {
+            for try await byte in bytes {
                 try Task.checkCancellation()
-                guard let event = try events.append(line) else { continue }
+                guard let event = try events.append(byte: byte) else { continue }
                 if let result = try decode(Data(event.utf8), id: id) { return (result, responseSessionID) }
             }
         } else if http.mimeType == "application/json" {
