@@ -25,6 +25,14 @@ on:
 permissions:
   contents: read
 
+# A security NodeMobile build is an expensive, pinned source build. Serialize
+# those dispatches so two cold runs cannot both miss the same archive cache and
+# spend an hour compiling identical device and simulator slices. Regular IPA
+# builds keep their own run ID and may still proceed independently.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.build_security_runtime == 'true' && 'security-node-24.22.3' || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   candidate:
     runs-on: macos-26
@@ -66,6 +74,12 @@ jobs:
       - name: Compile the security NodeMobile framework
         if: github.event_name == 'workflow_dispatch' && inputs.build_security_runtime && steps.security-framework-cache.outputs.cache-hit != 'true'
         run: bash scripts/build-node-mobile-security-ios.sh "$RUNNER_TEMP/node-mobile-security.zip"
+      - name: Cache the security framework archive
+        if: github.event_name == 'workflow_dispatch' && inputs.build_security_runtime && steps.security-framework-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/node-mobile-security.zip
+          key: ${{ steps.security-framework-cache.outputs.cache-primary-key }}
       - name: Select the security NodeMobile archive
         if: github.event_name == 'workflow_dispatch' && inputs.build_security_runtime
         run: |
@@ -78,12 +92,6 @@ jobs:
         env:
           DSBOT_OUT_DIR: ${{ runner.temp }}/dsbot-candidate
         run: bash scripts/build-unsigned-ipa.sh
-      - name: Cache the verified security framework
-        if: github.event_name == 'workflow_dispatch' && inputs.build_security_runtime && steps.security-framework-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ runner.temp }}/node-mobile-security.zip
-          key: ${{ steps.security-framework-cache.outputs.cache-primary-key }}
       - name: Smoke test DSH IPC and SQLite recovery
         run: python3 scripts/smoke-dsh-runtime.py
       - name: Smoke test DeepSeek search approval and privacy boundaries
