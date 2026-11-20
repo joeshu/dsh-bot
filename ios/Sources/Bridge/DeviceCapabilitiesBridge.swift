@@ -1,7 +1,24 @@
+import AVFoundation
 import Foundation
 import UIKit
 
 final class DeviceCapabilitiesBridge {
+    @MainActor private lazy var synthesizer = AVSpeechSynthesizer()
+
+    @MainActor
+    func speak(_ text: String) {
+        guard !Task.isCancelled else { return }
+        if synthesizer.isSpeaking { synthesizer.stopSpeaking(at: .immediate) }
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.rate = AVSpeechUtteranceDefaultSpeechRate
+        synthesizer.speak(utterance)
+    }
+
+    @MainActor
+    func stopSpeaking() {
+        if synthesizer.isSpeaking { synthesizer.stopSpeaking(at: .immediate) }
+    }
+
     @MainActor
     func deviceStatus() -> [String: Any] {
         let info = ProcessInfo.processInfo

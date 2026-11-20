@@ -325,6 +325,7 @@ public struct ChatView: View {
     @State private var showClearConfirm = false
     @State private var showEditBot = false
     @State private var showMemory = false
+    @State private var actionStatus = ""
     @State private var lastScrollAt = Date.distantPast
     @State private var expandStreamingReasoning = true
     @Environment(\.scenePhase) private var chatScenePhase
@@ -420,6 +421,8 @@ public struct ChatView: View {
         showEditBot = false
         showMemory = false
         showClearConfirm = false
+        actionStatus = ""
+        Task { _ = try? await host.rpc()?.request("device.stopSpeaking") }
         if host.streamingSessionId == bot.id { Task { await host.abortActiveTurn() } }
     }
 
@@ -490,6 +493,12 @@ public struct ChatView: View {
                         .padding(.bottom, 6)
                     }
 
+                    if !host.isStreaming, host.lastCancelledSessionId == liveBot.id {
+                        Text("已停止生成").font(.caption).foregroundStyle(.secondary)
+                    }
+                    if !actionStatus.isEmpty {
+                        Text(actionStatus).font(.caption).foregroundStyle(.secondary)
+                    }
                     composerBar
                 }
 
@@ -563,6 +572,10 @@ public struct ChatView: View {
                 .font(.caption2.weight(.medium))
                 .foregroundColor(.secondary)
 
+            if msg.incomplete == true {
+                Text("回复未完成").font(.caption).foregroundStyle(.secondary)
+            }
+
             if !msg.reasoning.isEmpty {
                 DisclosureGroup("深度思考过程") {
                     Text(msg.reasoning)
@@ -587,20 +600,26 @@ public struct ChatView: View {
                         Label("复制全文", systemImage: "doc.on.doc")
                     }
                     Button {
-                        Task { _ = try? await host.rpc()?.request("device.speak", params: ["text": msg.content]) }
-                        DSHaptics.impact(.soft)
+                        Task {
+                            do {
+                                guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
+                                _ = try await rpc.request("device.speak", params: ["text": msg.content])
+                                actionStatus = ""
+                            } catch { actionStatus = error.localizedDescription }
+                        }
                     } label: {
                         Label("朗读回复", systemImage: "speaker.wave.2")
                     }
                     Button {
                         Task {
-                            _ = try? await host.rpc()?.request("memory.add", params: [
-                                "botId": bot.id,
-                                "title": String(msg.content.prefix(24)),
-                                "content": msg.content,
-                                "layer": "pinned"
-                            ])
-                            DSHaptics.notify(.success)
+                            do {
+                                guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
+                                _ = try await rpc.request("memory.add", params: [
+                                    "botId": bot.id, "title": String(msg.content.prefix(24)),
+                                    "content": msg.content, "layer": "pinned"
+                                ])
+                                actionStatus = "已存入常驻记忆。"
+                            } catch { actionStatus = error.localizedDescription }
                         }
                     } label: {
                         Label("存入常驻记忆", systemImage: "brain.head.profile")

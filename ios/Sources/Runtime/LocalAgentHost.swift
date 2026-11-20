@@ -105,6 +105,7 @@ public final class LocalAgentHost: ObservableObject {
     @Published public private(set) var streamFirstTokenMs: Int?
     @Published public private(set) var lastStreamError: String?
     @Published public private(set) var lastErrorSessionId: String?
+    @Published public private(set) var lastCancelledSessionId: String?
     @Published public private(set) var pendingApprovals: [PendingApproval] = []
     @Published public private(set) var activeTurnId: String?
     @Published public var useBubbleLayout: Bool = (UserDefaults.standard.object(forKey: "dsbot.useBubbleLayout") as? Bool) ?? true {
@@ -179,10 +180,8 @@ public final class LocalAgentHost: ObservableObject {
             lastStreamError = "消息超过 256 KB。"
             return
         }
-        guard let provider = try? ModelProvider(apiBaseURL) else {
-            lastStreamError = ModelProviderError.invalidAddress.localizedDescription
-            return
-        }
+        let provider = try? ModelProvider(apiBaseURL)
+        lastCancelledSessionId = nil
         let turnId = UUID().uuidString
         messagesBySession[sessionId, default: []].append(ChatMessageItem(sessionId: sessionId, role: "user", content: trimmed))
         persistWorkspace()
@@ -198,8 +197,9 @@ public final class LocalAgentHost: ObservableObject {
         DSHaptics.impact(.light)
 
         let bot = bots.first(where: { $0.id == sessionId })
-        let tools = provider.isDeepSeek || customTools
-        let history = Self.providerHistory(messages(for: sessionId), provider: provider, model: model, tools: tools)
+        let history = provider.map {
+            Self.providerHistory(messages(for: sessionId), provider: $0, model: model, tools: $0.isDeepSeek || customTools)
+        } ?? [["role": "user", "content": trimmed]]
         do {
             _ = try await channel.request("chat.send", params: [
                 "sessionId": sessionId, "turnId": turnId, "model": model, "apiBaseURL": apiBaseURL,
@@ -471,6 +471,7 @@ public final class LocalAgentHost: ObservableObject {
                     self.scheduleStreamFlushIfNeeded()
                 case "chat.done":
                     self.lastStreamError = params["error"] as? String
+                    if params["status"] as? String == "aborted" { self.lastCancelledSessionId = sessionId }
                     self.finishTurn(params)
                 case "approval.request":
                     guard !self.sentCancellation, let id = params["approvalId"] as? String,

@@ -191,7 +191,7 @@ public struct GroupWorkspaceSheet: View {
                     }
                 }
 
-                Section("共享待办 (上限 100 条)") {
+                Section("共享待办") {
                     HStack {
                         TextField("添加群待办...", text: $newTodoText)
                         Button("添加") {

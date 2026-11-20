@@ -45,6 +45,7 @@ targets:
     dependencies:
       - sdk: LocalAuthentication.framework
       - sdk: Security.framework
+      - sdk: AVFoundation.framework
 
   DSBotStandaloneTests:
     type: bundle.unit-test

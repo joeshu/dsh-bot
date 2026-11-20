@@ -290,6 +290,7 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
         case "agent.suspend":
             suspended = true
             cancelWork()
+            Task { await device.stopSpeaking() }
             reply(id, ["suspended": true])
         case "agent.resume":
             suspended = false
@@ -381,6 +382,14 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
             let result = await js.evaluate(params["script"] as? String ?? "")
             return ["ok": result.ok, "value": result.value, "logs": result.logs, "error": result.error ?? ""]
         case "device.status": return await device.deviceStatus()
+        case "device.speak":
+            let text = params["text"] as? String ?? ""
+            guard !text.isEmpty else { throw IPCFrameError.remoteError(code: -32602, message: "没有可朗读的内容。") }
+            await device.speak(text)
+            return ["ok": true]
+        case "device.stopSpeaking":
+            await device.stopSpeaking()
+            return ["ok": true]
         case "mcp.listTools":
             guard let connector = await store.connector(id: params["connectorId"] as? String ?? ""), connector.type == "remote-mcp" else {
                 throw IPCFrameError.remoteError(code: -32602, message: "连接器已移除。")
