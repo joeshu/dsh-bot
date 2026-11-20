@@ -164,14 +164,11 @@ def verify_runtime(archive, prefix, names):
         require(metadata.get("version") == version, f"Embedded package version mismatch: {package}")
     require("@deepseek-ai/dsh" not in top_level and "@deepseek-ai/dsh-base" not in top_level,
             "The full desktop DSH umbrella/base profile must not be embedded")
-    for desktop_package in ["@deepseek-ai/dsh", "@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"]:
+    for desktop_package in ["@deepseek-ai/dsh", "@deepseek-ai/dsh-base"]:
         require(prefix + "DSHRuntime/node_modules/" + desktop_package + "/package.json" not in names,
                 f"The desktop bundle {desktop_package} must not be embedded")
     forbidden_packages = [
         "@deepseek-ai/dsh", "@deepseek-ai/dsh-base",
-        "@deepseek-ai/dsh-web-app", "@deepseek-ai/dsh-web-frontend",
-        "@deepseek-ai/dsh-shell", "@deepseek-ai/dsh-terminal",
-        "@deepseek-ai/dsh-cordis-client-runner", "@deepseek-ai/dsh-cordis-host-runner",
         "@deepseek-ai/dsh-experimental-terminal-bundle", "@deepseek-ai/dsh-cua-bundle",
     ]
     runtime_files = [name for name in names if name.startswith(prefix + "DSHRuntime/")]
@@ -179,6 +176,9 @@ def verify_runtime(archive, prefix, names):
         marker = "/node_modules/" + package + "/package.json"
         require(not any(marker in name for name in runtime_files),
                 f"Desktop DSH package {package} must not be embedded at any dependency depth")
+    for unmounted_desktop in [b"@deepseek-ai/dsh-shell", b"@deepseek-ai/dsh-terminal", b"@deepseek-ai/dsh-tool-bash", b"@deepseek-ai/dsh-tool-pwsh"]:
+        require(unmounted_desktop not in profile_patch,
+                f"Desktop shell/terminal plugin {unmounted_desktop.decode()} must not be mounted in iOS cordis.patch.yml")
     require(not any("/nodejs-project/" in name for name in names),
             "The legacy desktop Node project must not be embedded")
     require(not any("/Frameworks/Python.framework/" in name or "/Frameworks/FFmpeg.framework/" in name

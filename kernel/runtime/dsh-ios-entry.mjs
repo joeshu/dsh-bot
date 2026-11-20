@@ -349,6 +349,7 @@ async function boot() {
   const requiredRows = ['session', 'session-projection', 'llm', 'llm-deepseek', 'system-prompt', 'tools',
     'agent', 'agent-loop', 'tool-executor-native', 'ios-web', 'ios-web-search', 'ios-fs', 'ios-working-directory', 'ios-subagent', 'ios-subagent-in-process', 'ios-tool-subagent',
     'commands', 'token-meter', 'compaction-pruner', 'compaction-basic', 'time-context', 'skill', 'skill-filesystem', 'tool-skill',
+    'webserver', 'web-runtime', 'modules', 'connection',
     'ios-keychain-credentials', 'ios-session-persistence', 'ios-native-tools']
   const inactive = requiredRows.filter((id) => mountedRows.get(id)?.state !== 2)
   if (inactive.length) throw new Error(`Required iOS DSH profile rows are inactive: ${inactive.join(', ')}`)
@@ -364,17 +365,29 @@ async function boot() {
   await rpc.request('runtime.ready', runtimeInfo(), 30_000)
 }
 
+const webUiInfo = () => {
+  const port = ctx?.webServer?.port
+  if (!Number.isInteger(port) || port <= 0) return { ready: false, url: '', port: 0 }
+  const baseUrl = `http://127.0.0.1:${port}/`
+  const authUrl = typeof ctx?.connection?.authenticatedUrl === 'function'
+    ? ctx.connection.authenticatedUrl(baseUrl)
+    : baseUrl
+  return { ready: true, url: authUrl, baseUrl, port }
+}
+
 const runtimeInfo = () => ({
   engine: 'node+dsh', dshVersion: '0.2.2-rc.5', nodeVersion: process.versions.node,
   ipcProtocolVersion: '1.0.0', persistentSessions: true,
   bootLifecycle: 'official-runProfile',
   profile: { name: PROFILE, bundles: runtime.profile?.layers?.map((layer) => layer.packageName) ?? [] },
   webProviders: ctx?.web?.listProviders(),
+  webUI: webUiInfo(),
   pluginIndexFormat: 1, safeMode: workerData?.safeMode === true,
   plugins: ACTIVE_PLUGINS,
   tools: [...NATIVE_TOOL_NAMES],
 })
 rpc.handle('agent.info', async () => runtimeInfo())
+rpc.handle('web.ui.info', async () => webUiInfo())
 
 rpc.handle('chat.send', async (params) => {
   if (runtime.preparingTurn || runtime.activeTurns.size) throw new Error('Another DSH turn is already running')

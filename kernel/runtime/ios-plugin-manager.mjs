@@ -451,7 +451,7 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
         const manifest = await readFile(manifestPath, 'utf8').then(JSON.parse).catch(() => ({}))
         return {
           name: item.name, version: item.version, enabled, desiredEnabled: item.enabled,
-          compatibility: manifest.dsh?.client?.platform === 'web' ? 'host-only' : (enabled ? 'verified' : 'unverified'),
+          compatibility: manifest.dsh?.client?.platform === 'web' ? 'web-ui' : (enabled ? 'verified' : 'unverified'),
         }
       }))
 
@@ -522,15 +522,22 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
     return { manifest, patchPath }
   }
 
-  async function assertDependenciesAvailable(manifest) {
+  async function assertDependenciesAvailable(manifest, stagedRoot = undefined) {
     const { profile } = await currentProfile()
     const resolution = await createRuntimeResolution({ installAnchor, profile })
     const versions = new Map(resolution.entries.map((entry) => [entry.name, entry.version]))
     for (const [name, range] of Object.entries(manifest.dependencies ?? {})) {
       const version = versions.get(name)
-      if (!version || !semver.satisfies(version, range, { includePrerelease: true })) {
-        throw new Error(`缺少 iOS runtime dependency ${name}@${range}；本安装器不会运行 npm/pnpm 脚本或下载未审核依赖`)
+      if (version && semver.satisfies(version, range, { includePrerelease: true })) continue
+      if (stagedRoot && packageName(name)) {
+        const bundledPkg = resolve(stagedRoot, 'node_modules', ...name.split('/'), 'package.json')
+        assertInside(stagedRoot, bundledPkg)
+        const bundled = await readFile(bundledPkg, 'utf8').then(JSON.parse).catch(() => undefined)
+        if (bundled?.name === name && typeof bundled.version === 'string' && semver.satisfies(bundled.version, range, { includePrerelease: true })) {
+          continue
+        }
       }
+      throw new Error(`缺少 iOS runtime dependency ${name}@${range}；本安装器不会运行 npm/pnpm 脚本或下载未审核依赖`)
     }
     for (const [name, range] of Object.entries(manifest.peerDependencies ?? {})) {
       if (manifest.peerDependenciesMeta?.[name]?.optional) continue
@@ -540,6 +547,88 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
       }
     }
     return new Set(versions.keys())
+  }
+
+  async function inspectDependencyPackage(root, expectedName, expectedVersion) {
+    const manifestPath = join(root, 'package.json')
+    let manifest
+    try { manifest = JSON.parse(await readFile(manifestPath, 'utf8')) } catch { throw new Error('依赖包缺少有效 package.json') }
+    validatePackageName(manifest.name)
+    if (manifest.name !== expectedName || manifest.version !== expectedVersion) throw new Error('依赖包名称或版本与 registry 元数据不一致')
+    const nativeFiles = []
+    const unsupportedImports = []
+    let filesSeen = 0
+    async function walk(directory) {
+      for (const entry of await readdir(directory, { withFileTypes: true })) {
+        filesSeen++
+        if (filesSeen > MAX_PACKAGE_FILES) throw new RangeError('依赖包文件数超过安全上限')
+        const filePath = join(directory, entry.name)
+        const info = await lstat(filePath)
+        if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) throw new Error('依赖包不能包含链接或特殊文件')
+        const extension = extname(entry.name).toLowerCase()
+        if (info.isFile() && ['.node', '.dylib', '.so', '.wasm'].includes(extension)) nativeFiles.push(relative(root, filePath))
+        if (info.isFile() && ['.js', '.mjs', '.cjs'].includes(extension)) {
+          if (info.size > 8 * 1024 * 1024) throw new RangeError('依赖包单个 JavaScript 文件不得超过 8 MiB')
+          const source = await readFile(filePath, 'utf8')
+          if (/(?:from\s*|import\s*\(?\s*|require\s*\(\s*)['"](?:node:)?(?:child_process|worker_threads|cluster|inspector|vm)(?:\/[^'"]*)?['"]/.test(source)) {
+            unsupportedImports.push(relative(root, filePath))
+          }
+        }
+        if (info.isDirectory()) await walk(filePath)
+      }
+    }
+    await walk(root)
+    if (nativeFiles.length) throw new Error(`依赖包 ${expectedName} 含本机二进制：${nativeFiles.slice(0, 3).join(', ')}`)
+    if (unsupportedImports.length) throw new Error(`依赖包 ${expectedName} 使用受限 Node API：${unsupportedImports.slice(0, 3).join(', ')}`)
+    return manifest
+  }
+
+  async function resolvePureJsDependencies(pluginRoot) {
+    const MAX_TRANSITIVE_DEPS = 24
+    const MAX_DEPTH = 4
+    const { profile } = await currentProfile()
+    const resolution = await createRuntimeResolution({ installAnchor, profile })
+    const embeddedVersions = new Map(resolution.entries.map((entry) => [entry.name, entry.version]))
+    const rootManifest = JSON.parse(await readFile(join(pluginRoot, 'package.json'), 'utf8'))
+    const queue = Object.entries(rootManifest.dependencies ?? {}).map(([name, range]) => ({ name, range, depth: 1 }))
+    const installed = new Map()
+    const pluginNodeModules = resolve(pluginRoot, 'node_modules')
+    while (queue.length) {
+      const { name, range, depth } = queue.shift()
+      if (depth > MAX_DEPTH) throw new Error(`插件依赖层级超过安全上限（${MAX_DEPTH}）`)
+      if (typeof range !== 'string' || !packageName(name)) throw new Error(`无效的插件依赖声明：${name}`)
+      const embedded = embeddedVersions.get(name)
+      if (embedded && semver.satisfies(embedded, range, { includePrerelease: true })) continue
+      const existing = installed.get(name)
+      if (existing) {
+        if (semver.satisfies(existing, range, { includePrerelease: true })) continue
+        throw new Error(`插件传递依赖版本冲突：${name}@${range} 与 ${existing}`)
+      }
+      if (installed.size >= MAX_TRANSITIVE_DEPS) throw new Error(`插件传递依赖数量超过上限（${MAX_TRANSITIVE_DEPS}）`)
+      validatePackageName(name)
+      const registryName = name.replace('/', '%2f')
+      const metadataBuffer = await fetchBuffer(`https://registry.npmjs.org/${registryName}`, MAX_INDEX_BYTES)
+      let metadata
+      try { metadata = JSON.parse(metadataBuffer.toString('utf8')) } catch { throw new Error(`依赖 ${name} 的 registry 元数据无效`) }
+      const availableVersions = Object.keys(metadata.versions ?? {})
+      const chosen = semver.maxSatisfying(availableVersions, range, { includePrerelease: true })
+      if (!chosen) throw new Error(`无法在 npm registry 解析插件依赖 ${name}@${range}`)
+      const info = metadata.versions[chosen]
+      if (!info || info.name !== name || typeof info.dist?.tarball !== 'string') throw new Error(`依赖 ${name}@${chosen} 缺少下载地址`)
+      const tarball = httpsURL(info.dist.tarball)
+      if (tarball.origin !== 'https://registry.npmjs.org') throw new Error(`依赖 ${name} 下载地址不属于 npm registry`)
+      const bytes = await fetchBuffer(tarball.href, MAX_ARCHIVE_BYTES)
+      await verifyIntegrity(bytes, info.dist.integrity)
+      const dest = resolve(pluginNodeModules, ...name.split('/'))
+      assertInside(pluginNodeModules, dest)
+      await mkdir(dest, { recursive: true })
+      await unpackNpmTarball(bytes, dest)
+      const depManifest = await inspectDependencyPackage(dest, name, chosen)
+      installed.set(name, chosen)
+      for (const [subName, subRange] of Object.entries(depManifest.dependencies ?? {})) {
+        queue.push({ name: subName, range: subRange, depth: depth + 1 })
+      }
+    }
   }
 
   async function packageItems(root) {
@@ -580,7 +669,7 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
       }
       const { manifest } = await inspectPackage(staged, expectedName, expectedVersion)
       if (DESKTOP_ONLY_BUNDLES.has(manifest.name)) throw new Error('这个完整桌面 bundle 不允许安装到 iOS profile')
-      const available = await assertDependenciesAvailable(manifest)
+      const available = await assertDependenciesAvailable(manifest, staged)
       if (available.has(manifest.name)) throw new Error('插件名称与已经内嵌的 DSH runtime 包冲突')
       const active = await installedPlugins()
       if (active.some((item) => item.name === manifest.name)) throw new Error(`${manifest.name} 已安装；请先卸载再重新安装此版本`)
@@ -637,6 +726,7 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
     await mkdir(staging)
     try {
       await unpackNpmTarball(bytes, staging)
+      await resolvePureJsDependencies(staging)
       return await installDirectory(staging, name, version)
     } finally {
       await rm(staging, { recursive: true, force: true })

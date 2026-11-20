@@ -32,6 +32,25 @@ public struct PluginManagerView: View {
         NavigationStack {
             Form {
                 Section {
+                    NavigationLink {
+                        DSHWebUIView(host: host)
+                    } label: {
+                        Label {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("打开 DSH Web 工作台")
+                                    .font(.headline)
+                                Text("内嵌官方 Web UI，支持社区 dsh-client-ui-* 界面插件")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } icon: {
+                            Image(systemName: "macwindow.on.rectangle")
+                                .foregroundStyle(DSTheme.brand)
+                        }
+                    }
+                }
+
+                Section {
                     Label {
                         Text("第三方插件由其作者维护，DS Bot 不审核插件代码。插件在本机 DSH Node 进程内运行，可访问应用沙盒和网络。只安装你信任的来源。")
                             .font(.footnote)
@@ -39,7 +58,7 @@ public struct PluginManagerView: View {
                         Image(systemName: "exclamationmark.shield.fill")
                             .foregroundStyle(.orange)
                     }
-                    Text("iOS 安装会检查 DSH bundle、平台声明、依赖和本机二进制；不会执行 npm 安装脚本。检查不能代替对作者和代码的信任判断。")
+                    Text("iOS 安装会检查 DSH bundle、平台声明、纯 JS 依赖树和本机二进制；不会执行 npm 安装脚本。检查不能代替对作者和代码的信任判断。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
