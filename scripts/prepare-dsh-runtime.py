@@ -63,7 +63,11 @@ def main():
     DESTINATION.mkdir(parents=True)
     for name, source in FILES.items():
         shutil.copy2(source, DESTINATION / name)
-    shutil.copytree(node_modules, DESTINATION / "node_modules", ignore=shutil.ignore_patterns("*.map", ".DS_Store"))
+    shutil.copytree(
+        node_modules,
+        DESTINATION / "node_modules",
+        ignore=shutil.ignore_patterns("*.map", ".DS_Store", "*.node", "*.dylib", "*.so", "*.dll", "*.exe", "*.wasm"),
+    )
     vendor_source = SOURCE / "vendor" / "dsh-profile-boot"
     vendor_destination = DESTINATION / "vendor" / "dsh-profile-boot"
     vendor_destination.parent.mkdir(parents=True, exist_ok=True)
