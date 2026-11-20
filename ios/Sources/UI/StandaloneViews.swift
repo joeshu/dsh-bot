@@ -211,7 +211,7 @@ public struct BotRosterTabView: View {
                                     )
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text(bot.name).font(.headline)
-                                        Text(liveBot.roleLabel).font(.caption).foregroundColor(.secondary)
+                                        Text(bot.roleLabel).font(.caption).foregroundColor(.secondary)
                                     }
                                     Spacer()
                                     DSStatusBadge(bot.model == "deepseek-reasoner" ? "深度思考" : "标准", color: .secondary)
