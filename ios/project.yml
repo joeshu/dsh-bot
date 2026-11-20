@@ -23,11 +23,11 @@ targets:
     deploymentTarget: "16.4"
     sources:
       - path: Sources
-    resources:
       - path: Resources/Assets.xcassets
+        buildPhase: resources
       - path: Resources/KernelAssets
         type: folder
-        optional: true
+        buildPhase: resources
     info:
       path: Resources/Info.plist
     settings:
