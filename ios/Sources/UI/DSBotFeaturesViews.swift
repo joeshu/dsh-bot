@@ -80,22 +80,46 @@ public struct SideChatSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var host: LocalAgentHost
     let model: String
+    let botId: String
+    let botName: String
+    let isPrivate: Bool
     @State private var status = ""
     @State private var sending = false
     @State private var request: Task<Void, Never>?
     @State private var sideId: String?
     @State private var question = ""
+    @State private var includeRecentContext = false
     @State private var messages: [(role: String, text: String)] = []
+
+    private var recentContext: [[String: String]] {
+        guard includeRecentContext else { return [] }
+        return host.messages(for: botId).suffix(8).compactMap { message in
+            guard ["user", "assistant"].contains(message.role), message.incomplete != true,
+                  !message.content.isEmpty else { return nil }
+            return ["role": message.role, "content": String(message.content.prefix(2_000))]
+        }
+    }
 
     public var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                Text("侧边对话不会打断当前 Bot 工作，也不会写入主对话上下文。")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .padding(8)
-                    .frame(maxWidth: .infinity)
-                    .background(Color(.secondarySystemBackground))
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("侧边对话不会打断主会话，也不会把侧边回复写回主会话。默认不附带聊天历史。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    if !host.messages(for: botId).isEmpty {
+                        Toggle("附带最近 8 条可见消息", isOn: $includeRecentContext)
+                            .font(.caption)
+                        Text(includeRecentContext
+                             ? "这次请求会把「\(botName)」的可见对话片段发送给当前模型服务。\(isPrivate ? "此会话为私密会话。" : "")"
+                             : "不附带主会话内容；思考过程不会被引用。")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(.secondarySystemBackground))
 
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
@@ -125,13 +149,18 @@ public struct SideChatSheet: View {
                         status = ""
                         sending = true
                         let id = UUID().uuidString
+                        let contextSnapshot = recentContext
                         sideId = id
                         request = Task {
-                            defer { sending = false }
+                            defer {
+                                sending = false
+                                if sideId == id { sideId = nil }
+                            }
                             do {
                                 guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
                                 let response = try await rpc.request("side.ask", params: [
-                                    "model": model, "question": q, "apiBaseURL": host.apiBaseURL, "sideId": id
+                                    "model": model, "question": q, "apiBaseURL": host.apiBaseURL,
+                                    "sideId": id, "context": contextSnapshot
                                 ], timeoutSeconds: 95)
                                 guard let reply = response["reply"] as? String else { throw ModelProviderError.invalidResponse }
                                 messages.append((role: "Side", text: reply))
@@ -154,9 +183,24 @@ public struct SideChatSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("关闭") { dismiss() }
+                    if sending {
+                        Button("停止") { cancelSideRequest() }
+                    } else {
+                        Button("关闭") { dismiss() }
+                    }
                 }
             }
+        }
+    }
+
+    private func cancelSideRequest() {
+        request?.cancel()
+        guard let sideId else { return }
+        self.sideId = nil
+        status = "已停止侧边请求。"
+        Task {
+            guard let rpc = host.rpc() else { return }
+            _ = try? await rpc.request("side.cancel", params: ["sideId": sideId], timeoutSeconds: 10)
         }
     }
 }

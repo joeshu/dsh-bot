@@ -414,7 +414,10 @@ public struct ChatView: View {
             }
         }
         .sheet(isPresented: $showSideChat) {
-            if !isLocked { SideChatSheet(host: host, model: selectedModel) }
+            if !isLocked {
+                SideChatSheet(host: host, model: selectedModel, botId: liveBot.id,
+                              botName: liveBot.name, isPrivate: liveBot.isPrivate)
+            }
         }
         .sheet(isPresented: $showGroupWorkspace) {
             if !isLocked { GroupWorkspaceSheet(host: host, groupId: bot.id) }

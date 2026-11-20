@@ -232,6 +232,7 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
     private var turnTasks: [String: Task<Void, Never>] = [:]
     private var requestTasks: [Int: Task<Void, Never>] = [:]
     private var sideRequests: [String: Int] = [:]
+    private var workspaceSideTasks: [String: Task<[String: Any], Error>] = [:]
     private var suspended = false
     private var closed = false
 
@@ -258,6 +259,12 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
     /// Exposes only the pre-existing native workspace RPC allowlist. Chat and
     /// agent lifecycle calls remain exclusively owned by the embedded DSH runtime.
     func nativeWorkspaceRequest(method: String, params: [String: Any]) async throws -> [String: Any] {
+        if method == "side.cancel" {
+            let sideId = params["sideId"] as? String ?? ""
+            let task = io.sync { workspaceSideTasks.removeValue(forKey: sideId) }
+            task?.cancel()
+            return ["cancelled": task != nil]
+        }
         let allowed: Set<String> = [
             "models.test", "memory.add", "memory.journal", "memory.legacy", "memory.assign", "memory.undo",
             "group.state", "group.goal.set", "group.todo.add", "group.todo.toggle", "group.todo.clearCompleted",
@@ -267,6 +274,31 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
         ]
         guard allowed.contains(method) else {
             throw IPCFrameError.remoteError(code: -32601, message: "Unsupported native workspace method: \(method)")
+        }
+        if method == "side.ask" {
+            let sideId = params["sideId"] as? String ?? ""
+            guard !sideId.isEmpty, sideId.utf8.count <= 128 else {
+                throw IPCFrameError.remoteError(code: -32602, message: "无效的侧边请求编号。")
+            }
+            let task = Task { try await self.handle(method: method, params: params) }
+            let inserted = io.sync { () -> Bool in
+                guard workspaceSideTasks[sideId] == nil else { return false }
+                workspaceSideTasks[sideId] = task
+                return true
+            }
+            guard inserted else {
+                task.cancel()
+                throw IPCFrameError.remoteError(code: -32602, message: "侧边请求编号重复。")
+            }
+            defer {
+                _ = io.sync { workspaceSideTasks.removeValue(forKey: sideId) }
+                task.cancel()
+            }
+            return try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
         }
         return try await handle(method: method, params: params)
     }
@@ -313,6 +345,8 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
     private func cancelWork() {
         for task in turnTasks.values { task.cancel() }
         for task in requestTasks.values { task.cancel() }
+        for task in workspaceSideTasks.values { task.cancel() }
+        workspaceSideTasks.removeAll()
     }
 
     private func route(id: Int, method: String, params: [String: Any]) {
@@ -708,11 +742,25 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
 
     private func sideChat(_ params: [String: Any]) async throws -> [String: Any] {
         let provider = try ModelProvider(params["apiBaseURL"] as? String ?? "")
+        try Task.checkCancellation()
         let key = try await modelKey(provider)
+        try Task.checkCancellation()
         var body = try provider.modelFields(params["model"] as? String ?? "")
         body["stream"] = false
-        body["messages"] = [["role": "user", "content": params["question"] as? String ?? ""]]
+        let question = (params["question"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !question.isEmpty, question.utf8.count <= 65_536 else {
+            throw IPCFrameError.remoteError(code: -32602, message: "侧边问题不能为空或超过 64 KB。")
+        }
+        let snapshot = params["context"] as? [[String: Any]] ?? []
+        var contextMessages: [[String: Any]] = []
+        for item in snapshot.suffix(8) {
+            guard let role = item["role"] as? String, ["user", "assistant"].contains(role),
+                  let content = item["content"] as? String, !content.isEmpty else { continue }
+            contextMessages.append(["role": role, "content": String(content.prefix(2_000))])
+        }
+        body["messages"] = contextMessages + [["role": "user", "content": question]]
         let (data, response) = try await session.data(for: makeRequest(provider.endpoint("chat/completions"), key: key, fields: body))
+        try Task.checkCancellation()
         try checkHTTP(response)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let choice = (json["choices"] as? [[String: Any]])?.first,

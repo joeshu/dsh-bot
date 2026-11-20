@@ -46,6 +46,7 @@ const runtime = {
   pluginManager: undefined,
   activeAgents: new Map(),
   activeTurns: new Map(),
+  sideRequests: new Map(),
   suspended: false,
   shuttingDown: false,
   pluginMutationInProgress: false,
@@ -509,7 +510,10 @@ rpc.handle('agent.suspend', async () => {
       botId: turn.botId, sessionId: turn.botId, turnId: turn.turnId,
     }, 5_000).catch(() => {}))
   }
-  await Promise.all(cancelTools)
+  const cancelSideRequests = [...runtime.sideRequests.keys()].map((sideId) => rpc.request('workspace.request', {
+    method: 'side.cancel', params: { sideId },
+  }, 5_000).catch(() => {}))
+  await Promise.all([...cancelTools, ...cancelSideRequests])
   for (const [id, active] of runtime.activeAgents) await drainAndDispose(id, active)
   await runtime.persistence.flush()
   return { suspended: true }
@@ -544,7 +548,7 @@ for (const method of [
   'models.test', 'memory.add', 'memory.journal', 'memory.legacy', 'memory.assign', 'memory.undo',
   'group.state', 'group.goal.set', 'group.todo.add', 'group.todo.toggle', 'group.todo.clearCompleted',
   'connectors.list', 'connectors.upsert', 'connectors.delete', 'usage.legacySummary', 'tools.jsEval',
-  'device.status', 'device.speak', 'device.stopSpeaking', 'mcp.listTools', 'mcp.callTool', 'side.ask',
+  'device.status', 'device.speak', 'device.stopSpeaking', 'mcp.listTools', 'mcp.callTool',
   'approval.respond',
 ]) {
   rpc.handle(method, (params) => rpc.request('workspace.request', { method, params }, 120_000))
@@ -552,7 +556,27 @@ for (const method of [
 
 rpc.handle('usage.summary', (params) => dshUsageSummary(params))
 
-rpc.handle('side.cancel', async () => ({ cancelled: false, reason: 'Side-chat sessions are not included in the local DSH profile yet.' }))
+rpc.handle('side.ask', async (params) => {
+  const sideId = typeof params?.sideId === 'string' ? params.sideId : ''
+  if (!sideId || sideId.length > 128 || runtime.sideRequests.has(sideId)) throw new TypeError('Invalid or duplicate side-chat request id')
+  const request = rpc.request('workspace.request', { method: 'side.ask', params }, 120_000)
+  runtime.sideRequests.set(sideId, request)
+  try { return await request } finally {
+    if (runtime.sideRequests.get(sideId) === request) runtime.sideRequests.delete(sideId)
+  }
+})
+
+rpc.handle('side.cancel', async (params = {}) => {
+  const sideId = params?.sideId
+  if (typeof sideId !== 'string' || !sideId || sideId.length > 128) return { cancelled: false }
+  const wasActive = runtime.sideRequests.has(sideId)
+  try {
+    const result = await rpc.request('workspace.request', { method: 'side.cancel', params: { sideId } }, 5_000)
+    return { cancelled: result?.cancelled === true || wasActive }
+  } catch {
+    return { cancelled: false }
+  }
+})
 
 rpc.onNotification((method, params) => {
   if (method === 'approval.request' || method === 'approval.closed') rpc.notify(method, params)
