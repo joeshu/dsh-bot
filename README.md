@@ -45,7 +45,7 @@ Runtime dependencies and licenses are recorded in `DSHRuntime/THIRD-PARTY-NOTICE
 
 ## Re-signing and device evidence
 
-Use a macOS keychain identity and a device provisioning profile that authorizes the original bundle ID. The helper validates the unsigned archive, signs the nested NodeMobile framework before the app, and prints both checksums.
+Use a macOS keychain identity and a device provisioning profile that authorizes the original bundle ID. The helper validates the unsigned archive, signs the nested NodeMobile framework before the app, checks that both signatures use a certificate listed in the provisioning profile, and prints both checksums.
 
 ```bash
 bash scripts/resign-ios-ipa.sh unsigned.ipa device.mobileprovision 'Apple Development: Name (TEAM)' signed.ipa

@@ -23,7 +23,9 @@ from pathlib import Path
 profile = plistlib.loads(Path(sys.argv[1]).read_bytes())
 report = json.loads(Path(sys.argv[2]).read_text())
 expiration = profile["ExpirationDate"]
-if expiration <= datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None):
+if expiration.tzinfo is None:
+    expiration = expiration.replace(tzinfo=datetime.timezone.utc)
+if expiration <= datetime.datetime.now(datetime.timezone.utc):
     sys.exit("Provisioning profile has expired")
 team, = profile["TeamIdentifier"]
 allowed = profile["Entitlements"]
@@ -48,6 +50,19 @@ codesign --force --sign "$3" "$APP/Frameworks/NodeMobile.framework"
 codesign --force --sign "$3" --entitlements "$TMP/entitlements.plist" "$APP"
 codesign --verify --deep --strict "$APP"
 codesign -d --verbose=4 "$APP" 2>&1 | grep -Fx "TeamIdentifier=$TEAM"
+codesign -d --extract-certificates "$TMP/app-cert-" "$APP"
+codesign -d --extract-certificates "$TMP/framework-cert-" "$APP/Frameworks/NodeMobile.framework"
+python3 - "$TMP/profile.plist" "$TMP/app-cert-0" "$TMP/framework-cert-0" <<'PY'
+import plistlib
+import sys
+from pathlib import Path
+
+profile, application, framework = (Path(argument).read_bytes() for argument in sys.argv[1:])
+if application != framework:
+    sys.exit("The app and NodeMobile framework were signed with different certificates")
+if application not in plistlib.loads(profile).get("DeveloperCertificates", []):
+    sys.exit("The signing certificate is not authorized by this provisioning profile")
+PY
 (cd "$TMP" && zip -qry -9 signed.ipa Payload)
 ( set -o noclobber; cat "$TMP/signed.ipa" > "$4" )
 shasum -a 256 "$1" "$4"
