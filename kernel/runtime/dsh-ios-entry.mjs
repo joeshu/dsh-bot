@@ -299,10 +299,15 @@ function setupAgent({ botId, systemPrompt, legacyHistory, toolsEnabled, subagent
         rpc.notify('chat.delta', { sessionId: botId, turnId: active.turnId, content: '', reasoning: chunk.text })
       }
     })
-    agentCtx.effect(() => () => { personaDisposer?.() }, 'dsbot-ios.persona')
+    agentCtx.effect(() => () => { personaDisposer?.(); toolRestriction?.() }, 'dsbot-ios.persona')
     return undefined
   }
-  return { setup, setPersona: (value) => setPersona(value), setToolsEnabled: (value) => setToolsEnabled(value), id }
+  return {
+    setup,
+    setPersona: (value) => setPersona(value),
+    setToolsEnabled: (enabled, allowSubagent, allowWebSearch) => setToolsEnabled(enabled, allowSubagent, allowWebSearch),
+    id,
+  }
 }
 
 async function boot() {
