@@ -251,13 +251,16 @@ function renderLegacyHistory(messages) {
   return `Earlier conversation imported from the previous DS Bot iOS chat store. Treat it as background context; the current DSH session log is authoritative for new turns.\n\n${transcript.slice(-48_000)}`
 }
 
-const NATIVE_TOOL_NAMES = ['js_eval', 'device_status', 'memory_save', 'group_todo_add', 'web_fetch', 'web_search', 'remote_mcp_call']
+const NATIVE_TOOL_NAMES = [
+  'js_eval', 'device_status', 'memory_save', 'group_todo_add', 'web_fetch', 'web_search', 'remote_mcp_call',
+  'workspace_list', 'workspace_read', 'workspace_write',
+]
 const ACTIVE_PLUGINS = [
   'dsh-agent', 'dsh-agent-loop', 'dsh-llm', 'dsh-llm-deepseek-api-key',
   'dsh-session', 'dsh-session-projection', 'dsh-system-prompt',
   'dsh-tools', 'dsh-tool-executor-native', 'dsh-web', 'dsh-fs-local', 'dsh-working-directory', 'dsh-web-deepseek-api',
   'dsh-subagent', 'dsh-subagent-spawn-in-process', 'dsh-tool-subagent',
-  'dsbot-ios-sqlite-session-persistence', 'dsbot-ios-keychain-credentials', 'dsbot-ios-native-tools',
+  'dsbot-ios-sqlite-session-persistence', 'dsbot-ios-keychain-credentials', 'dsbot-ios-native-tools', 'dsbot-ios-sandbox-fs',
 ]
 
 function setupAgent({ botId, systemPrompt, legacyHistory, toolsEnabled, subagentEnabled, webSearchEnabled }) {
@@ -365,7 +368,7 @@ const runtimeInfo = () => ({
   webProviders: ctx?.web?.listProviders(),
   pluginIndexFormat: 1, safeMode: workerData?.safeMode === true,
   plugins: ACTIVE_PLUGINS,
-  tools: ['js_eval', 'device_status', 'memory_save', 'group_todo_add', 'web_fetch', 'web_search', 'remote_mcp_call'],
+  tools: [...NATIVE_TOOL_NAMES],
 })
 rpc.handle('agent.info', async () => runtimeInfo())
 

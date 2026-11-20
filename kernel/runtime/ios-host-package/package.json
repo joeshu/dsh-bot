@@ -7,7 +7,8 @@
     ".": "./index.mjs",
     "./credentials": "./credentials.mjs",
     "./session-persistence": "./session-persistence.mjs",
-    "./native-tools": "./native-tools.mjs"
+    "./native-tools": "./native-tools.mjs",
+    "./sandbox-fs": "./sandbox-fs.mjs"
   },
   "dependencies": {
     "@deepseek-ai/dsh-credentials": "0.2.2-rc.5",

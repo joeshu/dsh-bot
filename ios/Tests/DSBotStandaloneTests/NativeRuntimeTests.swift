@@ -172,4 +172,44 @@ final class NativeRuntimeTests: XCTestCase {
         XCTAssertTrue(HostRPC.directWorkspaceMethods.contains("approval.respond"))
         XCTAssertTrue(HostRPC.nodeOriginatedMethods.contains("side.ask"))
     }
+
+    func testWorkspaceFileToolsContainPathsAndRequireWriteApproval() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("dsbot-ws-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("secret".utf8).write(to: root.appendingPathComponent("chats.json"))
+
+        let transport = LocalAgentTransport(root: root)
+        let traversal = try await transport.executeNativeTool(
+            name: "workspace_read", arguments: ["path": "../chats.json"], botId: "main", turnId: "t1", isGroup: false
+        )
+        XCTAssertTrue((traversal["output"] as? String ?? "").contains("Invalid"))
+
+        let approvalSeen = expectation(description: "workspace_write asks for approval")
+        transport.setNativeNotificationHandler { method, params in
+            guard method == "approval.request",
+                  let approvalId = params["approvalId"] as? String else { return }
+            approvalSeen.fulfill()
+            Task {
+                _ = try? await transport.nativeWorkspaceRequest(method: "approval.respond", params: [
+                    "approvalId": approvalId, "turnId": "t1", "sessionId": "main", "approved": true
+                ])
+            }
+        }
+        let written = try await transport.executeNativeTool(
+            name: "workspace_write", arguments: ["path": "notes/todo.md", "content": "hello dsh"], botId: "main", turnId: "t1", isGroup: false
+        )
+        await fulfillment(of: [approvalSeen], timeout: 3)
+        XCTAssertTrue((written["output"] as? String ?? "").contains("Saved files/notes/todo.md"))
+
+        let listed = try await transport.executeNativeTool(
+            name: "workspace_list", arguments: ["path": "notes"], botId: "main", turnId: "t1", isGroup: false
+        )
+        XCTAssertTrue((listed["output"] as? String ?? "").contains("todo.md"))
+
+        let readBack = try await transport.executeNativeTool(
+            name: "workspace_read", arguments: ["path": "notes/todo.md"], botId: "main", turnId: "t1", isGroup: false
+        )
+        XCTAssertEqual(readBack["output"] as? String, "hello dsh")
+    }
 }

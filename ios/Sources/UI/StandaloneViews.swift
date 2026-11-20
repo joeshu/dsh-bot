@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -343,6 +344,8 @@ public struct ChatView: View {
     @State private var showClearConfirm = false
     @State private var showEditBot = false
     @State private var showMemory = false
+    @State private var showFileImporter = false
+    @State private var attachedFile: LocalAgentHost.AttachedWorkspaceFile?
     @State private var actionStatus = ""
     @State private var lastScrollAt = Date.distantPast
     @State private var expandStreamingReasoning = true
@@ -438,6 +441,22 @@ public struct ChatView: View {
             }
             Button("取消", role: .cancel) {}
         }
+        .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.item]) { result in
+            guard !isLocked else { return }
+            switch result {
+            case .success(let url):
+                do {
+                    attachedFile = try host.importFileToWorkspace(from: url)
+                    actionStatus = "已附加：files/\(attachedFile?.relativePath ?? "")"
+                    DSHaptics.notify(.success)
+                } catch {
+                    actionStatus = "附加失败：\(error.localizedDescription)"
+                    DSHaptics.notify(.error)
+                }
+            case .failure(let error):
+                actionStatus = "附加失败：\(error.localizedDescription)"
+            }
+        }
     }
 
     private func lockPrivateConversation() {
@@ -446,6 +465,8 @@ public struct ChatView: View {
         showGroupWorkspace = false
         showEditBot = false
         showMemory = false
+        showFileImporter = false
+        attachedFile = nil
         showClearConfirm = false
         actionStatus = ""
         Task { _ = try? await host.rpc()?.request("device.stopSpeaking") }
@@ -761,8 +782,31 @@ public struct ChatView: View {
     private var composerBar: some View {
         VStack(spacing: 0) {
             Divider()
+            if let file = attachedFile {
+                HStack(spacing: 8) {
+                    Image(systemName: "paperclip")
+                        .font(.caption)
+                        .foregroundColor(DSTheme.brand)
+                    Text("files/\(file.relativePath) (\(ByteCountFormatter.string(fromByteCount: Int64(file.byteCount), countStyle: .file)))")
+                        .font(.caption)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Button {
+                        attachedFile = nil
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 6)
+                .background(DSTheme.surfaceSecondary.opacity(0.7))
+            }
             HStack(spacing: 8) {
                 Menu {
+                    Button { showFileImporter = true } label: { Label("附加文件到工作区", systemImage: "paperclip") }
                     Button { showSideChat = true } label: { Label("/side 侧边对话", systemImage: "bubble.left.and.exclamationmark.bubble.right") }
                     if liveBot.isGroup { Button { showGroupWorkspace = true } label: { Label("/goal 群目标与待办", systemImage: "target") } }
                     Button { showClearConfirm = true } label: { Label("/clear 清空当前会话", systemImage: "trash") }
@@ -797,7 +841,7 @@ public struct ChatView: View {
                 } else {
                     Button {
                         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !text.isEmpty else { return }
+                        guard !text.isEmpty || attachedFile != nil else { return }
                         if text == "/side" {
                             input = ""
                             showSideChat = true
@@ -813,14 +857,18 @@ public struct ChatView: View {
                             showClearConfirm = true
                             return
                         }
+                        let prefix = attachedFile?.promptPrefix() ?? ""
+                        let body = text.isEmpty ? "请查看我刚附加的工作区文件。" : text
+                        let payload = prefix + body
                         input = ""
-                        Task { await host.sendMessage(sessionId: bot.id, text: text, model: selectedModel) }
+                        attachedFile = nil
+                        Task { await host.sendMessage(sessionId: bot.id, text: payload, model: selectedModel) }
                     } label: {
                         Image(systemName: "arrow.up.circle.fill")
                             .font(.title2)
-                            .foregroundColor(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .secondary : DSTheme.brand)
+                            .foregroundColor((input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachedFile == nil) ? .secondary : DSTheme.brand)
                     }
-                    .disabled(host.state != .ready || host.isStreaming || input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(host.state != .ready || host.isStreaming || (input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachedFile == nil))
                 }
             }
             .padding(.horizontal, 12)

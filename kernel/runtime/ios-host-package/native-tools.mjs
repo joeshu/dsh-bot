@@ -99,6 +99,27 @@ function apply(context) {
       parameters: { connectorName: { type: 'string', required: true }, toolName: { type: 'string', required: true }, arguments: { type: 'json' } },
       timeoutMs: 70_000, execute: (args, exec) => bridge('remote_mcp_call', args, exec),
     }),
+    defineTool({
+      ...common, name: 'workspace_list',
+      description: 'List files inside the sandboxed DS Bot workspace files/ folder (visible in the iOS Files app).',
+      parameters: { path: { type: 'string', description: 'Optional relative subfolder inside files/.' } },
+      timeoutMs: 10_000, execute: (args, exec) => bridge('workspace_list', args, exec),
+    }),
+    defineTool({
+      ...common, name: 'workspace_read',
+      description: 'Read a UTF-8 text file (up to 64 KB) inside the sandboxed DS Bot workspace files/ folder.',
+      parameters: { path: { type: 'string', required: true, description: 'Relative path inside files/.' } },
+      timeoutMs: 10_000, execute: (args, exec) => bridge('workspace_read', args, exec),
+    }),
+    defineTool({
+      ...common, name: 'workspace_write',
+      description: 'Write a UTF-8 text file (up to 256 KB) inside the sandboxed DS Bot workspace files/ folder after user approval.',
+      parameters: {
+        path: { type: 'string', required: true, description: 'Relative path inside files/.' },
+        content: { type: 'string', required: true, description: 'UTF-8 file content to write.' },
+      },
+      timeoutMs: 70_000, execute: (args, exec) => bridge('workspace_write', args, exec),
+    }),
   ]
   const removers = definitions.map((definition) => context.tools.register(definition))
   context.effect(() => () => { unregisterFetch(); removers.reverse().forEach((remove) => remove()) }, 'dsbot-ios.nativeTools')

@@ -340,6 +340,58 @@ public final class LocalAgentHost: ObservableObject {
         return lines.joined(separator: "\n")
     }
 
+    public struct AttachedWorkspaceFile: Equatable, Sendable {
+        public let relativePath: String
+        public let fileName: String
+        public let byteCount: Int
+        public let inlineText: String?
+
+        public func promptPrefix() -> String {
+            if let inlineText, !inlineText.isEmpty {
+                return "[附件文件：files/\(relativePath)（\(byteCount) 字节）]\n```\n\(inlineText)\n```\n\n"
+            }
+            return "[附件文件：files/\(relativePath)（\(byteCount) 字节，已存入工作区，可使用 workspace_read 查看）]\n\n"
+        }
+    }
+
+    public func importFileToWorkspace(from sourceURL: URL) throws -> AttachedWorkspaceFile {
+        let accessed = sourceURL.startAccessingSecurityScopedResource()
+        defer { if accessed { sourceURL.stopAccessingSecurityScopedResource() } }
+        let values = try sourceURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+        guard values.isRegularFile == true else {
+            throw IPCFrameError.remoteError(code: -32602, message: "只能附加普通文件。")
+        }
+        let maxImportBytes = 2 * 1024 * 1024
+        if let size = values.fileSize, size > maxImportBytes {
+            throw IPCFrameError.remoteError(code: -32602, message: "单个附件不能超过 2 MB。")
+        }
+        let data = try Data(contentsOf: sourceURL)
+        guard data.count <= maxImportBytes else {
+            throw IPCFrameError.remoteError(code: -32602, message: "单个附件不能超过 2 MB。")
+        }
+        let rawName = sourceURL.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
+        let safeChars = rawName.map { ch -> Character in
+            (ch.isASCII && (ch.isLetter || ch.isNumber || ch == "." || ch == "-" || ch == "_")) ? ch : "_"
+        }
+        let baseName = String(safeChars).trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        let fileName = baseName.isEmpty ? "attachment_\(UUID().uuidString.prefix(6)).txt" : baseName
+        let filesDir = LocalAgentTransport.defaultWorkspace.appendingPathComponent("files", isDirectory: true)
+        try FileManager.default.createDirectory(at: filesDir, withIntermediateDirectories: true)
+        var targetName = fileName
+        var dest = filesDir.appendingPathComponent(targetName, isDirectory: false)
+        if FileManager.default.fileExists(atPath: dest.path) {
+            let stem = (fileName as NSString).deletingPathExtension
+            let ext = (fileName as NSString).pathExtension
+            let suffix = String(UUID().uuidString.prefix(6)).lowercased()
+            targetName = ext.isEmpty ? "\(stem)_\(suffix)" : "\(stem)_\(suffix).\(ext)"
+            dest = filesDir.appendingPathComponent(targetName, isDirectory: false)
+        }
+        try data.write(to: dest, options: .atomic)
+        let inlineLimit = 24_576
+        let inlineText: String? = data.count <= inlineLimit ? String(data: data, encoding: .utf8) : nil
+        return AttachedWorkspaceFile(relativePath: targetName, fileName: targetName, byteCount: data.count, inlineText: inlineText)
+    }
+
     public func deleteBot(id: String) {
         guard let target = bots.first(where: { $0.id == id }), !target.isMain else { return }
         bots.removeAll { $0.id == id }

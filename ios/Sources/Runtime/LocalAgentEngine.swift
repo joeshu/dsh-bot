@@ -216,6 +216,7 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
     static let defaultWorkspace = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("dsh-home", isDirectory: true)
 
+    private let workspaceRoot: URL
     private let keychain: KeychainBridge
     private let modelKey: (ModelProvider) async throws -> String
     private let session: URLSession
@@ -239,6 +240,7 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
     init(root: URL = LocalAgentTransport.defaultWorkspace, keychain: KeychainBridge = KeychainBridge(),
          migrateOfficialKey: Bool = false, session: URLSession? = nil, mcp: RemoteMCPClient? = nil,
          modelKey: ((ModelProvider) async throws -> String)? = nil) {
+        self.workspaceRoot = root
         self.keychain = keychain
         self.modelKey = modelKey ?? { provider in
             try await keychain.modelKey(provider: provider, migrateOfficialKey: migrateOfficialKey)
@@ -304,7 +306,8 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
     }
 
     func executeNativeTool(name: String, arguments: [String: Any], botId: String, turnId: String, isGroup: Bool) async throws -> [String: Any] {
-        guard ["js_eval", "device_status", "memory_save", "group_todo_add", "web_fetch", "web_search", "remote_mcp_call"].contains(name) else {
+        guard ["js_eval", "device_status", "memory_save", "group_todo_add", "web_fetch", "web_search", "remote_mcp_call",
+               "workspace_list", "workspace_read", "workspace_write"].contains(name) else {
             throw IPCFrameError.remoteError(code: -32601, message: "Unsupported DSH native tool: \(name)")
         }
         guard let data = try? JSONSerialization.data(withJSONObject: arguments),
@@ -675,6 +678,20 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
             address = try? ModelProvider.httpsComponents(text("url")).url
             guard let address else { return "A valid HTTPS URL is required." }
             summary = address.absoluteString
+        case "workspace_list":
+            return listWorkspaceFiles(relativePath: text("path"))
+        case "workspace_read":
+            return readWorkspaceFile(relativePath: text("path"))
+        case "workspace_write":
+            let relPath = text("path")
+            let content = args["content"] as? String ?? ""
+            guard !relPath.isEmpty, sandboxedWorkspaceFileURL(relativePath: relPath, allowEmpty: false) != nil else {
+                return "Invalid workspace file path. Use a relative path inside files/ without '..'."
+            }
+            let byteCount = content.utf8.count
+            guard byteCount <= 262_144 else { return "Workspace file write exceeds 256 KB limit." }
+            let preview = String(content.prefix(240))
+            summary = "写入工作区文件：files/\(relPath)（\(byteCount) 字节）\n\(preview)"
         default: return "Unsupported tool."
         }
 
@@ -727,12 +744,94 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
                     "body": ["kind": "text", "content": content], "truncated": plain.count > content.count
                 ]
                 return String(decoding: try JSONSerialization.data(withJSONObject: result), as: UTF8.self)
+            case "workspace_write":
+                return try writeWorkspaceFile(relativePath: text("path"), content: args["content"] as? String ?? "")
             default: return "Unsupported tool."
             }
         } catch {
             try Task.checkCancellation()
             return "Tool failed: \(error.localizedDescription)"
         }
+    }
+
+    private func workspaceFilesRoot() -> URL {
+        let dir = workspaceRoot.appendingPathComponent("files", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    private func sandboxedWorkspaceFileURL(relativePath: String, allowEmpty: Bool) -> URL? {
+        let normalized = relativePath.replacingOccurrences(of: "\\", with: "/").trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalized.isEmpty { return allowEmpty ? workspaceFilesRoot() : nil }
+        if normalized.hasPrefix("/") || normalized.contains("\0") { return nil }
+        let parts = normalized.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard !parts.isEmpty, !parts.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }) else { return nil }
+        let base = workspaceFilesRoot().standardizedFileURL
+        var target = base
+        let fm = FileManager.default
+        for part in parts {
+            target = target.appendingPathComponent(part, isDirectory: false)
+            if fm.fileExists(atPath: target.path),
+               let attrs = try? fm.attributesOfItem(atPath: target.path),
+               (attrs[.type] as? FileAttributeType) == .typeSymbolicLink {
+                return nil
+            }
+        }
+        let resolvedBase = base.resolvingSymlinksInPath().path
+        let resolvedTarget = target.resolvingSymlinksInPath().path
+        guard resolvedTarget == resolvedBase || resolvedTarget.hasPrefix(resolvedBase + "/") else { return nil }
+        return target
+    }
+
+    private func listWorkspaceFiles(relativePath: String) -> String {
+        guard let dir = sandboxedWorkspaceFileURL(relativePath: relativePath, allowEmpty: true) else {
+            return "Invalid workspace path."
+        }
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue else {
+            return "Workspace folder not found."
+        }
+        guard let entries = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey], options: [.skipsHiddenFiles]) else {
+            return "Unable to read workspace folder."
+        }
+        let lines = entries.sorted { $0.lastPathComponent < $1.lastPathComponent }.prefix(200).compactMap { url -> String? in
+            let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey])
+            if values?.isSymbolicLink == true { return nil }
+            if values?.isDirectory == true { return "[DIR] \(url.lastPathComponent)/" }
+            let size = values?.fileSize ?? 0
+            return "[FILE] \(url.lastPathComponent) (\(size) bytes)"
+        }
+        return lines.isEmpty ? "(files/ is empty)" : lines.joined(separator: "\n")
+    }
+
+    private func readWorkspaceFile(relativePath: String) -> String {
+        guard let url = sandboxedWorkspaceFileURL(relativePath: relativePath, allowEmpty: false) else {
+            return "Invalid workspace file path."
+        }
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue else {
+            return "Workspace file not found."
+        }
+        guard let data = try? Data(contentsOf: url) else { return "Unable to read workspace file." }
+        let maxRead = 65_536
+        let slice = data.count > maxRead ? data.prefix(maxRead) : data
+        guard let text = String(data: slice, encoding: .utf8) else {
+            return "Workspace file is not UTF-8 text (\(data.count) bytes)."
+        }
+        return data.count > maxRead ? text + "\n…(truncated at 64 KB)" : text
+    }
+
+    private func writeWorkspaceFile(relativePath: String, content: String) throws -> String {
+        guard let url = sandboxedWorkspaceFileURL(relativePath: relativePath, allowEmpty: false) else {
+            return "Invalid workspace file path."
+        }
+        let data = Data(content.utf8)
+        guard data.count <= 262_144 else { return "Workspace file write exceeds 256 KB limit." }
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
+        return "Saved files/\(relativePath) (\(data.count) bytes)."
     }
 
     private func recordUsage(_ usage: [String: Any]) async {

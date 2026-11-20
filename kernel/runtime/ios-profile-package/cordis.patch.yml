@@ -60,7 +60,7 @@
         count: 5
 
     - id: ios-fs
-      name: '@deepseek-ai/dsh-fs-local'
+      name: '@dsbot/dsh-ios-host/sandbox-fs'
 
     - id: ios-working-directory
       name: '@deepseek-ai/dsh-working-directory'
