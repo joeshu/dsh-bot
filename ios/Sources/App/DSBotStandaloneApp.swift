@@ -2,7 +2,7 @@ import SwiftUI
 
 @main
 public struct DSBotStandaloneApp: App {
-    @StateObject private var host = BareWorkletHost()
+    @StateObject private var host = LocalAgentHost.shared
     @Environment(\.scenePhase) private var scenePhase
 
     public init() {}
@@ -11,9 +11,14 @@ public struct DSBotStandaloneApp: App {
         WindowGroup {
             MainTabView(host: host)
                 .tint(DSTheme.brand)
+                .overlay {
+                    if scenePhase != .active {
+                        Color(uiColor: .systemBackground).ignoresSafeArea().accessibilityHidden(true)
+                    }
+                }
                 .task {
                     if host.state == .idle {
-                        await host.boot { _ in LocalAgentTransport(dshVersion: host.activeVersion) }
+                        await host.boot()
                     }
                 }
                 .onChange(of: scenePhase) { newPhase in

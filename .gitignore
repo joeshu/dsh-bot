@@ -16,3 +16,14 @@ ios/Resources/KernelAssets/
 *.swp
 .idea/
 .vscode/
+
+# Generated native build dependencies and reports
+ios/Vendor/QuickJS/
+ios/Vendor/NodeMobile.xcframework/
+ios/Sources/Resources/DSHRuntime/
+dist/ipa-report.json
+
+# Generated subscription source
+dist/source.json
+
+__pycache__/

@@ -1,127 +1,55 @@
 #!/usr/bin/env bash
-# Builds a 100% standalone, clean, unsigned arm64 iOS .ipa with embedded DSH 0.2.2-rc.5 kernel.
-# Compatible with SideStore, AltStore, LiveContainer, TrollStore, and offline zsign re-signing.
+# Archive and verify the native iOS app for re-signing with a sideloading tool.
 set -euo pipefail
 
-export LANG="en_US.UTF-8"
-export LC_ALL="en_US.UTF-8"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+OUT_DIR="${DSBOT_OUT_DIR:-$ROOT/dist}"
+REPO="${DSBOT_REPOSITORY:-joeshu/dsh-bot}"
+COMMIT="${DSBOT_COMMIT:-$(git -C "$ROOT" rev-parse HEAD)}"
+mkdir -p "$OUT_DIR"
+OUT_DIR="$(cd "$OUT_DIR" && pwd)"
+BUILD="$(mktemp -d)"
+trap 'rm -rf "$BUILD"' EXIT
 
-ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-KERNEL_DIR="$ROOT_DIR/kernel"
-IOS_DIR="$ROOT_DIR/ios"
-OUT_DIR="$ROOT_DIR/dist"
-KERNEL_ASSETS_DIR="$IOS_DIR/Resources/KernelAssets"
-
-mkdir -p "$OUT_DIR" "$KERNEL_ASSETS_DIR"
-
-echo "==> [1/5] Verifying DSH kernel alignment & running 4-gate contract tests"
-(
-  cd "$KERNEL_DIR"
-  node scripts/sync-dsh-lock.mjs --check
-  node --test test/*.test.mjs
-  node scripts/build-kernel.mjs
-)
-
-DSH_VERSION="$(node -p "require('$KERNEL_DIR/dsh.lock.json').dshVersion")"
-APP_VERSION="$(node -p "require('$KERNEL_DIR/package.json').version")"
-IPA_NAME="DS-Bot-iOS-Standalone-v${APP_VERSION}-dsh${DSH_VERSION}-unsigned.ipa"
-IPA_PATH="$OUT_DIR/$IPA_NAME"
-
-echo "==> [2/5] Embedding DSH $DSH_VERSION kernel bundle into iOS resources"
-rm -rf "$KERNEL_ASSETS_DIR"
-mkdir -p "$KERNEL_ASSETS_DIR"
-cp "$KERNEL_DIR/dist/dsh-kernel-${DSH_VERSION}.bundle" "$KERNEL_ASSETS_DIR/"
-cp "$KERNEL_DIR/dist/kernel-manifest.json" "$KERNEL_ASSETS_DIR/"
-
-echo "==> [3/5] Generating Xcode project & archiving unsigned arm64 release"
-cd "$IOS_DIR"
+if [[ "$(node --version)" != "v24.22.1" || "$(npm --version)" != "11.9.0" ]]; then
+  echo "Build requires Node v24.22.1 with npm 11.9.0" >&2
+  exit 1
+fi
+npm --prefix "$ROOT/kernel/runtime" ci --ignore-scripts --omit=optional --no-audit --no-fund
+python3 "$ROOT/scripts/prepare-dsh-runtime.py"
+python3 "$ROOT/scripts/prepare-node-mobile-ios.py"
+python3 "$ROOT/scripts/prepare-quickjs.py"
+cd "$ROOT/ios"
 xcodegen generate --spec project.yml
-
-# xcodegen's plist generation can clobber the source Info.plist in the
-# checkout (the archive's built plist was a generated default: en / 1.0 /
-# MinimumOSVersion 16.4, none of our keys). Restore it from git and prove
-# the four gated keys are present before building.
-git checkout -- Resources/Info.plist
-echo "--- Source Info.plist keys after xcodegen ---"
-plutil -p Resources/Info.plist | grep -E "NSFaceIDUsageDescription|NSLocalNetworkUsageDescription|UIFileSharingEnabled|ITSAppUsesNonExemptEncryption" || { echo "ERROR: source Info.plist lost its keys after xcodegen"; exit 1; }
-
-rm -rf build
-xcodebuild \
+xcodebuild archive \
   -project DSBotStandalone.xcodeproj \
   -scheme DSBotStandalone \
   -configuration Release \
   -destination 'generic/platform=iOS' \
-  -archivePath build/DSBotStandalone.xcarchive \
-  MARKETING_VERSION="$APP_VERSION" \
-  INFOPLIST_FILE=Resources/Info.plist \
-  ARCHS=arm64 \
-  ONLY_ACTIVE_ARCH=NO \
-  CODE_SIGNING_ALLOWED=NO \
-  CODE_SIGNING_REQUIRED=NO \
-  CODE_SIGN_IDENTITY="" \
-  CODE_SIGN_ENTITLEMENTS="" \
-  DEVELOPMENT_TEAM="" \
-  archive
+  -archivePath "$BUILD/DSBotStandalone.xcarchive" \
+  ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+  CODE_SIGN_IDENTITY="" CODE_SIGN_ENTITLEMENTS="" DEVELOPMENT_TEAM=""
 
-echo "==> [4/5] Stripping signature residue & packing unsigned IPA"
-APP_BUNDLE="$(ls -d build/DSBotStandalone.xcarchive/Products/Applications/*.app | head -n 1)"
-if [[ -z "$APP_BUNDLE" || ! -d "$APP_BUNDLE" ]]; then
-  echo "::error::No .app bundle found inside xcarchive"
+shopt -s nullglob
+apps=("$BUILD"/DSBotStandalone.xcarchive/Products/Applications/*.app)
+if [[ ${#apps[@]} != 1 ]]; then
+  echo "Expected exactly one .app in the archive" >&2
   exit 1
 fi
-
-STAGE_DIR="$(mktemp -d)"
-trap 'rm -rf "$STAGE_DIR"' EXIT
-mkdir -p "$STAGE_DIR/Payload"
-cp -a "$APP_BUNDLE" "$STAGE_DIR/Payload/"
-
-# Strip any prebuilt framework _CodeSignature, provisioning profiles, and macOS metadata
-find "$STAGE_DIR/Payload" -name "_CodeSignature" -type d -exec rm -rf {} +
-find "$STAGE_DIR/Payload" -name "embedded.mobileprovision" -type f -delete
-find "$STAGE_DIR/Payload" -name ".DS_Store" -type f -delete
-rm -rf "$STAGE_DIR/Payload"/*.app/SC_Info
-
-rm -f "$IPA_PATH"
-(cd "$STAGE_DIR" && zip -r -y -9 -q "$IPA_PATH" Payload)
-
-echo "==> [5/5] Running 4-gate unsigned IPA verification"
-# Gate A: Info.plist & embedded DSH kernel present
-if ! unzip -l "$IPA_PATH" | grep -q 'Payload/.*\.app/Info\.plist'; then
-  echo "::error::Missing Payload/*.app/Info.plist"
+VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${apps[0]}/Info.plist")"
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "Invalid app version" >&2
   exit 1
 fi
-if ! unzip -l "$IPA_PATH" | grep -q "dsh-kernel-${DSH_VERSION}\.bundle"; then
-  echo "::error::Missing embedded dsh-kernel-${DSH_VERSION}.bundle"
-  exit 1
-fi
+IPA="DS-Bot-iOS-Standalone-v${VERSION}-unsigned.ipa"
 
-# Gate B: Zero code signature or provisioning profile residue anywhere in Payload
-if unzip -l "$IPA_PATH" | grep -Eq '(_CodeSignature|embedded\.mobileprovision)'; then
-  echo "::error::Signature residue detected inside unsigned IPA"
-  exit 1
-fi
-
-# Gate C: Main binary strictly contains arm64 device slice (no x86_64 simulator slice)
-BIN_PATH="$STAGE_DIR/Payload/DSBotStandalone.app/DSBotStandalone"
-if command -v lipo >/dev/null 2>&1 && [[ -f "$BIN_PATH" ]]; then
-  ARCHS_OUT="$(lipo -archs "$BIN_PATH" | xargs)"
-  if [[ "$ARCHS_OUT" != "arm64" ]]; then
-    echo "::error::Expected arm64 binary slice, got: $ARCHS_OUT"
-    exit 1
-  fi
-fi
-
-# Gate D: Required privacy & sideload keys present in Info.plist
-PLIST_PATH="$STAGE_DIR/Payload/DSBotStandalone.app/Info.plist"
-echo "--- Built Info.plist (full) ---"
-plutil -p "$PLIST_PATH" || echo "(plutil -p failed on $PLIST_PATH)"
-ls -la "$STAGE_DIR/Payload/DSBotStandalone.app/Info.plist"
-for key in NSFaceIDUsageDescription NSLocalNetworkUsageDescription UIFileSharingEnabled ITSAppUsesNonExemptEncryption; do
-  if ! /usr/libexec/PlistBuddy -c "Print :$key" "$PLIST_PATH" >/dev/null 2>&1; then
-    echo "::error::Missing required Info.plist key: $key"
-    exit 1
-  fi
+mkdir -p "$BUILD/Payload" "$BUILD/candidate"
+cp -pR "${apps[0]}" "$BUILD/Payload/"
+(cd "$BUILD" && /usr/bin/zip -qry -9 "candidate/$IPA" Payload)
+python3 "$ROOT/scripts/verify-unsigned-ipa.py" "$BUILD/candidate/$IPA" \
+  --release-dir "$BUILD/candidate" --repo "$REPO" --commit "$COMMIT"
+for name in "$IPA" ipa-report.json source.json SHA256SUMS.txt; do
+  mv "$BUILD/candidate/$name" "$OUT_DIR/$name"
 done
-
-(cd "$OUT_DIR" && shasum -a 256 "$IPA_NAME" > SHA256SUMS.txt)
-echo "SUCCESS: Verified unsigned IPA -> $IPA_PATH ($(stat -f %z "$IPA_PATH" 2>/dev/null || stat -c %s "$IPA_PATH") bytes)"
+echo "Verified unsigned IPA at $OUT_DIR/$IPA"

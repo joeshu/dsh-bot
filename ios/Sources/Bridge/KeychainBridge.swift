@@ -1,6 +1,7 @@
 import Foundation
 import LocalAuthentication
 import Security
+import CryptoKit
 
 public enum KeychainBridgeError: Error, LocalizedError {
     case authenticationFailed
@@ -46,6 +47,8 @@ public final class KeychainBridge: Sendable {
                     localizedReason: "Authenticate to access DS Bot credentials."
                 )
                 guard ok else { throw KeychainBridgeError.authenticationFailed }
+            } else {
+                throw KeychainBridgeError.authenticationFailed
             }
         }
 
@@ -68,23 +71,33 @@ public final class KeychainBridge: Sendable {
         return ["value": value]
     }
 
-    public func setSecret(account: String, value: String) throws -> [String: Any] {
-        let safeAccount = try validatedAccount(account)
-        let data = Data(value.utf8)
-        let query: [String: Any] = [
+    private func insertSecret(query: [String: Any], data: Data) -> OSStatus {
+        var attributes = query
+        attributes[kSecValueData as String] = data
+        attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        return SecItemAdd(attributes as CFDictionary, nil)
+    }
+
+    private func passwordQuery(account: String) throws -> [String: Any] {
+        [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: safeAccount
+            kSecAttrAccount as String: try validatedAccount(account)
         ]
-        SecItemDelete(query as CFDictionary)
+    }
 
-        var attrs = query
-        attrs[kSecValueData as String] = data
-        attrs[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        let status = SecItemAdd(attrs as CFDictionary, nil)
-        guard status == errSecSuccess else {
-            throw KeychainBridgeError.osStatus(status)
+    public func setSecret(account: String, value: String) throws -> [String: Any] {
+        let query = try passwordQuery(account: account)
+        let data = Data(value.utf8)
+        let update = [kSecValueData as String: data] as CFDictionary
+        var status = SecItemUpdate(query as CFDictionary, update)
+        if status == errSecItemNotFound {
+            status = insertSecret(query: query, data: data)
+            if status == errSecDuplicateItem {
+                status = SecItemUpdate(query as CFDictionary, update)
+            }
         }
+        guard status == errSecSuccess else { throw KeychainBridgeError.osStatus(status) }
         return ["ok": true]
     }
 
@@ -100,5 +113,35 @@ public final class KeychainBridge: Sendable {
             throw KeychainBridgeError.osStatus(status)
         }
         return ["ok": true]
+    }
+}
+
+extension KeychainBridge {
+    private func modelAccount(_ provider: ModelProvider) -> String {
+        let digest = SHA256.hash(data: Data(provider.baseURL.absoluteString.utf8))
+        return "model:" + digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    func saveModelKey(_ value: String, provider: ModelProvider) throws {
+        _ = try setSecret(account: modelAccount(provider), value: value)
+    }
+
+    func modelKey(provider: ModelProvider, migrateOfficialKey: Bool) async throws -> String {
+        if let value = try await getSecret(account: modelAccount(provider), requireBiometrics: false)["value"] as? String,
+           !value.isEmpty {
+            return value
+        }
+        if provider.isDeepSeek, migrateOfficialKey,
+           let value = try await getSecret(account: "deepseek_api_key", requireBiometrics: false)["value"] as? String,
+           !value.isEmpty {
+            let account = modelAccount(provider)
+            let status = try insertSecret(query: passwordQuery(account: account), data: Data(value.utf8))
+            if status == errSecSuccess { return value }
+            if status == errSecDuplicateItem,
+               let current = try await getSecret(account: account, requireBiometrics: false)["value"] as? String,
+               !current.isEmpty { return current }
+            throw KeychainBridgeError.osStatus(status)
+        }
+        throw ModelProviderError.missingKey
     }
 }

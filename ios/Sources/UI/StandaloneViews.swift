@@ -1,12 +1,12 @@
 import SwiftUI
+import UniformTypeIdentifiers
 #if canImport(UIKit)
 import UIKit
 #endif
 
-/// Modern 5-Tab iOS architecture matching Apple HIG & DSH mobile ecosystem:
-/// 1. 会话 (Chats)  2. Bot (Team)  3. 小工具 (Tools)  4. 探索 (Plugin Store)  5. 设置 (Kernel & Vault)
+/// Native agent navigation.
 public struct MainTabView: View {
-    @ObservedObject var host: BareWorkletHost
+    @ObservedObject var host: LocalAgentHost
 
     public var body: some View {
         TabView {
@@ -19,10 +19,10 @@ public struct MainTabView: View {
             ToolsHubTabView(host: host)
                 .tabItem { Label("小工具", systemImage: "square.grid.2x2") }
 
-            PluginStoreView(host: host)
+            PluginManagerView(host: host)
                 .tabItem { Label("探索", systemImage: "safari") }
 
-            KernelSettingsView(host: host)
+            AgentSettingsView(host: host)
                 .tabItem { Label("设置", systemImage: "gearshape") }
         }
     }
@@ -31,16 +31,25 @@ public struct MainTabView: View {
 // MARK: - Tab 1: 会话 (Sessions)
 
 public struct SessionsTabView: View {
-    @ObservedObject var host: BareWorkletHost
+    @ObservedObject var host: LocalAgentHost
     @State private var searchText = ""
     @State private var showCreateSheet = false
 
     private var filteredBots: [BotProfile] {
-        guard !searchText.isEmpty else { return host.bots }
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return host.bots }
         return host.bots.filter { bot in
-            bot.name.localizedCaseInsensitiveContains(searchText)
-            || bot.roleLabel.localizedCaseInsensitiveContains(searchText)
-            || host.messages(for: bot.id).contains { $0.content.localizedCaseInsensitiveContains(searchText) }
+            bot.name.localizedCaseInsensitiveContains(query)
+            || bot.roleLabel.localizedCaseInsensitiveContains(query)
+            || matchingMessage(for: bot, query: query) != nil
+        }
+    }
+
+    private func matchingMessage(for bot: BotProfile, query: String? = nil) -> ChatMessageItem? {
+        let searchQuery = (query ?? searchText).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !bot.isPrivate, !searchQuery.isEmpty else { return nil }
+        return host.messages(for: bot.id).last {
+            $0.content.localizedCaseInsensitiveContains(searchQuery)
         }
     }
 
@@ -48,15 +57,16 @@ public struct SessionsTabView: View {
         NavigationStack {
             List {
                 Section {
-                    kernelStatusCard
+                    agentStatusCard
                 }
                 .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
                 .listRowBackground(Color.clear)
 
                 Section("最近会话") {
                     ForEach(filteredBots) { bot in
+                        let matchedMessage = matchingMessage(for: bot)
                         NavigationLink {
-                            ChatView(bot: bot, host: host)
+                            ChatView(bot: bot, host: host, targetMessageID: matchedMessage?.id)
                         } label: {
                             HStack(spacing: 12) {
                                 DSBotAvatar(
@@ -75,21 +85,18 @@ public struct SessionsTabView: View {
                                             DSStatusBadge("群聊", color: .indigo)
                                         }
                                     }
-                                    Text(lastPreview(for: bot))
+                                    Text(lastPreview(for: bot, matching: matchedMessage))
                                         .font(.caption)
                                         .foregroundColor(.secondary)
-                                        .lineLimit(1)
+                                        .lineLimit(2)
                                 }
                                 Spacer()
                                 VStack(alignment: .trailing, spacing: 3) {
-                                    if let lastTs = host.messages(for: bot.id).last?.timestamp {
-                                        Text(lastTs.formatted(date: .omitted, time: .shortened))
+                                    if !bot.isPrivate, let timestamp = (matchedMessage ?? host.messages(for: bot.id).last)?.timestamp {
+                                        Text(timestamp.formatted(date: .omitted, time: .shortened))
                                             .font(.caption2)
                                             .foregroundColor(.secondary)
                                     }
-                                    Text(bot.model == "deepseek-reasoner" ? "R1" : "V3")
-                                        .font(.caption2.monospaced().weight(.semibold))
-                                        .foregroundColor(.secondary)
                                 }
                             }
                             .padding(.vertical, 3)
@@ -99,7 +106,7 @@ public struct SessionsTabView: View {
             }
             .listStyle(.insetGrouped)
             .navigationTitle("会话")
-            .searchable(text: $searchText, prompt: "搜索 Bot 或群聊")
+            .searchable(text: $searchText, prompt: "搜索会话和消息")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { showCreateSheet = true } label: {
@@ -114,27 +121,36 @@ public struct SessionsTabView: View {
         }
     }
 
-    private func lastPreview(for bot: BotProfile) -> String {
+    private func lastPreview(for bot: BotProfile, matching message: ChatMessageItem? = nil) -> String {
+        if bot.isPrivate { return "私密会话" }
+        if let message {
+            let sender = message.role == "user" ? "你" : bot.name
+            return "\(sender)：\(message.content)"
+        }
         if let last = host.messages(for: bot.id).last {
             return last.content
         }
         return bot.roleLabel
     }
 
-    private var kernelStatusCard: some View {
+    private var agentStatusCard: some View {
         HStack(spacing: 12) {
             Image(systemName: statusIcon)
                 .font(.title2)
                 .foregroundColor(statusColor)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    Text("DSH \(host.activeVersion)")
+                    Text(host.embeddedRuntimeLabel ?? "Node.js + DSH 0.2.2-rc.5")
                         .font(.subheadline.weight(.semibold))
-                    DSStatusBadge(isBaselineBadge, color: statusColor)
+                    DSStatusBadge(host.isDSHRecoveryMode ? "恢复模式" : statusBadge, color: host.isDSHRecoveryMode ? DSTheme.warning : statusColor)
                 }
-                Text(statusDescription)
+                Text(host.workspaceError ?? statusDescription)
                     .font(.caption)
                     .foregroundColor(.secondary)
+                if case .failed = host.state {
+                    Button("重试启动") { Task { await host.boot() } }
+                        .font(.caption)
+                }
             }
             Spacer()
         }
@@ -144,10 +160,9 @@ public struct SessionsTabView: View {
         .shadow(color: .black.opacity(0.04), radius: 6, y: 2)
     }
 
-    private var isBaselineBadge: String {
+    private var statusBadge: String {
         switch host.state {
-        case .ready(_, let isBase): return isBase ? "基线核" : "热更核"
-        case .rolledBack: return "已回滚"
+        case .ready: return "就绪"
         case .failed: return "异常"
         default: return "启动中"
         }
@@ -156,7 +171,6 @@ public struct SessionsTabView: View {
     private var statusIcon: String {
         switch host.state {
         case .ready: return "cpu.fill"
-        case .rolledBack: return "arrow.uturn.backward.circle.fill"
         case .failed: return "exclamationmark.triangle.fill"
         default: return "clock.fill"
         }
@@ -165,7 +179,6 @@ public struct SessionsTabView: View {
     private var statusColor: Color {
         switch host.state {
         case .ready: return DSTheme.success
-        case .rolledBack: return DSTheme.warning
         case .failed: return DSTheme.danger
         default: return .secondary
         }
@@ -173,21 +186,21 @@ public struct SessionsTabView: View {
 
     private var statusDescription: String {
         switch host.state {
-        case .idle: return "独立端侧内核待命"
-        case .booting(let v): return "正在初始化 DSH \(v)..."
-        case .ready: return "独立 iOS 端侧就绪 · 零桌面依赖"
-        case .rolledBack(let from, let to, _): return "已从 \(from) 自动回滚至 \(to)"
-        case .failed(let msg): return msg
+        case .idle, .starting: return "正在读取本机工作区…"
+        case .ready: return "应用版本 \(host.appVersion)"
+        case .failed(let message): return message
         }
     }
+
 }
 
 // MARK: - Tab 2: Bot (Grouped Team Roster)
 
 public struct BotRosterTabView: View {
-    @ObservedObject var host: BareWorkletHost
+    @ObservedObject var host: LocalAgentHost
     @State private var showCreateSheet = false
     @State private var editingBot: BotProfile?
+    @State private var pendingDeleteBot: BotProfile?
 
     private var sections: [String] {
         Array(NSOrderedSet(array: host.bots.map(\.section))) as? [String] ?? []
@@ -214,13 +227,13 @@ public struct BotRosterTabView: View {
                                         Text(bot.roleLabel).font(.caption).foregroundColor(.secondary)
                                     }
                                     Spacer()
-                                    DSStatusBadge(bot.model == "deepseek-reasoner" ? "深度思考" : "标准", color: .secondary)
+                                    Text(host.modelSelection(bot.model)).font(.caption).foregroundStyle(.secondary)
                                 }
                             }
                             .swipeActions(edge: .trailing) {
                                 if !bot.isMain {
                                     Button("删除", role: .destructive) {
-                                        host.deleteBot(id: bot.id)
+                                        pendingDeleteBot = bot
                                     }
                                 }
                                 Button("编辑") {
@@ -247,6 +260,22 @@ public struct BotRosterTabView: View {
             .sheet(item: $editingBot) { target in
                 EditBotSheet(bot: target, host: host)
             }
+            .confirmationDialog(
+                "确定删除「\(pendingDeleteBot?.name ?? "")」及其聊天记录？",
+                isPresented: Binding(
+                    get: { pendingDeleteBot != nil },
+                    set: { if !$0 { pendingDeleteBot = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button("删除", role: .destructive) {
+                    if let target = pendingDeleteBot {
+                        pendingDeleteBot = nil
+                        host.deleteBot(id: target.id)
+                    }
+                }
+                Button("取消", role: .cancel) { pendingDeleteBot = nil }
+            }
         }
     }
 }
@@ -254,7 +283,7 @@ public struct BotRosterTabView: View {
 // MARK: - Tab 3: 小工具 (DS-Bot Ported Capabilities Hub)
 
 public struct ToolsHubTabView: View {
-    @ObservedObject var host: BareWorkletHost
+    @ObservedObject var host: LocalAgentHost
 
     public var body: some View {
         NavigationStack {
@@ -263,7 +292,7 @@ public struct ToolsHubTabView: View {
                     WidgetBlueprintCardView(
                         title: "端侧运行态势（实时）",
                         metrics: [
-                            WidgetMetricItem(label: "DSH 内核", value: host.activeVersion),
+                            WidgetMetricItem(label: "应用版本", value: host.appVersion),
                             WidgetMetricItem(label: "Bot / 群聊", value: "\(host.bots.count)"),
                             WidgetMetricItem(label: "活跃会话", value: "\(host.messagesBySession.count)"),
                             WidgetMetricItem(label: "待审批", value: "\(host.pendingApprovals.count)")
@@ -277,26 +306,35 @@ public struct ToolsHubTabView: View {
                     NavigationLink {
                         MemoryVaultView(host: host, botId: "main")
                     } label: {
-                        toolRow(icon: "brain.head.profile", color: .purple, title: "四层记忆与撤销", subtitle: "常驻 / 增量 / 召回 / 按需 · journal.jsonl 单条逆操作撤销")
+                        toolRow(icon: "brain.head.profile", color: .purple, title: "主 Bot 记忆", subtitle: "查看、添加和撤销本机记忆")
                     }
 
                     NavigationLink {
                         ConnectorsAndUsageView(host: host)
                     } label: {
-                        toolRow(icon: "cable.connector", color: DSTheme.brand, title: "通用连接器与 Remote MCP", subtitle: "GitHub · 邮箱 · 远程 MCP · 凭据仅存 Keychain")
+                        toolRow(icon: "cable.connector", color: DSTheme.brand, title: "Remote MCP 与用量", subtitle: "设定 HTTPS 连接器与工具发现")
                     }
 
                     NavigationLink {
                         JSSandboxPlaygroundView(host: host)
                     } label: {
-                        toolRow(icon: "chevron.left.forwardslash.chevron.right", color: DSTheme.success, title: "端侧 JS 沙盒与设备探针", subtitle: "离线运行 JavaScriptCore 脚本与读取本机电量/温控状态")
+                        toolRow(icon: "chevron.left.forwardslash.chevron.right", color: DSTheme.success, title: "端侧 JS 沙盒与设备探针", subtitle: "离线执行脚本并查看本机电量和温控")
+                    }
+
+                    NavigationLink {
+                        WorkspaceFilesView(host: host)
+                    } label: {
+                        toolRow(icon: "folder.fill", color: .orange, title: "工作区文件（files/）", subtitle: "管理智能体可读写的沙盒文档与导入附件")
+                    }
+
+                    NavigationLink {
+                        DSHWebUIView(host: host)
+                    } label: {
+                        toolRow(icon: "macwindow.on.rectangle", color: .indigo, title: "DSH Web 工作台", subtitle: "完整官方 Web UI 与社区 dsh-client-ui-* 插件")
                     }
                 }
 
-                Section("端侧原生能力") {
-                    toolRow(icon: "doc.text.magnifyingglass", color: .orange, title: "超长回复外置落盘", subtitle: "超过 20,000 字自动存为沙盒文件，保护 iOS 内存不闪退")
-                    toolRow(icon: "lock.shield", color: DSTheme.warning, title: "隐私 Bot 隔离保护", subtitle: "禁入群、禁作 Main Bot、外发前强制 Face ID 与用户审批")
-                }
+
             }
             .listStyle(.insetGrouped)
             .navigationTitle("小工具")
@@ -324,7 +362,8 @@ public struct ToolsHubTabView: View {
 
 public struct ChatView: View {
     let bot: BotProfile
-    @ObservedObject var host: BareWorkletHost
+    @ObservedObject var host: LocalAgentHost
+    private let searchResultMessageID: String?
     @State private var input = ""
     @State private var selectedModel: String
     @State private var showSideChat = false
@@ -333,22 +372,33 @@ public struct ChatView: View {
     @State private var isPrivateUnlocked = false
     @State private var showClearConfirm = false
     @State private var showEditBot = false
+    @State private var showMemory = false
+    @State private var showFileImporter = false
+    @State private var attachedFile: LocalAgentHost.AttachedWorkspaceFile?
+    @StateObject private var speechInput = SpeechInputController()
+    @State private var actionStatus = ""
     @State private var lastScrollAt = Date.distantPast
     @State private var expandStreamingReasoning = true
+    @State private var pendingSearchMessageID: String?
     @Environment(\.scenePhase) private var chatScenePhase
 
-    public init(bot: BotProfile, host: BareWorkletHost) {
+    @MainActor
+    public init(bot: BotProfile, host: LocalAgentHost, targetMessageID: String? = nil) {
         self.bot = bot
         self.host = host
-        _selectedModel = State(initialValue: bot.model)
+        self.searchResultMessageID = targetMessageID
+        _pendingSearchMessageID = State(initialValue: targetMessageID)
+        _selectedModel = State(initialValue: host.modelSelection(bot.model))
     }
 
     private var liveBot: BotProfile {
         host.bots.first(where: { $0.id == bot.id }) ?? bot
     }
 
+    private var isLocked: Bool { liveBot.isPrivate && !isPrivateUnlocked }
+
     private var sessionMessages: [ChatMessageItem] {
-        host.messages(for: liveBot.id)
+        isLocked ? [] : host.messages(for: liveBot.id)
     }
 
     private var latestHeadings: [MarkdownHeading] {
@@ -358,6 +408,103 @@ public struct ChatView: View {
     }
 
     public var body: some View {
+        Group {
+            if isLocked {
+                PrivateBotLockOverlay(botName: liveBot.name) { isPrivateUnlocked = true }
+            } else {
+                conversation
+            }
+        }
+        .navigationTitle(liveBot.name)
+        .onChange(of: liveBot.model) { selectedModel = host.modelSelection($0) }
+        .onChange(of: host.apiBaseURL) { _ in selectedModel = host.modelSelection(liveBot.model) }
+        .onDisappear { if liveBot.isPrivate { lockPrivateConversation() } }
+        .onChange(of: chatScenePhase) { phase in
+            if phase == .background && liveBot.isPrivate { lockPrivateConversation() }
+        }
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if !isLocked {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Menu {
+                        if host.usesOfficialModels || !host.models.isEmpty {
+                            ModelSelectionView(host: host, model: $selectedModel, allowsTyping: false)
+                        }
+                        Button("侧边对话 (/side)") { showSideChat = true }
+                        if liveBot.isGroup { Button("群目标与待办") { showGroupWorkspace = true } }
+                        if liveBot.isPrivate { Button("锁定私密会话") { lockPrivateConversation() } }
+                        ShareLink(item: host.exportSessionMarkdown(sessionId: liveBot.id, botName: liveBot.name)) {
+                            Label("导出会话为 Markdown", systemImage: "square.and.arrow.up")
+                        }
+                        Button("记忆") { showMemory = true }
+                        Button("编辑 Bot 设置") { showEditBot = true }
+                        Button("清空当前会话", role: .destructive) { showClearConfirm = true }
+                            .disabled(host.isStreaming)
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                }
+            }
+        }
+        .sheet(isPresented: $showSideChat) {
+            if !isLocked {
+                SideChatSheet(host: host, model: selectedModel, botId: liveBot.id,
+                              botName: liveBot.name, isPrivate: liveBot.isPrivate)
+            }
+        }
+        .sheet(isPresented: $showGroupWorkspace) {
+            if !isLocked { GroupWorkspaceSheet(host: host, groupId: bot.id) }
+        }
+        .sheet(isPresented: $showMemory) {
+            if !isLocked { NavigationStack { MemoryVaultView(host: host, botId: liveBot.id) } }
+        }
+        .sheet(isPresented: $showEditBot) {
+            if !isLocked { EditBotSheet(bot: liveBot, host: host) }
+        }
+        .confirmationDialog("确定清空「\(liveBot.name)」的全部聊天记录？", isPresented: $showClearConfirm, titleVisibility: .visible) {
+            Button("清空记录", role: .destructive) {
+                guard !isLocked, !host.isStreaming else { return }
+                Task {
+                    await host.clearSession(bot.id)
+                    DSHaptics.notify(.warning)
+                }
+            }
+            Button("取消", role: .cancel) {}
+        }
+        .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.item]) { result in
+            guard !isLocked else { return }
+            switch result {
+            case .success(let url):
+                do {
+                    attachedFile = try host.importFileToWorkspace(from: url)
+                    actionStatus = "已附加：files/\(attachedFile?.relativePath ?? "")"
+                    DSHaptics.notify(.success)
+                } catch {
+                    actionStatus = "附加失败：\(error.localizedDescription)"
+                    DSHaptics.notify(.error)
+                }
+            case .failure(let error):
+                actionStatus = "附加失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func lockPrivateConversation() {
+        isPrivateUnlocked = false
+        showSideChat = false
+        showGroupWorkspace = false
+        showEditBot = false
+        showMemory = false
+        showFileImporter = false
+        attachedFile = nil
+        speechInput.stop()
+        showClearConfirm = false
+        actionStatus = ""
+        Task { _ = try? await host.rpc()?.request("device.stopSpeaking") }
+        if host.streamingSessionId == bot.id { Task { await host.abortActiveTurn() } }
+    }
+
+    private var conversation: some View {
         ScrollViewReader { proxy in
             ZStack(alignment: .top) {
                 VStack(spacing: 0) {
@@ -369,7 +516,7 @@ public struct ChatView: View {
                                 DSBannerCard(
                                     icon: "lock.shield.fill",
                                     tint: DSTheme.warning,
-                                    message: "隐私 Bot 模式：独立记忆与沙盒目录，其他 Bot 不可读取，外发前需审批。"
+                                    message: "聊天记录保存在本机。发送后，消息和对话上下文会发给设置中选定的模型服务。"
                                 )
                             }
 
@@ -385,7 +532,7 @@ public struct ChatView: View {
                                 streamingRow
                             }
 
-                            ForEach(host.pendingApprovals.filter { $0.sessionId == bot.id || $0.sessionId == "main" }) { approval in
+                            ForEach(host.pendingApprovals.filter { $0.sessionId == bot.id }) { approval in
                                 approvalCard(approval)
                             }
 
@@ -394,8 +541,13 @@ public struct ChatView: View {
                         .padding()
                     }
                     .scrollDismissesKeyboard(.interactively)
+                    .onAppear {
+                        scrollToSearchResult(using: proxy)
+                    }
                     .onChange(of: sessionMessages.count) { _ in
-                        withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
+                        if !scrollToSearchResult(using: proxy) {
+                            withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
+                        }
                     }
                     .onChange(of: host.streamingContent.count) { _ in
                         let now = Date()
@@ -411,13 +563,13 @@ public struct ChatView: View {
                             proxy.scrollTo("chat_bottom", anchor: .bottom)
                         }
                     }
-                    .onChange(of: chatScenePhase) { phase in
-                        if phase == .background && bot.isPrivate {
-                            isPrivateUnlocked = false
-                        }
+                    .onChange(of: host.pendingApprovals.count) { _ in
+                        withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
                     }
-
-                    if let errMsg = host.lastStreamError, !host.isStreaming {
+                    .onDisappear {
+                        speechInput.stop()
+                    }
+                    if host.lastErrorSessionId == bot.id, let errMsg = host.lastStreamError, !host.isStreaming {
                         DSBannerCard(
                             icon: "exclamationmark.triangle.fill",
                             tint: DSTheme.danger,
@@ -430,6 +582,12 @@ public struct ChatView: View {
                         .padding(.bottom, 6)
                     }
 
+                    if !host.isStreaming, host.lastCancelledSessionId == liveBot.id {
+                        Text("已停止生成").font(.caption).foregroundStyle(.secondary)
+                    }
+                    if !actionStatus.isEmpty {
+                        Text(actionStatus).font(.caption).foregroundStyle(.secondary)
+                    }
                     composerBar
                 }
 
@@ -449,72 +607,22 @@ public struct ChatView: View {
                     )
                     .padding(.top, 8)
                 }
-                if bot.isPrivate && !isPrivateUnlocked {
-                    PrivateBotLockOverlay(botName: bot.name) {
-                        isPrivateUnlocked = true
-                    }
-                }
             }
         }
-        .navigationTitle(liveBot.name)
-        .onChange(of: liveBot.model) { selectedModel = $0 }
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                Menu {
-                    Picker("模型", selection: $selectedModel) {
-                        Text("DeepSeek V3 (标准)").tag("deepseek-chat")
-                        Text("DeepSeek R1 (深度思考)").tag("deepseek-reasoner")
-                    }
-                    Divider()
-                    Button { showSideChat = true } label: {
-                        Label("侧边对话 (/side)", systemImage: "bubble.left.and.exclamationmark.bubble.right")
-                    }
-                    Button { showGroupWorkspace = true } label: {
-                        Label("群目标与待办", systemImage: "checklist")
-                    }
-                    if bot.isPrivate && isPrivateUnlocked {
-                        Button {
-                            isPrivateUnlocked = false
-                            DSHaptics.impact(.medium)
-                        } label: {
-                            Label("立即锁定隐私 Bot", systemImage: "lock.fill")
-                        }
-                    }
-                    ShareLink(item: host.exportSessionMarkdown(sessionId: liveBot.id, botName: liveBot.name)) {
-                        Label("导出会话为 Markdown", systemImage: "square.and.arrow.up")
-                    }
-                    Button {
-                        showEditBot = true
-                    } label: {
-                        Label("编辑 Bot 设置", systemImage: "slider.horizontal.3")
-                    }
-                    Button(role: .destructive) {
-                        showClearConfirm = true
-                    } label: {
-                        Label("清空当前会话", systemImage: "trash")
-                    }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                }
+    }
+
+    @discardableResult
+    private func scrollToSearchResult(using proxy: ScrollViewProxy) -> Bool {
+        guard let messageID = pendingSearchMessageID,
+              sessionMessages.contains(where: { $0.id == messageID }) else { return false }
+        pendingSearchMessageID = nil
+        Task { @MainActor in
+            await Task.yield()
+            withAnimation(.easeInOut(duration: 0.25)) {
+                proxy.scrollTo(messageID, anchor: .center)
             }
         }
-        .sheet(isPresented: $showSideChat) {
-            SideChatSheet(host: host, parentSessionId: bot.id)
-        }
-        .sheet(isPresented: $showGroupWorkspace) {
-            GroupWorkspaceSheet(host: host, groupId: bot.id)
-        }
-        .sheet(isPresented: $showEditBot) {
-            EditBotSheet(bot: liveBot, host: host)
-        }
-        .confirmationDialog("确定清空「\(liveBot.name)」的全部聊天记录？", isPresented: $showClearConfirm, titleVisibility: .visible) {
-            Button("清空记录", role: .destructive) {
-                host.clearSession(bot.id)
-                DSHaptics.notify(.warning)
-            }
-            Button("取消", role: .cancel) {}
-        }
+        return true
     }
 
     private var starterPrompts: [String] {
@@ -523,19 +631,19 @@ public struct ChatView: View {
         } else if bot.isPrivate {
             return ["帮我整理一份私密备忘并存入常驻记忆", "总结这段敏感文本的要点"]
         }
-        return ["用端侧 JS 沙盒计算 10 万年化 6% 复利 5 年", "查看当前 iPhone 设备状态", "介绍一下内置 DSH 0.2.2-rc.5 的能力"]
+        return ["用端侧 JS 沙盒计算 10 万年化 6% 复利 5 年", "查看当前 iPhone 设备状态", "帮我拟一份会议议程"]
     }
 
     private var emptyWelcomeView: some View {
         VStack(spacing: 12) {
             DSBotAvatar(
-                initials: bot.name,
-                color: bot.isMain ? DSTheme.brand : (bot.isGroup ? .indigo : (bot.isPrivate ? DSTheme.warning : .teal)),
-                isPrivate: bot.isPrivate,
+                initials: liveBot.name,
+                color: liveBot.isMain ? DSTheme.brand : (liveBot.isGroup ? .indigo : (liveBot.isPrivate ? DSTheme.warning : .teal)),
+                isPrivate: liveBot.isPrivate,
                 size: 56
             )
             Text(liveBot.name).font(.title3.weight(.semibold))
-            Text(bot.roleLabel).font(.caption).foregroundColor(.secondary)
+            Text(liveBot.roleLabel).font(.caption).foregroundColor(.secondary)
             VStack(spacing: 8) {
                 ForEach(starterPrompts, id: \.self) { prompt in
                     Button {
@@ -567,6 +675,10 @@ public struct ChatView: View {
                 .font(.caption2.weight(.medium))
                 .foregroundColor(.secondary)
 
+            if msg.incomplete == true {
+                Text("回复未完成").font(.caption).foregroundStyle(.secondary)
+            }
+
             if !msg.reasoning.isEmpty {
                 DisclosureGroup("深度思考过程") {
                     Text(msg.reasoning)
@@ -591,20 +703,26 @@ public struct ChatView: View {
                         Label("复制全文", systemImage: "doc.on.doc")
                     }
                     Button {
-                        Task { _ = try? await host.rpc()?.request("device.speak", params: ["text": msg.content]) }
-                        DSHaptics.impact(.soft)
+                        Task {
+                            do {
+                                guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
+                                _ = try await rpc.request("device.speak", params: ["text": msg.content])
+                                actionStatus = ""
+                            } catch { actionStatus = error.localizedDescription }
+                        }
                     } label: {
                         Label("朗读回复", systemImage: "speaker.wave.2")
                     }
                     Button {
                         Task {
-                            _ = try? await host.rpc()?.request("memory.add", params: [
-                                "botId": bot.id,
-                                "title": String(msg.content.prefix(24)),
-                                "content": msg.content,
-                                "layer": "pinned"
-                            ])
-                            DSHaptics.notify(.success)
+                            do {
+                                guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
+                                _ = try await rpc.request("memory.add", params: [
+                                    "botId": bot.id, "title": String(msg.content.prefix(24)),
+                                    "content": msg.content, "layer": "pinned"
+                                ])
+                                actionStatus = "已存入常驻记忆。"
+                            } catch { actionStatus = error.localizedDescription }
                         }
                     } label: {
                         Label("存入常驻记忆", systemImage: "brain.head.profile")
@@ -613,7 +731,7 @@ public struct ChatView: View {
                         Button {
                             Task { await host.regenerateLastReply(sessionId: bot.id, model: selectedModel) }
                         } label: {
-                            Label("重新生成回复", systemImage: "arrow.clockwise")
+                            Label("再次回答", systemImage: "arrow.clockwise")
                         }
                     }
                 }
@@ -626,6 +744,17 @@ public struct ChatView: View {
                 .clipShape(RoundedRectangle(cornerRadius: DSTheme.cornerBubble, style: .continuous))
         }
         .frame(maxWidth: .infinity, alignment: isUser && host.useBubbleLayout ? .trailing : .leading)
+        .padding(8)
+        .background {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(searchResultMessageID == msg.id ? DSTheme.brand.opacity(0.10) : .clear)
+        }
+        .overlay {
+            if searchResultMessageID == msg.id {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(DSTheme.brand.opacity(0.45), lineWidth: 1)
+            }
+        }
     }
 
     private var streamingRow: some View {
@@ -669,7 +798,8 @@ public struct ChatView: View {
                 Image(systemName: "hand.raised.fill").foregroundColor(DSTheme.warning)
                 Text("需要审批：\(approval.tool)").font(.subheadline.weight(.semibold))
             }
-            Text(approval.summary).font(.caption).foregroundColor(.secondary)
+            Text(approval.summary).font(.caption).foregroundColor(.secondary).textSelection(.enabled)
+            Text("工具结果会返回当前模型服务。").font(.caption2).foregroundStyle(.secondary)
             HStack(spacing: 10) {
                 Button("批准") {
                     Task { await host.respondToApproval(id: approval.id, approved: true) }
@@ -689,10 +819,33 @@ public struct ChatView: View {
     private var composerBar: some View {
         VStack(spacing: 0) {
             Divider()
+            if let file = attachedFile {
+                HStack(spacing: 8) {
+                    Image(systemName: "paperclip")
+                        .font(.caption)
+                        .foregroundColor(DSTheme.brand)
+                    Text("files/\(file.relativePath) (\(ByteCountFormatter.string(fromByteCount: Int64(file.byteCount), countStyle: .file)))")
+                        .font(.caption)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Button {
+                        attachedFile = nil
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 6)
+                .background(DSTheme.surfaceSecondary.opacity(0.7))
+            }
             HStack(spacing: 8) {
                 Menu {
+                    Button { showFileImporter = true } label: { Label("附加文件到工作区", systemImage: "paperclip") }
                     Button { showSideChat = true } label: { Label("/side 侧边对话", systemImage: "bubble.left.and.exclamationmark.bubble.right") }
-                    Button { showGroupWorkspace = true } label: { Label("/goal 群目标与待办", systemImage: "target") }
+                    if liveBot.isGroup { Button { showGroupWorkspace = true } label: { Label("/goal 群目标与待办", systemImage: "target") } }
                     Button { showClearConfirm = true } label: { Label("/clear 清空当前会话", systemImage: "trash") }
                     Menu {
                         ForEach(host.bots.filter { !$0.isPrivate && !$0.isGroup }) { member in
@@ -714,6 +867,20 @@ public struct ChatView: View {
                     .background(DSTheme.surfaceSecondary)
                     .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
 
+                Button {
+                    speechInput.toggle { transcript in
+                        input = transcript
+                    }
+                    if let err = speechInput.errorMessage {
+                        actionStatus = err
+                    }
+                } label: {
+                    Image(systemName: speechInput.isRecording ? "mic.circle.fill" : "mic.circle")
+                        .font(.title3)
+                        .foregroundColor(speechInput.isRecording ? DSTheme.danger : .secondary)
+                }
+                .disabled(host.isStreaming)
+
                 if host.isStreaming && host.streamingSessionId == bot.id {
                     Button {
                         Task { await host.abortActiveTurn() }
@@ -724,14 +891,15 @@ public struct ChatView: View {
                     }
                 } else {
                     Button {
+                        speechInput.stop()
                         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !text.isEmpty else { return }
+                        guard !text.isEmpty || attachedFile != nil else { return }
                         if text == "/side" {
                             input = ""
                             showSideChat = true
                             return
                         }
-                        if text == "/goal" {
+                        if text == "/goal", liveBot.isGroup {
                             input = ""
                             showGroupWorkspace = true
                             return
@@ -741,14 +909,18 @@ public struct ChatView: View {
                             showClearConfirm = true
                             return
                         }
+                        let prefix = attachedFile?.promptPrefix() ?? ""
+                        let body = text.isEmpty ? "请查看我刚附加的工作区文件。" : text
+                        let payload = prefix + body
                         input = ""
-                        Task { await host.sendMessage(sessionId: bot.id, text: text, model: selectedModel) }
+                        attachedFile = nil
+                        Task { await host.sendMessage(sessionId: bot.id, text: payload, model: selectedModel) }
                     } label: {
                         Image(systemName: "arrow.up.circle.fill")
                             .font(.title2)
-                            .foregroundColor(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .secondary : DSTheme.brand)
+                            .foregroundColor((input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachedFile == nil) ? .secondary : DSTheme.brand)
                     }
-                    .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(host.state != .ready || host.isStreaming || (input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachedFile == nil))
                 }
             }
             .padding(.horizontal, 12)
@@ -762,10 +934,10 @@ public struct ChatView: View {
 
 private struct CreateBotSheet: View {
     @Environment(\.dismiss) private var dismiss
-    @ObservedObject var host: BareWorkletHost
+    @ObservedObject var host: LocalAgentHost
     @State private var name = ""
     @State private var roleLabel = ""
-    @State private var model = "deepseek-chat"
+    @State private var model = ModelProvider.defaultModel
     @State private var systemPrompt = ""
     @State private var isPrivate = false
     @State private var isGroup = false
@@ -776,19 +948,16 @@ private struct CreateBotSheet: View {
                 Section("基本信息") {
                     TextField("名称（如 研报助手）", text: $name)
                     TextField("职责描述", text: $roleLabel)
-                    Picker("默认模型", selection: $model) {
-                        Text("DeepSeek V3").tag("deepseek-chat")
-                        Text("DeepSeek R1 深度思考").tag("deepseek-reasoner")
-                    }
+                    ModelSelectionView(host: host, model: $model)
                 }
                 Section("系统提示词（可选）") {
                     TextEditor(text: $systemPrompt)
                         .frame(minHeight: 72)
                 }
                 Section("形态与隔离") {
-                    Toggle("创建为多 Bot 协作群聊", isOn: $isGroup)
+                    Toggle("创建群会话与待办", isOn: $isGroup)
                         .onChange(of: isGroup) { v in if v { isPrivate = false } }
-                    Toggle("开启隐私 Bot（隔离且不可进群）", isOn: $isPrivate)
+                    Toggle("锁定私密会话", isOn: $isPrivate)
                         .onChange(of: isPrivate) { v in if v { isGroup = false } }
                 }
             }
@@ -816,143 +985,139 @@ private struct CreateBotSheet: View {
     }
 }
 
-// MARK: - Tab 5: 设置 (DSH 0.2.2-rc.5 Kernel, Hot-Swap, Keychain Vault & Layout)
+// MARK: - 设置
 
-public struct KernelSettingsView: View {
-    @ObservedObject var host: BareWorkletHost
-    @State private var apiKey = ""
-    @State private var manifestURLText = ""
-    @State private var statusBanner = ""
-    @State private var showResetConfirm = false
+private struct ModelSelectionView: View {
+    @ObservedObject var host: LocalAgentHost
+    @Binding var model: String
+    var allowsTyping = true
 
-    public var body: some View {
-        NavigationStack {
-            Form {
-                Section("内置 DSH 内核") {
-                    LabeledContent("基线版本", value: KernelManager.baselineVersion)
-                    LabeledContent("当前激活", value: host.activeVersion)
-                    LabeledContent("IPC 协议", value: IPCFrameCodec.protocolVersion)
-                    Button("复制内核诊断 JSON") {
-                        Task {
-                            if let diag = try? await host.rpc()?.request("kernel.diagnostics"),
-                               let data = try? JSONSerialization.data(withJSONObject: diag, options: [.prettyPrinted, .sortedKeys]),
-                               let str = String(data: data, encoding: .utf8) {
-                                #if canImport(UIKit)
-                                UIPasteboard.general.string = str
-                                #endif
-                                statusBanner = "已复制内核诊断 JSON 至剪贴板。"
-                                DSHaptics.notify(.success)
-                            }
-                        }
-                    }
-                    Button("重置回基线内核 (\(KernelManager.baselineVersion))", role: .destructive) {
-                        showResetConfirm = true
-                    }
-                }
-
-                Section("免重签热更新 DSH 内核") {
-                    TextField("https://.../kernel-manifest.json", text: $manifestURLText)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    Button("拉取校验 SHA-256 并热切换") {
-                        guard let url = URL(string: manifestURLText.trimmingCharacters(in: .whitespacesAndNewlines)) else {
-                            statusBanner = "请输入有效的 HTTPS manifest 地址。"
-                            return
-                        }
-                        Task {
-                            do {
-                                let installed = try await host.kernelManager.downloadAndInstallHotSwap(manifestURL: url)
-                                statusBanner = "已校验并切换至 DSH \(installed.dshVersion)。"
-                                DSHaptics.notify(.success)
-                                await host.boot { _ in LocalAgentTransport(dshVersion: installed.dshVersion) }
-                            } catch {
-                                statusBanner = error.localizedDescription
-                                DSHaptics.notify(.error)
-                            }
-                        }
-                    }
-                }
-
-                Section("模型接入（DeepSeek / OpenAI 兼容）") {
-                    TextField("Base URL (默认 https://api.deepseek.com)", text: $host.apiBaseURL)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    SecureField("API Key (sk-...)", text: $apiKey)
-                    Button("安全保存至 Keychain") {
-                        let vault = KeychainBridge()
-                        do {
-                            _ = try vault.setSecret(account: "deepseek_api_key", value: apiKey.trimmingCharacters(in: .whitespacesAndNewlines))
-                            statusBanner = "API Key 已安全写入 iOS Keychain，返回「会话」即可直连流式对话。"
-                            apiKey = ""
-                            DSHaptics.notify(.success)
-                        } catch {
-                            statusBanner = error.localizedDescription
-                        }
-                    }
-                    .disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    Button("测试 API 连通性与延迟") {
-                        statusBanner = "正在测试模型服务连通性..."
-                        Task {
-                            if let res = try? await host.rpc()?.request("models.test", params: ["apiBaseURL": host.apiBaseURL]) {
-                                if (res["ok"] as? Bool) == true {
-                                    let ms = res["latencyMs"] as? Int ?? 0
-                                    let cnt = res["modelCount"] as? Int ?? 0
-                                    statusBanner = "连接正常（延迟 \(ms) ms，可用模型 \(cnt) 个）。"
-                                    DSHaptics.notify(.success)
-                                } else {
-                                    statusBanner = "连通性测试失败：\(res["error"] as? String ?? "未知错误")"
-                                    DSHaptics.notify(.error)
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Section("界面与布局") {
-                    Toggle("消息气泡布局（关闭则平铺展示）", isOn: $host.useBubbleLayout)
-                }
-
-                if !statusBanner.isEmpty {
-                    Section("操作状态") {
-                        Text(statusBanner)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
+    var body: some View {
+        if host.usesOfficialModels {
+            Picker("模型", selection: $model) {
+                Text("DeepSeek Flash").tag(ModelProvider.defaultModel)
+                Text("DeepSeek Flash · 思考").tag(ModelProvider.thinkingModel)
+                Text("DeepSeek V4 Pro").tag("deepseek-v4-pro")
+                if ![ModelProvider.defaultModel, ModelProvider.thinkingModel, "deepseek-v4-pro"].contains(model) {
+                    Text(model).tag(model)
                 }
             }
-            .scrollDismissesKeyboard(.interactively)
-            .navigationTitle("设置")
-            .confirmationDialog("重置回内置基线内核 \(KernelManager.baselineVersion)？", isPresented: $showResetConfirm, titleVisibility: .visible) {
-                Button("确认重置", role: .destructive) {
-                    host.kernelManager.resetToBaseline()
-                    statusBanner = "已重置为内置基线内核 \(KernelManager.baselineVersion)。"
-                    DSHaptics.notify(.warning)
-                    Task { await host.boot { _ in LocalAgentTransport(dshVersion: KernelManager.baselineVersion) } }
+        } else {
+            if allowsTyping {
+                TextField("服务商模型 ID", text: $model)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            }
+            if !host.models.isEmpty {
+                Menu("选择服务商模型") {
+                    ForEach(host.models, id: \.self) { id in Button(id) { model = id } }
                 }
-                Button("取消", role: .cancel) {}
             }
         }
     }
 }
 
+public struct AgentSettingsView: View {
+    @ObservedObject var host: LocalAgentHost
+    @State private var apiKey = ""
+    @State private var status = ""
+    @State private var keyConfigured = false
+
+    public var body: some View {
+        NavigationStack {
+            Form {
+                Section("运行诊断") {
+                    LabeledContent("应用", value: "\(host.appVersion) (\(host.buildNumber))")
+                    LabeledContent("引擎", value: host.embeddedRuntimeLabel ?? "Node.js + DSH 0.2.2-rc.5")
+                    LabeledContent("Web 工作台", value: "已内嵌（支持 dsh-client-ui-*）")
+                    Button("复制诊断 JSON") {
+                        Task {
+                            do {
+                                guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
+                                let info = try await rpc.request("agent.info")
+                                let data = try JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys])
+                                UIPasteboard.general.string = String(decoding: data, as: UTF8.self)
+                                status = "已复制诊断。"
+                            } catch { status = error.localizedDescription }
+                        }
+                    }
+                }
+
+                Section("模型服务") {
+                    LabeledContent("当前地址密钥") {
+                        DSStatusBadge(keyConfigured ? "已配置" : "未配置", color: keyConfigured ? DSTheme.success : DSTheme.warning)
+                    }
+                    TextField("HTTPS Base URL", text: $host.apiBaseURL)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .onChange(of: host.apiBaseURL) { _ in
+                            apiKey = ""
+                            status = ""
+                            Task { keyConfigured = await host.hasSavedAPIKey() }
+                        }
+                    if !host.usesOfficialModels {
+                        Button("恢复官方地址（api.deepseek.com）") {
+                            host.apiBaseURL = ModelProvider.defaultAddress
+                        }
+                        .font(.caption)
+                        Text("DSH 自定义服务需兼容 Anthropic Messages API；模型 ID 可在 Bot 设置中手动填写。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Toggle("服务支持工具调用", isOn: $host.customTools)
+                    }
+                    SecureField("当前地址的 API Key", text: $apiKey)
+                    Button("保存至 Keychain") {
+                        do {
+                            try host.saveAPIKey(apiKey.trimmingCharacters(in: .whitespacesAndNewlines))
+                            apiKey = ""
+                            status = "已为当前服务地址保存密钥。"
+                            Task { keyConfigured = await host.hasSavedAPIKey() }
+                        } catch { status = error.localizedDescription }
+                    }
+                    .disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button("测试连接并读取模型列表") {
+                        status = "正在读取服务模型…"
+                        Task {
+                            do {
+                                let result = try await host.refreshModels()
+                                status = "已读到 \(result.count) 个模型，耗时 \(result.latency) ms。"
+                            } catch {
+                                status = "\(error.localizedDescription) 自定义服务可在 Bot 设置手填模型 ID。"
+                            }
+                        }
+                    }
+                }
+
+                Section("界面") {
+                    Toggle("消息气泡布局", isOn: $host.useBubbleLayout)
+                }
+                if !status.isEmpty { Section { Text(status).font(.caption) } }
+            }
+            .scrollDismissesKeyboard(.interactively)
+            .navigationTitle("设置")
+            .task { keyConfigured = await host.hasSavedAPIKey() }
+        }
+    }
+}
 
 // MARK: - Edit Bot Sheet
 
 private struct EditBotSheet: View {
     @Environment(\.dismiss) private var dismiss
     let bot: BotProfile
-    @ObservedObject var host: BareWorkletHost
+    @ObservedObject var host: LocalAgentHost
     @State private var name: String
     @State private var roleLabel: String
     @State private var model: String
     @State private var systemPrompt: String
 
-    init(bot: BotProfile, host: BareWorkletHost) {
+    @MainActor
+    init(bot: BotProfile, host: LocalAgentHost) {
         self.bot = bot
         self.host = host
         _name = State(initialValue: bot.name)
         _roleLabel = State(initialValue: bot.roleLabel)
-        _model = State(initialValue: bot.model)
+        _model = State(initialValue: host.modelSelection(bot.model))
         _systemPrompt = State(initialValue: bot.systemPrompt)
     }
 
@@ -962,10 +1127,7 @@ private struct EditBotSheet: View {
                 Section("Bot 信息") {
                     TextField("名称", text: $name)
                     TextField("职责描述", text: $roleLabel)
-                    Picker("默认模型", selection: $model) {
-                        Text("DeepSeek V3").tag("deepseek-chat")
-                        Text("DeepSeek R1 深度思考").tag("deepseek-reasoner")
-                    }
+                    ModelSelectionView(host: host, model: $model)
                 }
                 Section("系统提示词（人设与指令）") {
                     TextEditor(text: $systemPrompt)

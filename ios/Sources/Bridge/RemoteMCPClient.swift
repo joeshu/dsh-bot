@@ -6,135 +6,156 @@ public struct MCPToolDescriptor: Identifiable, Equatable {
     public let description: String
 }
 
-public enum RemoteMCPError: Error, LocalizedError {
-    case invalidEndpoint(String)
-    case httpError(Int)
-    case rpcError(String)
+enum RemoteMCPError: Error, LocalizedError {
+    case http(Int)
+    case invalidResponse
+    case unsupportedVersion
+    case toolError
 
-    public var errorDescription: String? {
+    var errorDescription: String? {
         switch self {
-        case .invalidEndpoint(let raw): return "Invalid MCP endpoint URL: \(raw)"
-        case .httpError(let code): return "MCP server returned HTTP \(code)"
-        case .rpcError(let msg): return "MCP RPC error: \(msg)"
+        case .http(let status): return "MCP 服务返回 HTTP \(status)。"
+        case .invalidResponse: return "MCP 服务返回了无效响应。"
+        case .unsupportedVersion: return "连接器不支持 MCP 2025-03-26 Streamable HTTP。"
+        case .toolError: return "MCP 工具报告执行失败。"
         }
     }
 }
 
-/// Real Model Context Protocol (MCP) Streamable HTTP JSON-RPC 2.0 client for standalone iOS.
-/// Supports `initialize`, `tools/list`, and `tools/call` with optional Bearer token loaded from iOS Keychain.
 public actor RemoteMCPClient {
+    private static let protocolVersion = "2025-03-26"
     private let session: URLSession
     private let keychain: KeychainBridge
-    private var sessionIds: [String: String] = [:] // endpoint -> Mcp-Session-Id
+    private var connections: [String: String] = [:]
+    private var handshakes: [String: Task<String, Error>] = [:]
 
-    public init(keychain: KeychainBridge = KeychainBridge()) {
-        let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 45
-        self.session = URLSession(configuration: cfg)
+    public init(keychain: KeychainBridge = KeychainBridge(), session: URLSession? = nil) {
+        self.session = session ?? isolatedHTTPSession(timeout: 30)
         self.keychain = keychain
     }
 
-    public func listTools(endpoint: String, keychainAccount: String? = nil) async throws -> [MCPToolDescriptor] {
-        _ = try? await sendRPC(
-            endpoint: endpoint,
-            method: "initialize",
-            params: [
-                "protocolVersion": "2025-03-26",
-                "capabilities": [:],
-                "clientInfo": ["name": "DSBot-iOS-Standalone", "version": "1.2.0"]
-            ],
-            keychainAccount: keychainAccount
-        )
+    static func endpointURL(_ raw: String) throws -> URL {
+        guard let url = try ModelProvider.httpsComponents(raw.trimmingCharacters(in: .whitespacesAndNewlines)).url else {
+            throw ModelProviderError.invalidAddress
+        }
+        return url
+    }
 
-        let result = try await sendRPC(endpoint: endpoint, method: "tools/list", params: [:], keychainAccount: keychainAccount)
-        let rawTools = result["tools"] as? [[String: Any]] ?? []
-        return rawTools.compactMap { dict in
-            guard let name = dict["name"] as? String else { return nil }
-            return MCPToolDescriptor(
-                id: name,
-                name: name,
-                description: dict["description"] as? String ?? ""
-            )
+    public func listTools(endpoint: String, keychainAccount: String? = nil) async throws -> [MCPToolDescriptor] {
+        let result = try await request(endpoint: endpoint, keychainAccount: keychainAccount, method: "tools/list", params: [:])
+        guard let tools = result["tools"] as? [[String: Any]] else { throw RemoteMCPError.invalidResponse }
+        return tools.compactMap { tool in
+            guard let name = tool["name"] as? String, !name.isEmpty else { return nil }
+            return MCPToolDescriptor(id: name, name: name, description: tool["description"] as? String ?? "")
         }
     }
 
     public func callTool(endpoint: String, name: String, arguments: [String: Any], keychainAccount: String? = nil) async throws -> String {
-        let result = try await sendRPC(
-            endpoint: endpoint,
-            method: "tools/call",
-            params: ["name": name, "arguments": arguments],
-            keychainAccount: keychainAccount
-        )
+        let result = try await request(endpoint: endpoint, keychainAccount: keychainAccount,
+                                       method: "tools/call", params: ["name": name, "arguments": arguments])
+        if result["isError"] as? Bool == true { throw RemoteMCPError.toolError }
         if let content = result["content"] as? [[String: Any]] {
             let texts = content.compactMap { $0["text"] as? String }
             if !texts.isEmpty { return texts.joined(separator: "\n") }
         }
-        if let data = try? JSONSerialization.data(withJSONObject: result),
-           let str = String(data: data, encoding: .utf8) {
-            return str
-        }
-        return ""
+        return String(decoding: try JSONSerialization.data(withJSONObject: result), as: UTF8.self)
     }
 
-    private func sendRPC(endpoint: String, method: String, params: [String: Any], keychainAccount: String?) async throws -> [String: Any] {
-        guard let url = URL(string: endpoint.trimmingCharacters(in: .whitespacesAndNewlines)),
-              url.scheme == "https" || url.scheme == "http" else {
-            throw RemoteMCPError.invalidEndpoint(endpoint)
+    private func request(endpoint: String, keychainAccount: String?, method: String, params: [String: Any]) async throws -> [String: Any] {
+        let url = try Self.endpointURL(endpoint)
+        var token: String?
+        if let keychainAccount {
+            token = try await keychain.getSecret(account: keychainAccount, requireBiometrics: false)["value"] as? String
         }
-
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
-        if let sid = sessionIds[endpoint] {
-            req.setValue(sid, forHTTPHeaderField: "Mcp-Session-Id")
+        let connection = "\(keychainAccount ?? "")|\(url.absoluteString)"
+        let sessionID = try await connect(url: url, token: token, connection: connection)
+        try Task.checkCancellation()
+        do {
+            return try await send(url, token: token, sessionID: sessionID, method: method, params: params).result
+        } catch RemoteMCPError.http(404) {
+            connections.removeValue(forKey: connection)
+            throw RemoteMCPError.http(404)
         }
-        if let account = keychainAccount,
-           let secretObj = try? await keychain.getSecret(account: account, requireBiometrics: false),
-           let token = secretObj["value"] as? String, !token.isEmpty {
-            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
+    }
 
-        let payload: [String: Any] = [
-            "jsonrpc": "2.0",
-            "id": Int.random(in: 1...999_999),
-            "method": method,
-            "params": params
-        ]
-        req.httpBody = try JSONSerialization.data(withJSONObject: payload)
+    private func connect(url: URL, token: String?, connection: String) async throws -> String {
+        if let current = connections[connection] { return current }
+        if let pending = handshakes[connection] { return try await pending.value }
 
-        let (data, response) = try await session.data(for: req)
-        if let http = response as? HTTPURLResponse {
-            if let sid = http.value(forHTTPHeaderField: "Mcp-Session-Id"), !sid.isEmpty {
-                sessionIds[endpoint] = sid
+        let task = Task {
+            let initialization = try await send(url, token: token, sessionID: "", method: "initialize", params: [
+                "protocolVersion": Self.protocolVersion,
+                "capabilities": [:],
+                "clientInfo": ["name": "DS Bot iOS", "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1"]
+            ])
+            guard initialization.result["protocolVersion"] as? String == Self.protocolVersion else {
+                throw RemoteMCPError.unsupportedVersion
             }
-            guard (200..<300).contains(http.statusCode) else {
-                throw RemoteMCPError.httpError(http.statusCode)
+            let sessionID = initialization.sessionID ?? ""
+            _ = try await send(url, token: token, sessionID: sessionID, method: "notifications/initialized", params: [:], notification: true)
+            return sessionID
+        }
+        handshakes[connection] = task
+        defer { handshakes.removeValue(forKey: connection) }
+        let sessionID = try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
+        connections[connection] = sessionID
+        return sessionID
+    }
+
+    private func send(_ url: URL, token: String?, sessionID: String, method: String,
+                      params: [String: Any], notification: Bool = false) async throws -> (result: [String: Any], sessionID: String?) {
+        let id = UUID().uuidString
+        var payload: [String: Any] = ["jsonrpc": "2.0", "method": method, "params": params]
+        if !notification { payload["id"] = id }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
+        if method != "initialize" { request.setValue(Self.protocolVersion, forHTTPHeaderField: "MCP-Protocol-Version") }
+        if !sessionID.isEmpty { request.setValue(sessionID, forHTTPHeaderField: "Mcp-Session-Id") }
+        if let token, !token.isEmpty { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+
+        let (bytes, response) = try await session.bytes(for: request)
+        defer { bytes.task.cancel() }
+        guard let http = response as? HTTPURLResponse else { throw RemoteMCPError.invalidResponse }
+        guard (200..<300).contains(http.statusCode) else { throw RemoteMCPError.http(http.statusCode) }
+        let responseSessionID = http.value(forHTTPHeaderField: "Mcp-Session-Id")
+        if notification {
+            guard http.statusCode == 202 else { throw RemoteMCPError.invalidResponse }
+            return ([:], responseSessionID)
+        }
+
+        if http.mimeType == "text/event-stream" {
+            var events = ServerSentEvents()
+            for try await byte in bytes {
+                try Task.checkCancellation()
+                guard let event = try events.append(byte: byte) else { continue }
+                if let result = try decode(Data(event.utf8), id: id) { return (result, responseSessionID) }
             }
+        } else if http.mimeType == "application/json" {
+            var data = Data()
+            for try await byte in bytes {
+                try Task.checkCancellation()
+                guard data.count < 1_500_000 else { throw ModelProviderError.responseTooLarge }
+                data.append(byte)
+            }
+            if let result = try decode(data, id: id) { return (result, responseSessionID) }
         }
+        throw RemoteMCPError.invalidResponse
+    }
 
-        // Handle either direct JSON or `data: {...}` SSE-wrapped MCP response
-        let rawText = String(data: data, encoding: .utf8) ?? ""
-        let jsonData: Data
-        if rawText.contains("data: ") {
-            let line = rawText.split(separator: "\n")
-                .reversed()
-                .compactMap { l -> String? in
-                    guard l.hasPrefix("data: ") else { return nil }
-                    let body = String(l.dropFirst(6)).trimmingCharacters(in: .whitespaces)
-                    return body.hasPrefix("{") ? body : nil
-                }.first ?? "{}"
-            jsonData = Data(line.utf8)
-        } else {
-            jsonData = data
-        }
-
-        guard let obj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
-            return [:]
-        }
-        if let err = obj["error"] as? [String: Any] {
-            throw RemoteMCPError.rpcError(err["message"] as? String ?? "Unknown MCP error")
-        }
-        return obj["result"] as? [String: Any] ?? [:]
+    private func decode(_ data: Data, id: String) throws -> [String: Any]? {
+        guard let message = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              message["jsonrpc"] as? String == "2.0" else { throw RemoteMCPError.invalidResponse }
+        guard message["id"] as? String == id else { return nil }
+        if message["error"] != nil { throw RemoteMCPError.toolError }
+        guard let result = message["result"] as? [String: Any] else { throw RemoteMCPError.invalidResponse }
+        return result
     }
 }

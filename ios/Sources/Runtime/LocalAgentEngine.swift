@@ -1,19 +1,12 @@
 import Foundation
 
-/// Actor-isolated, disk-persisted on-device state for `LocalAgentTransport`.
-/// Eliminates all Swift concurrency data races and persists memories, group goals/todos,
-/// connectors, plugin index sources, experimental flags, and token usage across app launches.
-private actor LocalAgentStore {
+/// Disk-persisted native tool state.
+actor LocalAgentStore {
     struct PersistedState: Codable {
         var memoryJournal: [[String: String]] = []
         var groupTodos: [String: [TodoItem]] = [:]
         var groupGoals: [String: String] = [:]
         var connectors: [ConnectorItem] = []
-        var activeIndexSourceId: String? = nil
-        var registryUrl: String = "https://registry.npmmirror.com"
-        var customIndexSources: [CustomIndexSource] = []
-        var experimentalFlags: [String: Bool] = [:]
-        var installedPlugins: [InstalledPluginItem] = []
         var totalTokens: Int = 0
         var cachedInputTokens: Int = 0
         var totalInputTokens: Int = 0
@@ -21,56 +14,48 @@ private actor LocalAgentStore {
 
     struct TodoItem: Codable { let id: String; let text: String; var done: Bool }
     struct ConnectorItem: Codable { let id: String; let type: String; let name: String; let endpoint: String }
-    struct CustomIndexSource: Codable { let id: String; let name: String; let host: String; let url: String }
-    struct InstalledPluginItem: Codable { let name: String; let version: String; let description: String; var enabled: Bool }
 
     private let stateURL: URL
     private var state: PersistedState
-    private var activeStreamTasks: [String: Task<Void, Never>] = [:]
+    private var lastSavedState: PersistedState?
+    private(set) var loadError: Error?
 
-    init() {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let root = docs.appendingPathComponent("dsh-home", isDirectory: true)
-        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        self.stateURL = root.appendingPathComponent("local-state.json")
-        if let data = try? Data(contentsOf: stateURL),
-           let decoded = try? JSONDecoder().decode(PersistedState.self, from: data) {
-            self.state = decoded
-        } else {
-            self.state = PersistedState()
+    init(root: URL) {
+        let url = root.appendingPathComponent("local-state.json")
+        self.stateURL = url
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            if FileManager.default.fileExists(atPath: url.path) {
+                state = try JSONDecoder().decode(PersistedState.self, from: Data(contentsOf: url))
+            } else {
+                state = PersistedState()
+            }
+        } catch {
+            state = PersistedState()
+            loadError = error
+        }
+        lastSavedState = state
+    }
+
+    private func save() throws {
+        do {
+            try JSONEncoder().encode(state).write(to: stateURL, options: .atomic)
+            lastSavedState = state
+        } catch {
+            if let lastSavedState { state = lastSavedState }
+            throw error
         }
     }
 
-    private func save() {
-        if let data = try? JSONEncoder().encode(state) {
-            try? data.write(to: stateURL, options: .atomic)
+    func recordUsage(input: Int, cached: Int, output: Int) throws {
+        func adding(_ value: Int, _ increment: Int) -> Int {
+            let (total, overflow) = max(0, value).addingReportingOverflow(max(0, increment))
+            return overflow ? Int.max : total
         }
-    }
-
-    func registerStream(turnId: String, task: Task<Void, Never>) {
-        activeStreamTasks[turnId] = task
-    }
-
-    func removeStream(turnId: String) {
-        activeStreamTasks.removeValue(forKey: turnId)
-    }
-
-    func abortStream(turnId: String) -> Bool {
-        guard let task = activeStreamTasks.removeValue(forKey: turnId) else { return false }
-        task.cancel()
-        return true
-    }
-
-    func cancelAllStreams() {
-        for (_, task) in activeStreamTasks { task.cancel() }
-        activeStreamTasks.removeAll()
-    }
-
-    func recordUsage(input: Int, cached: Int, output: Int) {
-        state.totalInputTokens += input
-        state.cachedInputTokens += cached
-        state.totalTokens += input + output
-        save()
+        state.totalInputTokens = adding(state.totalInputTokens, input)
+        state.cachedInputTokens = adding(state.cachedInputTokens, min(input, cached))
+        state.totalTokens = adding(adding(state.totalTokens, input), output)
+        try save()
     }
 
     func usageSummary() -> [String: Any] {
@@ -78,21 +63,11 @@ private actor LocalAgentStore {
         return ["totalTokens": state.totalTokens, "cacheHitRate": rate]
     }
 
-    func diagnostics(dshVersion: String) -> [String: Any] {
-        [
-            "dshVersion": dshVersion,
-            "ipcProtocolVersion": IPCFrameCodec.protocolVersion,
-            "totalTokens": state.totalTokens,
-            "connectorCount": state.connectors.count,
-            "memoryJournalCount": state.memoryJournal.count,
-            "installedPluginCount": state.installedPlugins.count
-        ]
-    }
-
-    func addMemory(title: String, content: String, layer: String) -> [String: Any] {
+    func addMemory(botId: String, title: String, content: String, layer: String) throws -> [String: Any] {
         let jId = "jrn_\(UUID().uuidString.prefix(8))"
         let eId = "mem_\(UUID().uuidString.prefix(8))"
         state.memoryJournal.insert([
+            "botId": botId,
             "journalId": jId,
             "op": "add",
             "entryId": eId,
@@ -101,12 +76,12 @@ private actor LocalAgentStore {
             "layer": layer,
             "at": ISO8601DateFormatter().string(from: Date())
         ], at: 0)
-        save()
+        try save()
         return ["journalId": jId, "entryId": eId]
     }
 
-    func pinnedMemoriesSummary() -> String {
-        let pinned = state.memoryJournal.filter { $0["layer"] == "pinned" }
+    func pinnedMemoriesSummary(botId: String) -> String {
+        let pinned = state.memoryJournal.filter { $0["layer"] == "pinned" && $0["botId"] == botId }
         guard !pinned.isEmpty else { return "" }
         return pinned.prefix(8).compactMap { rec in
             guard let t = rec["title"], let c = rec["content"], !c.isEmpty else { return nil }
@@ -114,11 +89,22 @@ private actor LocalAgentStore {
         }.joined(separator: "\n")
     }
 
-    func memoryJournal() -> [[String: String]] { state.memoryJournal }
+    func memoryJournal(botId: String?) -> [[String: String]] {
+        state.memoryJournal.filter { $0["botId"] == botId }
+    }
 
-    func undoMemory(journalId: String) {
-        state.memoryJournal.removeAll { $0["journalId"] == journalId }
-        save()
+    func assignMemory(journalId: String, botId: String) throws -> Bool {
+        guard let index = state.memoryJournal.firstIndex(where: { $0["journalId"] == journalId && $0["botId"] == nil }) else { return false }
+        state.memoryJournal[index]["botId"] = botId
+        try save()
+        return true
+    }
+
+    func undoMemory(botId: String, journalId: String) throws -> Bool {
+        guard let index = state.memoryJournal.firstIndex(where: { $0["journalId"] == journalId && $0["botId"] == botId }) else { return false }
+        state.memoryJournal.remove(at: index)
+        try save()
+        return true
     }
 
     func groupState(groupId: String) -> [String: Any] {
@@ -126,865 +112,887 @@ private actor LocalAgentStore {
         return ["goal": ["title": state.groupGoals[groupId] ?? "未设定群目标"], "todos": todos]
     }
 
-    func setGroupGoal(groupId: String, title: String) -> [String: Any] {
+    func setGroupGoal(groupId: String, title: String) throws -> [String: Any] {
         state.groupGoals[groupId] = title
-        save()
+        try save()
         return ["goal": ["title": title, "status": "active"]]
     }
 
-    func addGroupTodo(groupId: String, text: String) -> [String: Any] {
+    func addGroupTodo(groupId: String, text: String) throws -> [String: Any] {
         let item = TodoItem(id: "todo_\(UUID().uuidString.prefix(6))", text: text, done: false)
         state.groupTodos[groupId, default: []].append(item)
-        save()
+        try save()
         return ["todo": ["id": item.id, "text": item.text, "done": item.done]]
     }
 
-    func toggleGroupTodo(groupId: String, id: String, done: Bool) {
+    func toggleGroupTodo(groupId: String, id: String, done: Bool) throws {
         if var list = state.groupTodos[groupId], let idx = list.firstIndex(where: { $0.id == id }) {
             list[idx].done = done
             state.groupTodos[groupId] = list
-            save()
+            try save()
         }
     }
 
-    func clearCompletedTodos(groupId: String) -> Int {
+    func clearCompletedTodos(groupId: String) throws -> Int {
         guard let list = state.groupTodos[groupId] else { return 0 }
         let kept = list.filter { !$0.done }
         let removed = list.count - kept.count
         if removed > 0 {
             state.groupTodos[groupId] = kept
-            save()
+            try save()
         }
         return removed
-    }
-
-    func currentRegistryUrl() -> String {
-        state.registryUrl
     }
 
     func listConnectors() -> [[String: Any]] {
         state.connectors.map { ["id": $0.id, "type": $0.type, "name": $0.name, "endpoint": $0.endpoint] }
     }
 
-    func upsertConnector(id: String?, type: String, name: String, endpoint: String) -> [String: Any] {
+    func upsertConnector(id: String?, type: String, name: String, endpoint: String) throws -> [String: Any] {
         let cid = id ?? "conn_\(UUID().uuidString.prefix(6))"
         state.connectors.removeAll { $0.id == cid }
         let entry = ConnectorItem(id: cid, type: type, name: name, endpoint: endpoint)
         state.connectors.append(entry)
-        save()
+        try save()
         return ["id": cid, "type": type, "name": name, "endpoint": endpoint]
     }
 
-    func deleteConnector(id: String) {
+    func connector(id: String) -> ConnectorItem? { state.connectors.first { $0.id == id } }
+
+    func deleteConnector(id: String) throws {
         state.connectors.removeAll { $0.id == id }
-        save()
+        try save()
     }
 
-    // --- Plugin Store & Community Index Sources ---
-    func pluginsOverview() -> [String: Any] {
-        let installed = state.installedPlugins.map {
-            ["name": $0.name, "version": $0.version, "description": $0.description, "enabled": $0.enabled] as [String: Any]
-        }
-        let customSources = state.customIndexSources.map {
-            ["id": $0.id, "name": $0.name, "host": $0.host, "url": $0.url] as [String: Any]
-        }
-        return [
-            "installed": installed,
-            "activeIndexSourceId": state.activeIndexSourceId ?? "",
-            "customIndexSources": customSources,
-            "experimentalFlags": state.experimentalFlags,
-            "registryUrl": state.registryUrl
-        ]
+}
+
+actor ToolApprovals {
+    private struct Pending {
+        let turnId: String
+        let sessionId: String
+        let continuation: CheckedContinuation<Bool, Never>
+        let timeout: Task<Void, Never>
     }
 
-    func setActiveIndexSource(_ sourceId: String?) {
-        let trimmed = (sourceId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        state.activeIndexSourceId = trimmed.isEmpty ? nil : trimmed
-        save()
-    }
+    private var pending: [String: Pending] = [:]
 
-    func addCustomIndexSource(url: String) {
-        guard let parsed = URL(string: url), parsed.scheme == "https", let host = parsed.host else { return }
-        let id = "custom-\(host)"
-        state.customIndexSources.removeAll { $0.url == url }
-        state.customIndexSources.append(CustomIndexSource(id: id, name: host, host: host, url: url))
-        state.activeIndexSourceId = id
-        save()
-    }
-
-    func activeIndexSourceURL() -> URL? {
-        guard let id = state.activeIndexSourceId else { return nil }
-        if id == "dsh-market" { return URL(string: "https://cdn.jsdelivr.net/gh/dsh-market/index@main/index.json") }
-        if id == "dshfind" { return URL(string: "https://api.dshfind.com/v1/index.json") }
-        if let custom = state.customIndexSources.first(where: { $0.id == id }) {
-            return URL(string: custom.url)
-        }
-        return nil
-    }
-
-    func setRegistryUrl(_ url: String) {
-        state.registryUrl = url
-        save()
-    }
-
-    func setExperimental(id: String, enabled: Bool) {
-        state.experimentalFlags[id] = enabled
-        save()
-    }
-
-    func installPluginRecord(name: String, version: String, description: String) -> [String: Any] {
-        state.installedPlugins.removeAll { $0.name == name }
-        state.installedPlugins.append(InstalledPluginItem(name: name, version: version, description: description, enabled: true))
-        save()
-        return ["name": name, "version": version, "description": description, "enabled": true]
-    }
-
-    func togglePlugin(name: String, enabled: Bool) {
-        if let idx = state.installedPlugins.firstIndex(where: { $0.name == name }) {
-            state.installedPlugins[idx].enabled = enabled
-            save()
+    func wait(id: String, turnId: String, sessionId: String, announce: () -> Void) async -> Bool {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else { continuation.resume(returning: false); return }
+                let timeout = Task { [weak self] in
+                    do { try await Task.sleep(nanoseconds: 60_000_000_000) } catch { return }
+                    await self?.finish(id, approved: false)
+                }
+                pending[id] = Pending(turnId: turnId, sessionId: sessionId, continuation: continuation, timeout: timeout)
+                announce()
+            }
+        } onCancel: {
+            Task { await self.finish(id, approved: false) }
         }
     }
 
-    func uninstallPlugin(name: String) {
-        state.installedPlugins.removeAll { $0.name == name }
-        save()
+    func respond(id: String, turnId: String, sessionId: String, approved: Bool) -> Bool {
+        guard let item = pending[id], item.sessionId == sessionId, item.turnId == turnId else { return false }
+        finish(id, approved: approved)
+        return true
+    }
+
+    func cancel(sessionId: String, turnId: String) {
+        let matching = pending.compactMap { id, item in
+            item.sessionId == sessionId && item.turnId == turnId ? id : nil
+        }
+        matching.forEach { finish($0, approved: false) }
+    }
+
+    private func finish(_ id: String, approved: Bool) {
+        guard let item = pending.removeValue(forKey: id) else { return }
+        item.timeout.cancel()
+        item.continuation.resume(returning: approved)
     }
 }
 
-/// Race-free, disk-persisted on-device transport implementing the DS-Bot JSON-RPC 2.0 contract.
-/// Supports real multi-turn DeepSeek / OpenAI-compatible HTTPS SSE streaming and live community plugin index discovery.
-public final class LocalAgentTransport: IPCByteTransport {
-    private var receiveHandler: ((Data) -> Void)?
-    private let dshVersion: String
-    private let keychain: KeychainBridge
-    private let session: URLSession
-    private let store = LocalAgentStore()
-    private let jsc = JSCEmbeddedRuntime()
-    private let deviceBridge = DeviceCapabilitiesBridge()
-    private let mcpClient = RemoteMCPClient()
-    private let decoder = IPCFrameDecoder()
-    private let decoderQueue = DispatchQueue(label: "io.github.dsbot.localagent.ipc")
-    private let emitQueue = DispatchQueue(label: "io.github.dsbot.localagent.emit")
+public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
+    static let defaultWorkspace = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("dsh-home", isDirectory: true)
 
-    public init(dshVersion: String = KernelManager.baselineVersion, keychain: KeychainBridge = KeychainBridge()) {
-        self.dshVersion = dshVersion
+    private let workspaceRoot: URL
+    private let keychain: KeychainBridge
+    private let modelKey: (ModelProvider) async throws -> String
+    private let session: URLSession
+    private let store: LocalAgentStore
+    private let js = LocalJavaScript()
+    private let device = DeviceCapabilitiesBridge()
+    private let mcp: RemoteMCPClient
+    private let approvals = ToolApprovals()
+
+    private let io = DispatchQueue(label: "io.github.dsbot.localagent.ipc")
+    private let decoder = IPCFrameDecoder()
+    private var receiver: ((Data) -> Void)?
+    private var nativeNotificationHandler: ((String, [String: Any]) -> Void)?
+    private var turnTasks: [String: Task<Void, Never>] = [:]
+    private var requestTasks: [Int: Task<Void, Never>] = [:]
+    private var sideRequests: [String: Int] = [:]
+    private var workspaceSideTasks: [String: Task<[String: Any], Error>] = [:]
+    private var suspended = false
+    private var closed = false
+
+    init(root: URL = LocalAgentTransport.defaultWorkspace, keychain: KeychainBridge = KeychainBridge(),
+         migrateOfficialKey: Bool = false, session: URLSession? = nil, mcp: RemoteMCPClient? = nil,
+         modelKey: ((ModelProvider) async throws -> String)? = nil) {
+        self.workspaceRoot = root
         self.keychain = keychain
-        let cfg = URLSessionConfiguration.default
-        cfg.waitsForConnectivity = true
-        cfg.timeoutIntervalForRequest = 90
-        self.session = URLSession(configuration: cfg)
+        self.modelKey = modelKey ?? { provider in
+            try await keychain.modelKey(provider: provider, migrateOfficialKey: migrateOfficialKey)
+        }
+        self.session = session ?? isolatedHTTPSession(timeout: 45)
+        self.store = LocalAgentStore(root: root)
+        self.mcp = mcp ?? RemoteMCPClient(keychain: keychain)
     }
 
     public func setReceiveHandler(_ handler: @escaping (Data) -> Void) {
-        self.receiveHandler = handler
-        emitQueue.asyncAfter(deadline: .now() + 0.04) { [weak self] in
-            guard let self else { return }
-            self.emitNotification("kernel.ready", params: [
-                "dshVersion": self.dshVersion,
-                "ipcProtocolVersion": IPCFrameCodec.protocolVersion,
-                "activeServices": ["sessionController", "sessionQuery", "sessionPersistence", "workspaceRegistry"]
-            ])
+        io.async { if !self.closed { self.receiver = handler } }
+    }
+
+    func setNativeNotificationHandler(_ handler: @escaping (String, [String: Any]) -> Void) {
+        io.async { self.nativeNotificationHandler = handler }
+    }
+
+    /// Exposes only the pre-existing native workspace RPC allowlist. Chat and
+    /// agent lifecycle calls remain exclusively owned by the embedded DSH runtime.
+    func nativeWorkspaceRequest(method: String, params: [String: Any]) async throws -> [String: Any] {
+        if method == "side.cancel" {
+            let sideId = params["sideId"] as? String ?? ""
+            let task = io.sync { workspaceSideTasks.removeValue(forKey: sideId) }
+            task?.cancel()
+            return ["cancelled": task != nil]
         }
+        let allowed: Set<String> = [
+            "models.test", "memory.add", "memory.journal", "memory.legacy", "memory.assign", "memory.undo",
+            "group.state", "group.goal.set", "group.todo.add", "group.todo.toggle", "group.todo.clearCompleted",
+            "connectors.list", "connectors.upsert", "connectors.delete", "usage.legacySummary", "tools.jsEval",
+            "device.status", "device.speak", "device.stopSpeaking", "mcp.listTools", "mcp.callTool", "side.ask",
+            "approval.respond"
+        ]
+        guard allowed.contains(method) else {
+            throw IPCFrameError.remoteError(code: -32601, message: "Unsupported native workspace method: \(method)")
+        }
+        if method == "side.ask" {
+            let sideId = params["sideId"] as? String ?? ""
+            guard !sideId.isEmpty, sideId.utf8.count <= 128 else {
+                throw IPCFrameError.remoteError(code: -32602, message: "无效的侧边请求编号。")
+            }
+            let task = Task { try await self.handle(method: method, params: params) }
+            let inserted = io.sync { () -> Bool in
+                guard workspaceSideTasks[sideId] == nil else { return false }
+                workspaceSideTasks[sideId] = task
+                return true
+            }
+            guard inserted else {
+                task.cancel()
+                throw IPCFrameError.remoteError(code: -32602, message: "侧边请求编号重复。")
+            }
+            defer {
+                _ = io.sync { workspaceSideTasks.removeValue(forKey: sideId) }
+                task.cancel()
+            }
+            return try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
+        }
+        return try await handle(method: method, params: params)
+    }
+
+    func executeNativeTool(name: String, arguments: [String: Any], botId: String, turnId: String, isGroup: Bool) async throws -> [String: Any] {
+        guard ["js_eval", "device_status", "memory_save", "group_todo_add", "web_fetch", "web_search", "remote_mcp_call",
+               "workspace_list", "workspace_read", "workspace_write", "workspace_search", "workspace_edit"].contains(name) else {
+            throw IPCFrameError.remoteError(code: -32601, message: "Unsupported DSH native tool: \(name)")
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: arguments),
+              let encoded = String(data: data, encoding: .utf8) else {
+            throw IPCFrameError.invalidJSON
+        }
+        var call = ProviderMessage.ToolCall()
+        call.id = "dsh_\(UUID().uuidString)"
+        call.function.name = name
+        call.function.arguments = encoded
+        let output = try await execute(call, sessionId: botId, turnId: turnId, isGroup: isGroup, structuredWeb: name == "web_fetch")
+        return ["output": output]
+    }
+
+    func cancelNativeTool(botId: String, turnId: String) async {
+        await approvals.cancel(sessionId: botId, turnId: turnId)
     }
 
     public func write(_ data: Data) {
-        decoderQueue.async { [weak self] in
-            guard let self, let messages = try? self.decoder.push(data) else { return }
-            for msg in messages {
-                guard let id = msg["id"] as? Int, let method = msg["method"] as? String else { continue }
-                let params = msg["params"] as? [String: Any] ?? [:]
-                Task { [weak self] in
-                    await self?.handleRPC(id: id, method: method, params: params)
-                }
+        io.async {
+            guard !self.closed, let messages = try? self.decoder.push(data) else { return }
+            for message in messages {
+                guard let id = message["id"] as? Int, let method = message["method"] as? String else { continue }
+                self.route(id: id, method: method, params: message["params"] as? [String: Any] ?? [:])
             }
         }
     }
 
     public func close() {
-        Task { await store.cancelAllStreams() }
-        receiveHandler = nil
+        io.async {
+            self.closed = true
+            self.receiver = nil
+            self.cancelWork()
+            self.session.invalidateAndCancel()
+        }
     }
 
-    private func handleRPC(id: Int, method: String, params: [String: Any]) async {
+    private func cancelWork() {
+        for task in turnTasks.values { task.cancel() }
+        for task in requestTasks.values { task.cancel() }
+        for task in workspaceSideTasks.values { task.cancel() }
+        workspaceSideTasks.removeAll()
+    }
+
+    private func route(id: Int, method: String, params: [String: Any]) {
         switch method {
-        case "kernel.ping":
-            reply(id: id, result: ["pong": true, "dshVersion": dshVersion, "ipcProtocolVersion": IPCFrameCodec.protocolVersion])
-        case "kernel.diagnostics":
-            reply(id: id, result: await store.diagnostics(dshVersion: dshVersion))
         case "chat.send":
-            await handleChatSend(id: id, params: params)
+            guard !suspended, let turnId = params["turnId"] as? String, !turnId.isEmpty, turnTasks.isEmpty else {
+                fail(id, code: -32602, "当前无法启动新回合。")
+                return
+            }
+            turnTasks[turnId] = Task { [weak self] in
+                guard let self else { return }
+                await self.chat(turnId: turnId, params: params)
+            }
+            reply(id, ["turnId": turnId, "status": "accepted"])
         case "chat.abort":
-            let aborted = await store.abortStream(turnId: params["turnId"] as? String ?? "")
-            reply(id: id, result: ["found": aborted, "aborted": aborted])
-        case "side.ask":
-            await handleSideAsk(id: id, params: params)
+            let task = turnTasks[params["turnId"] as? String ?? ""]
+            task?.cancel()
+            reply(id, ["aborted": task != nil])
+        case "side.cancel":
+            let sideId = params["sideId"] as? String ?? ""
+            if let request = sideRequests[sideId] { requestTasks[request]?.cancel() }
+            reply(id, ["cancelled": true])
+        case "agent.suspend":
+            suspended = true
+            cancelWork()
+            Task { await device.stopSpeaking() }
+            reply(id, ["suspended": true])
+        case "agent.resume":
+            suspended = false
+            reply(id, ["suspended": false])
+        default:
+            guard !suspended else { fail(id, "应用在后台。"); return }
+            let sideId = method == "side.ask" ? params["sideId"] as? String : nil
+            if let sideId { sideRequests[sideId] = id }
+            requestTasks[id] = Task { [weak self] in
+                guard let self else { return }
+                defer {
+                    self.io.async {
+                        self.requestTasks.removeValue(forKey: id)
+                        if let sideId { self.sideRequests.removeValue(forKey: sideId) }
+                    }
+                }
+                do {
+                    let result = try await self.handle(method: method, params: params)
+                    self.reply(id, result)
+                } catch let error as IPCFrameError {
+                    if case .remoteError(let code, let message) = error { self.fail(id, code: code, message) }
+                    else { self.fail(id, error.localizedDescription) }
+                } catch {
+                    self.fail(id, error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func handle(method: String, params: [String: Any]) async throws -> [String: Any] {
+        if await store.loadError != nil { throw IPCFrameError.remoteError(code: -32000, message: "无法读取本机工作区。原有数据已保留。") }
+        let botId = params["botId"] as? String ?? "main"
+        let groupId = params["groupId"] as? String ?? "default"
+        switch method {
+        case "agent.info":
+            return [
+                "engine": "native-workspace-bridge",
+                "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
+                "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "",
+                "ipcProtocolVersion": IPCFrameCodec.protocolVersion,
+                "tools": Self.tools.compactMap { ($0["function"] as? [String: Any])?["name"] as? String }
+            ]
+        case "side.ask": return try await sideChat(params)
+        case "models.test": return try await listModels(params)
         case "memory.add":
-            let res = await store.addMemory(
-                title: params["title"] as? String ?? "",
-                content: params["content"] as? String ?? "",
-                layer: params["layer"] as? String ?? "delta"
-            )
-            reply(id: id, result: res)
+            return try await store.addMemory(botId: botId, title: params["title"] as? String ?? "",
+                                             content: params["content"] as? String ?? "", layer: params["layer"] as? String ?? "delta")
         case "memory.journal":
-            reply(id: id, result: ["records": await store.memoryJournal()])
+            return ["records": await store.memoryJournal(botId: botId)]
+        case "memory.legacy":
+            return ["records": await store.memoryJournal(botId: nil)]
+        case "memory.assign":
+            return ["assigned": try await store.assignMemory(journalId: params["journalId"] as? String ?? "", botId: botId)]
         case "memory.undo":
-            await store.undoMemory(journalId: params["journalId"] as? String ?? "")
-            reply(id: id, result: ["undone": true])
-        case "group.state":
-            reply(id: id, result: await store.groupState(groupId: params["groupId"] as? String ?? "default"))
-        case "group.goal.set":
-            reply(id: id, result: await store.setGroupGoal(groupId: params["groupId"] as? String ?? "default", title: params["title"] as? String ?? ""))
-        case "group.todo.add":
-            reply(id: id, result: await store.addGroupTodo(groupId: params["groupId"] as? String ?? "default", text: params["text"] as? String ?? ""))
+            return ["undone": try await store.undoMemory(botId: botId, journalId: params["journalId"] as? String ?? "")]
+        case "group.state": return await store.groupState(groupId: groupId)
+        case "group.goal.set": return try await store.setGroupGoal(groupId: groupId, title: params["title"] as? String ?? "")
+        case "group.todo.add": return try await store.addGroupTodo(groupId: groupId, text: params["text"] as? String ?? "")
         case "group.todo.toggle":
-            await store.toggleGroupTodo(groupId: params["groupId"] as? String ?? "default", id: params["id"] as? String ?? "", done: params["done"] as? Bool ?? false)
-            reply(id: id, result: ["found": true])
-        case "group.todo.clearCompleted":
-            let removed = await store.clearCompletedTodos(groupId: params["groupId"] as? String ?? "default")
-            reply(id: id, result: ["removed": removed])
-        case "connectors.list":
-            reply(id: id, result: ["connectors": await store.listConnectors()])
+            try await store.toggleGroupTodo(groupId: groupId, id: params["id"] as? String ?? "", done: params["done"] as? Bool ?? false)
+            return ["found": true]
+        case "group.todo.clearCompleted": return ["removed": try await store.clearCompletedTodos(groupId: groupId)]
+        case "connectors.list": return ["connectors": await store.listConnectors()]
         case "connectors.upsert":
-            let c = await store.upsertConnector(
-                id: params["id"] as? String,
-                type: params["type"] as? String ?? "remote-mcp",
-                name: params["name"] as? String ?? "Connector",
-                endpoint: params["endpoint"] as? String ?? ""
-            )
-            reply(id: id, result: ["connector": c])
+            let endpoint = try RemoteMCPClient.endpointURL(params["endpoint"] as? String ?? "").absoluteString
+            let name = (params["name"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty else { throw IPCFrameError.remoteError(code: -32602, message: "请输入连接器名称。") }
+            let id = "conn_" + UUID().uuidString
+            let account = "connector:\(id)"
+            let token = params["token"] as? String ?? ""
+            if !token.isEmpty { _ = try keychain.setSecret(account: account, value: token) }
+            do {
+                return ["connector": try await store.upsertConnector(id: id, type: "remote-mcp", name: name, endpoint: endpoint)]
+            } catch {
+                if !token.isEmpty { _ = try? keychain.deleteSecret(account: account) }
+                throw error
+            }
         case "connectors.delete":
-            await store.deleteConnector(id: params["id"] as? String ?? "")
-            reply(id: id, result: ["removed": true])
-        case "usage.summary":
-            reply(id: id, result: await store.usageSummary())
-        case "plugins.overview":
-            reply(id: id, result: await store.pluginsOverview())
-        case "plugins.index.setActive":
-            await store.setActiveIndexSource(params["sourceId"] as? String)
-            reply(id: id, result: ["ok": true])
-        case "plugins.index.addCustom":
-            await store.addCustomIndexSource(url: params["url"] as? String ?? "")
-            reply(id: id, result: ["ok": true])
-        case "plugins.discover":
-            await handlePluginsDiscover(id: id)
-        case "plugins.experimental.toggle":
-            await store.setExperimental(id: params["id"] as? String ?? "", enabled: params["enabled"] as? Bool ?? false)
-            reply(id: id, result: ["ok": true])
-        case "plugins.install":
-            await handlePluginInstall(id: id, params: params)
-        case "plugins.installLocal":
-            let path = params["folderPath"] as? String ?? ""
-            let name = URL(fileURLWithPath: path).lastPathComponent
-            let rec = await store.installPluginRecord(name: name, version: "local", description: "Installed from local folder")
-            reply(id: id, result: ["plugin": rec])
-        case "plugins.toggle":
-            await store.togglePlugin(name: params["name"] as? String ?? "", enabled: params["enabled"] as? Bool ?? true)
-            reply(id: id, result: ["ok": true])
-        case "plugins.uninstall":
-            await store.uninstallPlugin(name: params["name"] as? String ?? "")
-            reply(id: id, result: ["removed": true])
-        case "plugins.setRegistry":
-            let url = params["url"] as? String ?? "https://registry.npmmirror.com"
-            await store.setRegistryUrl(url)
-            reply(id: id, result: ["registryUrl": url])
+            let id = params["id"] as? String ?? ""
+            try await store.deleteConnector(id: id)
+            _ = try keychain.deleteSecret(account: "connector:\(id)")
+            return ["removed": true]
+        case "usage.legacySummary": return await store.usageSummary()
         case "approval.respond":
-            reply(id: id, result: ["found": true, "approved": params["approved"] as? Bool ?? false])
-        case "kernel.suspend":
-            await store.cancelAllStreams()
-            reply(id: id, result: ["suspended": true])
-        case "kernel.resume":
-            reply(id: id, result: ["suspended": false])
+            return ["found": await approvals.respond(
+                id: params["approvalId"] as? String ?? "", turnId: params["turnId"] as? String ?? "",
+                sessionId: params["sessionId"] as? String ?? "", approved: params["approved"] as? Bool ?? false)]
         case "tools.jsEval":
-            let code = params["script"] as? String ?? ""
-            let res = jsc.evaluate(script: code)
-            reply(id: id, result: ["ok": res.ok, "value": res.value, "logs": res.logs, "error": res.error ?? ""])
-        case "device.status":
-            reply(id: id, result: deviceBridge.deviceStatus())
+            let result = await js.evaluate(params["script"] as? String ?? "")
+            return ["ok": result.ok, "value": result.value, "logs": result.logs, "error": result.error ?? ""]
+        case "device.status": return await device.deviceStatus()
         case "device.speak":
-            deviceBridge.speak(text: params["text"] as? String ?? "", language: params["language"] as? String ?? "zh-CN")
-            reply(id: id, result: ["ok": true])
-        case "device.notify":
-            let ok = await deviceBridge.scheduleLocalNotification(
-                title: params["title"] as? String ?? "DS Bot",
-                body: params["body"] as? String ?? "",
-                delaySeconds: params["delaySeconds"] as? Double ?? 5
-            )
-            reply(id: id, result: ["scheduled": ok])
+            let text = params["text"] as? String ?? ""
+            guard !text.isEmpty else { throw IPCFrameError.remoteError(code: -32602, message: "没有可朗读的内容。") }
+            await device.speak(text)
+            return ["ok": true]
+        case "device.stopSpeaking":
+            await device.stopSpeaking()
+            return ["ok": true]
         case "mcp.listTools":
-            let endpoint = params["endpoint"] as? String ?? ""
-            let account = params["keychainAccount"] as? String
-            do {
-                let tools = try await mcpClient.listTools(endpoint: endpoint, keychainAccount: account)
-                let serialized = tools.map { ["name": $0.name, "description": $0.description] }
-                reply(id: id, result: ["ok": true, "tools": serialized])
-            } catch {
-                reply(id: id, result: ["ok": false, "tools": [], "error": error.localizedDescription])
+            guard let connector = await store.connector(id: params["connectorId"] as? String ?? ""), connector.type == "remote-mcp" else {
+                throw IPCFrameError.remoteError(code: -32602, message: "连接器已移除。")
             }
-        case "mcp.callTool":
-            let endpoint = params["endpoint"] as? String ?? ""
-            let name = params["name"] as? String ?? ""
-            let args = params["arguments"] as? [String: Any] ?? [:]
-            let account = params["keychainAccount"] as? String
-            do {
-                let output = try await mcpClient.callTool(endpoint: endpoint, name: name, arguments: args, keychainAccount: account)
-                reply(id: id, result: ["ok": true, "output": output])
-            } catch {
-                reply(id: id, result: ["ok": false, "error": error.localizedDescription])
-            }
-        case "models.test":
-            await handleModelsTest(id: id, params: params)
-        case "kernel.shutdown":
-            await store.cancelAllStreams()
-            reply(id: id, result: ["shutdown": true])
-        default:
-            reply(id: id, result: ["ok": true])
+            let tools = try await mcp.listTools(endpoint: connector.endpoint, keychainAccount: "connector:\(connector.id)")
+            return ["ok": true, "tools": tools.map { ["name": $0.name, "description": $0.description] }]
+        default: throw IPCFrameError.remoteError(code: -32601, message: "不支持的方法 \(method)。")
         }
     }
 
-    private func handlePluginsDiscover(id: Int) async {
-        guard let url = await store.activeIndexSourceURL() else {
-            reply(id: id, result: ["items": []])
-            return
-        }
-        do {
-            let (data, _) = try await session.data(from: url)
-            let json = try JSONSerialization.jsonObject(with: data)
-            let list: [[String: Any]]
-            if let arr = json as? [[String: Any]] {
-                list = arr
-            } else if let dict = json as? [String: Any] {
-                list = (dict["plugins"] as? [[String: Any]])
-                    ?? (dict["packages"] as? [[String: Any]])
-                    ?? (dict["items"] as? [[String: Any]])
-                    ?? []
-            } else {
-                list = []
-            }
-            reply(id: id, result: ["items": list])
-        } catch {
-            reply(id: id, result: ["items": [], "error": error.localizedDescription])
-        }
+    private static let tools: [[String: Any]] = [
+        tool("js_eval", "Evaluate JavaScript locally for calculations and data transforms.", ["script": "string"], ["script"]),
+        tool("memory_save", "Save memory for the current bot.", ["title": "string", "content": "string", "layer": "string"], ["title", "content"]),
+        tool("group_todo_add", "Add a todo to the current group.", ["text": "string"], ["text"]),
+        tool("device_status", "Read iOS device power and thermal status.", [:], []),
+        tool("remote_mcp_call", "Call a user-configured MCP connector.", ["connectorName": "string", "toolName": "string", "arguments": "object"], ["connectorName", "toolName"]),
+        tool("web_fetch", "Read an HTTPS URL after the user approves the exact address.", ["url": "string"], ["url"])
+    ]
+
+    private static func tool(_ name: String, _ summary: String, _ fields: [String: String], _ required: [String]) -> [String: Any] {
+        ["type": "function", "function": ["name": name, "description": summary,
+          "parameters": ["type": "object", "properties": fields.mapValues { ["type": $0] }, "required": required]]]
     }
 
-    private func handleChatSend(id: Int, params: [String: Any]) async {
+    private func chat(turnId: String, params: [String: Any]) async {
         let sessionId = params["sessionId"] as? String ?? "main"
-        let text = params["text"] as? String ?? ""
-        let model = params["model"] as? String ?? "deepseek-chat"
-        let baseURLRaw = (params["apiBaseURL"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let baseURL = (baseURLRaw?.isEmpty == false ? baseURLRaw! : "https://api.deepseek.com").trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let history = params["history"] as? [[String: String]] ?? []
-        let requestedTurn = (params["turnId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let turnId = (requestedTurn?.isEmpty == false) ? requestedTurn! : "turn_\(UUID().uuidString.prefix(8))"
-
-        let keyObj = try? await keychain.getSecret(account: "deepseek_api_key", requireBiometrics: false)
-        let apiKey = (keyObj?["value"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
-        if apiKey.isEmpty {
-            emitNotification("chat.delta", params: [
-                "sessionId": sessionId,
-                "turnId": turnId,
-                "reasoning": "检测到 iOS Keychain 尚未配置 API Key，进入快速引导。",
-                "content": "## 配置 API Key 后即可独立流式对话\n请前往底部 **设置 → DeepSeek API Key** 保存 `sk-...`（加密存储于 iOS Keychain），也支持自定义 OpenAI 兼容 Base URL。\n\n### 当前内置能力\n- 内置锁定 **DSH \(dshVersion)** 可热换内核\n- 支持四层记忆撤销、群 Goal/待办、`/side` 侧边对话与社区插件索引源"
-            ])
-            emitNotification("chat.done", params: ["sessionId": sessionId, "turnId": turnId, "status": "completed"])
-            reply(id: id, result: ["turnId": turnId, "status": "completed"])
-            return
-        }
-
-        let pinnedMem = await store.pinnedMemoriesSummary()
-        let customPrompt = (params["systemPrompt"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        var sysPrompt = "You are DS Bot running standalone on iOS with embedded DSH \(dshVersion). Reply concisely in the user's language."
-        if !customPrompt.isEmpty {
-            sysPrompt += "\n\nBot Persona & Instructions:\n\(customPrompt)"
-        }
-        if !pinnedMem.isEmpty {
-            sysPrompt += "\n\nPinned User Memory:\n\(pinnedMem)"
-        }
-
-        var apiMessages: [[String: Any]] = [["role": "system", "content": sysPrompt]]
-        for item in history.suffix(16) {
-            if let r = item["role"], let c = item["content"], !c.isEmpty {
-                apiMessages.append(["role": r, "content": c])
+        var terminal: [String: Any] = ["sessionId": sessionId, "turnId": turnId]
+        var status = "error"
+        defer {
+            terminal["status"] = status
+            let frame = (try? IPCFrameCodec.encode(["jsonrpc": "2.0", "method": "chat.done", "params": terminal]))
+                ?? (try? IPCFrameCodec.encode([
+                    "jsonrpc": "2.0", "method": "chat.done",
+                    "params": ["turnId": turnId, "sessionId": sessionId, "status": "incomplete",
+                               "error": "回复超出本机保存上限。"]
+                ]))
+            io.async {
+                self.turnTasks.removeValue(forKey: turnId)
+                if let frame { self.receiver?(frame) }
             }
         }
-        if (apiMessages.last?["content"] as? String) != text {
-            apiMessages.append(["role": "user", "content": text])
-        }
-
-        let builtInTools: [[String: Any]] = [
-            [
-                "type": "function",
-                "function": [
-                    "name": "js_eval",
-                    "description": "Execute JavaScript in the isolated on-device JavaScriptCore sandbox for math, JSON/CSV processing, or data transforms.",
-                    "parameters": ["type": "object", "properties": ["script": ["type": "string"]], "required": ["script"]]
-                ]
-            ],
-            [
-                "type": "function",
-                "function": [
-                    "name": "memory_save",
-                    "description": "Persist an important user preference or fact into the 4-layer on-device memory store.",
-                    "parameters": ["type": "object", "properties": ["title": ["type": "string"], "content": ["type": "string"], "layer": ["type": "string"]], "required": ["title", "content"]]
-                ]
-            ],
-            [
-                "type": "function",
-                "function": [
-                    "name": "group_todo_add",
-                    "description": "Add a concrete action item to the current session/group shared todo list.",
-                    "parameters": ["type": "object", "properties": ["text": ["type": "string"]], "required": ["text"]]
-                ]
-            ],
-            [
-                "type": "function",
-                "function": [
-                    "name": "device_status",
-                    "description": "Read current iOS device battery level, thermal state, low power mode, and OS version.",
-                    "parameters": ["type": "object", "properties": [:]]
-                ]
-            ],
-            [
-                "type": "function",
-                "function": [
-                    "name": "remote_mcp_call",
-                    "description": "Invoke a tool on a configured Remote MCP connector by connectorName, toolName, and arguments.",
-                    "parameters": ["type": "object", "properties": ["connectorName": ["type": "string"], "toolName": ["type": "string"], "arguments": ["type": "object"]], "required": ["connectorName", "toolName"]]
-                ]
-            ],
-            [
-                "type": "function",
-                "function": [
-                    "name": "web_fetch",
-                    "description": "Fetch a public HTTPS URL and extract plain readable text (up to 12 KB).",
-                    "parameters": ["type": "object", "properties": ["url": ["type": "string"]], "required": ["url"]]
-                ]
-            ]
-        ]
-
-        let task = Task { [weak self] in
-            guard let self else { return }
-            defer { Task { await self.store.removeStream(turnId: turnId) } }
-            do {
-                guard let endpoint = URL(string: "\(baseURL)/chat/completions") else {
-                    throw NetworkBridgeError.invalidURL(baseURL)
-                }
-
-                // Autonomous multi-step Agent Tool-Calling Loop (max 6 rounds per turn)
-                for _ in 0..<6 {
-                    if Task.isCancelled { break }
-                    var req = URLRequest(url: endpoint)
-                    req.httpMethod = "POST"
-                    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                    req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-                    var body: [String: Any] = [
-                        "model": model,
-                        "stream": true,
-                        "stream_options": ["include_usage": true],
-                        "messages": apiMessages
-                    ]
-                    body["tools"] = builtInTools
-                    req.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-                    var roundContent = ""
-                    var roundReasoning = ""
-                    var toolCallsByIndex: [Int: (id: String, name: String, args: String)] = [:]
-
-                    // Bounded pre-first-token retry (max 2 retries: 1s -> 2s) for transient 429/502/503/504 or cellular drops
-                    var bytesResult: (URLSession.AsyncBytes, URLResponse)?
-                    let retryableStatuses: Set<Int> = [429, 502, 503, 504]
-                    for attempt in 0..<3 {
-                        if Task.isCancelled { break }
-                        do {
-                            let (b, resp) = try await self.session.bytes(for: req)
-                            if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-                                if retryableStatuses.contains(http.statusCode) && attempt < 2 {
-                                    let waitSec = attempt + 1
-                                    self.emitNotification("chat.delta", params: [
-                                        "sessionId": sessionId,
-                                        "turnId": turnId,
-                                        "reasoning": "[网络重试] 服务端返回 HTTP \(http.statusCode)，\(waitSec) 秒后自动重试 (\(attempt + 1)/2)…\n"
-                                    ])
-                                    try await Task.sleep(nanoseconds: UInt64(waitSec) * 1_000_000_000)
-                                    continue
-                                }
-                                var errSnippet = ""
-                                for try await errLine in b.lines {
-                                    errSnippet += errLine
-                                    if errSnippet.count > 600 { break }
-                                }
-                                let hint: String
-                                switch http.statusCode {
-                                case 401: hint = "HTTP 401：API Key 无效或已失效，请在「设置」检查 Keychain 密钥。"
-                                case 402: hint = "HTTP 402：模型服务商账户余额不足。"
-                                case 429: hint = "HTTP 429：请求过于频繁，请稍后重试。"
-                                default: hint = "HTTP \(http.statusCode)：\(errSnippet.prefix(240))"
-                                }
-                                throw IPCFrameError.remoteError(code: http.statusCode, message: hint)
-                            }
-                            bytesResult = (b, resp)
-                            break
-                        } catch let urlErr as URLError where attempt < 2 && (urlErr.code == .networkConnectionLost || urlErr.code == .timedOut || urlErr.code == .notConnectedToInternet) {
-                            let waitSec = attempt + 1
-                            self.emitNotification("chat.delta", params: [
-                                "sessionId": sessionId,
-                                "turnId": turnId,
-                                "reasoning": "[网络重试] 连接波动（\(urlErr.localizedDescription)），\(waitSec) 秒后自动重试 (\(attempt + 1)/2)…\n"
-                            ])
-                            try await Task.sleep(nanoseconds: UInt64(waitSec) * 1_000_000_000)
-                        }
-                    }
-                    guard let (bytes, _) = bytesResult else { break }
-                    for try await line in bytes.lines {
-                        if Task.isCancelled { break }
-                        guard line.hasPrefix("data:") else { continue }
-                        let payload = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-                        if payload == "[DONE]" { break }
-                        guard let jsonData = payload.data(using: .utf8),
-                              let obj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else { continue }
-                        if let usage = obj["usage"] as? [String: Any] {
-                            await self.store.recordUsage(
-                                input: usage["prompt_tokens"] as? Int ?? 0,
-                                cached: usage["prompt_cache_hit_tokens"] as? Int ?? 0,
-                                output: usage["completion_tokens"] as? Int ?? 0
-                            )
-                        }
-                        if let choices = obj["choices"] as? [[String: Any]],
-                           let delta = choices.first?["delta"] as? [String: Any] {
-                            var outDelta: [String: Any] = ["sessionId": sessionId, "turnId": turnId]
-                            if let r = delta["reasoning_content"] as? String, !r.isEmpty {
-                                roundReasoning += r
-                                outDelta["reasoning"] = r
-                            }
-                            if let c = delta["content"] as? String, !c.isEmpty {
-                                roundContent += c
-                                outDelta["content"] = c
-                            }
-                            if outDelta.count > 2 {
-                                self.emitNotification("chat.delta", params: outDelta)
-                            }
-                            if let tcDeltas = delta["tool_calls"] as? [[String: Any]] {
-                                for tc in tcDeltas {
-                                    let idx = tc["index"] as? Int ?? 0
-                                    var cur = toolCallsByIndex[idx] ?? (id: "", name: "", args: "")
-                                    if let cid = tc["id"] as? String, !cid.isEmpty { cur.id = cid }
-                                    if let fn = tc["function"] as? [String: Any] {
-                                        if let n = fn["name"] as? String { cur.name += n }
-                                        if let a = fn["arguments"] as? String { cur.args += a }
-                                    }
-                                    toolCallsByIndex[idx] = cur
-                                }
-                            }
-                        }
-                    }
-
-                    if toolCallsByIndex.isEmpty || Task.isCancelled { break }
-
-                    let orderedCalls = toolCallsByIndex.keys.sorted().compactMap { toolCallsByIndex[$0] }
-                    let serializedCalls: [[String: Any]] = orderedCalls.map { tc in
-                        [
-                            "id": tc.id.isEmpty ? "call_\(UUID().uuidString.prefix(6))" : tc.id,
-                            "type": "function",
-                            "function": ["name": tc.name, "arguments": tc.args]
-                        ]
-                    }
-                    var assistantMsg: [String: Any] = ["role": "assistant", "content": roundContent, "tool_calls": serializedCalls]
-                    if !roundReasoning.isEmpty {
-                        assistantMsg["reasoning_content"] = roundReasoning
-                    }
-                    apiMessages.append(assistantMsg)
-
-                    for (i, tc) in orderedCalls.enumerated() {
-                        let callId = (serializedCalls[i]["id"] as? String) ?? "call_\(i)"
-                        self.emitNotification("chat.delta", params: [
-                            "sessionId": sessionId,
-                            "turnId": turnId,
-                            "reasoning": "\n[Tool] \(tc.name)(\(tc.args.prefix(120)))\n"
-                        ])
-                        let toolOutput = await self.executeBuiltInTool(name: tc.name, argsJSON: tc.args, sessionId: sessionId)
-                        self.emitNotification("chat.delta", params: [
-                            "sessionId": sessionId,
-                            "turnId": turnId,
-                            "reasoning": "[Result] \(toolOutput.prefix(160))\n"
-                        ])
-                        apiMessages.append(["role": "tool", "tool_call_id": callId, "content": toolOutput])
-                    }
-                }
-
-                self.emitNotification("chat.done", params: ["sessionId": sessionId, "turnId": turnId, "status": Task.isCancelled ? "aborted" : "completed"])
-                self.reply(id: id, result: ["turnId": turnId, "status": Task.isCancelled ? "aborted" : "completed"])
-            } catch {
-                let isCancel = Task.isCancelled || (error as? URLError)?.code == .cancelled
-                if isCancel {
-                    self.emitNotification("chat.done", params: ["sessionId": sessionId, "turnId": turnId, "status": "aborted"])
-                    self.reply(id: id, result: ["turnId": turnId, "status": "aborted"])
-                } else {
-                    self.emitNotification("chat.delta", params: ["sessionId": sessionId, "turnId": turnId, "content": "\n[请求失败：\(error.localizedDescription)]"])
-                    self.emitNotification("chat.done", params: ["sessionId": sessionId, "turnId": turnId, "status": "error", "error": error.localizedDescription])
-                    self.reply(id: id, result: ["turnId": turnId, "status": "error"])
-                }
-            }
-        }
-        await store.registerStream(turnId: turnId, task: task)
-    }
-
-    private func executeBuiltInTool(name: String, argsJSON: String, sessionId: String) async -> String {
-        let args = (argsJSON.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }) ?? [:]
-        switch name {
-        case "js_eval":
-            let res = jsc.evaluate(script: args["script"] as? String ?? "")
-            return res.ok ? (res.value.isEmpty ? res.logs.joined(separator: "\n") : res.value) : "Error: \(res.error ?? "failed")"
-        case "memory_save":
-            let r = await store.addMemory(
-                title: args["title"] as? String ?? "Note",
-                content: args["content"] as? String ?? "",
-                layer: args["layer"] as? String ?? "pinned"
-            )
-            return "Saved memory: \(r["entryId"] ?? "")"
-        case "group_todo_add":
-            let r = await store.addGroupTodo(groupId: sessionId, text: args["text"] as? String ?? "")
-            return "Added todo: \(r)"
-        case "device_status":
-            let st = deviceBridge.deviceStatus()
-            if let d = try? JSONSerialization.data(withJSONObject: st), let s = String(data: d, encoding: .utf8) { return s }
-            return "{}"
-        case "remote_mcp_call":
-            let cname = args["connectorName"] as? String ?? ""
-            let tname = args["toolName"] as? String ?? ""
-            let targs = args["arguments"] as? [String: Any] ?? [:]
-            let conns = await store.listConnectors()
-            guard let target = conns.first(where: { ($0["name"] as? String)?.caseInsensitiveCompare(cname) == .orderedSame }),
-                  let ep = target["endpoint"] as? String,
-                  let cid = target["id"] as? String else {
-                return "Error: Remote MCP connector '\(cname)' not found."
-            }
-            do {
-                return try await mcpClient.callTool(endpoint: ep, name: tname, arguments: targs, keychainAccount: "connector:\(cid)")
-            } catch {
-                return "MCP call failed: \(error.localizedDescription)"
-            }
-        case "web_fetch":
-            guard let raw = args["url"] as? String, let url = URL(string: raw), url.scheme == "https",
-                  let host = url.host?.lowercased(),
-                  host != "localhost", !host.hasPrefix("127."), !host.hasPrefix("169.254.") else {
-                return "Error: web_fetch requires a public https:// URL."
-            }
-            do {
-                let (data, _) = try await session.data(from: url)
-                guard data.count <= 1_500_000 else { return "Error: response exceeds 1.5 MB limit." }
-                let html = String(data: data, encoding: .utf8) ?? ""
-                let stripped = html.replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
-                    .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                return String(stripped.prefix(12_000))
-            } catch {
-                return "Error fetching URL: \(error.localizedDescription)"
-            }
-        default:
-            return "Unsupported tool: \(name)"
-        }
-    }
-
-    private func handleSideAsk(id: Int, params: [String: Any]) async {
-        let q = (params["question"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let baseURLRaw = (params["apiBaseURL"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let baseURL = (baseURLRaw?.isEmpty == false ? baseURLRaw! : "https://api.deepseek.com").trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let keyObj = try? await keychain.getSecret(account: "deepseek_api_key", requireBiometrics: false)
-        let apiKey = (keyObj?["value"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
-        if apiKey.isEmpty {
-            reply(id: id, result: ["reply": "【Side Chat · 无工具模式】请先在「设置 → DeepSeek API Key」保存密钥后即可独立问答（不中断主回合）。"])
-            return
-        }
-
-        guard let endpoint = URL(string: "\(baseURL)/chat/completions") else {
-            reply(id: id, result: ["reply": "Side Chat 请求失败：Base URL 格式无效。"])
-            return
-        }
-        var req = URLRequest(url: endpoint)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        let body: [String: Any] = [
-            "model": "deepseek-chat",
-            "stream": false,
-            "messages": [
-                ["role": "system", "content": "You are DS Bot Side Chat (tool-free mode). Answer briefly without invoking any tools."],
-                ["role": "user", "content": q]
-            ]
-        ]
         do {
-            req.httpBody = try JSONSerialization.data(withJSONObject: body)
-            let (data, response) = try await session.data(for: req)
-            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-                reply(id: id, result: ["reply": "Side Chat 请求失败（HTTP \(http.statusCode)）。"])
-                return
+            try Task.checkCancellation()
+            if await store.loadError != nil {
+                throw IPCFrameError.remoteError(code: -32000, message: "无法读取本机工作区。")
             }
-            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let choices = obj["choices"] as? [[String: Any]],
-               let msg = choices.first?["message"] as? [String: Any],
-               let content = msg["content"] as? String {
-                if let usage = obj["usage"] as? [String: Any] {
-                    await store.recordUsage(
-                        input: usage["prompt_tokens"] as? Int ?? 0,
-                        cached: usage["prompt_cache_hit_tokens"] as? Int ?? 0,
-                        output: usage["completion_tokens"] as? Int ?? 0
-                    )
+
+            let provider = try ModelProvider(params["apiBaseURL"] as? String ?? "")
+            let key = try await modelKey(provider)
+            let selectedModel = params["model"] as? String ?? ""
+            var fields = try provider.modelFields(selectedModel)
+            let toolsEnabled = provider.isDeepSeek || params["customTools"] as? Bool == true
+            let isGroup = params["isGroup"] as? Bool == true
+            if toolsEnabled {
+                fields["tools"] = isGroup ? Self.tools : Self.tools.filter {
+                    ($0["function"] as? [String: Any])?["name"] as? String != "group_todo_add"
                 }
-                reply(id: id, result: ["reply": content])
-                return
             }
-            reply(id: id, result: ["reply": "Side Chat 未收到有效响应内容。"])
-        } catch {
-            reply(id: id, result: ["reply": "Side Chat 网络错误：\(error.localizedDescription)"])
-        }
-    }
+            fields["stream"] = true
+            if provider.isDeepSeek { fields["stream_options"] = ["include_usage": true] }
+            var prompt = "You are DS Bot on iOS. Reply concisely in the user's language."
+            if let custom = params["systemPrompt"] as? String, !custom.isEmpty { prompt += "\n\n" + custom }
+            let pinned = await store.pinnedMemoriesSummary(botId: sessionId)
+            if !pinned.isEmpty { prompt += "\n\nPinned user memory:\n" + pinned }
+            let historical = ((params["history"] as? [[String: Any]]) ?? []).map { message -> [String: Any] in
+                var message = message
+                if !provider.isDeepSeek || !toolsEnabled { message.removeValue(forKey: "reasoning_content") }
+                return message
+            }
+            var messages = [["role": "system", "content": prompt] as [String: Any]] + historical
+            var transcript: [ProviderMessage] = []
+            var usedIDs = Set<String>()
 
-    private func handlePluginInstall(id: Int, params: [String: Any]) async {
-        let spec = (params["name"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !spec.isEmpty else {
-            replyError(id: id, code: -32602, message: "插件包名或 GitHub 地址不能为空。")
-            return
-        }
-
-        let coreBuiltins: Set<String> = [
-            "@deepseek-ai/dsh", "@deepseek-ai/dsh-app-boot", "@deepseek-ai/dsh-base",
-            "@deepseek-ai/dsh-session-query-sqlite"
-        ]
-        let desktopOnly: Set<String> = [
-            "@deepseek-ai/dsh-web-app", "@deepseek-ai/dsh-bash-local", "@deepseek-ai/dsh-computer-use",
-            "@deepseek-ai/dsh-cua", "@deepseek-ai/dsh-experimental-cua-macos", "@deepseek-ai/dsh-skill-office",
-            "@deepseek-ai/libreoffice-kit", "playwright-core", "node-pty", "sharp", "koffi", "pnpm"
-        ]
-
-        // GitHub URL install path
-        if spec.hasPrefix("https://github.com/") || spec.hasPrefix("github:") {
-            let cleanName = spec.split(separator: "/").last.map(String.init)?.replacingOccurrences(of: ".git", with: "") ?? spec
-            let rec = await store.installPluginRecord(name: cleanName, version: "github", description: "Installed from GitHub: \(spec)")
-            reply(id: id, result: ["plugin": rec])
-            return
-        }
-
-        if coreBuiltins.contains(spec) {
-            replyError(id: id, code: -32010, message: "「\(spec)」已内置于锁定内核 DSH \(dshVersion)，禁止覆盖安装（#13730）。")
-            return
-        }
-        if desktopOnly.contains(spec) {
-            replyError(id: id, code: -32011, message: "「\(spec)」为桌面端专用模块，iOS 沙盒不支持本地进程或原生扩展。")
-            return
-        }
-
-        // Fetch real npm metadata from active registry (npmmirror / npmjs) and validate DSH 0.2.2-rc.5 compatibility
-        let registry = await store.currentRegistryUrl().trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let encoded = spec.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? spec
-        var resolvedVersion = "latest"
-        var resolvedDesc = "DSH Plugin"
-
-        if let metaURL = URL(string: "\(registry)/\(encoded)/latest") {
-            do {
-                let (data, resp) = try await session.data(from: metaURL)
-                if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-                    replyError(id: id, code: -32012, message: "无法从镜像源获取「\(spec)」（HTTP \(http.statusCode)）。")
+            for roundIndex in 0...6 {
+                try Task.checkCancellation()
+                fields["messages"] = messages
+                let round = try await completion(provider: provider, key: key, fields: fields, sessionId: sessionId, turnId: turnId)
+                if ["length", "content_filter"].contains(round.finishReason ?? "") {
+                    status = "incomplete"
+                    terminal["error"] = "模型在生成结束前停止了回复。"
                     return
                 }
-                if let manifest = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    resolvedVersion = manifest["version"] as? String ?? "latest"
-                    resolvedDesc = manifest["description"] as? String ?? "DSH Plugin"
 
-                    // Guard #13792: broken experimental session-search on 0.2.2-rc.5
-                    if spec == "@deepseek-ai/dsh-experimental-session-search" && dshVersion == "0.2.2-rc.5" && resolvedVersion.hasPrefix("0.2.1-") {
-                        replyError(id: id, code: -32013, message: "已拦截：「\(spec)@\(resolvedVersion)」在 DSH 0.2.2-rc.5 上会导致工作区选择器异常（#13792）。")
-                        return
-                    }
-                    if (manifest["gypfile"] as? Bool) == true {
-                        replyError(id: id, code: -32011, message: "已拦截：「\(spec)」需要 node-gyp 原生编译，不兼容 iOS 沙盒。")
-                        return
-                    }
-                    if let engines = manifest["engines"] as? [String: Any],
-                       let dshRange = engines["dsh"] as? String, !dshRange.trimmingCharacters(in: .whitespaces).isEmpty {
-                        let branches = dshRange.components(separatedBy: "||").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-                        let exactPattern = try? NSRegularExpression(pattern: "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?$")
-                        let allExact = !branches.isEmpty && branches.allSatisfy { b in
-                            exactPattern?.firstMatch(in: b, range: NSRange(b.startIndex..., in: b)) != nil
-                        }
-                        if allExact && !branches.contains(dshVersion) {
-                            replyError(id: id, code: -32014, message: "版本不兼容：「\(spec)」声明 engines.dsh=\"\(dshRange)\"，不包含当前内核 DSH \(dshVersion)。")
-                            return
-                        }
-                    }
-                    if let peers = manifest["peerDependencies"] as? [String: Any] {
-                        for (peerName, rawRange) in peers where peerName.hasPrefix("@deepseek-ai/dsh") {
-                            if let range = rawRange as? String {
-                                let trimmed = range.trimmingCharacters(in: .whitespaces)
-                                let exactPattern = try? NSRegularExpression(pattern: "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?$")
-                                let isExact = exactPattern?.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..., in: trimmed)) != nil
-                                if isExact && trimmed != dshVersion {
-                                    replyError(id: id, code: -32014, message: "版本不兼容：「\(spec)」强锁定 \(peerName)@\(trimmed)，与当前内核 DSH \(dshVersion) 冲突（#13798）。")
-                                    return
-                                }
-                            }
-                        }
+                let calls = round.toolCalls
+                let assistant = ProviderMessage(role: "assistant", content: round.content.isEmpty ? nil : round.content,
+                    reasoning_content: round.reasoning.isEmpty ? nil : round.reasoning, tool_calls: calls.isEmpty ? nil : calls)
+                transcript.append(assistant)
+                guard !calls.isEmpty else {
+                    guard round.finishReason != "tool_calls", !round.content.isEmpty else { throw ModelProviderError.invalidResponse }
+                    status = "completed"
+                    terminal["transcript"] = transcript.map(\.payload)
+                    terminal["profile"] = provider.historyProfile(model: selectedModel, tools: toolsEnabled)
+                    return
+                }
+                guard toolsEnabled, round.finishReason == "tool_calls" else { throw ModelProviderError.invalidToolCall }
+                guard roundIndex < 6 else { throw ModelProviderError.toolLimit }
+                // Validate the entire batch before any side effects.
+                for call in calls {
+                    guard !call.id.isEmpty, !call.function.name.isEmpty, usedIDs.insert(call.id).inserted,
+                          (try? JSONSerialization.jsonObject(with: Data(call.function.arguments.utf8))) is [String: Any] else {
+                        throw ModelProviderError.invalidToolCall
                     }
                 }
-            } catch {
-                replyError(id: id, code: -32015, message: "插件元数据拉取失败：\(error.localizedDescription)")
-                return
+                var assistantPayload = assistant.payload
+                if !provider.isDeepSeek { assistantPayload.removeValue(forKey: "reasoning_content") }
+                messages.append(assistantPayload)
+                for call in calls {
+                    try Task.checkCancellation()
+                    let result = try await execute(call, sessionId: sessionId, turnId: turnId, isGroup: isGroup)
+                    let response = ProviderMessage(role: "tool", content: String(result.prefix(16_384)), tool_call_id: call.id)
+                    transcript.append(response)
+                    messages.append(response.payload)
+                }
             }
-        }
-
-        let rec = await store.installPluginRecord(name: spec, version: resolvedVersion, description: resolvedDesc)
-        reply(id: id, result: ["plugin": rec])
-    }
-
-    private func handleModelsTest(id: Int, params: [String: Any]) async {
-        let baseURLRaw = (params["apiBaseURL"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let baseURL = (baseURLRaw?.isEmpty == false ? baseURLRaw! : "https://api.deepseek.com").trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let keyObj = try? await keychain.getSecret(account: "deepseek_api_key", requireBiometrics: false)
-        let apiKey = (keyObj?["value"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !apiKey.isEmpty else {
-            reply(id: id, result: ["ok": false, "error": "尚未在 Keychain 保存 API Key。"])
-            return
-        }
-        guard let url = URL(string: "\(baseURL)/models") else {
-            reply(id: id, result: ["ok": false, "error": "Base URL 格式无效。"])
-            return
-        }
-        var req = URLRequest(url: url)
-        req.httpMethod = "GET"
-        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        let t0 = Date()
-        do {
-            let (data, resp) = try await session.data(for: req)
-            let latencyMs = Int(Date().timeIntervalSince(t0) * 1000)
-            let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
-            guard (200..<300).contains(status) else {
-                reply(id: id, result: ["ok": false, "statusCode": status, "latencyMs": latencyMs, "error": "HTTP \(status)"])
-                return
-            }
-            var modelCount = 0
-            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let list = obj["data"] as? [[String: Any]] {
-                modelCount = list.count
-            }
-            reply(id: id, result: ["ok": true, "statusCode": status, "latencyMs": latencyMs, "modelCount": modelCount])
         } catch {
-            reply(id: id, result: ["ok": false, "error": error.localizedDescription])
+            if Task.isCancelled || (error as? URLError)?.code == .cancelled { status = "aborted" }
+            else { terminal["error"] = error.localizedDescription }
         }
     }
 
-    private func replyError(id: Int, code: Int, message: String) {
-        guard let frame = try? IPCFrameCodec.encode(["jsonrpc": "2.0", "id": id, "error": ["code": code, "message": message]]) else { return }
-        emitQueue.async { [weak self] in self?.receiveHandler?(frame) }
+    private func completion(provider: ModelProvider, key: String, fields: [String: Any],
+                            sessionId: String, turnId: String) async throws -> CompletionRound {
+        let request = try makeRequest(provider.endpoint("chat/completions"), key: key, fields: fields)
+        for attempt in 0...2 {
+            try Task.checkCancellation()
+            let response: (URLSession.AsyncBytes, URLResponse)
+            do {
+                response = try await session.bytes(for: request)
+            } catch let error as URLError where attempt < 2 &&
+                [.notConnectedToInternet, .networkConnectionLost, .timedOut].contains(error.code) {
+                try await Task.sleep(nanoseconds: UInt64(attempt + 1) * 1_000_000_000)
+                continue
+            }
+
+            guard let http = response.1 as? HTTPURLResponse else { throw ModelProviderError.invalidResponse }
+            if attempt < 2, [429, 502, 503, 504].contains(http.statusCode) {
+                response.0.task.cancel()
+                try await Task.sleep(nanoseconds: UInt64(attempt + 1) * 1_000_000_000)
+                continue
+            }
+            defer { response.0.task.cancel() }
+            try checkHTTP(http)
+            guard http.mimeType == "text/event-stream" else { throw ModelProviderError.invalidResponse }
+
+            var events = ServerSentEvents()
+            var round = CompletionRound()
+            for try await byte in response.0 {
+                try Task.checkCancellation()
+                guard let event = try events.append(byte: byte) else { continue }
+                let delta = try round.consume(event)
+                if !delta.content.isEmpty || !delta.reasoning.isEmpty {
+                    emit("chat.delta", ["sessionId": sessionId, "turnId": turnId, "content": delta.content, "reasoning": delta.reasoning])
+                }
+                if let usage = delta.usage { await recordUsage(usage) }
+                if round.done { break }
+            }
+            try Task.checkCancellation()
+            guard round.done || (!provider.isDeepSeek && round.finishReason != nil) else { throw ModelProviderError.interrupted }
+            guard let reason = round.finishReason, ["stop", "tool_calls", "length", "content_filter"].contains(reason) else {
+                throw ModelProviderError.invalidResponse
+            }
+            return round
+        }
+        throw ModelProviderError.interrupted
     }
 
-    private func reply(id: Int, result: [String: Any]) {
-        guard let frame = try? IPCFrameCodec.encode(["jsonrpc": "2.0", "id": id, "result": result]) else { return }
-        emitQueue.async { [weak self] in self?.receiveHandler?(frame) }
+    private func execute(_ call: ProviderMessage.ToolCall, sessionId: String, turnId: String, isGroup: Bool, structuredWeb: Bool = false) async throws -> String {
+        let name = call.function.name
+        guard let args = try JSONSerialization.jsonObject(with: Data(call.function.arguments.utf8)) as? [String: Any] else {
+            return "Invalid tool arguments."
+        }
+        func text(_ field: String) -> String {
+            (args[field] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        var summary = call.function.arguments
+        var connector: LocalAgentStore.ConnectorItem?
+        var address: URL?
+        switch name {
+        case "js_eval":
+            let result = await js.evaluate(text("script"))
+            return result.error ?? (result.value.isEmpty ? result.logs.joined(separator: "\n") : result.value)
+        case "memory_save":
+            guard !text("title").isEmpty, !text("content").isEmpty else { return "Memory title and content are required." }
+        case "group_todo_add":
+            guard isGroup, !text("text").isEmpty else { return "This tool requires a group and a todo." }
+        case "device_status": break
+        case "remote_mcp_call":
+            let matches = await store.listConnectors().filter { ($0["name"] as? String)?.caseInsensitiveCompare(text("connectorName")) == .orderedSame }
+            if matches.count == 1, let id = matches[0]["id"] as? String { connector = await store.connector(id: id) }
+            guard let connector, connector.type == "remote-mcp", !text("toolName").isEmpty else { return "Choose a configured MCP connector and tool." }
+            summary = connector.endpoint + "\n" + summary
+        case "web_search":
+            let query = text("query")
+            guard !query.isEmpty, query.unicodeScalars.count <= 300,
+                  !query.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }) else {
+                return "搜索关键词须为单行，且不能超过 300 个字符。"
+            }
+            summary = "发送到 api.deepseek.com 的搜索关键词：\n" + query
+        case "web_fetch":
+            address = try? ModelProvider.httpsComponents(text("url")).url
+            guard let address else { return "A valid HTTPS URL is required." }
+            summary = address.absoluteString
+        case "workspace_list":
+            return listWorkspaceFiles(relativePath: text("path"))
+        case "workspace_read":
+            return readWorkspaceFile(relativePath: text("path"))
+        case "workspace_write":
+            let relPath = text("path")
+            let content = args["content"] as? String ?? ""
+            guard !relPath.isEmpty, sandboxedWorkspaceFileURL(relativePath: relPath, allowEmpty: false) != nil else {
+                return "Invalid workspace file path. Use a relative path inside files/ without '..'."
+            }
+            let byteCount = content.utf8.count
+            guard byteCount <= 262_144 else { return "Workspace file write exceeds 256 KB limit." }
+            let preview = String(content.prefix(240))
+            summary = "写入工作区文件：files/\(relPath)（\(byteCount) 字节）\n\(preview)"
+        case "workspace_search":
+            return searchWorkspaceFiles(query: text("query"), relativePath: text("path"))
+        case "workspace_edit":
+            let relPath = text("path")
+            let oldText = args["old_text"] as? String ?? ""
+            let newText = args["new_text"] as? String ?? ""
+            guard !relPath.isEmpty, !oldText.isEmpty, sandboxedWorkspaceFileURL(relativePath: relPath, allowEmpty: false) != nil else {
+                return "Invalid workspace_edit arguments. Provide a valid relative path inside files/ and non-empty old_text."
+            }
+            guard newText.utf8.count <= 262_144 else { return "Replacement text exceeds 256 KB limit." }
+            summary = "编辑工作区文件：files/\(relPath)\n替换片段（\(oldText.count) 字符 → \(newText.count) 字符）"
+        default: return "Unsupported tool."
+        }
+
+        let approvalId = UUID().uuidString
+        let approved = await approvals.wait(id: approvalId, turnId: turnId, sessionId: sessionId) {
+            emit("approval.request", ["approvalId": approvalId, "sessionId": sessionId, "turnId": turnId, "tool": name, "summary": summary])
+        }
+        emit("approval.closed", ["approvalId": approvalId])
+        try Task.checkCancellation()
+        guard approved else { return "The user did not approve this tool call." }
+
+        do {
+            switch name {
+            case "memory_save":
+                let requested = text("layer")
+                let layer = ["pinned", "delta"].contains(requested) ? requested : "delta"
+                _ = try await store.addMemory(botId: sessionId, title: text("title"), content: text("content"), layer: layer)
+                return "Memory saved."
+            case "group_todo_add":
+                _ = try await store.addGroupTodo(groupId: sessionId, text: text("text"))
+                return "Todo added."
+            case "device_status":
+                let status = await device.deviceStatus()
+                return String(decoding: try JSONSerialization.data(withJSONObject: status), as: UTF8.self)
+            case "remote_mcp_call":
+                guard let connector, await store.connector(id: connector.id)?.endpoint == connector.endpoint else { return "Connector changed." }
+                return try await mcp.callTool(endpoint: connector.endpoint, name: text("toolName"),
+                    arguments: args["arguments"] as? [String: Any] ?? [:], keychainAccount: "connector:\(connector.id)")
+            case "web_search": return "approved"
+            case "web_fetch":
+                guard let address else { return "Invalid URL." }
+                let (bytes, response) = try await session.bytes(from: address)
+                defer { bytes.task.cancel() }
+                guard let http = response as? HTTPURLResponse else { throw ModelProviderError.invalidResponse }
+                if !structuredWeb { try checkHTTP(http) }
+                guard ["text/plain", "text/html"].contains(response.mimeType ?? "") else { return "Unsupported web content type." }
+                var data = Data()
+                for try await byte in bytes {
+                    try Task.checkCancellation()
+                    guard data.count < 1_500_000 else { throw ModelProviderError.responseTooLarge }
+                    data.append(byte)
+                }
+                let plain = String(decoding: data, as: UTF8.self)
+                    .replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
+                    .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+                let content = String(plain.prefix(12_000))
+                if !structuredWeb { return content }
+                let result: [String: Any] = [
+                    "url": http.url?.absoluteString ?? address.absoluteString, "statusCode": http.statusCode,
+                    "body": ["kind": "text", "content": content], "truncated": plain.count > content.count
+                ]
+                return String(decoding: try JSONSerialization.data(withJSONObject: result), as: UTF8.self)
+            case "workspace_write":
+                return try writeWorkspaceFile(relativePath: text("path"), content: args["content"] as? String ?? "")
+            case "workspace_edit":
+                return try editWorkspaceFile(
+                    relativePath: text("path"),
+                    oldText: args["old_text"] as? String ?? "",
+                    newText: args["new_text"] as? String ?? ""
+                )
+            default: return "Unsupported tool."
+            }
+        } catch {
+            try Task.checkCancellation()
+            return "Tool failed: \(error.localizedDescription)"
+        }
     }
 
-    private func emitNotification(_ method: String, params: [String: Any]) {
-        guard let frame = try? IPCFrameCodec.encode(["jsonrpc": "2.0", "method": method, "params": params]) else { return }
-        emitQueue.async { [weak self] in self?.receiveHandler?(frame) }
+    private func workspaceFilesRoot() -> URL {
+        let dir = workspaceRoot.appendingPathComponent("files", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    private func sandboxedWorkspaceFileURL(relativePath: String, allowEmpty: Bool) -> URL? {
+        let normalized = relativePath.replacingOccurrences(of: "\\", with: "/").trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalized.isEmpty { return allowEmpty ? workspaceFilesRoot() : nil }
+        if normalized.hasPrefix("/") || normalized.contains("\0") { return nil }
+        let parts = normalized.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard !parts.isEmpty, !parts.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }) else { return nil }
+        let base = workspaceFilesRoot().standardizedFileURL
+        var target = base
+        let fm = FileManager.default
+        for part in parts {
+            target = target.appendingPathComponent(part, isDirectory: false)
+            if fm.fileExists(atPath: target.path),
+               let attrs = try? fm.attributesOfItem(atPath: target.path),
+               (attrs[.type] as? FileAttributeType) == .typeSymbolicLink {
+                return nil
+            }
+        }
+        let resolvedBase = base.resolvingSymlinksInPath().path
+        let resolvedTarget = target.resolvingSymlinksInPath().path
+        guard resolvedTarget == resolvedBase || resolvedTarget.hasPrefix(resolvedBase + "/") else { return nil }
+        return target
+    }
+
+    private func listWorkspaceFiles(relativePath: String) -> String {
+        guard let dir = sandboxedWorkspaceFileURL(relativePath: relativePath, allowEmpty: true) else {
+            return "Invalid workspace path."
+        }
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue else {
+            return "Workspace folder not found."
+        }
+        guard let entries = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey], options: [.skipsHiddenFiles]) else {
+            return "Unable to read workspace folder."
+        }
+        let lines = entries.sorted { $0.lastPathComponent < $1.lastPathComponent }.prefix(200).compactMap { url -> String? in
+            let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey])
+            if values?.isSymbolicLink == true { return nil }
+            if values?.isDirectory == true { return "[DIR] \(url.lastPathComponent)/" }
+            let size = values?.fileSize ?? 0
+            return "[FILE] \(url.lastPathComponent) (\(size) bytes)"
+        }
+        return lines.isEmpty ? "(files/ is empty)" : lines.joined(separator: "\n")
+    }
+
+    private func readWorkspaceFile(relativePath: String) -> String {
+        guard let url = sandboxedWorkspaceFileURL(relativePath: relativePath, allowEmpty: false) else {
+            return "Invalid workspace file path."
+        }
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue else {
+            return "Workspace file not found."
+        }
+        guard let data = try? Data(contentsOf: url) else { return "Unable to read workspace file." }
+        let maxRead = 65_536
+        let slice = data.count > maxRead ? data.prefix(maxRead) : data
+        guard let text = String(data: slice, encoding: .utf8) else {
+            return "Workspace file is not UTF-8 text (\(data.count) bytes)."
+        }
+        return data.count > maxRead ? text + "\n…(truncated at 64 KB)" : text
+    }
+
+    private func writeWorkspaceFile(relativePath: String, content: String) throws -> String {
+        guard let url = sandboxedWorkspaceFileURL(relativePath: relativePath, allowEmpty: false) else {
+            return "Invalid workspace file path."
+        }
+        let data = Data(content.utf8)
+        guard data.count <= 262_144 else { return "Workspace file write exceeds 256 KB limit." }
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
+        return "Saved files/\(relativePath) (\(data.count) bytes)."
+    }
+
+    private func searchWorkspaceFiles(query: String, relativePath: String) -> String {
+        guard !query.isEmpty, query.count <= 200 else { return "Provide a non-empty search query (up to 200 chars)." }
+        guard let dir = sandboxedWorkspaceFileURL(relativePath: relativePath, allowEmpty: true) else {
+            return "Invalid workspace path."
+        }
+        let fm = FileManager.default
+        let basePath = workspaceFilesRoot().standardizedFileURL.path
+        guard let enumerator = fm.enumerator(
+            at: dir,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return "Unable to search workspace folder."
+        }
+        var matches: [String] = []
+        var scannedFiles = 0
+        for case let fileURL as URL in enumerator {
+            guard scannedFiles < 300, matches.count < 50 else { break }
+            let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+            if values?.isSymbolicLink == true || values?.isRegularFile != true { continue }
+            if (values?.fileSize ?? 0) > 262_144 { continue }
+            scannedFiles += 1
+            guard let content = try? String(contentsOf: fileURL, encoding: .utf8) else { continue }
+            let rel = fileURL.standardizedFileURL.path.replacingOccurrences(of: basePath + "/", with: "")
+            for (idx, line) in content.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+                if line.range(of: query, options: .caseInsensitive) != nil {
+                    matches.append("\(rel):\(idx + 1): \(String(line.prefix(160)))")
+                    if matches.count >= 50 { break }
+                }
+            }
+        }
+        return matches.isEmpty ? "No matches found in files/." : matches.joined(separator: "\n")
+    }
+
+    private func editWorkspaceFile(relativePath: String, oldText: String, newText: String) throws -> String {
+        guard let url = sandboxedWorkspaceFileURL(relativePath: relativePath, allowEmpty: false) else {
+            return "Invalid workspace file path."
+        }
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue else {
+            return "Workspace file not found."
+        }
+        let existingData = try Data(contentsOf: url)
+        guard existingData.count <= 262_144, let existing = String(data: existingData, encoding: .utf8) else {
+            return "Workspace file is not an editable UTF-8 file (max 256 KB)."
+        }
+        guard let range = existing.range(of: oldText) else {
+            return "Target old_text was not found in files/\(relativePath)."
+        }
+        var updated = existing
+        updated.replaceSubrange(range, with: newText)
+        let outData = Data(updated.utf8)
+        guard outData.count <= 262_144 else { return "Edited file exceeds 256 KB limit." }
+        try outData.write(to: url, options: .atomic)
+        return "Updated files/\(relativePath) (\(outData.count) bytes)."
+    }
+
+    private func recordUsage(_ usage: [String: Any]) async {
+        try? await store.recordUsage(input: usage["prompt_tokens"] as? Int ?? 0,
+            cached: usage["prompt_cache_hit_tokens"] as? Int ?? 0, output: usage["completion_tokens"] as? Int ?? 0)
+    }
+
+    private func sideChat(_ params: [String: Any]) async throws -> [String: Any] {
+        let provider = try ModelProvider(params["apiBaseURL"] as? String ?? "")
+        try Task.checkCancellation()
+        let key = try await modelKey(provider)
+        try Task.checkCancellation()
+        var body = try provider.modelFields(params["model"] as? String ?? "")
+        body["stream"] = false
+        let question = (params["question"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !question.isEmpty, question.utf8.count <= 65_536 else {
+            throw IPCFrameError.remoteError(code: -32602, message: "侧边问题不能为空或超过 64 KB。")
+        }
+        let snapshot = params["context"] as? [[String: Any]] ?? []
+        var contextMessages: [[String: Any]] = []
+        for item in snapshot.suffix(8) {
+            guard let role = item["role"] as? String, ["user", "assistant"].contains(role),
+                  let content = item["content"] as? String, !content.isEmpty else { continue }
+            contextMessages.append(["role": role, "content": String(content.prefix(2_000))])
+        }
+        body["messages"] = contextMessages + [["role": "user", "content": question]]
+        let (data, response) = try await session.data(for: makeRequest(provider.endpoint("chat/completions"), key: key, fields: body))
+        try Task.checkCancellation()
+        try checkHTTP(response)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let choice = (json["choices"] as? [[String: Any]])?.first,
+              let reply = (choice["message"] as? [String: Any])?["content"] as? String, !reply.isEmpty else {
+            throw ModelProviderError.invalidResponse
+        }
+        if let usage = json["usage"] as? [String: Any] { await recordUsage(usage) }
+        return ["reply": reply]
+    }
+
+    private func listModels(_ params: [String: Any]) async throws -> [String: Any] {
+        let provider = try ModelProvider(params["apiBaseURL"] as? String ?? "")
+        let key = try await modelKey(provider)
+        let start = Date()
+        let (data, response) = try await session.data(for: makeRequest(provider.endpoint("models"), key: key))
+        try checkHTTP(response)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let models = json["data"] as? [[String: Any]] else { throw ModelProviderError.invalidResponse }
+        let ids = models.compactMap { $0["id"] as? String }
+        return ["ok": true, "models": ids, "modelCount": ids.count, "latencyMs": Int(Date().timeIntervalSince(start) * 1000)]
+    }
+
+    private func checkHTTP(_ response: URLResponse) throws {
+        guard let http = response as? HTTPURLResponse else { throw ModelProviderError.invalidResponse }
+        guard (200..<300).contains(http.statusCode) else { throw ModelProviderError.http(http.statusCode) }
+    }
+
+    private func makeRequest(_ url: URL, key: String, fields: [String: Any]? = nil) throws -> URLRequest {
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        if let fields {
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: fields)
+        }
+        return request
+    }
+
+    private func reply(_ id: Int, _ result: [String: Any]) {
+        send(["jsonrpc": "2.0", "id": id, "result": result])
+    }
+
+    private func fail(_ id: Int, code: Int = -32000, _ message: String) {
+        send(["jsonrpc": "2.0", "id": id, "error": ["code": code, "message": message]])
+    }
+
+    private func emit(_ method: String, _ params: [String: Any]) {
+        io.async {
+            if let handler = self.nativeNotificationHandler {
+                handler(method, params)
+            } else {
+                self.send(["jsonrpc": "2.0", "method": method, "params": params])
+            }
+        }
+    }
+
+    private func send(_ frame: [String: Any]) {
+        guard let data = try? IPCFrameCodec.encode(frame) else { return }
+        io.async { self.receiver?(data) }
     }
 }

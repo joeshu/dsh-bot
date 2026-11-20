@@ -1,0 +1,18 @@
+{
+  "name": "@dsbot/dsh-ios-host",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.mjs",
+    "./credentials": "./credentials.mjs",
+    "./session-persistence": "./session-persistence.mjs",
+    "./native-tools": "./native-tools.mjs",
+    "./sandbox-fs": "./sandbox-fs.mjs"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-credentials": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-session-persistence": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.5"
+  }
+}

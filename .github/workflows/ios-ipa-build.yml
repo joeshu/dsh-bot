@@ -1,112 +1,120 @@
-name: iOS Standalone Unsigned IPA
+name: iOS Native IPA
 
 on:
   push:
-    branches: [main, master]
     paths:
-      - 'kernel/**'
       - 'ios/**'
+      - 'kernel/runtime/**'
+      - 'kernel/src/**'
+      - 'scripts/**'
+      - '.github/workflows/ios-ipa-build.yml'
+  pull_request:
+    paths:
+      - 'ios/**'
+      - 'kernel/runtime/**'
+      - 'kernel/src/**'
       - 'scripts/**'
       - '.github/workflows/ios-ipa-build.yml'
   workflow_dispatch:
     inputs:
-      publish_release:
-        description: Publish unsigned IPA + SideStore source.json to GitHub Release
+      build_security_runtime:
+        description: Build the full NodeMobile 24.22.3 runtime from source
         type: boolean
         default: false
 
 permissions:
-  contents: write
+  contents: read
+
+# A security NodeMobile build is an expensive, pinned source build. Serialize
+# those dispatches so two cold runs cannot both miss the same archive cache and
+# spend an hour compiling identical device and simulator slices. Regular IPA
+# builds keep their own run ID and may still proceed independently.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.build_security_runtime == 'true' && 'security-node-24.22.3' || github.run_id }}
+  cancel-in-progress: false
 
 jobs:
-  build-unsigned-ipa:
-    name: Build Standalone iOS Unsigned IPA (DSH 0.2.2-rc.5)
-    runs-on: macos-latest
-    timeout-minutes: 45
+  candidate:
+    runs-on: macos-26
+    timeout-minutes: 150
     env:
-      LANG: en_US.UTF-8
-      LC_ALL: en_US.UTF-8
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      DSBOT_REPOSITORY: ${{ github.repository }}
+      DSBOT_COMMIT: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-
-      - name: Cache npm downloads
-        uses: actions/cache@v4
+          node-version: 24.22.1
+      - name: Pin npm for the runtime lockfile
+        run: npm install --global npm@11.9.0
+      - uses: actions/setup-python@v5
         with:
-          path: ~/.npm
-          key: npm-${{ runner.os }}-${{ hashFiles('kernel/package.json') }}
-          restore-keys: |
-            npm-${{ runner.os }}-
-
-      - name: Install XcodeGen
-        run: brew install xcodegen
-
-      - name: Install DSH kernel dependencies (ignore native desktop scripts)
-        working-directory: kernel
-        run: npm install --ignore-scripts --no-fund --no-audit
-
-      - name: Run DSH 4-gate contract & feature tests
-        working-directory: kernel
+          python-version: '3.12'
+      - name: Install XcodeGen 2.46.0
         run: |
-          node scripts/sync-dsh-lock.mjs --check
-          npm test
-
-      - name: Build unsigned arm64 IPA & run 4-gate verification
+          set -euo pipefail
+          cd "${RUNNER_TEMP}"
+          curl --fail --location --retry 3 -o xcodegen.zip https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip
+          echo '4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806  xcodegen.zip' | shasum -a 256 -c
+          unzip -q xcodegen.zip
+          XCODEGEN="$(find "${RUNNER_TEMP}" -type f -path '*/bin/xcodegen' -print -quit)"
+          test -n "$XCODEGEN"
+          dirname "$XCODEGEN" >> "$GITHUB_PATH"
+          xcodebuild -version
+      - name: Check IPA verification regressions
+        run: python3 -m unittest discover -s scripts/tests
+      - name: Restore the pinned security NodeMobile build
+        if: github.event_name == 'workflow_dispatch' && inputs.build_security_runtime
+        id: security-framework-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/node-mobile-security.zip
+          key: dsbot-node-mobile-security-${{ runner.os }}-${{ runner.arch }}-xcode-26.6-${{ hashFiles('scripts/build-node-mobile-security-ios.sh') }}
+      - name: Compile the security NodeMobile framework
+        if: github.event_name == 'workflow_dispatch' && inputs.build_security_runtime && steps.security-framework-cache.outputs.cache-hit != 'true'
+        run: bash scripts/build-node-mobile-security-ios.sh "$RUNNER_TEMP/node-mobile-security.zip"
+      - name: Cache the security framework archive
+        if: github.event_name == 'workflow_dispatch' && inputs.build_security_runtime && steps.security-framework-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/node-mobile-security.zip
+          key: ${{ steps.security-framework-cache.outputs.cache-primary-key }}
+      - name: Select the security NodeMobile archive
+        if: github.event_name == 'workflow_dispatch' && inputs.build_security_runtime
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/node-mobile-security.zip"
+          test -s "$archive"
+          echo "DSBOT_SECURITY_NODE_ARCHIVE=$archive" >> "$GITHUB_ENV"
+          echo "DSBOT_SECURITY_NODE_SHA256=$(shasum -a 256 "$archive" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+      - name: Build and verify the unsigned IPA
+        env:
+          DSBOT_OUT_DIR: ${{ runner.temp }}/dsbot-candidate
         run: bash scripts/build-unsigned-ipa.sh
-
-      - name: Run Swift XCTest suite on available iOS Simulator
-        working-directory: ios
-        run: |
-          SIM_ID="$(xcrun simctl list devices available -j | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; iphones=[dev['udid'] for rt,devs in sorted(d.items(), reverse=True) if 'iOS' in rt for dev in devs if 'iPhone' in dev['name'] and dev.get('isAvailable')]; print(iphones[0] if iphones else '')")"
-          if [ -z "$SIM_ID" ]; then
-            echo "::error::No available iPhone simulator found"
-            exit 1
-          fi
-          xcodebuild test \
-            -project DSBotStandalone.xcodeproj \
-            -scheme DSBotStandalone \
-            -destination "platform=iOS Simulator,id=$SIM_ID" \
-            CODE_SIGNING_ALLOWED=NO
-
-      - name: Generate SideStore / AltStore source.json
-        run: |
-          IPA_FILE="$(ls dist/DS-Bot-iOS-Standalone-*-unsigned.ipa | head -n 1)"
-          TAG="v$(node -p "require('./kernel/package.json').version")"
-          node scripts/generate-sidestore-source.mjs \
-            --repo "${{ github.repository }}" \
-            --tag "$TAG" \
-            --ipa "$IPA_FILE" \
-            --out dist/source.json
-
+      - name: Smoke test DSH IPC and SQLite recovery
+        run: python3 scripts/smoke-dsh-runtime.py
+      - name: Smoke test DeepSeek search approval and privacy boundaries
+        run: python3 scripts/smoke-dsh-web-search.py
       - uses: actions/upload-artifact@v4
         with:
-          name: DS-Bot-iOS-Standalone-Unsigned-IPA
-          path: |
-            dist/*.ipa
-            dist/SHA256SUMS.txt
-            dist/source.json
-            kernel/dist/dsh-kernel-*.bundle
-            kernel/dist/kernel-manifest.json
-          retention-days: 14
+          name: dsbot-native-ios-candidate
+          path: ${{ runner.temp }}/dsbot-candidate/
+          if-no-files-found: error
+          retention-days: 30
           compression-level: 0
-
-      - name: Publish unsigned IPA & SideStore source.json to GitHub Release
-        if: github.event_name == 'workflow_dispatch' && inputs.publish_release == true
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Test the native runtime on iOS Simulator
+        working-directory: ios
         run: |
-          TAG="v$(node -p "require('./kernel/package.json').version")"
-          DSH_VER="$(node -p "require('./kernel/dsh.lock.json').dshVersion")"
-          IPA_FILE="$(ls dist/DS-Bot-iOS-Standalone-*-unsigned.ipa | head -n 1)"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$IPA_FILE" dist/SHA256SUMS.txt dist/source.json \
-              "kernel/dist/dsh-kernel-${DSH_VER}.bundle" kernel/dist/kernel-manifest.json --clobber
-          else
-            gh release create "$TAG" "$IPA_FILE" dist/SHA256SUMS.txt dist/source.json \
-              "kernel/dist/dsh-kernel-${DSH_VER}.bundle" kernel/dist/kernel-manifest.json \
-              --title "DS-Bot iOS Standalone $TAG (DSH $DSH_VER)" \
-              --notes "Unsigned arm64 iOS IPA with embedded hot-swappable DSH $DSH_VER kernel."
-          fi
+          set -euo pipefail
+          SIM_ID="$(xcrun simctl list devices available -j | python3 -c 'import json,sys; devices=json.load(sys.stdin)["devices"]; print(next(d["udid"] for r, items in sorted(devices.items(), reverse=True) if ".iOS-" in r for d in items if d["name"].startswith("iPhone")))')"
+          xcodebuild test -project DSBotStandalone.xcodeproj -scheme DSBotStandalone \
+            -destination "platform=iOS Simulator,id=$SIM_ID,arch=arm64" \
+            -parallel-testing-enabled NO -resultBundlePath "${RUNNER_TEMP}/DSBotTests.xcresult" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-test-results
+          path: ${{ runner.temp }}/DSBotTests.xcresult
+          if-no-files-found: ignore
