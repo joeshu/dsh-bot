@@ -346,6 +346,7 @@ public struct ChatView: View {
     @State private var showMemory = false
     @State private var showFileImporter = false
     @State private var attachedFile: LocalAgentHost.AttachedWorkspaceFile?
+    @StateObject private var speechInput = SpeechInputController()
     @State private var actionStatus = ""
     @State private var lastScrollAt = Date.distantPast
     @State private var expandStreamingReasoning = true
@@ -467,6 +468,7 @@ public struct ChatView: View {
         showMemory = false
         showFileImporter = false
         attachedFile = nil
+        speechInput.stop()
         showClearConfirm = false
         actionStatus = ""
         Task { _ = try? await host.rpc()?.request("device.stopSpeaking") }
@@ -830,6 +832,20 @@ public struct ChatView: View {
                     .background(DSTheme.surfaceSecondary)
                     .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
 
+                Button {
+                    speechInput.toggle { transcript in
+                        input = transcript
+                    }
+                    if let err = speechInput.errorMessage {
+                        actionStatus = err
+                    }
+                } label: {
+                    Image(systemName: speechInput.isRecording ? "mic.circle.fill" : "mic.circle")
+                        .font(.title3)
+                        .foregroundColor(speechInput.isRecording ? DSTheme.danger : .secondary)
+                }
+                .disabled(host.isStreaming)
+
                 if host.isStreaming && host.streamingSessionId == bot.id {
                     Button {
                         Task { await host.abortActiveTurn() }
@@ -840,6 +856,7 @@ public struct ChatView: View {
                     }
                 } else {
                     Button {
+                        speechInput.stop()
                         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !text.isEmpty || attachedFile != nil else { return }
                         if text == "/side" {

@@ -253,13 +253,15 @@ function renderLegacyHistory(messages) {
 
 const NATIVE_TOOL_NAMES = [
   'js_eval', 'device_status', 'memory_save', 'group_todo_add', 'web_fetch', 'web_search', 'remote_mcp_call',
-  'workspace_list', 'workspace_read', 'workspace_write',
+  'workspace_list', 'workspace_read', 'workspace_write', 'workspace_search', 'workspace_edit',
 ]
 const ACTIVE_PLUGINS = [
   'dsh-agent', 'dsh-agent-loop', 'dsh-llm', 'dsh-llm-deepseek-api-key',
   'dsh-session', 'dsh-session-projection', 'dsh-system-prompt',
   'dsh-tools', 'dsh-tool-executor-native', 'dsh-web', 'dsh-fs-local', 'dsh-working-directory', 'dsh-web-deepseek-api',
   'dsh-subagent', 'dsh-subagent-spawn-in-process', 'dsh-tool-subagent',
+  'dsh-commands', 'dsh-token-meter', 'dsh-compaction-tool-result-pruner', 'dsh-compaction-basic',
+  'dsh-time-context', 'dsh-skill', 'dsh-skill-filesystem', 'dsh-tool-skill',
   'dsbot-ios-sqlite-session-persistence', 'dsbot-ios-keychain-credentials', 'dsbot-ios-native-tools', 'dsbot-ios-sandbox-fs',
 ]
 
@@ -345,7 +347,9 @@ async function boot() {
   const mountedRows = new Map([...ctx.loader.entries()].map((entry) => [entry.options.id, entry.fiber]))
   runtime.providerFiber = mountedRows.get('llm-deepseek')
   const requiredRows = ['session', 'session-projection', 'llm', 'llm-deepseek', 'system-prompt', 'tools',
-    'agent', 'agent-loop', 'tool-executor-native', 'ios-web', 'ios-web-search', 'ios-fs', 'ios-working-directory', 'ios-subagent', 'ios-subagent-in-process', 'ios-tool-subagent', 'ios-keychain-credentials', 'ios-session-persistence', 'ios-native-tools']
+    'agent', 'agent-loop', 'tool-executor-native', 'ios-web', 'ios-web-search', 'ios-fs', 'ios-working-directory', 'ios-subagent', 'ios-subagent-in-process', 'ios-tool-subagent',
+    'commands', 'token-meter', 'compaction-pruner', 'compaction-basic', 'time-context', 'skill', 'skill-filesystem', 'tool-skill',
+    'ios-keychain-credentials', 'ios-session-persistence', 'ios-native-tools']
   const inactive = requiredRows.filter((id) => mountedRows.get(id)?.state !== 2)
   if (inactive.length) throw new Error(`Required iOS DSH profile rows are inactive: ${inactive.join(', ')}`)
   if (!runtime.persistence || !runtime.providerFiber) {

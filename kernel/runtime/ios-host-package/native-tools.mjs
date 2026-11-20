@@ -120,6 +120,25 @@ function apply(context) {
       },
       timeoutMs: 70_000, execute: (args, exec) => bridge('workspace_write', args, exec),
     }),
+    defineTool({
+      ...common, name: 'workspace_search',
+      description: 'Search UTF-8 text files inside the sandboxed DS Bot workspace files/ folder by substring.',
+      parameters: {
+        query: { type: 'string', required: true, description: 'Text substring to search for (case-insensitive).' },
+        path: { type: 'string', description: 'Optional relative subfolder inside files/.' },
+      },
+      timeoutMs: 10_000, execute: (args, exec) => bridge('workspace_search', args, exec),
+    }),
+    defineTool({
+      ...common, name: 'workspace_edit',
+      description: 'Replace an exact text snippet inside a UTF-8 file in the sandboxed DS Bot workspace files/ folder after user approval.',
+      parameters: {
+        path: { type: 'string', required: true, description: 'Relative path inside files/.' },
+        old_text: { type: 'string', required: true, description: 'Exact existing text to replace.' },
+        new_text: { type: 'string', required: true, description: 'Replacement text.' },
+      },
+      timeoutMs: 70_000, execute: (args, exec) => bridge('workspace_edit', args, exec),
+    }),
   ]
   const removers = definitions.map((definition) => context.tools.register(definition))
   context.effect(() => () => { unregisterFetch(); removers.reverse().forEach((remove) => remove()) }, 'dsbot-ios.nativeTools')

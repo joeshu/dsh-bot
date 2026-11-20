@@ -82,3 +82,27 @@
         provider: spawn
         toolName: subagent
         maxDepth: 1
+
+    - id: commands
+      name: '@deepseek-ai/dsh-commands'
+
+    - id: token-meter
+      name: '@deepseek-ai/dsh-token-meter'
+
+    - id: compaction-pruner
+      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+
+    - id: time-context
+      name: '@deepseek-ai/dsh-time-context'
+
+    - id: skill
+      name: '@deepseek-ai/dsh-skill'
+
+    - id: skill-filesystem
+      name: '@deepseek-ai/dsh-skill-filesystem'
+
+    - id: tool-skill
+      name: '@deepseek-ai/dsh-tool-skill'

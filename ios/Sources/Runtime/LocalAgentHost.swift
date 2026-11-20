@@ -1,5 +1,14 @@
 import Combine
 import Foundation
+#if canImport(PDFKit)
+import PDFKit
+#endif
+#if canImport(Vision)
+import Vision
+#endif
+#if canImport(UIKit)
+import UIKit
+#endif
 
 public enum LocalAgentState: Equatable {
     case idle
@@ -388,8 +397,56 @@ public final class LocalAgentHost: ObservableObject {
         }
         try data.write(to: dest, options: .atomic)
         let inlineLimit = 24_576
-        let inlineText: String? = data.count <= inlineLimit ? String(data: data, encoding: .utf8) : nil
+        var inlineText: String? = data.count <= inlineLimit ? String(data: data, encoding: .utf8) : nil
+        if inlineText == nil {
+            let ext = dest.pathExtension.lowercased()
+            if ext == "pdf" {
+                inlineText = Self.extractPDFText(from: data, maxChars: inlineLimit)
+            } else if ["png", "jpg", "jpeg", "heic", "heif", "webp", "bmp", "tif", "tiff"].contains(ext) {
+                inlineText = Self.extractImageOCRText(from: data, maxChars: inlineLimit)
+            }
+        }
         return AttachedWorkspaceFile(relativePath: targetName, fileName: targetName, byteCount: data.count, inlineText: inlineText)
+    }
+
+    private static func extractPDFText(from data: Data, maxChars: Int) -> String? {
+        #if canImport(PDFKit)
+        guard let doc = PDFDocument(data: data) else { return nil }
+        var buffer = ""
+        let pageCap = min(doc.pageCount, 30)
+        for index in 0..<pageCap {
+            if let pageText = doc.page(at: index)?.string?.trimmingCharacters(in: .whitespacesAndNewlines), !pageText.isEmpty {
+                if !buffer.isEmpty { buffer += "\n\n" }
+                buffer += pageText
+                if buffer.count >= maxChars { break }
+            }
+        }
+        guard !buffer.isEmpty else { return nil }
+        return String(buffer.prefix(maxChars))
+        #else
+        return nil
+        #endif
+    }
+
+    private static func extractImageOCRText(from data: Data, maxChars: Int) -> String? {
+        #if canImport(Vision) && canImport(UIKit)
+        guard let cgImage = UIImage(data: data)?.cgImage else { return nil }
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.recognitionLanguages = ["zh-Hans", "en-US"]
+        request.usesLanguageCorrection = true
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        do {
+            try handler.perform([request])
+            let lines = (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+            let joined = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            return joined.isEmpty ? nil : String(joined.prefix(maxChars))
+        } catch {
+            return nil
+        }
+        #else
+        return nil
+        #endif
     }
 
     public func deleteBot(id: String) {

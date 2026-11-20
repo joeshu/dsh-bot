@@ -307,7 +307,7 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
 
     func executeNativeTool(name: String, arguments: [String: Any], botId: String, turnId: String, isGroup: Bool) async throws -> [String: Any] {
         guard ["js_eval", "device_status", "memory_save", "group_todo_add", "web_fetch", "web_search", "remote_mcp_call",
-               "workspace_list", "workspace_read", "workspace_write"].contains(name) else {
+               "workspace_list", "workspace_read", "workspace_write", "workspace_search", "workspace_edit"].contains(name) else {
             throw IPCFrameError.remoteError(code: -32601, message: "Unsupported DSH native tool: \(name)")
         }
         guard let data = try? JSONSerialization.data(withJSONObject: arguments),
@@ -692,6 +692,17 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
             guard byteCount <= 262_144 else { return "Workspace file write exceeds 256 KB limit." }
             let preview = String(content.prefix(240))
             summary = "写入工作区文件：files/\(relPath)（\(byteCount) 字节）\n\(preview)"
+        case "workspace_search":
+            return searchWorkspaceFiles(query: text("query"), relativePath: text("path"))
+        case "workspace_edit":
+            let relPath = text("path")
+            let oldText = args["old_text"] as? String ?? ""
+            let newText = args["new_text"] as? String ?? ""
+            guard !relPath.isEmpty, !oldText.isEmpty, sandboxedWorkspaceFileURL(relativePath: relPath, allowEmpty: false) != nil else {
+                return "Invalid workspace_edit arguments. Provide a valid relative path inside files/ and non-empty old_text."
+            }
+            guard newText.utf8.count <= 262_144 else { return "Replacement text exceeds 256 KB limit." }
+            summary = "编辑工作区文件：files/\(relPath)\n替换片段（\(oldText.count) 字符 → \(newText.count) 字符）"
         default: return "Unsupported tool."
         }
 
@@ -746,6 +757,12 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
                 return String(decoding: try JSONSerialization.data(withJSONObject: result), as: UTF8.self)
             case "workspace_write":
                 return try writeWorkspaceFile(relativePath: text("path"), content: args["content"] as? String ?? "")
+            case "workspace_edit":
+                return try editWorkspaceFile(
+                    relativePath: text("path"),
+                    oldText: args["old_text"] as? String ?? "",
+                    newText: args["new_text"] as? String ?? ""
+                )
             default: return "Unsupported tool."
             }
         } catch {
@@ -832,6 +849,64 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try data.write(to: url, options: .atomic)
         return "Saved files/\(relativePath) (\(data.count) bytes)."
+    }
+
+    private func searchWorkspaceFiles(query: String, relativePath: String) -> String {
+        guard !query.isEmpty, query.count <= 200 else { return "Provide a non-empty search query (up to 200 chars)." }
+        guard let dir = sandboxedWorkspaceFileURL(relativePath: relativePath, allowEmpty: true) else {
+            return "Invalid workspace path."
+        }
+        let fm = FileManager.default
+        let basePath = workspaceFilesRoot().standardizedFileURL.path
+        guard let enumerator = fm.enumerator(
+            at: dir,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return "Unable to search workspace folder."
+        }
+        var matches: [String] = []
+        var scannedFiles = 0
+        for case let fileURL as URL in enumerator {
+            guard scannedFiles < 300, matches.count < 50 else { break }
+            let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+            if values?.isSymbolicLink == true || values?.isRegularFile != true { continue }
+            if (values?.fileSize ?? 0) > 262_144 { continue }
+            scannedFiles += 1
+            guard let content = try? String(contentsOf: fileURL, encoding: .utf8) else { continue }
+            let rel = fileURL.standardizedFileURL.path.replacingOccurrences(of: basePath + "/", with: "")
+            for (idx, line) in content.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+                if line.range(of: query, options: .caseInsensitive) != nil {
+                    matches.append("\(rel):\(idx + 1): \(String(line.prefix(160)))")
+                    if matches.count >= 50 { break }
+                }
+            }
+        }
+        return matches.isEmpty ? "No matches found in files/." : matches.joined(separator: "\n")
+    }
+
+    private func editWorkspaceFile(relativePath: String, oldText: String, newText: String) throws -> String {
+        guard let url = sandboxedWorkspaceFileURL(relativePath: relativePath, allowEmpty: false) else {
+            return "Invalid workspace file path."
+        }
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue else {
+            return "Workspace file not found."
+        }
+        let existingData = try Data(contentsOf: url)
+        guard existingData.count <= 262_144, let existing = String(data: existingData, encoding: .utf8) else {
+            return "Workspace file is not an editable UTF-8 file (max 256 KB)."
+        }
+        guard let range = existing.range(of: oldText) else {
+            return "Target old_text was not found in files/\(relativePath)."
+        }
+        var updated = existing
+        updated.replaceSubrange(range, with: newText)
+        let outData = Data(updated.utf8)
+        guard outData.count <= 262_144 else { return "Edited file exceeds 256 KB limit." }
+        try outData.write(to: url, options: .atomic)
+        return "Updated files/\(relativePath) (\(outData.count) bytes)."
     }
 
     private func recordUsage(_ usage: [String: Any]) async {
