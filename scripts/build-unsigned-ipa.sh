@@ -37,6 +37,14 @@ echo "==> [3/5] Generating Xcode project & archiving unsigned arm64 release"
 cd "$IOS_DIR"
 xcodegen generate --spec project.yml
 
+# xcodegen's plist generation can clobber the source Info.plist in the
+# checkout (the archive's built plist was a generated default: en / 1.0 /
+# MinimumOSVersion 16.4, none of our keys). Restore it from git and prove
+# the four gated keys are present before building.
+git checkout -- Resources/Info.plist
+echo "--- Source Info.plist keys after xcodegen ---"
+plutil -p Resources/Info.plist | grep -E "NSFaceIDUsageDescription|NSLocalNetworkUsageDescription|UIFileSharingEnabled|ITSAppUsesNonExemptEncryption" || { echo "ERROR: source Info.plist lost its keys after xcodegen"; exit 1; }
+
 rm -rf build
 xcodebuild \
   -project DSBotStandalone.xcodeproj \
@@ -45,6 +53,7 @@ xcodebuild \
   -destination 'generic/platform=iOS' \
   -archivePath build/DSBotStandalone.xcarchive \
   MARKETING_VERSION="$APP_VERSION" \
+  INFOPLIST_FILE=Resources/Info.plist \
   ARCHS=arm64 \
   ONLY_ACTIVE_ARCH=NO \
   CODE_SIGNING_ALLOWED=NO \
