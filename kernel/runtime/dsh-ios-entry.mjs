@@ -544,15 +544,8 @@ rpc.handle('session.clear', async ({ sessionId }) => {
   return { cleared: true }
 })
 
-for (const method of [
-  'models.test', 'memory.add', 'memory.journal', 'memory.legacy', 'memory.assign', 'memory.undo',
-  'group.state', 'group.goal.set', 'group.todo.add', 'group.todo.toggle', 'group.todo.clearCompleted',
-  'connectors.list', 'connectors.upsert', 'connectors.delete', 'usage.legacySummary', 'tools.jsEval',
-  'device.status', 'device.speak', 'device.stopSpeaking', 'mcp.listTools', 'mcp.callTool',
-  'approval.respond',
-]) {
-  rpc.handle(method, (params) => rpc.request('workspace.request', { method, params }, 120_000))
-}
+// UI-owned workspace methods (memory, connectors, approvals, speech, local JS) are routed by
+// Swift directly to its native workspace and are intentionally not reachable through this process.
 
 rpc.handle('usage.summary', (params) => dshUsageSummary(params))
 
@@ -578,9 +571,7 @@ rpc.handle('side.cancel', async (params = {}) => {
   }
 })
 
-rpc.onNotification((method, params) => {
-  if (method === 'approval.request' || method === 'approval.closed') rpc.notify(method, params)
-})
+// Approval notifications stay inside Swift and do not transit Node.
 
 wire.once('close', () => {
   if (runtime.shuttingDown) return

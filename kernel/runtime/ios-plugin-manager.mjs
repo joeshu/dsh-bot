@@ -647,7 +647,7 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
     validatePackageName(name)
     if (safeMode && enabled) throw new Error('恢复模式下只能停用或卸载插件')
     if (typeof enabled !== 'boolean') throw new TypeError('enabled must be a boolean')
-    if ((await embeddedPackages()).has(name)) throw new Error('Fish Pocket 内置的 DSH profile 插件不能单独停用')
+    if ((await embeddedPackages()).has(name)) throw new Error('DS Bot 内置的 DSH profile 插件不能单独停用')
     const before = readProfileManifest('dsh', profileDir)
     const inventory = readProfilePlugins({ binName: 'dsh', profileDir, installAnchor })
     if (!inventory.dependencies.some((item) => item.name === name && item.bundle)) throw new Error('找不到已安装的 DSH 插件 bundle')
@@ -662,7 +662,7 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
 
   async function removePlugin(name) {
     validatePackageName(name)
-    if ((await embeddedPackages()).has(name)) throw new Error('Fish Pocket 内置的 DSH profile 插件不能卸载')
+    if ((await embeddedPackages()).has(name)) throw new Error('DS Bot 内置的 DSH profile 插件不能卸载')
     const before = readProfileManifest('dsh', profileDir)
     const dependencies = { ...before.dependencies }
     const inventory = readProfilePlugins({ binName: 'dsh', profileDir, installAnchor })

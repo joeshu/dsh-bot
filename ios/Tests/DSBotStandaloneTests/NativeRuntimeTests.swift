@@ -163,4 +163,13 @@ final class NativeRuntimeTests: XCTestCase {
         XCTAssertNil(old.transcript)
         XCTAssertEqual(old.content, "Hello")
     }
+
+    func testHostRPCKeepsPrivilegedWorkspaceMethodsOffNode() {
+        XCTAssertTrue(HostRPC.directWorkspaceMethods.isDisjoint(with: HostRPC.nodeOriginatedMethods))
+        XCTAssertFalse(HostRPC.nodeOriginatedMethods.contains("approval.respond"))
+        XCTAssertFalse(HostRPC.nodeOriginatedMethods.contains("connectors.upsert"))
+        XCTAssertFalse(HostRPC.nodeOriginatedMethods.contains("memory.add"))
+        XCTAssertTrue(HostRPC.directWorkspaceMethods.contains("approval.respond"))
+        XCTAssertTrue(HostRPC.nodeOriginatedMethods.contains("side.ask"))
+    }
 }

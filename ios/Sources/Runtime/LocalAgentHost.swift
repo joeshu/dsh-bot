@@ -188,9 +188,9 @@ public final class LocalAgentHost: ObservableObject {
     }
 
     func refreshModels() async throws -> (latency: Int, count: Int) {
-        guard let channel else { throw IPCFrameError.channelClosed }
+        guard channel != nil else { throw IPCFrameError.channelClosed }
         let address = apiBaseURL
-        let result = try await channel.request("models.test", params: ["apiBaseURL": address], timeoutSeconds: 95)
+        let result = try await workspaceCapabilities.nativeWorkspaceRequest(method: "models.test", params: ["apiBaseURL": address])
         let ids = result["models"] as? [String] ?? []
         if apiBaseURL == address { models = ids }
         return (result["latencyMs"] as? Int ?? 0, ids.count)
@@ -238,8 +238,7 @@ public final class LocalAgentHost: ObservableObject {
         )
         workspaceCapabilities.setNativeNotificationHandler { [weak self] method, params in
             Task { @MainActor [weak self] in
-                guard let channel = self?.channel else { return }
-                try? await channel.notify(method, params: params)
+                self?.handleNativeApprovalNotification(method: method, params: params)
             }
         }
     }
@@ -435,12 +434,25 @@ public final class LocalAgentHost: ObservableObject {
         guard let approval = pendingApprovals.first(where: { $0.id == id }),
               approval.turnId == activeTurnId, !sentCancellation else { return }
         pendingApprovals.removeAll { $0.id == id }
-        _ = try? await channel?.request("approval.respond", params: [
+        _ = try? await workspaceCapabilities.nativeWorkspaceRequest(method: "approval.respond", params: [
             "approvalId": id, "turnId": approval.turnId, "sessionId": approval.sessionId, "approved": approved
         ])
     }
 
-    public func rpc() -> IPCChannel? { state == .ready ? channel : nil }
+    public func rpc() -> HostRPC? {
+        guard state == .ready, let channel else { return nil }
+        return HostRPC(channel: channel, workspace: workspaceCapabilities)
+    }
+
+    /// Only the Keychain key for the address currently selected in Settings is released to Node.
+    private func configuredCredentialProvider(_ params: [String: Any]) throws -> ModelProvider {
+        let configured = try ModelProvider(apiBaseURL)
+        if let requested = params["apiBaseURL"] as? String,
+           try ModelProvider(requested).baseURL != configured.baseURL {
+            throw IPCFrameError.remoteError(code: -32003, message: "凭据只提供给当前设置的服务地址。")
+        }
+        return configured
+    }
 
     public func refreshPluginState() async {
         guard let channel else { return }
@@ -719,14 +731,14 @@ public final class LocalAgentHost: ObservableObject {
         }
         await rpc.registerHandler(method: "credential.resolve") { [weak self] params in
             guard let self else { throw IPCFrameError.channelClosed }
-            let provider = try ModelProvider(params["apiBaseURL"] as? String ?? self.apiBaseURL)
+            let provider = try self.configuredCredentialProvider(params)
             let value = try await self.keychain.modelKey(provider: provider, migrateOfficialKey: self.migrateOfficialKey)
             return ["value": value]
         }
         await rpc.registerHandler(method: "credential.describe") { [weak self] params in
             guard let self else { throw IPCFrameError.channelClosed }
             do {
-                let provider = try ModelProvider(params["apiBaseURL"] as? String ?? self.apiBaseURL)
+                let provider = try self.configuredCredentialProvider(params)
                 _ = try await self.keychain.modelKey(provider: provider, migrateOfficialKey: self.migrateOfficialKey)
                 return ["configured": true]
             } catch {
@@ -735,6 +747,9 @@ public final class LocalAgentHost: ObservableObject {
         }
         await rpc.registerHandler(method: "workspace.request") { [weak self] params in
             guard let self, let method = params["method"] as? String else { throw IPCFrameError.invalidJSON }
+            guard HostRPC.nodeOriginatedMethods.contains(method) else {
+                throw IPCFrameError.remoteError(code: -32003, message: "DSH runtime cannot call UI workspace method \(method).")
+            }
             return try await self.workspaceCapabilities.nativeWorkspaceRequest(
                 method: method,
                 params: params["params"] as? [String: Any] ?? [:]
@@ -860,10 +875,6 @@ public final class LocalAgentHost: ObservableObject {
                     self.state = .failed(message)
                     continue
                 }
-                if method == "approval.closed" {
-                    self.pendingApprovals.removeAll { $0.id == params["approvalId"] as? String }
-                    continue
-                }
                 guard let turnId = params["turnId"] as? String, self.activeTurnId == turnId,
                       let sessionId = params["sessionId"] as? String, sessionId == self.streamingSessionId else { continue }
                 switch method {
@@ -879,13 +890,24 @@ public final class LocalAgentHost: ObservableObject {
                     self.lastStreamError = params["error"] as? String
                     if params["status"] as? String == "aborted" { self.lastCancelledSessionId = sessionId }
                     self.finishTurn(params)
-                case "approval.request":
-                    guard !self.sentCancellation, let id = params["approvalId"] as? String,
-                          let tool = params["tool"] as? String, let summary = params["summary"] as? String else { continue }
-                    self.pendingApprovals.append(PendingApproval(id: id, sessionId: sessionId, turnId: turnId, tool: tool, summary: summary))
                 default: break
                 }
             }
         }
+    }
+
+    private func handleNativeApprovalNotification(method: String, params: [String: Any]) {
+        if method == "approval.closed" {
+            pendingApprovals.removeAll { $0.id == params["approvalId"] as? String }
+            return
+        }
+        guard method == "approval.request",
+              !sentCancellation,
+              let turnId = params["turnId"] as? String, activeTurnId == turnId,
+              let sessionId = params["sessionId"] as? String, sessionId == streamingSessionId,
+              let id = params["approvalId"] as? String,
+              let tool = params["tool"] as? String,
+              let summary = params["summary"] as? String else { return }
+        pendingApprovals.append(PendingApproval(id: id, sessionId: sessionId, turnId: turnId, tool: tool, summary: summary))
     }
 }
