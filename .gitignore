@@ -16,3 +16,4 @@ ios/Resources/KernelAssets/
 *.swp
 .idea/
 .vscode/
+dist/source.json
