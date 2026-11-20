@@ -1,5 +1,6 @@
 import LocalAuthentication
 import SwiftUI
+import UniformTypeIdentifiers
 
 // MARK: - 1. Long Reply Reading Pill (`2026-11-13-long-reply-reading.md`)
 
@@ -121,19 +122,27 @@ public struct SideChatSheet: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color(.secondarySystemBackground))
 
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 10) {
-                        ForEach(Array(messages.enumerated()), id: \.offset) { _, msg in
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(msg.role).font(.caption2).foregroundColor(.secondary)
-                                Text(msg.text)
-                                    .padding(10)
-                                    .background(msg.role == "You" ? Color.accentColor.opacity(0.14) : Color(.secondarySystemBackground))
-                                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 10) {
+                            ForEach(Array(messages.enumerated()), id: \.offset) { idx, msg in
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(msg.role).font(.caption2).foregroundColor(.secondary)
+                                    DSMarkdownText(msg.text)
+                                        .padding(10)
+                                        .background(msg.role == "You" ? Color.accentColor.opacity(0.14) : Color(.secondarySystemBackground))
+                                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                                }
+                                .id(idx)
                             }
                         }
+                        .padding()
                     }
-                    .padding()
+                    .onChange(of: messages.count) { count in
+                        if count > 0 {
+                            withAnimation { proxy.scrollTo(count - 1, anchor: .bottom) }
+                        }
+                    }
                 }
 
                 if !status.isEmpty { Text(status).font(.caption).foregroundStyle(.secondary) }
@@ -215,6 +224,7 @@ public struct GroupWorkspaceSheet: View {
     @State private var todos: [(id: String, text: String, done: Bool)] = []
     @State private var goalTitle = "未设定群目标"
     @State private var newGoalInput = ""
+    @State private var status = ""
 
     public var body: some View {
         NavigationStack {
@@ -228,10 +238,15 @@ public struct GroupWorkspaceSheet: View {
                             guard !g.isEmpty else { return }
                             newGoalInput = ""
                             Task {
-                                _ = try? await host.rpc()?.request("group.goal.set", params: ["groupId": groupId, "title": g])
-                                await reload()
+                                do {
+                                    guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
+                                    _ = try await rpc.request("group.goal.set", params: ["groupId": groupId, "title": g])
+                                    status = ""
+                                    await reload()
+                                } catch { status = error.localizedDescription }
                             }
                         }
+                        .disabled(newGoalInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                 }
 
@@ -243,10 +258,15 @@ public struct GroupWorkspaceSheet: View {
                             guard !t.isEmpty else { return }
                             newTodoText = ""
                             Task {
-                                _ = try? await host.rpc()?.request("group.todo.add", params: ["groupId": groupId, "text": t])
-                                await reload()
+                                do {
+                                    guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
+                                    _ = try await rpc.request("group.todo.add", params: ["groupId": groupId, "text": t])
+                                    status = ""
+                                    await reload()
+                                } catch { status = error.localizedDescription }
                             }
                         }
+                        .disabled(newTodoText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                     ForEach(todos, id: \.id) { todo in
                         HStack {
@@ -271,6 +291,9 @@ public struct GroupWorkspaceSheet: View {
                             }
                         }
                     }
+                }
+                if !status.isEmpty {
+                    Section { Text(status).font(.caption).foregroundStyle(.secondary) }
                 }
             }
             .navigationTitle("群协作面板")
@@ -411,7 +434,10 @@ public struct MemoryVaultView: View {
                                 } catch { status = error.localizedDescription }
                             }
                         }
-                        .disabled(newMemTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .disabled(
+                            newMemTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || newMemContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        )
                     }
                 }
             }
@@ -579,22 +605,28 @@ public struct ConnectorsAndUsageView: View {
                     .autocorrectionDisabled()
                 SecureField("Bearer Token（可选，存 Keychain）", text: $connectorToken)
                 Button("保存连接器") {
-                    guard !connectorName.isEmpty else { return }
+                    let trimmedName = connectorName.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let trimmedEndpoint = connectorEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmedName.isEmpty, !trimmedEndpoint.isEmpty else { return }
                     Task {
                         do {
                             guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
                             _ = try await rpc.request("connectors.upsert", params: [
-                                "name": connectorName, "endpoint": connectorEndpoint,
+                                "name": trimmedName, "endpoint": trimmedEndpoint,
                                 "token": connectorToken.trimmingCharacters(in: .whitespacesAndNewlines)
                             ])
                             connectorName = ""
                             connectorEndpoint = ""
                             connectorToken = ""
-                            mcpStatus = ""
+                            mcpStatus = "已保存连接器：\(trimmedName)"
                             await reload()
                         } catch { mcpStatus = error.localizedDescription }
                     }
                 }
+                .disabled(
+                    connectorName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || connectorEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                )
             }
 
             if !connectors.isEmpty {
@@ -734,6 +766,7 @@ public struct JSSandboxPlaygroundView: View {
     @State private var script = "const items = [12, 28, 45];\nconsole.log('count:', items.length);\n({ sum: items.reduce((a,b)=>a+b, 0) })"
     @State private var output = ""
     @State private var deviceInfo = ""
+    @State private var isRunning = false
 
     public var body: some View {
         Form {
@@ -741,19 +774,29 @@ public struct JSSandboxPlaygroundView: View {
                 TextEditor(text: $script)
                     .font(.caption.monospaced())
                     .frame(minHeight: 110)
-                Button("在 iOS 沙盒中运行") {
-                    Task {
-                        if let res = try? await host.rpc()?.request("tools.jsEval", params: ["script": script]) {
-                            let ok = res["ok"] as? Bool ?? false
-                            let val = res["value"] as? String ?? ""
-                            let logs = (res["logs"] as? [String] ?? []).joined(separator: "\n")
-                            let err = res["error"] as? String ?? ""
-                            output = ok ? [logs, val].filter { !$0.isEmpty }.joined(separator: "\n") : "错误：\(err)"
-                            DSHaptics.notify(ok ? .success : .error)
+                HStack {
+                    Button(isRunning ? "运行中…" : "在 iOS 沙盒中运行") {
+                        isRunning = true
+                        Task {
+                            defer { isRunning = false }
+                            if let res = try? await host.rpc()?.request("tools.jsEval", params: ["script": script]) {
+                                let ok = res["ok"] as? Bool ?? false
+                                let val = res["value"] as? String ?? ""
+                                let logs = (res["logs"] as? [String] ?? []).joined(separator: "\n")
+                                let err = res["error"] as? String ?? ""
+                                output = ok ? [logs, val].filter { !$0.isEmpty }.joined(separator: "\n") : "错误：\(err)"
+                                DSHaptics.notify(ok ? .success : .error)
+                            }
                         }
                     }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isRunning || script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                    if !output.isEmpty {
+                        Button("清空输出") { output = "" }
+                            .buttonStyle(.bordered)
+                    }
                 }
-                .buttonStyle(.borderedProminent)
             }
 
             if !output.isEmpty {
@@ -773,11 +816,149 @@ public struct JSSandboxPlaygroundView: View {
                     }
                 }
                 if !deviceInfo.isEmpty {
-                    Text(deviceInfo).font(.caption2.monospaced())
+                    Text(deviceInfo).font(.caption2.monospaced()).textSelection(.enabled)
                 }
             }
         }
         .scrollDismissesKeyboard(.interactively)
         .navigationTitle("端侧 JS 沙盒")
+    }
+}
+
+// MARK: - 8. Sandboxed Workspace Files Browser (`Documents/dsh-home/files/`)
+
+public struct WorkspaceFilesView: View {
+    @ObservedObject var host: LocalAgentHost
+    private struct FileEntry: Identifiable {
+        let id: String
+        let url: URL
+        let name: String
+        let byteCount: Int
+    }
+
+    @State private var entries: [FileEntry] = []
+    @State private var selectedPreview: (name: String, content: String)?
+    @State private var showImporter = false
+    @State private var status = ""
+
+    private var filesRoot: URL {
+        let dir = LocalAgentTransport.defaultWorkspace.appendingPathComponent("files", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    public var body: some View {
+        List {
+            Section {
+                Text("此目录供智能体通过 workspace_list / workspace_read / workspace_search / workspace_write / workspace_edit 安全读写（写入与编辑均需原生审批）。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Section("工作区文件（files/）") {
+                if entries.isEmpty {
+                    Text("暂无文件，可点击右上角导入文档或图片。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(entries) { entry in
+                        Button {
+                            preview(entry)
+                        } label: {
+                            HStack {
+                                Image(systemName: "doc.text")
+                                    .foregroundStyle(DSTheme.brand)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(entry.name).font(.subheadline)
+                                    Text(ByteCountFormatter.string(fromByteCount: Int64(entry.byteCount), countStyle: .file))
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .swipeActions(edge: .trailing) {
+                            Button("删除", role: .destructive) {
+                                try? FileManager.default.removeItem(at: entry.url)
+                                reload()
+                            }
+                        }
+                    }
+                }
+            }
+            if !status.isEmpty {
+                Section { Text(status).font(.caption).foregroundStyle(.secondary) }
+            }
+        }
+        .navigationTitle("工作区文件")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button { showImporter = true } label: { Label("导入", systemImage: "plus") }
+            }
+        }
+        .fileImporter(isPresented: $showImporter, allowedContentTypes: [.item]) { result in
+            switch result {
+            case .success(let url):
+                do {
+                    let imported = try host.importFileToWorkspace(from: url)
+                    status = "已导入：files/\(imported.relativePath)"
+                    reload()
+                } catch { status = "导入失败：\(error.localizedDescription)" }
+            case .failure(let error):
+                status = "导入失败：\(error.localizedDescription)"
+            }
+        }
+        .sheet(isPresented: Binding(
+            get: { selectedPreview != nil },
+            set: { if !$0 { selectedPreview = nil } }
+        )) {
+            if let preview = selectedPreview {
+                NavigationStack {
+                    ScrollView {
+                        Text(preview.content)
+                            .font(.caption.monospaced())
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding()
+                            .textSelection(.enabled)
+                    }
+                    .navigationTitle(preview.name)
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .topBarTrailing) {
+                            Button("完成") { selectedPreview = nil }
+                        }
+                    }
+                }
+            }
+        }
+        .onAppear { reload() }
+    }
+
+    private func reload() {
+        let fm = FileManager.default
+        guard let urls = try? fm.contentsOfDirectory(
+            at: filesRoot,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            entries = []
+            return
+        }
+        entries = urls.compactMap { url in
+            let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+            guard values?.isSymbolicLink != true, values?.isRegularFile == true else { return nil }
+            return FileEntry(id: url.lastPathComponent, url: url, name: url.lastPathComponent, byteCount: values?.fileSize ?? 0)
+        }.sorted { $0.name < $1.name }
+    }
+
+    private func preview(_ entry: FileEntry) {
+        guard let data = try? Data(contentsOf: entry.url) else {
+            status = "无法读取文件。"
+            return
+        }
+        let slice = data.prefix(65_536)
+        if let text = String(data: slice, encoding: .utf8) {
+            selectedPreview = (entry.name, data.count > 65_536 ? text + "\n…(已截断)" : text)
+        } else {
+            selectedPreview = (entry.name, "二进制文件（\(data.count) 字节），暂不支持文本预览。")
+        }
     }
 }

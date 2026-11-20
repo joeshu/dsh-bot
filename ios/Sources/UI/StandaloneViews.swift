@@ -140,9 +140,9 @@ public struct SessionsTabView: View {
                 .foregroundColor(statusColor)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    Text("Swift 原生引擎")
+                    Text(host.embeddedRuntimeLabel ?? "Node.js + DSH 0.2.2-rc.5")
                         .font(.subheadline.weight(.semibold))
-                    DSStatusBadge(statusBadge, color: statusColor)
+                    DSStatusBadge(host.isDSHRecoveryMode ? "恢复模式" : statusBadge, color: host.isDSHRecoveryMode ? DSTheme.warning : statusColor)
                 }
                 Text(host.workspaceError ?? statusDescription)
                     .font(.caption)
@@ -200,6 +200,7 @@ public struct BotRosterTabView: View {
     @ObservedObject var host: LocalAgentHost
     @State private var showCreateSheet = false
     @State private var editingBot: BotProfile?
+    @State private var pendingDeleteBot: BotProfile?
 
     private var sections: [String] {
         Array(NSOrderedSet(array: host.bots.map(\.section))) as? [String] ?? []
@@ -232,7 +233,7 @@ public struct BotRosterTabView: View {
                             .swipeActions(edge: .trailing) {
                                 if !bot.isMain {
                                     Button("删除", role: .destructive) {
-                                        host.deleteBot(id: bot.id)
+                                        pendingDeleteBot = bot
                                     }
                                 }
                                 Button("编辑") {
@@ -258,6 +259,22 @@ public struct BotRosterTabView: View {
             }
             .sheet(item: $editingBot) { target in
                 EditBotSheet(bot: target, host: host)
+            }
+            .confirmationDialog(
+                "确定删除「\(pendingDeleteBot?.name ?? "")」及其聊天记录？",
+                isPresented: Binding(
+                    get: { pendingDeleteBot != nil },
+                    set: { if !$0 { pendingDeleteBot = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button("删除", role: .destructive) {
+                    if let target = pendingDeleteBot {
+                        pendingDeleteBot = nil
+                        host.deleteBot(id: target.id)
+                    }
+                }
+                Button("取消", role: .cancel) { pendingDeleteBot = nil }
             }
         }
     }
@@ -302,6 +319,18 @@ public struct ToolsHubTabView: View {
                         JSSandboxPlaygroundView(host: host)
                     } label: {
                         toolRow(icon: "chevron.left.forwardslash.chevron.right", color: DSTheme.success, title: "端侧 JS 沙盒与设备探针", subtitle: "离线执行脚本并查看本机电量和温控")
+                    }
+
+                    NavigationLink {
+                        WorkspaceFilesView(host: host)
+                    } label: {
+                        toolRow(icon: "folder.fill", color: .orange, title: "工作区文件（files/）", subtitle: "管理智能体可读写的沙盒文档与导入附件")
+                    }
+
+                    NavigationLink {
+                        DSHWebUIView(host: host)
+                    } label: {
+                        toolRow(icon: "macwindow.on.rectangle", color: .indigo, title: "DSH Web 工作台", subtitle: "完整官方 Web UI 与社区 dsh-client-ui-* 插件")
                     }
                 }
 
@@ -534,6 +563,12 @@ public struct ChatView: View {
                             proxy.scrollTo("chat_bottom", anchor: .bottom)
                         }
                     }
+                    .onChange(of: host.pendingApprovals.count) { _ in
+                        withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
+                    }
+                    .onDisappear {
+                        speechInput.stop()
+                    }
                     if host.lastErrorSessionId == bot.id, let errMsg = host.lastStreamError, !host.isStreaming {
                         DSBannerCard(
                             icon: "exclamationmark.triangle.fill",
@@ -602,13 +637,13 @@ public struct ChatView: View {
     private var emptyWelcomeView: some View {
         VStack(spacing: 12) {
             DSBotAvatar(
-                initials: bot.name,
-                color: bot.isMain ? DSTheme.brand : (bot.isGroup ? .indigo : (bot.isPrivate ? DSTheme.warning : .teal)),
-                isPrivate: bot.isPrivate,
+                initials: liveBot.name,
+                color: liveBot.isMain ? DSTheme.brand : (liveBot.isGroup ? .indigo : (liveBot.isPrivate ? DSTheme.warning : .teal)),
+                isPrivate: liveBot.isPrivate,
                 size: 56
             )
             Text(liveBot.name).font(.title3.weight(.semibold))
-            Text(bot.roleLabel).font(.caption).foregroundColor(.secondary)
+            Text(liveBot.roleLabel).font(.caption).foregroundColor(.secondary)
             VStack(spacing: 8) {
                 ForEach(starterPrompts, id: \.self) { prompt in
                     Button {
@@ -986,13 +1021,15 @@ public struct AgentSettingsView: View {
     @ObservedObject var host: LocalAgentHost
     @State private var apiKey = ""
     @State private var status = ""
+    @State private var keyConfigured = false
 
     public var body: some View {
         NavigationStack {
             Form {
                 Section("运行诊断") {
                     LabeledContent("应用", value: "\(host.appVersion) (\(host.buildNumber))")
-                    LabeledContent("引擎", value: "Node.js + DSH 0.2.2-rc.5")
+                    LabeledContent("引擎", value: host.embeddedRuntimeLabel ?? "Node.js + DSH 0.2.2-rc.5")
+                    LabeledContent("Web 工作台", value: "已内嵌（支持 dsh-client-ui-*）")
                     Button("复制诊断 JSON") {
                         Task {
                             do {
@@ -1007,11 +1044,22 @@ public struct AgentSettingsView: View {
                 }
 
                 Section("模型服务") {
+                    LabeledContent("当前地址密钥") {
+                        DSStatusBadge(keyConfigured ? "已配置" : "未配置", color: keyConfigured ? DSTheme.success : DSTheme.warning)
+                    }
                     TextField("HTTPS Base URL", text: $host.apiBaseURL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                        .onChange(of: host.apiBaseURL) { _ in apiKey = ""; status = "" }
+                        .onChange(of: host.apiBaseURL) { _ in
+                            apiKey = ""
+                            status = ""
+                            Task { keyConfigured = await host.hasSavedAPIKey() }
+                        }
                     if !host.usesOfficialModels {
+                        Button("恢复官方地址（api.deepseek.com）") {
+                            host.apiBaseURL = ModelProvider.defaultAddress
+                        }
+                        .font(.caption)
                         Text("DSH 自定义服务需兼容 Anthropic Messages API；模型 ID 可在 Bot 设置中手动填写。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -1023,6 +1071,7 @@ public struct AgentSettingsView: View {
                             try host.saveAPIKey(apiKey.trimmingCharacters(in: .whitespacesAndNewlines))
                             apiKey = ""
                             status = "已为当前服务地址保存密钥。"
+                            Task { keyConfigured = await host.hasSavedAPIKey() }
                         } catch { status = error.localizedDescription }
                     }
                     .disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -1046,6 +1095,7 @@ public struct AgentSettingsView: View {
             }
             .scrollDismissesKeyboard(.interactively)
             .navigationTitle("设置")
+            .task { keyConfigured = await host.hasSavedAPIKey() }
         }
     }
 }

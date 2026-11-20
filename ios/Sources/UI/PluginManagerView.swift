@@ -27,6 +27,7 @@ public struct PluginManagerView: View {
     @State private var newSourceURL = ""
     @State private var showFolderPicker = false
     @State private var pendingInstall: PendingPluginInstall?
+    @State private var pendingRemoval: DSHInstalledPlugin?
 
     public var body: some View {
         NavigationStack {
@@ -130,6 +131,22 @@ public struct PluginManagerView: View {
                     secondaryButton: .cancel(Text("取消"))
                 )
             }
+            .confirmationDialog(
+                "确定卸载插件「\(pendingRemoval?.name ?? "")」？",
+                isPresented: Binding(
+                    get: { pendingRemoval != nil },
+                    set: { if !$0 { pendingRemoval = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button("卸载", role: .destructive) {
+                    if let target = pendingRemoval {
+                        pendingRemoval = nil
+                        Task { await host.removePlugin(target) }
+                    }
+                }
+                Button("取消", role: .cancel) { pendingRemoval = nil }
+            }
         }
     }
 
@@ -179,7 +196,7 @@ public struct PluginManagerView: View {
                         }
                         .disabled(host.isDSHRecoveryMode && !plugin.desiredEnabled)
                         Button("卸载", role: .destructive) {
-                            Task { await host.removePlugin(plugin) }
+                            pendingRemoval = plugin
                         }
                         .font(.caption)
                     }

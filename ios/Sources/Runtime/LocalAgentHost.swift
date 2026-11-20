@@ -59,6 +59,7 @@ public struct DSHInstalledPlugin: Identifiable, Decodable, Equatable {
 
     var compatibilityLabel: String {
         switch compatibility {
+        case "web-ui": return "Web UI 插件"
         case "host-only": return "仅 Host 功能"
         case "verified": return "已验证"
         default: return "待验证"
@@ -194,6 +195,11 @@ public final class LocalAgentHost: ObservableObject {
 
     func saveAPIKey(_ key: String) throws {
         try KeychainBridge().saveModelKey(key, provider: ModelProvider(apiBaseURL))
+    }
+
+    func hasSavedAPIKey() async -> Bool {
+        guard let provider = try? ModelProvider(apiBaseURL) else { return false }
+        return (try? await keychain.modelKey(provider: provider, migrateOfficialKey: migrateOfficialKey)) != nil
     }
 
     func refreshModels() async throws -> (latency: Int, count: Int) {
