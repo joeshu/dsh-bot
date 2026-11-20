@@ -18,12 +18,16 @@ on:
   workflow_dispatch:
     inputs:
       build_security_runtime:
-        description: Build the full NodeMobile 24.22.3 runtime from source
+        description: Build the full NodeMobile 24.22.3 runtime from source (parallel slices)
         type: boolean
         default: false
+      publish_runtime_release:
+        description: Publish the assembled NodeMobile 24.22.3 XCFramework to Release nodemobile-v24.22.3 so future builds never recompile
+        type: boolean
+        default: true
 
 permissions:
-  contents: read
+  contents: write
 
 # A security NodeMobile build is an expensive, pinned source build. Serialize
 # those dispatches so two cold runs cannot both miss the same archive cache and
@@ -34,9 +38,46 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  candidate:
+  build-security-slice:
+    if: github.event_name == 'workflow_dispatch' && inputs.build_security_runtime
     runs-on: macos-26
-    timeout-minutes: 150
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [arm64, arm64-simulator]
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore cached ${{ matrix.slice }} slice
+        id: slice-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/nodemobile-24.22.3-${{ matrix.slice }}.zip
+          key: dsbot-node-24.22.3-${{ matrix.slice }}-${{ runner.os }}-${{ runner.arch }}-xcode-26.6-${{ hashFiles('scripts/build-node-mobile-security-ios.sh') }}
+      - name: Compile NodeMobile 24.22.3 (${{ matrix.slice }})
+        if: steps.slice-cache.outputs.cache-hit != 'true'
+        run: bash scripts/build-node-mobile-security-ios.sh --slice=${{ matrix.slice }} "$RUNNER_TEMP/nodemobile-24.22.3-${{ matrix.slice }}.zip"
+      - name: Cache compiled ${{ matrix.slice }} slice
+        if: steps.slice-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/nodemobile-24.22.3-${{ matrix.slice }}.zip
+          key: ${{ steps.slice-cache.outputs.cache-primary-key }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nodemobile-24.22.3-${{ matrix.slice }}
+          path: ${{ runner.temp }}/nodemobile-24.22.3-${{ matrix.slice }}.zip
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  candidate:
+    needs: [build-security-slice]
+    if: always() && (needs.build-security-slice.result == 'success' || needs.build-security-slice.result == 'skipped')
+    runs-on: macos-26
+    timeout-minutes: 90
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
       DSBOT_REPOSITORY: ${{ github.repository }}
@@ -64,30 +105,60 @@ jobs:
           xcodebuild -version
       - name: Check IPA verification regressions
         run: python3 -m unittest discover -s scripts/tests
-      - name: Restore the pinned security NodeMobile build
+      - name: Download device NodeMobile 24.22.3 slice
         if: github.event_name == 'workflow_dispatch' && inputs.build_security_runtime
-        id: security-framework-cache
-        uses: actions/cache/restore@v4
+        uses: actions/download-artifact@v4
         with:
-          path: ${{ runner.temp }}/node-mobile-security.zip
-          key: dsbot-node-mobile-security-${{ runner.os }}-${{ runner.arch }}-xcode-26.6-${{ hashFiles('scripts/build-node-mobile-security-ios.sh') }}
-      - name: Compile the security NodeMobile framework
-        if: github.event_name == 'workflow_dispatch' && inputs.build_security_runtime && steps.security-framework-cache.outputs.cache-hit != 'true'
-        run: bash scripts/build-node-mobile-security-ios.sh "$RUNNER_TEMP/node-mobile-security.zip"
-      - name: Cache the security framework archive
-        if: github.event_name == 'workflow_dispatch' && inputs.build_security_runtime && steps.security-framework-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+          name: nodemobile-24.22.3-arm64
+          path: ${{ runner.temp }}/slices
+      - name: Download simulator NodeMobile 24.22.3 slice
+        if: github.event_name == 'workflow_dispatch' && inputs.build_security_runtime
+        uses: actions/download-artifact@v4
         with:
-          path: ${{ runner.temp }}/node-mobile-security.zip
-          key: ${{ steps.security-framework-cache.outputs.cache-primary-key }}
-      - name: Select the security NodeMobile archive
+          name: nodemobile-24.22.3-arm64-simulator
+          path: ${{ runner.temp }}/slices
+      - name: Assemble NodeMobile 24.22.3 XCFramework
         if: github.event_name == 'workflow_dispatch' && inputs.build_security_runtime
         run: |
           set -euo pipefail
-          archive="$RUNNER_TEMP/node-mobile-security.zip"
-          test -s "$archive"
+          archive="$RUNNER_TEMP/nodejs-mobile-ios-24.22.3-dsbot.zip"
+          bash scripts/build-node-mobile-security-ios.sh --assemble \
+            "$RUNNER_TEMP/slices/nodemobile-24.22.3-arm64.zip" \
+            "$RUNNER_TEMP/slices/nodemobile-24.22.3-arm64-simulator.zip" \
+            "$archive"
+          sha="$(shasum -a 256 "$archive" | cut -d' ' -f1)"
+          printf '%s  %s\n' "$sha" "$(basename "$archive")" > "$RUNNER_TEMP/nodejs-mobile-ios-24.22.3-dsbot.sha256"
           echo "DSBOT_SECURITY_NODE_ARCHIVE=$archive" >> "$GITHUB_ENV"
-          echo "DSBOT_SECURITY_NODE_SHA256=$(shasum -a 256 "$archive" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          echo "DSBOT_SECURITY_NODE_SHA256=$sha" >> "$GITHUB_ENV"
+      - name: Upload assembled NodeMobile 24.22.3 XCFramework artifact
+        if: github.event_name == 'workflow_dispatch' && inputs.build_security_runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodemobile-24.22.3-xcframework
+          path: |
+            ${{ runner.temp }}/nodejs-mobile-ios-24.22.3-dsbot.zip
+            ${{ runner.temp }}/nodejs-mobile-ios-24.22.3-dsbot.sha256
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+      - name: Publish NodeMobile 24.22.3 runtime asset to permanent GitHub Release
+        if: github.event_name == 'workflow_dispatch' && inputs.build_security_runtime && inputs.publish_runtime_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="nodemobile-v24.22.3"
+          ARCHIVE="$RUNNER_TEMP/nodejs-mobile-ios-24.22.3-dsbot.zip"
+          SUMFILE="$RUNNER_TEMP/nodejs-mobile-ios-24.22.3-dsbot.sha256"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ARCHIVE" "$SUMFILE" --clobber
+          else
+            gh release create "$TAG" "$ARCHIVE" "$SUMFILE" \
+              --target "$GITHUB_SHA" \
+              --title "NodeMobile iOS 24.22.3 Prebuilt XCFramework" \
+              --prerelease --latest=false \
+              --notes "Pinned NodeMobile 24.22.3 (iPhoneOS arm64 + Simulator arm64) built from fogtape/nodejs-mobile@b5bcc8d8 with verified upstream Node 24.22.3 security patch. Cached here so future iOS IPA builds never need to recompile Node."
+          fi
       - name: Build and verify the unsigned IPA
         env:
           DSBOT_OUT_DIR: ${{ runner.temp }}/dsbot-candidate
