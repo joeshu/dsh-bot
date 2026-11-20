@@ -56,20 +56,38 @@ jobs:
           xcodebuild -version
       - name: Check IPA verification regressions
         run: python3 -m unittest discover -s scripts/tests
+      - name: Restore the pinned security NodeMobile build
+        if: github.event_name == 'workflow_dispatch' && inputs.build_security_runtime
+        id: security-framework-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/node-mobile-security.zip
+          key: dsbot-node-mobile-security-${{ runner.os }}-${{ runner.arch }}-xcode-26.6-${{ hashFiles('scripts/build-node-mobile-security-ios.sh') }}
       - name: Compile the security NodeMobile framework
+        if: github.event_name == 'workflow_dispatch' && inputs.build_security_runtime && steps.security-framework-cache.outputs.cache-hit != 'true'
+        run: bash scripts/build-node-mobile-security-ios.sh "$RUNNER_TEMP/node-mobile-security.zip"
+      - name: Select the security NodeMobile archive
         if: github.event_name == 'workflow_dispatch' && inputs.build_security_runtime
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/node-mobile-security.zip"
-          bash scripts/build-node-mobile-security-ios.sh "$archive"
+          test -s "$archive"
           echo "DSBOT_SECURITY_NODE_ARCHIVE=$archive" >> "$GITHUB_ENV"
           echo "DSBOT_SECURITY_NODE_SHA256=$(shasum -a 256 "$archive" | cut -d' ' -f1)" >> "$GITHUB_ENV"
       - name: Build and verify the unsigned IPA
         env:
           DSBOT_OUT_DIR: ${{ runner.temp }}/dsbot-candidate
         run: bash scripts/build-unsigned-ipa.sh
+      - name: Cache the verified security framework
+        if: github.event_name == 'workflow_dispatch' && inputs.build_security_runtime && steps.security-framework-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/node-mobile-security.zip
+          key: ${{ steps.security-framework-cache.outputs.cache-primary-key }}
       - name: Smoke test DSH IPC and SQLite recovery
         run: python3 scripts/smoke-dsh-runtime.py
+      - name: Smoke test DeepSeek search approval and privacy boundaries
+        run: python3 scripts/smoke-dsh-web-search.py
       - uses: actions/upload-artifact@v4
         with:
           name: dsbot-native-ios-candidate

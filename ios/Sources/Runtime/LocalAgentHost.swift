@@ -133,6 +133,9 @@ public final class LocalAgentHost: ObservableObject {
     @Published public private(set) var state: LocalAgentState = .idle
     @Published public private(set) var workspaceError: String?
     @Published public private(set) var models: [String] = []
+    @Published public var webSearchEnabled = UserDefaults.standard.bool(forKey: "dsbot.webSearchEnabled") {
+        didSet { UserDefaults.standard.set(webSearchEnabled, forKey: "dsbot.webSearchEnabled") }
+    }
     @Published public var subagentEnabled = UserDefaults.standard.bool(forKey: "dsbot.subagentEnabled") {
         didSet { UserDefaults.standard.set(subagentEnabled, forKey: "dsbot.subagentEnabled") }
     }
@@ -283,7 +286,7 @@ public final class LocalAgentHost: ObservableObject {
             _ = try await channel.request("chat.send", params: [
                 "sessionId": sessionId, "turnId": turnId, "model": model, "apiBaseURL": apiBaseURL,
                 "systemPrompt": bot?.systemPrompt ?? "", "isGroup": bot?.isGroup ?? false,
-                "subagentEnabled": subagentEnabled, "customTools": customTools, "text": trimmed, "legacyHistory": legacyHistory
+                "subagentEnabled": subagentEnabled, "webSearchEnabled": webSearchEnabled, "customTools": customTools, "text": trimmed, "legacyHistory": legacyHistory
             ])
         } catch {
             guard activeTurnId == turnId else { return }
@@ -739,6 +742,13 @@ public final class LocalAgentHost: ObservableObject {
         }
         await rpc.registerHandler(method: "native.tool.execute") { [weak self] params in
             guard let self, let name = params["name"] as? String else { throw IPCFrameError.invalidJSON }
+            if name == "web_search" {
+                guard self.webSearchEnabled, self.usesOfficialModels, !self.sentCancellation,
+                      let turnId = params["turnId"] as? String, turnId == self.activeTurnId,
+                      let botId = params["botId"] as? String, botId == self.streamingSessionId else {
+                    throw IPCFrameError.remoteError(code: -32000, message: "当前会话不能发起网页搜索。")
+                }
+            }
             return try await self.workspaceCapabilities.executeNativeTool(
                 name: name,
                 arguments: params["args"] as? [String: Any] ?? [:],

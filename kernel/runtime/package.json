@@ -40,6 +40,7 @@
     "@deepseek-ai/dsh-tool-subagent": "0.2.2-rc.5",
     "@deepseek-ai/dsh-tools": "0.2.2-rc.5",
     "@deepseek-ai/dsh-web": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-web-deepseek-api": "0.2.2-rc.5",
     "@deepseek-ai/dsh-working-directory": "0.2.2-rc.5",
     "@dsbot/dsh-ios-host": "file:./ios-host-package",
     "@dsbot/dsh-ios-profile": "file:./ios-profile-package",

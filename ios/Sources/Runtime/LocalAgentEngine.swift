@@ -272,7 +272,7 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
     }
 
     func executeNativeTool(name: String, arguments: [String: Any], botId: String, turnId: String, isGroup: Bool) async throws -> [String: Any] {
-        guard ["js_eval", "device_status", "memory_save", "group_todo_add", "web_fetch", "remote_mcp_call"].contains(name) else {
+        guard ["js_eval", "device_status", "memory_save", "group_todo_add", "web_fetch", "web_search", "remote_mcp_call"].contains(name) else {
             throw IPCFrameError.remoteError(code: -32601, message: "Unsupported DSH native tool: \(name)")
         }
         guard let data = try? JSONSerialization.data(withJSONObject: arguments),
@@ -630,6 +630,13 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
             if matches.count == 1, let id = matches[0]["id"] as? String { connector = await store.connector(id: id) }
             guard let connector, connector.type == "remote-mcp", !text("toolName").isEmpty else { return "Choose a configured MCP connector and tool." }
             summary = connector.endpoint + "\n" + summary
+        case "web_search":
+            let query = text("query")
+            guard !query.isEmpty, query.unicodeScalars.count <= 300,
+                  !query.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }) else {
+                return "搜索关键词须为单行，且不能超过 300 个字符。"
+            }
+            summary = "发送到 api.deepseek.com 的搜索关键词：\n" + query
         case "web_fetch":
             address = try? ModelProvider.httpsComponents(text("url")).url
             guard let address else { return "A valid HTTPS URL is required." }
@@ -662,6 +669,7 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
                 guard let connector, await store.connector(id: connector.id)?.endpoint == connector.endpoint else { return "Connector changed." }
                 return try await mcp.callTool(endpoint: connector.endpoint, name: text("toolName"),
                     arguments: args["arguments"] as? [String: Any] ?? [:], keychainAccount: "connector:\(connector.id)")
+            case "web_search": return "approved"
             case "web_fetch":
                 guard let address else { return "Invalid URL." }
                 let (bytes, response) = try await session.bytes(from: address)

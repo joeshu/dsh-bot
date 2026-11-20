@@ -111,7 +111,7 @@ def main():
             "dsh-session", "dsh-session-projection",
             "dsh-llm", "dsh-llm-deepseek-api-key", "dsh-system-prompt", "dsh-tools",
             "dsh-tool-executor-native", "dsh-agent", "dsh-agent-loop",
-            "dsh-web", "dsh-fs-local", "dsh-working-directory", "dsh-subagent",
+            "dsh-web", "dsh-web-deepseek-api", "dsh-fs-local", "dsh-working-directory", "dsh-subagent",
             "dsh-subagent-spawn-in-process", "dsh-tool-subagent",
         ],
         "iosHostAdapters": [

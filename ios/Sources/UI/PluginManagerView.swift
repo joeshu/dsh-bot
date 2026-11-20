@@ -119,7 +119,11 @@ public struct PluginManagerView: View {
         Section("内置能力") {
             if let label = host.embeddedRuntimeLabel { LabeledContent("内嵌引擎", value: label) }
             LabeledContent("网页抓取", value: "每次访问需批准")
-            LabeledContent("网页搜索", value: "未配置提供方")
+            Toggle("启用 DeepSeek 网页搜索", isOn: $host.webSearchEnabled)
+                .disabled(!host.usesOfficialModels)
+            Text(host.usesOfficialModels ? "每次搜索前确认关键词，可能产生 API 费用。" : "网页搜索需要 DeepSeek 官方 API 地址。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             Toggle("启用子智能体", isOn: $host.subagentEnabled)
             Text("最多一层、同时运行一个子智能体。")
                 .font(.caption)

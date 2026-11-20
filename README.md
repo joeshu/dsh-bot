@@ -55,6 +55,6 @@ bash scripts/resign-ios-ipa.sh unsigned.ipa device.mobileprovision 'Apple Develo
 
 Promotion accepts a JSON record with `commit`, `unsignedSha256`, `signedSha256`, `signingToolVersion` and `devices`. Each device has `model`, `ios` and a `results` object. The required scenario keys are listed in `scripts/verify-ios-device-evidence.py`; report `pass` only for an observed result. Use the same app identity for upgrade and Keychain retention checks.
 
-The iOS profile exposes the upstream `dsh-web` service through the existing Swift approval flow. Web search remains unavailable until a provider is configured. The in-process subagent tool is opt-in with one child at a time and one level of delegation.
+The iOS profile exposes the upstream `dsh-web` service through the existing Swift approval flow. DeepSeek web search is off by default and is available with an official API address and a Keychain API key. The app asks for approval before sending each exact query and leaves the original user prompt out of the search request. The in-process subagent tool is opt-in with one child at a time and one level of delegation.
 
 The **iOS Native IPA** workflow accepts `build_security_runtime` to build the full NodeMobile 24.22.3 framework from the pinned mobile snapshot and verified upstream security diff before archiving the app. This pipeline records the framework and archive digests. Use the same macOS toolchain for local reproduction.

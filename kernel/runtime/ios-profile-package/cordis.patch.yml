@@ -48,6 +48,16 @@
       name: '@deepseek-ai/dsh-web'
       config:
         fetchProvider: dsbot-ios-approved
+        searchProvider: deepseek-search-api
+
+    - id: ios-web-search
+      name: '@deepseek-ai/dsh-web-deepseek-api'
+      config:
+        searchBaseURL: https://api.deepseek.com/v1/tools
+        searchApiKeyEnv: DEEPSEEK_API_KEY
+        searchBilling: api-key
+        sendOriginalQuestion: false
+        count: 5
 
     - id: ios-fs
       name: '@deepseek-ai/dsh-fs-local'

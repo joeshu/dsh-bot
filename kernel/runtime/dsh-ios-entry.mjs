@@ -111,16 +111,16 @@ function renderLegacyHistory(messages) {
   return `Earlier conversation imported from the previous DS Bot iOS chat store. Treat it as background context; the current DSH session log is authoritative for new turns.\n\n${transcript.slice(-48_000)}`
 }
 
-const NATIVE_TOOL_NAMES = ['js_eval', 'device_status', 'memory_save', 'group_todo_add', 'web_fetch', 'remote_mcp_call']
+const NATIVE_TOOL_NAMES = ['js_eval', 'device_status', 'memory_save', 'group_todo_add', 'web_fetch', 'web_search', 'remote_mcp_call']
 const ACTIVE_PLUGINS = [
   'dsh-agent', 'dsh-agent-loop', 'dsh-llm', 'dsh-llm-deepseek-api-key',
   'dsh-session', 'dsh-session-projection', 'dsh-system-prompt',
-  'dsh-tools', 'dsh-tool-executor-native', 'dsh-web', 'dsh-fs-local', 'dsh-working-directory',
+  'dsh-tools', 'dsh-tool-executor-native', 'dsh-web', 'dsh-fs-local', 'dsh-working-directory', 'dsh-web-deepseek-api',
   'dsh-subagent', 'dsh-subagent-spawn-in-process', 'dsh-tool-subagent',
   'dsbot-ios-sqlite-session-persistence', 'dsbot-ios-keychain-credentials', 'dsbot-ios-native-tools',
 ]
 
-function setupAgent({ botId, systemPrompt, legacyHistory, toolsEnabled, subagentEnabled }) {
+function setupAgent({ botId, systemPrompt, legacyHistory, toolsEnabled, subagentEnabled, webSearchEnabled }) {
   const id = dshSessionId(botId)
   let setPersona = () => {}
   let setToolsEnabled = () => {}
@@ -135,14 +135,15 @@ function setupAgent({ botId, systemPrompt, legacyHistory, toolsEnabled, subagent
       }
     }
     setPersona(systemPrompt)
-    setToolsEnabled = (enabled, allowSubagent) => {
+    setToolsEnabled = (enabled, allowSubagent, allowWebSearch) => {
       toolRestriction?.()
       toolRestriction = undefined
       const deny = enabled ? [] : [...NATIVE_TOOL_NAMES]
       if (!allowSubagent || !enabled) deny.push('subagent')
+      if (enabled && !allowWebSearch) deny.push('web_search')
       if (deny.length) toolRestriction = agentCtx.tools.restrict({ deny })
     }
-    setToolsEnabled(toolsEnabled, subagentEnabled)
+    setToolsEnabled(toolsEnabled, subagentEnabled, webSearchEnabled)
     const importedContext = renderLegacyHistory(legacyHistory)
     if (importedContext) {
       agentCtx.systemPrompt.section({ name: 'dsbot-ios-imported-history', order: 800, text: importedContext })
@@ -196,7 +197,7 @@ async function boot() {
   const mountedRows = new Map([...ctx.loader.entries()].map((entry) => [entry.options.id, entry.fiber]))
   runtime.providerFiber = mountedRows.get('llm-deepseek')
   const requiredRows = ['session', 'session-projection', 'llm', 'llm-deepseek', 'system-prompt', 'tools',
-    'agent', 'agent-loop', 'tool-executor-native', 'ios-web', 'ios-fs', 'ios-working-directory', 'ios-subagent', 'ios-subagent-in-process', 'ios-tool-subagent', 'ios-keychain-credentials', 'ios-session-persistence', 'ios-native-tools']
+    'agent', 'agent-loop', 'tool-executor-native', 'ios-web', 'ios-web-search', 'ios-fs', 'ios-working-directory', 'ios-subagent', 'ios-subagent-in-process', 'ios-tool-subagent', 'ios-keychain-credentials', 'ios-session-persistence', 'ios-native-tools']
   const inactive = requiredRows.filter((id) => mountedRows.get(id)?.state !== 2)
   if (inactive.length) throw new Error(`Required iOS DSH profile rows are inactive: ${inactive.join(', ')}`)
   if (!runtime.persistence || !runtime.providerFiber) {
@@ -219,7 +220,7 @@ const runtimeInfo = () => ({
   webProviders: ctx?.web?.listProviders(),
   pluginIndexFormat: 1, safeMode: workerData?.safeMode === true,
   plugins: ACTIVE_PLUGINS,
-  tools: ['js_eval', 'device_status', 'memory_save', 'group_todo_add', 'web_fetch', 'remote_mcp_call'],
+  tools: ['js_eval', 'device_status', 'memory_save', 'group_todo_add', 'web_fetch', 'web_search', 'remote_mcp_call'],
 })
 rpc.handle('agent.info', async () => runtimeInfo())
 
@@ -259,6 +260,7 @@ async function startTurn(params) {
   const reasoningEnabled = model === 'deepseek-flash-thinking' || model === 'deepseek-v4-pro'
   const officialDeepSeek = isOfficialDeepSeekBase(runtime.apiBaseURL)
   const toolsEnabled = officialDeepSeek || params.customTools === true
+  const webSearchEnabled = officialDeepSeek && params.webSearchEnabled === true
   const id = dshSessionId(botId)
   let active = runtime.activeAgents.get(id)
   const options = {
@@ -266,7 +268,7 @@ async function startTurn(params) {
     reasoningEffort: reasoningEnabled ? 'high' : 'off',
   }
   if (!active) {
-    const composition = setupAgent({ botId, systemPrompt: params.systemPrompt, legacyHistory: params.legacyHistory, toolsEnabled, subagentEnabled: params.subagentEnabled === true })
+    const composition = setupAgent({ botId, systemPrompt: params.systemPrompt, legacyHistory: params.legacyHistory, toolsEnabled, subagentEnabled: params.subagentEnabled === true, webSearchEnabled })
     let handle
     try {
       if (await runtime.persistence.stat(id)) {
@@ -284,11 +286,11 @@ async function startTurn(params) {
   } else {
     active.agent.model.select(options)
     active.setPersona(params.systemPrompt)
-    active.setToolsEnabled(toolsEnabled, params.subagentEnabled === true)
+    active.setToolsEnabled(toolsEnabled, params.subagentEnabled === true, webSearchEnabled)
   }
 
   const userMessage = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })
-  const turn = { turnId, botId, isGroup: params.isGroup === true, done: false }
+  const turn = { turnId, botId, isGroup: params.isGroup === true, webSearchEnabled, done: false }
   runtime.activeTurns.set(id, turn)
   const startSeq = active.agent.session.seq
   try {

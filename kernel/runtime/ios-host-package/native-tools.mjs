@@ -69,6 +69,32 @@ function apply(context) {
       },
     }),
     defineTool({
+      ...common, name: 'web_search',
+      description: 'Search with the official DeepSeek Search API after the user approves the exact query.',
+      parameters: { query: { type: 'string', required: true } }, timeoutMs: 90_000,
+      async execute(args, exec) {
+        const { runtime } = iosHost()
+        const turn = runtime.activeTurns.get(exec.agent.session.id)
+        if (!turn?.webSearchEnabled || turn.done) throw new Error('Web search is disabled for this turn')
+        const query = args.query.trim()
+        if (!query || [...query].length > 300 || /[\x00-\x1f\x7f]/.test(query)) {
+          throw new Error('Use a single search query of at most 300 characters')
+        }
+        const llmProvider = 'deepseek-official'
+        if (!(await context.web.searchReady(llmProvider))) throw new Error('DeepSeek Search API requires an API key')
+        const approval = await bridge('web_search', { query }, exec)
+        if (approval.output !== 'approved') throw new Error(approval.output || 'Web search was not approved')
+        exec.signal?.throwIfAborted()
+        const result = await context.web.search({ query, llmProvider, maxResults: 5 }, exec.signal)
+        const sources = result.sources.map((source) => ({
+          url: source.url.slice(0, 2048),
+          title: source.title?.slice(0, 250),
+          snippet: (source.snippet ?? source.summary)?.slice(0, 750),
+        }))
+        return { output: JSON.stringify(sources) }
+      },
+    }),
+    defineTool({
       ...common, name: 'remote_mcp_call', description: 'Call a user-configured Remote MCP tool after the user approves the connector and tool.',
       parameters: { connectorName: { type: 'string', required: true }, toolName: { type: 'string', required: true }, arguments: { type: 'json' } },
       timeoutMs: 70_000, execute: (args, exec) => bridge('remote_mcp_call', args, exec),
