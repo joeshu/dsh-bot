@@ -33,14 +33,14 @@ npm test
 ```bash
 brew install xcodegen
 bash scripts/build-unsigned-ipa.sh
-# 产物位于 dist/DS-Bot-iOS-Standalone-v1.8.2-dsh0.2.2-rc.5-unsigned.ipa
+# 产物位于 dist/DS-Bot-iOS-Standalone-v0.1.0-dsh0.2.2-rc.5-unsigned.ipa
 ```
 
 ### 4. 生成 SideStore / AltStore 订阅源
 ```bash
 node scripts/generate-sidestore-source.mjs \
   --repo <owner>/<repo> \
-  --tag v1.8.2 \
-  --ipa dist/DS-Bot-iOS-Standalone-v1.8.2-dsh0.2.2-rc.5-unsigned.ipa \
+  --tag v0.1.0 \
+  --ipa dist/DS-Bot-iOS-Standalone-v0.1.0-dsh0.2.2-rc.5-unsigned.ipa \
   --out dist/source.json
 ```

@@ -2,7 +2,7 @@
 // Generates an AltStore / SideStore compatible `source.json` feed for the standalone unsigned IPA.
 // Usage:
 //   node scripts/generate-sidestore-source.mjs \
-//     --repo owner/repo --tag v1.8.2 --ipa dist/DS-Bot-iOS-Standalone-v1.8.2-dsh0.2.2-rc.5-unsigned.ipa --out dist/source.json
+//     --repo owner/repo --tag v0.1.0 --ipa dist/DS-Bot-iOS-Standalone-v0.1.0-dsh0.2.2-rc.5-unsigned.ipa --out dist/source.json
 
 import { readFileSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
@@ -55,7 +55,7 @@ export function buildSourceFeed({ repo, tag, ipaFilename, sizeBytes, dshVersion,
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  const repo = parseArg('--repo', 'joeshu/dsh-bot')
+  const repo = parseArg('--repo', 'joeshu/ds-bot-ios-standalone')
   const tag = parseArg('--tag', `v${pkg.version}`)
   const ipaPath = parseArg('--ipa', '')
   const outPath = parseArg('--out', join(rootDir, 'dist/source.json'))

@@ -14,63 +14,25 @@ public struct JSExecutionResult: Equatable {
 /// - Runs pure-JS DSH plugin handlers and the `js_eval` agent tool safely inside an isolated `JSVirtualMachine`
 public final class JSCEmbeddedRuntime: @unchecked Sendable {
     private let queue = DispatchQueue(label: "io.github.dsbot.jsc.runtime")
-    private let lock = NSLock()
-    private var runaway = 0
-    private static let maxRunaway = 2
-    private static let maxOutputBytes = 262_144
 
     public init() {}
 
     /// Execute a JavaScript expression or pure-JS plugin snippet inside a fresh isolated `JSContext` with timeout isolation.
-    /// JavaScriptCore's public API cannot terminate a running script, so a timed-out worker may keep spinning;
-    /// the number of such workers is capped and further runs are refused until they finish.
     public func evaluate(script: String, globals: [String: Any] = [:], timeoutSeconds: TimeInterval = 8.0) -> JSExecutionResult {
         guard script.utf8.count <= 262_144 else {
             return JSExecutionResult(value: "", logs: [], error: "Script exceeds 256 KB safety limit.")
         }
-        lock.lock()
-        let blocked = runaway >= Self.maxRunaway
-        lock.unlock()
-        if blocked {
-            return JSExecutionResult(value: "", logs: [], error: "Too many unfinished JavaScript runs; restart the app to recover.")
-        }
-
         let sem = DispatchSemaphore(value: 0)
         var outcome: JSExecutionResult?
-        var timedOut = false
         let worker = DispatchQueue(label: "io.github.dsbot.jsc.eval.\(UUID().uuidString.prefix(6))", qos: .userInitiated)
-        worker.async { [self] in
-            let result = Self.runIsolated(script: script, globals: globals)
-            lock.lock()
-            if timedOut {
-                runaway -= 1
-            } else {
-                outcome = result
-            }
-            lock.unlock()
+        worker.async {
+            outcome = Self.runIsolated(script: script, globals: globals)
             sem.signal()
         }
         if sem.wait(timeout: .now() + max(0.5, timeoutSeconds)) == .timedOut {
-            lock.lock()
-            if outcome == nil {
-                timedOut = true
-                runaway += 1
-            }
-            lock.unlock()
-            if timedOut {
-                return JSExecutionResult(value: "", logs: [], error: "JavaScript execution timed out after \(Int(timeoutSeconds))s.")
-            }
+            return JSExecutionResult(value: "", logs: [], error: "JavaScript execution timed out after \(Int(timeoutSeconds))s.")
         }
-        lock.lock()
-        let final = outcome
-        lock.unlock()
-        guard var res = final else {
-            return JSExecutionResult(value: "", logs: [], error: "JavaScript execution returned no result.")
-        }
-        if res.value.utf8.count > Self.maxOutputBytes {
-            res = JSExecutionResult(value: String(res.value.prefix(Self.maxOutputBytes)), logs: res.logs, error: res.error)
-        }
-        return res
+        return outcome ?? JSExecutionResult(value: "", logs: [], error: "JavaScript execution returned no result.")
     }
 
     private static func runIsolated(script: String, globals: [String: Any]) -> JSExecutionResult {
