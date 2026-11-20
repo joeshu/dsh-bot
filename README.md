@@ -45,6 +45,8 @@ Runtime dependencies and licenses are recorded in `DSHRuntime/THIRD-PARTY-NOTICE
 
 ## Re-signing and device evidence
 
+For LCSign, import the unsigned IPA from the build artifact. For an upgrade test, keep the original bundle ID `io.github.dsbot.ios.standalone` and the same signing identity as the installed copy. Use the separate signed IPA's SHA-256 in the device evidence.
+
 Use a macOS keychain identity and a device provisioning profile that authorizes the original bundle ID. The helper validates the unsigned archive, signs the nested NodeMobile framework before the app, checks that both signatures use a certificate listed in the provisioning profile, and prints both checksums.
 
 ```bash
