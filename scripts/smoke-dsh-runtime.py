@@ -148,6 +148,55 @@ def check_plugin_restart(peer, workspace):
         raise AssertionError("Removed plugin is still active")
 
 
+def check_preparation_abort(peer, workspace):
+    name = "dsbot-pending-turn-fixture"
+    plugin = """
+import { access, writeFile } from 'node:fs/promises'
+import { setTimeout as delay } from 'node:timers/promises'
+export default {
+  inject: ['sessionPersistence'],
+  apply(ctx) {
+    const store = ctx.sessionPersistence
+    const original = store.stat.bind(store)
+    store.stat = async (id) => {
+      if (id === 'ios:preparation') {
+        await writeFile('preparation-entered', '')
+        for (let retry = 0; retry < 500; retry++) {
+          if (await access('preparation-release').then(() => true, () => false)) break
+          await delay(10)
+        }
+      }
+      return original(id)
+    }
+  }
+}
+"""
+    peer.request("plugins.install.local", plugin_fixture(workspace, name, plugin))
+    peer.request("runtime.restart")
+    request_id = peer.next_id
+    peer.next_id += 1
+    peer.send({"jsonrpc": "2.0", "id": request_id, "method": "chat.send", "params": {
+        "sessionId": "preparation", "turnId": "preparing-turn", "model": "deepseek-flash",
+        "apiBaseURL": "https://api.deepseek.com", "text": "must never be sent",
+    }})
+    deadline = time.monotonic() + 5
+    while not (workspace / "preparation-entered").exists():
+        if time.monotonic() > deadline:
+            raise AssertionError("The agent never entered the delayed preparation phase")
+        time.sleep(0.01)
+    try:
+        result = peer.request("chat.abort", {"turnId": "preparing-turn"})
+        assert result.get("aborted") is True, result
+    finally:
+        (workspace / "preparation-release").touch()
+    event = peer.wait_for_chat_done()
+    assert event["turnId"] == "preparing-turn" and event["status"] == "aborted", event
+    state = peer.request("session.history", {"sessionId": "preparation"})
+    assert not state.get("messages"), state
+    peer.request("plugins.remove", {"name": name})
+    peer.request("runtime.restart")
+
+
 def main():
     node = shutil.which("node")
     if not node or not ENTRY.is_file():
@@ -190,6 +239,7 @@ def main():
             if "https://api.deepseek.com" not in peer.credentials or "https://gateway.example/v1" not in peer.credentials:
                 raise AssertionError(f"Keychain bridge did not follow the selected endpoint: {peer.credentials}")
             check_plugin_restart(peer, workspace)
+            check_preparation_abort(peer, workspace)
             peer.request("agent.suspend")
             before = peer.request("session.history", {"sessionId": "smoke"})
             contents = [item["content"] for item in before.get("messages", [])]
@@ -206,7 +256,7 @@ def main():
             contents = [item["content"] for item in recovered.get("messages", [])]
             if contents != ["Durable DSH turn 0", "Durable DSH turn 1"]:
                 raise AssertionError(f"DSH session did not survive runtime restart: {contents}")
-            print("DSH 0.2.2-rc.5 runtime, IPC, credential bridge, endpoint update, plugin worker restart and rollback, and SQLite recovery passed")
+            print("DSH 0.2.2-rc.5 runtime, IPC, credential bridge, endpoint update, plugin restart, rollback, preparation abort, and SQLite recovery passed")
         finally:
             stop_runtime(peer, process)
 

@@ -49,7 +49,7 @@ const runtime = {
   suspended: false,
   shuttingDown: false,
   pluginMutationInProgress: false,
-  preparingTurn: false,
+  preparingTurn: undefined,
   profileRestartRequired: false,
 }
 let ctx
@@ -227,15 +227,19 @@ rpc.handle('agent.info', async () => runtimeInfo())
 rpc.handle('chat.send', async (params) => {
   if (runtime.preparingTurn || runtime.activeTurns.size) throw new Error('Another DSH turn is already running')
   if (runtime.pluginMutationInProgress || runtime.profileRestartRequired) throw new Error('The DSH profile is changing')
-  runtime.preparingTurn = true
-  try {
-    return await startTurn(params)
-  } finally {
-    runtime.preparingTurn = false
+  const preparation = {
+    turnId: String(params.turnId ?? ''),
+    botId: String(params.sessionId ?? ''),
+    cancelled: false,
   }
+  runtime.preparingTurn = preparation
+  preparation.finished = startTurn(params, preparation).finally(() => {
+    runtime.preparingTurn = undefined
+  })
+  return await preparation.finished
 })
 
-async function startTurn(params) {
+async function startTurn(params, preparation) {
   if (runtime.suspended) throw new Error('The DSH runtime is suspended')
   if (runtime.pluginMutationInProgress) throw new Error('The DSH profile is changing; try again when the plugin operation finishes')
   const botId = String(params.sessionId ?? '')
@@ -289,6 +293,10 @@ async function startTurn(params) {
     active.setToolsEnabled(toolsEnabled, params.subagentEnabled === true, webSearchEnabled)
   }
 
+  if (preparation.cancelled || runtime.suspended) {
+    rpc.notify('chat.done', { sessionId: botId, turnId, status: 'aborted' })
+    return { turnId, status: 'accepted', engine: 'node+dsh' }
+  }
   const userMessage = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })
   const turn = { turnId, botId, isGroup: params.isGroup === true, webSearchEnabled, done: false }
   runtime.activeTurns.set(id, turn)
@@ -334,7 +342,12 @@ async function drainAndDispose(id, active) {
 
 rpc.handle('chat.abort', async ({ turnId }) => {
   const item = [...runtime.activeTurns.entries()].find(([, active]) => active.turnId === turnId)
-  if (!item) return { aborted: false }
+  if (!item) {
+    const preparation = runtime.preparingTurn
+    if (!preparation || preparation.turnId !== turnId) return { aborted: false }
+    preparation.cancelled = true
+    return { aborted: true, sessionId: preparation.botId }
+  }
   const [id, activeTurn] = item
   const active = runtime.activeAgents.get(id)
   active?.agent.cancel({ kind: 'user' })
@@ -345,6 +358,11 @@ rpc.handle('chat.abort', async ({ turnId }) => {
 
 rpc.handle('agent.suspend', async () => {
   runtime.suspended = true
+  const preparation = runtime.preparingTurn
+  if (preparation) {
+    preparation.cancelled = true
+    await preparation.finished.catch(() => {})
+  }
   const cancelTools = []
   for (const [id, turn] of runtime.activeTurns) {
     runtime.activeAgents.get(id)?.agent.cancel({ kind: 'user' })
