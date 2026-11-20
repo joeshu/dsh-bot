@@ -444,9 +444,17 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
       binName: 'dsh', profileDir, installAnchor,
     })
     const embedded = await embeddedPackages()
-    return dependencies.filter((item) => item.bundle && !embedded.has(item.name)).map((item) => ({
-      name: item.name, version: item.version, enabled: !safeMode && runtime.profile.layers.some(({ packageName }) => packageName === item.name),
-    }))
+    return Promise.all(dependencies.filter((item) => item.bundle && !embedded.has(item.name) && packageName(item.name))
+      .map(async (item) => {
+        const enabled = !safeMode && runtime.profile.layers.some(({ packageName }) => packageName === item.name)
+        const manifestPath = join(profileDir, 'node_modules', ...item.name.split('/'), 'package.json')
+        const manifest = await readFile(manifestPath, 'utf8').then(JSON.parse).catch(() => ({}))
+        return {
+          name: item.name, version: item.version, enabled, desiredEnabled: item.enabled,
+          compatibility: manifest.dsh?.client?.platform === 'web' ? 'host-only' : (enabled ? 'verified' : 'unverified'),
+        }
+      }))
+
   }
 
   function validatePackageName(value) {

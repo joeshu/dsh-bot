@@ -33,7 +33,7 @@ public struct PluginManagerView: View {
             Form {
                 Section {
                     Label {
-                        Text("第三方插件由其作者维护，Fish Pocket 不审核插件代码。插件在本机 DSH Node 进程内运行，可访问应用沙盒和网络。只安装你信任的来源。")
+                        Text("第三方插件由其作者维护，DS Bot 不审核插件代码。插件在本机 DSH Node 进程内运行，可访问应用沙盒和网络。只安装你信任的来源。")
                             .font(.footnote)
                     } icon: {
                         Image(systemName: "exclamationmark.shield.fill")
@@ -139,16 +139,22 @@ public struct PluginManagerView: View {
                 ForEach(host.installedPlugins) { plugin in
                     VStack(alignment: .leading, spacing: 7) {
                         Toggle(isOn: Binding(
-                            get: { host.installedPlugins.first(where: { $0.id == plugin.id })?.enabled ?? plugin.enabled },
+                            get: { host.installedPlugins.first(where: { $0.id == plugin.id })?.desiredEnabled ?? plugin.desiredEnabled },
                             set: { value in Task { await host.setPluginEnabled(plugin, enabled: value) } }
                         )) {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(plugin.name).font(.subheadline.weight(.semibold))
-                                Text("版本 \(plugin.version) · 已验证 Host")
+                                if plugin.desiredEnabled && !plugin.enabled {
+                                    Text(host.isDSHRecoveryMode ? "恢复模式下未加载" : "等待生效")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Text("版本 \(plugin.version) · \(plugin.compatibilityLabel)")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
                         }
+                        .disabled(host.isDSHRecoveryMode && !plugin.desiredEnabled)
                         Button("卸载", role: .destructive) {
                             Task { await host.removePlugin(plugin) }
                         }

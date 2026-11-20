@@ -44,7 +44,17 @@ public struct DSHInstalledPlugin: Identifiable, Decodable, Equatable {
     public let name: String
     public let version: String
     public let enabled: Bool
+    public let desiredEnabled: Bool
+    public let compatibility: String
     public var id: String { name }
+
+    var compatibilityLabel: String {
+        switch compatibility {
+        case "host-only": return "仅 Host 功能"
+        case "verified": return "已验证"
+        default: return "待验证"
+        }
+    }
 }
 
 public struct ChatMessageItem: Identifiable, Codable, Equatable {
@@ -152,6 +162,7 @@ public final class LocalAgentHost: ObservableObject {
     @Published public private(set) var isLoadingPlugins = false
     @Published public private(set) var pluginCatalogTotal = 0
     @Published public private(set) var embeddedRuntimeLabel: String?
+    @Published public private(set) var isDSHRecoveryMode = false
     private var pluginCatalogRequest = UUID()
     private var pluginCatalogQuery = ""
     @Published public private(set) var activeTurnId: String?
@@ -686,8 +697,9 @@ public final class LocalAgentHost: ObservableObject {
         }
     }
 
-    private func showPluginRecovery() {
-        pluginStatus = "DSH 已进入恢复模式。可在插件页停用或卸载问题插件。"
+    private func updatePluginRecovery(_ enabled: Bool) {
+        isDSHRecoveryMode = enabled
+        if enabled { pluginStatus = "DSH 已进入恢复模式。可在插件页停用或卸载问题插件。" }
     }
 
     private func registerRuntimeBridge(on rpc: IPCChannel) async {
@@ -698,9 +710,7 @@ public final class LocalAgentHost: ObservableObject {
                   plugins.contains("dsh-agent-loop"),
                   plugins.contains("dsh-session"),
                   plugins.contains("dsbot-ios-sqlite-session-persistence") else { throw IPCFrameError.invalidJSON }
-            if params["safeMode"] as? Bool == true {
-                await self?.showPluginRecovery()
-            }
+            await self?.updatePluginRecovery(params["safeMode"] as? Bool == true)
             await self?.resolveRuntimeReadiness()
             return ["accepted": true]
         }
