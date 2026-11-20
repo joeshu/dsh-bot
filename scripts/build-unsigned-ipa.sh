@@ -104,8 +104,9 @@ fi
 
 # Gate D: Required privacy & sideload keys present in Info.plist
 PLIST_PATH="$STAGE_DIR/Payload/DSBotStandalone.app/Info.plist"
-echo "--- Built Info.plist keys ---"
-plutil -p "$PLIST_PATH" | grep -E "NSFaceIDUsageDescription|NSLocalNetworkUsageDescription|UIFileSharingEnabled|ITSAppUsesNonExemptEncryption" || echo "(none of the required keys found by plutil -p)"
+echo "--- Built Info.plist (full) ---"
+plutil -p "$PLIST_PATH" || echo "(plutil -p failed on $PLIST_PATH)"
+ls -la "$STAGE_DIR/Payload/DSBotStandalone.app/Info.plist"
 for key in NSFaceIDUsageDescription NSLocalNetworkUsageDescription UIFileSharingEnabled ITSAppUsesNonExemptEncryption; do
   if ! /usr/libexec/PlistBuddy -c "Print :$key" "$PLIST_PATH" >/dev/null 2>&1; then
     echo "::error::Missing required Info.plist key: $key"
