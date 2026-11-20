@@ -199,7 +199,7 @@ public struct PrivateBotLockOverlay: View {
                 .foregroundColor(DSTheme.warning)
             Text("隐私 Bot 已锁定")
                 .font(.title3.weight(.semibold))
-            Text("「\(botName)」独立隔离存储，需要通过 Face ID / 锁屏密码验证后查看。")
+            Text("「\(botName)」需要通过设备身份验证后查看。")
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)

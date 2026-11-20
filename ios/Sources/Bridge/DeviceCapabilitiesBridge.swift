@@ -5,7 +5,7 @@ import UserNotifications
 import UIKit
 #endif
 
-/// Zero-entitlement-conflict iOS native device capabilities bridge for Agents & installed DSH plugins.
+/// Native iOS device status for the local agent.
 /// Covers device status, clipboard, text-to-speech (AVSpeechSynthesizer), and local notifications.
 public final class DeviceCapabilitiesBridge: @unchecked Sendable {
     private let synthesizer = AVSpeechSynthesizer()

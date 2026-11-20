@@ -1,3 +1,4 @@
+import LocalAuthentication
 import SwiftUI
 
 // MARK: - 1. Long Reply Reading Pill (`2026-11-13-long-reply-reading.md`)
@@ -77,8 +78,12 @@ public struct LongReplyReadingPill: View {
 
 public struct SideChatSheet: View {
     @Environment(\.dismiss) private var dismiss
-    @ObservedObject var host: BareWorkletHost
-    let parentSessionId: String
+    @ObservedObject var host: LocalAgentHost
+    let model: String
+    @State private var status = ""
+    @State private var sending = false
+    @State private var request: Task<Void, Never>?
+    @State private var sideId: String?
     @State private var question = ""
     @State private var messages: [(role: String, text: String)] = []
 
@@ -107,6 +112,7 @@ public struct SideChatSheet: View {
                     .padding()
                 }
 
+                if !status.isEmpty { Text(status).font(.caption).foregroundStyle(.secondary) }
                 Divider()
                 HStack(spacing: 8) {
                     TextField("顺手问一句...", text: $question)
@@ -116,19 +122,35 @@ public struct SideChatSheet: View {
                         guard !q.isEmpty else { return }
                         messages.append((role: "You", text: q))
                         question = ""
-                        Task {
-                            if let res = try? await host.rpc()?.request("side.ask", params: ["parentSessionId": parentSessionId, "question": q, "apiBaseURL": host.apiBaseURL]),
-                               let reply = res["reply"] as? String {
+                        status = ""
+                        sending = true
+                        let id = UUID().uuidString
+                        sideId = id
+                        request = Task {
+                            defer { sending = false }
+                            do {
+                                guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
+                                let response = try await rpc.request("side.ask", params: [
+                                    "model": model, "question": q, "apiBaseURL": host.apiBaseURL, "sideId": id
+                                ], timeoutSeconds: 95)
+                                guard let reply = response["reply"] as? String else { throw ModelProviderError.invalidResponse }
                                 messages.append((role: "Side", text: reply))
+                            } catch {
+                                if !Task.isCancelled { status = error.localizedDescription }
                             }
                         }
                     }
+                    .disabled(sending)
                     .buttonStyle(.borderedProminent)
                 }
                 .padding()
             }
             .scrollDismissesKeyboard(.interactively)
-            .navigationTitle("Side Chat (/side)")
+            .navigationTitle("侧边对话")
+            .onDisappear {
+                request?.cancel()
+                if let sideId { Task { _ = try? await host.rpc()?.request("side.cancel", params: ["sideId": sideId]) } }
+            }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -143,7 +165,7 @@ public struct SideChatSheet: View {
 
 public struct GroupWorkspaceSheet: View {
     @Environment(\.dismiss) private var dismiss
-    @ObservedObject var host: BareWorkletHost
+    @ObservedObject var host: LocalAgentHost
     let groupId: String
     @State private var newTodoText = ""
     @State private var todos: [(id: String, text: String, done: Bool)] = []
@@ -234,79 +256,96 @@ public struct GroupWorkspaceSheet: View {
 // MARK: - 4. 4-Layer Memory & Reversible Journal View
 
 public struct MemoryVaultView: View {
-    @ObservedObject var host: BareWorkletHost
+    @ObservedObject var host: LocalAgentHost
     let botId: String
-    @State private var journal: [(id: String, op: String, entryId: String, title: String, content: String, layer: String, at: String)] = []
+    private struct Record: Identifiable {
+        let id: String
+        let title: String
+        let content: String
+        let layer: String
+
+        init?(_ raw: [String: Any]) {
+            guard let id = raw["journalId"] as? String else { return nil }
+            self.id = id
+            title = raw["title"] as? String ?? "未命名记忆"
+            content = raw["content"] as? String ?? ""
+            layer = raw["layer"] as? String ?? ""
+        }
+    }
+
+    @State private var journal: [Record] = []
+    @State private var legacy: [Record] = []
+    @State private var showsLegacy = false
     @State private var status = ""
     @State private var showAddMemory = false
     @State private var newMemTitle = ""
     @State private var newMemContent = ""
     @State private var newMemLayer = "pinned"
+    @Environment(\.scenePhase) private var phase
 
     public var body: some View {
         List {
-            Section("四层记忆说明") {
-                Text("支持常驻（Pinned）、增量（Delta）、自动召回（Recall）与按需（On-Demand）四层读取，所有变更均写入可逆账本。")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+            Section("当前 Bot") {
+                if journal.isEmpty { Text("暂无记忆记录").foregroundStyle(.secondary) }
+                ForEach(journal) { row in
+                    HStack {
+                        memoryRow(row)
+                        Spacer()
+                        Button("撤销", role: .destructive) {
+                            Task { await mutate("memory.undo", id: row.id) }
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
             }
-            Section("更改记录（支持单条撤销）") {
-                if journal.isEmpty {
-                    Text("暂无记忆变更记录").font(.caption).foregroundColor(.secondary)
+            Section("升级前的记忆") {
+                if !showsLegacy {
+                    Button("验证设备身份并查看") {
+                        Task {
+                            let context = LAContext()
+                            do {
+                                guard try await context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "查看升级前的记忆") else { return }
+                                showsLegacy = true
+                                await reload()
+                            } catch { status = "无法验证设备身份。" }
+                        }
+                    }
                 } else {
-                    ForEach(journal, id: \.id) { row in
+                    Text("选择归属后，这条记忆将移到当前 Bot。常驻记忆会随请求发给模型服务。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if legacy.isEmpty { Text("暂无未归属记忆").foregroundStyle(.secondary) }
+                    ForEach(legacy) { row in
                         HStack {
-                            VStack(alignment: .leading, spacing: 3) {
-                                HStack(spacing: 6) {
-                                    Text(row.title.isEmpty ? "\(row.op.uppercased()) · \(row.entryId)" : row.title)
-                                        .font(.subheadline.weight(.medium))
-                                    if !row.layer.isEmpty {
-                                        DSStatusBadge(row.layer, color: row.layer == "pinned" ? DSTheme.brand : .secondary)
-                                    }
-                                }
-                                if !row.content.isEmpty {
-                                    Text(row.content).font(.caption).foregroundColor(.secondary).lineLimit(2)
-                                }
-                                Text("\(row.op.uppercased()) · \(row.at)").font(.caption2).foregroundColor(.secondary)
-                            }
+                            memoryRow(row)
                             Spacer()
-                            if row.op != "undo" {
-                                Button("撤销") {
-                                    Task {
-                                        _ = try? await host.rpc()?.request("memory.undo", params: ["botId": botId, "journalId": row.id])
-                                        status = "已撤销记录 \(row.id)"
-                                        await reload()
-                                    }
-                                }
+                            Button("分配给当前 Bot") { Task { await mutate("memory.assign", id: row.id) } }
                                 .buttonStyle(.bordered)
-                            }
                         }
                     }
                 }
             }
-            if !status.isEmpty {
-                Section("状态") { Text(status).font(.caption).foregroundColor(.secondary) }
-            }
+            if !status.isEmpty { Section("状态") { Text(status).font(.caption) } }
         }
         .refreshable { await reload() }
-        .navigationTitle("四层记忆与撤销")
+        .navigationTitle("记忆")
+        .onChange(of: phase) { phase in
+            if phase == .background { showsLegacy = false; legacy = [] }
+        }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Button { showAddMemory = true } label: { Image(systemName: "plus") }
+                Button { showAddMemory = true } label: { Label("新增", systemImage: "plus") }
             }
         }
         .sheet(isPresented: $showAddMemory) {
             NavigationStack {
                 Form {
                     TextField("记忆标题", text: $newMemTitle)
-                    Picker("记忆层级", selection: $newMemLayer) {
-                        Text("常驻 (Pinned)").tag("pinned")
-                        Text("增量 (Delta)").tag("delta")
-                        Text("自动召回 (Recall)").tag("recall")
-                        Text("按需 (On-Demand)").tag("on_demand")
+                    Picker("用途", selection: $newMemLayer) {
+                        Text("常驻 · 随聊天发送给模型").tag("pinned")
+                        Text("手动查阅 · 仅本机").tag("delta")
                     }
-                    TextField("记忆内容", text: $newMemContent, axis: .vertical)
-                        .lineLimit(3...6)
+                    TextField("记忆内容", text: $newMemContent, axis: .vertical).lineLimit(3...6)
+                    if !status.isEmpty { Text(status).font(.caption) }
                 }
                 .navigationTitle("新增记忆")
                 .navigationBarTitleDisplayMode(.inline)
@@ -315,16 +354,17 @@ public struct MemoryVaultView: View {
                     ToolbarItem(placement: .topBarTrailing) {
                         Button("保存") {
                             Task {
-                                _ = try? await host.rpc()?.request("memory.add", params: [
-                                    "botId": botId,
-                                    "title": newMemTitle,
-                                    "content": newMemContent,
-                                    "layer": newMemLayer
-                                ])
-                                newMemTitle = ""
-                                newMemContent = ""
-                                showAddMemory = false
-                                await reload()
+                                do {
+                                    guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
+                                    _ = try await rpc.request("memory.add", params: [
+                                        "botId": botId, "title": newMemTitle, "content": newMemContent, "layer": newMemLayer
+                                    ])
+                                    newMemTitle = ""
+                                    newMemContent = ""
+                                    showAddMemory = false
+                                    status = ""
+                                    await reload()
+                                } catch { status = error.localizedDescription }
                             }
                         }
                         .disabled(newMemTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -335,34 +375,45 @@ public struct MemoryVaultView: View {
         .task { await reload() }
     }
 
-    private func reload() async {
-        guard let res = try? await host.rpc()?.request("memory.journal", params: ["botId": botId]) else { return }
-        let raw = res["records"] as? [[String: Any]] ?? []
-        journal = raw.compactMap { d in
-            guard let id = d["journalId"] as? String, let op = d["op"] as? String else { return nil }
-            return (
-                id: id,
-                op: op,
-                entryId: d["entryId"] as? String ?? "",
-                title: d["title"] as? String ?? "",
-                content: d["content"] as? String ?? "",
-                layer: d["layer"] as? String ?? "",
-                at: d["at"] as? String ?? ""
-            )
+    private func memoryRow(_ row: Record) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(row.title)
+            if row.layer == "pinned" { Text("常驻").font(.caption2).foregroundStyle(.secondary) }
+            Text(row.content).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
         }
+    }
+
+    private func mutate(_ method: String, id: String) async {
+        do {
+            guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
+            let result = try await rpc.request(method, params: ["botId": botId, "journalId": id])
+            status = (result["assigned"] as? Bool == true || result["undone"] as? Bool == true) ? "" : "这条记忆已变更。"
+            await reload()
+        } catch { status = error.localizedDescription }
+    }
+
+    private func reload() async {
+        do {
+            guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
+            let current = try await rpc.request("memory.journal", params: ["botId": botId])
+            journal = (current["records"] as? [[String: Any]] ?? []).compactMap(Record.init)
+            if showsLegacy {
+                let previous = try await rpc.request("memory.legacy")
+                if showsLegacy { legacy = (previous["records"] as? [[String: Any]] ?? []).compactMap(Record.init) }
+            }
+        } catch { status = error.localizedDescription }
     }
 }
 
 // MARK: - 5. Universal Connectors & Token Usage Dashboard
 
 public struct ConnectorsAndUsageView: View {
-    @ObservedObject var host: BareWorkletHost
+    @ObservedObject var host: LocalAgentHost
     @State private var totalTokens = 0
     @State private var cacheHitRate = 0.0
     @State private var connectorName = ""
     @State private var connectorEndpoint = ""
     @State private var connectorToken = ""
-    @State private var connectorType = "remote-mcp"
     @State private var connectors: [(id: String, type: String, name: String, endpoint: String)] = []
     @State private var mcpStatus = ""
 
@@ -373,12 +424,7 @@ public struct ConnectorsAndUsageView: View {
                 LabeledContent("Prompt 缓存命中率", value: String(format: "%.1f%%", cacheHitRate * 100))
             }
 
-            Section("添加通用连接器（凭据仅存 Keychain）") {
-                Picker("类型", selection: $connectorType) {
-                    Text("Remote MCP").tag("remote-mcp")
-                    Text("GitHub").tag("github")
-                    Text("邮箱 (IMAP/SMTP)").tag("mail")
-                }
+            Section("添加 Remote MCP 连接器") {
                 TextField("名称（如 Office MCP）", text: $connectorName)
                 TextField("Endpoint / URL", text: $connectorEndpoint)
                     .textInputAutocapitalization(.never)
@@ -387,20 +433,18 @@ public struct ConnectorsAndUsageView: View {
                 Button("保存连接器") {
                     guard !connectorName.isEmpty else { return }
                     Task {
-                        if let res = try? await host.rpc()?.request("connectors.upsert", params: [
-                            "type": connectorType,
-                            "name": connectorName,
-                            "endpoint": connectorEndpoint
-                        ]), let conn = res["connector"] as? [String: Any], let cid = conn["id"] as? String {
-                            let tok = connectorToken.trimmingCharacters(in: .whitespacesAndNewlines)
-                            if !tok.isEmpty {
-                                _ = try? KeychainBridge().setSecret(account: "connector:\(cid)", value: tok)
-                            }
-                        }
-                        connectorName = ""
-                        connectorEndpoint = ""
-                        connectorToken = ""
-                        await reload()
+                        do {
+                            guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
+                            _ = try await rpc.request("connectors.upsert", params: [
+                                "name": connectorName, "endpoint": connectorEndpoint,
+                                "token": connectorToken.trimmingCharacters(in: .whitespacesAndNewlines)
+                            ])
+                            connectorName = ""
+                            connectorEndpoint = ""
+                            connectorToken = ""
+                            mcpStatus = ""
+                            await reload()
+                        } catch { mcpStatus = error.localizedDescription }
                     }
                 }
             }
@@ -417,12 +461,12 @@ public struct ConnectorsAndUsageView: View {
                             if c.type == "remote-mcp" {
                                 Button("发现工具") {
                                     Task {
-                                        if let res = try? await host.rpc()?.request("mcp.listTools", params: ["endpoint": c.endpoint, "keychainAccount": "connector:\(c.id)"]) {
-                                            let tools = res["tools"] as? [[String: Any]] ?? []
-                                            mcpStatus = (res["ok"] as? Bool == true)
-                                                ? "\(c.name)：已发现 \(tools.count) 个远程工具"
-                                                : "连接失败：\(res["error"] as? String ?? "未知错误")"
-                                        }
+                                        do {
+                                            guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
+                                            let result = try await rpc.request("mcp.listTools", params: ["connectorId": c.id], timeoutSeconds: 180)
+                                            let tools = result["tools"] as? [[String: Any]] ?? []
+                                            mcpStatus = "\(c.name)：已发现 \(tools.count) 个远程工具"
+                                        } catch { mcpStatus = error.localizedDescription }
                                     }
                                 }
                                 .buttonStyle(.bordered)
@@ -432,9 +476,11 @@ public struct ConnectorsAndUsageView: View {
                         .swipeActions(edge: .trailing) {
                             Button("删除", role: .destructive) {
                                 Task {
-                                    _ = try? await host.rpc()?.request("connectors.delete", params: ["id": c.id])
-                                    _ = try? KeychainBridge().deleteSecret(account: "connector:\(c.id)")
-                                    await reload()
+                                    do {
+                                        guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
+                                        _ = try await rpc.request("connectors.delete", params: ["id": c.id])
+                                        await reload()
+                                    } catch { mcpStatus = error.localizedDescription }
                                 }
                             }
                         }
@@ -523,17 +569,17 @@ public struct WidgetBlueprintCardView: View {
 }
 
 
-// MARK: - 7. On-Device JavaScriptCore Sandbox Playground
+// MARK: - 7. On-Device QuickJS Sandbox Playground
 
 public struct JSSandboxPlaygroundView: View {
-    @ObservedObject var host: BareWorkletHost
+    @ObservedObject var host: LocalAgentHost
     @State private var script = "const items = [12, 28, 45];\nconsole.log('count:', items.length);\n({ sum: items.reduce((a,b)=>a+b, 0) })"
     @State private var output = ""
     @State private var deviceInfo = ""
 
     public var body: some View {
         Form {
-            Section("JavaScriptCore 离线沙盒（免 JIT / 零体积增量）") {
+            Section("QuickJS 离线沙盒（免 JIT / 零体积增量）") {
                 TextEditor(text: $script)
                     .font(.caption.monospaced())
                     .frame(minHeight: 110)

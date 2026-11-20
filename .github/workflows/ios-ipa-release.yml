@@ -1,0 +1,115 @@
+name: iOS Native Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Stage a tested candidate or promote its exact IPA
+        type: choice
+        options: [stage, promote]
+        required: true
+      candidate_run:
+        description: Successful iOS Native IPA run ID from main
+        required: true
+        type: string
+      ipa_sha256:
+        description: Candidate IPA SHA-256
+        required: true
+        type: string
+      device_verification:
+        description: 'Promote only: SideStore and AltStore Classic versions, device/iOS, upgrade, chat and tool results'
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: native-ios-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CANDIDATE_RUN: ${{ inputs.candidate_run }}
+      IPA_SHA256: ${{ inputs.ipa_sha256 }}
+      OPERATION: ${{ inputs.operation }}
+      DEVICE_VERIFICATION: ${{ inputs.device_verification }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve a successful main-branch build
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_RUN" =~ ^[0-9]+$ ]]
+          [[ "$IPA_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          RUN="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN")"
+          jq -e --arg repo "$GITHUB_REPOSITORY" '
+            .path == ".github/workflows/ios-ipa-build.yml" and .head_repository.full_name == $repo
+            and .head_branch == "main" and .conclusion == "success"
+            and (.event == "push" or .event == "workflow_dispatch")
+          ' <<<"$RUN" > /dev/null
+          echo "CANDIDATE_COMMIT=$(jq -r .head_sha <<<"$RUN")" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: dsbot-native-ios-candidate
+          path: candidate
+          run-id: ${{ inputs.candidate_run }}
+          github-token: ${{ github.token }}
+      - name: Verify and release the archived candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          IPAS=(candidate/*.ipa)
+          [[ "${#IPAS[@]}" == 1 ]]
+          IPA="${IPAS[0]}"
+          python3 scripts/verify-unsigned-ipa.py "$IPA" > "$RUNNER_TEMP/current-report.json"
+          jq -e --arg hash "$IPA_SHA256" '.sha256 == $hash' "$RUNNER_TEMP/current-report.json" > /dev/null
+          jq -e --arg commit "$CANDIDATE_COMMIT" --slurpfile current "$RUNNER_TEMP/current-report.json" \
+            '.commit == $commit and del(.commit) == $current[0]' candidate/ipa-report.json > /dev/null
+          (cd candidate && sha256sum -c SHA256SUMS.txt)
+          TAG="v$(jq -r .version candidate/ipa-report.json)"
+          NAME="$(basename "$IPA")"
+          test "$NAME" = "DS-Bot-iOS-Standalone-$TAG-unsigned.ipa"
+          IPA_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$NAME"
+          ICON_URL="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$CANDIDATE_COMMIT/ios/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon.png"
+          jq -e --slurpfile report candidate/ipa-report.json --arg url "$IPA_URL" --arg icon "$ICON_URL" '
+            $report[0] as $r | .apps[0] as $a | $a.versions[0] as $v |
+            $a.iconURL == $icon and $a.bundleIdentifier == $r.bundleIdentifier and $a.appPermissions.privacy == $r.privacy
+            and $v.version == $r.version and $v.minOSVersion == $r.minOSVersion
+            and $v.size == $r.size and $v.sha256 == $r.sha256 and $v.downloadURL == $url
+          ' candidate/source.json > /dev/null
+          curl --fail --location --retry 2 -o /dev/null "$ICON_URL"
+
+          if [[ "$OPERATION" == stage ]]; then
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "Release $TAG already exists. Use a new version for different assets." >&2
+              exit 1
+            fi
+            if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+              echo "Tag $TAG already exists." >&2
+              exit 1
+            fi
+            gh release create "$TAG" "$IPA" candidate/ipa-report.json candidate/SHA256SUMS.txt candidate/source.json \
+              --target "$CANDIDATE_COMMIT" --title "DS Bot iOS $TAG" --prerelease --latest=false \
+              --notes "Swift 原生 iOS 候选版。真机侧载、升级和工具调用验证通过后转为正式版。"
+          else
+            [[ -n "${DEVICE_VERIFICATION//[[:space:]]/}" ]]
+            [[ "$(gh release view "$TAG" --json isPrerelease --jq .isPrerelease)" == true ]]
+            [[ "$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)" == "$CANDIDATE_COMMIT" ]]
+            mkdir "$RUNNER_TEMP/published"
+            gh release download "$TAG" --dir "$RUNNER_TEMP/published"
+            for file in "$NAME" ipa-report.json SHA256SUMS.txt source.json; do
+              cmp "candidate/$file" "$RUNNER_TEMP/published/$file"
+            done
+            {
+              printf 'Swift 原生 iOS 版，提供流式对话、端侧工具与 Remote MCP。\n\n'
+              printf '验证记录\n\n%s\n\nIPA SHA-256\n\n%s\n' "$DEVICE_VERIFICATION" "$IPA_SHA256"
+            } > "$RUNNER_TEMP/release-notes.md"
+            gh release edit "$TAG" --prerelease=false --latest --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi

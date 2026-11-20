@@ -1,6 +1,7 @@
 import Foundation
 import LocalAuthentication
 import Security
+import CryptoKit
 
 public enum KeychainBridgeError: Error, LocalizedError {
     case authenticationFailed
@@ -46,6 +47,8 @@ public final class KeychainBridge: Sendable {
                     localizedReason: "Authenticate to access DS Bot credentials."
                 )
                 guard ok else { throw KeychainBridgeError.authenticationFailed }
+            } else {
+                throw KeychainBridgeError.authenticationFailed
             }
         }
 
@@ -76,7 +79,9 @@ public final class KeychainBridge: Sendable {
             kSecAttrService as String: service,
             kSecAttrAccount as String: safeAccount
         ]
-        SecItemDelete(query as CFDictionary)
+        let update = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if update == errSecSuccess { return ["ok": true] }
+        guard update == errSecItemNotFound else { throw KeychainBridgeError.osStatus(update) }
 
         var attrs = query
         attrs[kSecValueData as String] = data
@@ -100,5 +105,30 @@ public final class KeychainBridge: Sendable {
             throw KeychainBridgeError.osStatus(status)
         }
         return ["ok": true]
+    }
+}
+
+extension KeychainBridge {
+    private func modelAccount(_ provider: ModelProvider) -> String {
+        let digest = SHA256.hash(data: Data(provider.baseURL.absoluteString.utf8))
+        return "model:" + digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    func saveModelKey(_ value: String, provider: ModelProvider) throws {
+        _ = try setSecret(account: modelAccount(provider), value: value)
+    }
+
+    func modelKey(provider: ModelProvider, migrateOfficialKey: Bool) async throws -> String {
+        if let value = try await getSecret(account: modelAccount(provider), requireBiometrics: false)["value"] as? String,
+           !value.isEmpty {
+            return value
+        }
+        if provider.isDeepSeek, migrateOfficialKey,
+           let value = try await getSecret(account: "deepseek_api_key", requireBiometrics: false)["value"] as? String,
+           !value.isEmpty {
+            try saveModelKey(value, provider: provider)
+            return value
+        }
+        throw ModelProviderError.missingKey
     }
 }

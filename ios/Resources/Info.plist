@@ -32,9 +32,9 @@
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
-	<true/>
+	<false/>
 	<key>NSFaceIDUsageDescription</key>
-	<string>DS Bot uses Face ID to protect API keys and approve sensitive agent actions.</string>
+	<string>DS Bot uses device authentication to unlock private conversations and older memories.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>DS Bot connects to local MCP servers or self-hosted endpoints on your network.</string>
 	<key>UIApplicationSceneManifest</key>
@@ -43,7 +43,7 @@
 		<false/>
 	</dict>
 	<key>UIFileSharingEnabled</key>
-	<true/>
+	<false/>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

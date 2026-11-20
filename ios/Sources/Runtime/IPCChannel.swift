@@ -51,7 +51,7 @@ public final class IPCFrameDecoder {
 
         while buffer.count >= 4 {
             let length = buffer.prefix(4).withUnsafeBytes { raw -> Int in
-                let val = raw.load(as: UInt32.self)
+                let val = raw.loadUnaligned(as: UInt32.self)
                 return Int(UInt32(bigEndian: val))
             }
             guard length > 0 && length <= IPCFrameCodec.maxFrameBytes else {
@@ -73,19 +73,20 @@ public final class IPCFrameDecoder {
     }
 }
 
-/// Transport abstraction implemented by BareKit (`Bare.IPC`) in production and loopback in XCTest.
+/// Transport abstraction for the native agent and its tests.
 public protocol IPCByteTransport: AnyObject {
     func write(_ data: Data)
     func setReceiveHandler(_ handler: @escaping (Data) -> Void)
     func close()
 }
 
-/// Async/await JSON-RPC 2.0 client/server endpoint for SwiftUI Shell <-> DSH Kernel.
+/// Async/await JSON-RPC 2.0 endpoint for the app and native agent.
 public actor IPCChannel {
     private let transport: IPCByteTransport
     private let decoder = IPCFrameDecoder()
     private var nextId = 1
     private var pending: [Int: CheckedContinuation<[String: Any], Error>] = [:]
+    private var deadlines: [Int: Task<Void, Never>] = [:]
     private var requestHandlers: [String: ([String: Any]) async throws -> [String: Any]] = [:]
     private var notificationHandlers: [UUID: (String, [String: Any]) -> Void] = [:]
     private var isClosed = false
@@ -125,20 +126,29 @@ public actor IPCChannel {
         notificationHandlers.removeValue(forKey: id)
     }
 
-    public func request(_ method: String, params: [String: Any] = [:]) async throws -> [String: Any] {
+    public func request(_ method: String, params: [String: Any] = [:], timeoutSeconds: UInt64 = 15) async throws -> [String: Any] {
         guard !isClosed else { throw IPCFrameError.channelClosed }
         let id = nextId
         nextId += 1
-        let frame = try IPCFrameCodec.encode([
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params
-        ])
-        return try await withCheckedThrowingContinuation { continuation in
-            pending[id] = continuation
-            transport.write(frame)
+        let frame = try IPCFrameCodec.encode(["jsonrpc": "2.0", "id": id, "method": method, "params": params])
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                guard !Task.isCancelled else { continuation.resume(throwing: CancellationError()); return }
+                pending[id] = continuation
+                deadlines[id] = Task { [weak self] in
+                    do { try await Task.sleep(nanoseconds: min(timeoutSeconds, 300) * 1_000_000_000) } catch { return }
+                    await self?.cancelRequest(id, error: IPCFrameError.timeout(method: method))
+                }
+                transport.write(frame)
+            }
+        } onCancel: {
+            Task { await self.cancelRequest(id, error: CancellationError()) }
         }
+    }
+
+    private func cancelRequest(_ id: Int, error: Error) {
+        deadlines.removeValue(forKey: id)?.cancel()
+        pending.removeValue(forKey: id)?.resume(throwing: error)
     }
 
     public func notify(_ method: String, params: [String: Any] = [:]) throws {
@@ -160,6 +170,8 @@ public actor IPCChannel {
             cont.resume(throwing: IPCFrameError.channelClosed)
         }
         pending.removeAll()
+        for deadline in deadlines.values { deadline.cancel() }
+        deadlines.removeAll()
     }
 
     private func handleIncomingData(_ data: Data) async {
@@ -183,6 +195,7 @@ public actor IPCChannel {
         // Response to outbound request
         if let id = msg["id"] as? Int, msg["method"] == nil {
             guard let cont = pending.removeValue(forKey: id) else { return }
+            deadlines.removeValue(forKey: id)?.cancel()
             if let errObj = msg["error"] as? [String: Any] {
                 let code = errObj["code"] as? Int ?? -32000
                 let message = errObj["message"] as? String ?? "Unknown IPC error"
@@ -203,7 +216,7 @@ public actor IPCChannel {
             return
         }
 
-        // Inbound request from DSH Kernel (e.g., bridge.sqlite.*, bridge.net.*, bridge.keychain.*)
+        // Inbound request from the transport.
         if let id = msg["id"] as? Int, let method = msg["method"] as? String {
             let params = msg["params"] as? [String: Any] ?? [:]
             guard let handler = requestHandlers[method] else {
