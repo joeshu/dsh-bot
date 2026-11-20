@@ -2,7 +2,7 @@ import SwiftUI
 
 @main
 public struct DSBotStandaloneApp: App {
-    @StateObject private var host = LocalAgentHost()
+    @StateObject private var host = LocalAgentHost.shared
     @Environment(\.scenePhase) private var scenePhase
 
     public init() {}

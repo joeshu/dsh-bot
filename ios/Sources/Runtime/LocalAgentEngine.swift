@@ -198,6 +198,13 @@ actor ToolApprovals {
         return true
     }
 
+    func cancel(sessionId: String, turnId: String) {
+        let matching = pending.compactMap { id, item in
+            item.sessionId == sessionId && item.turnId == turnId ? id : nil
+        }
+        matching.forEach { finish($0, approved: false) }
+    }
+
     private func finish(_ id: String, approved: Bool) {
         guard let item = pending.removeValue(forKey: id) else { return }
         item.timeout.cancel()
@@ -221,6 +228,7 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
     private let io = DispatchQueue(label: "io.github.dsbot.localagent.ipc")
     private let decoder = IPCFrameDecoder()
     private var receiver: ((Data) -> Void)?
+    private var nativeNotificationHandler: ((String, [String: Any]) -> Void)?
     private var turnTasks: [String: Task<Void, Never>] = [:]
     private var requestTasks: [Int: Task<Void, Never>] = [:]
     private var sideRequests: [String: Int] = [:]
@@ -241,6 +249,46 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
 
     public func setReceiveHandler(_ handler: @escaping (Data) -> Void) {
         io.async { if !self.closed { self.receiver = handler } }
+    }
+
+    func setNativeNotificationHandler(_ handler: @escaping (String, [String: Any]) -> Void) {
+        io.async { self.nativeNotificationHandler = handler }
+    }
+
+    /// Exposes only the pre-existing native workspace RPC allowlist. Chat and
+    /// agent lifecycle calls remain exclusively owned by the embedded DSH runtime.
+    func nativeWorkspaceRequest(method: String, params: [String: Any]) async throws -> [String: Any] {
+        let allowed: Set<String> = [
+            "models.test", "memory.add", "memory.journal", "memory.legacy", "memory.assign", "memory.undo",
+            "group.state", "group.goal.set", "group.todo.add", "group.todo.toggle", "group.todo.clearCompleted",
+            "connectors.list", "connectors.upsert", "connectors.delete", "usage.summary", "tools.jsEval",
+            "device.status", "device.speak", "device.stopSpeaking", "mcp.listTools", "mcp.callTool", "side.ask",
+            "approval.respond"
+        ]
+        guard allowed.contains(method) else {
+            throw IPCFrameError.remoteError(code: -32601, message: "Unsupported native workspace method: \(method)")
+        }
+        return try await handle(method: method, params: params)
+    }
+
+    func executeNativeTool(name: String, arguments: [String: Any], botId: String, turnId: String, isGroup: Bool) async throws -> [String: Any] {
+        guard ["js_eval", "device_status", "memory_save", "group_todo_add", "web_fetch", "remote_mcp_call"].contains(name) else {
+            throw IPCFrameError.remoteError(code: -32601, message: "Unsupported DSH native tool: \(name)")
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: arguments),
+              let encoded = String(data: data, encoding: .utf8) else {
+            throw IPCFrameError.invalidJSON
+        }
+        var call = ProviderMessage.ToolCall()
+        call.id = "dsh_\(UUID().uuidString)"
+        call.function.name = name
+        call.function.arguments = encoded
+        let output = try await execute(call, sessionId: botId, turnId: turnId, isGroup: isGroup, structuredWeb: name == "web_fetch")
+        return ["output": output]
+    }
+
+    func cancelNativeTool(botId: String, turnId: String) async {
+        await approvals.cancel(sessionId: botId, turnId: turnId)
     }
 
     public func write(_ data: Data) {
@@ -327,7 +375,7 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
         switch method {
         case "agent.info":
             return [
-                "engine": "swift",
+                "engine": "native-workspace-bridge",
                 "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
                 "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "",
                 "ipcProtocolVersion": IPCFrameCodec.protocolVersion,
@@ -556,7 +604,7 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
         throw ModelProviderError.interrupted
     }
 
-    private func execute(_ call: ProviderMessage.ToolCall, sessionId: String, turnId: String, isGroup: Bool) async throws -> String {
+    private func execute(_ call: ProviderMessage.ToolCall, sessionId: String, turnId: String, isGroup: Bool, structuredWeb: Bool = false) async throws -> String {
         let name = call.function.name
         guard let args = try JSONSerialization.jsonObject(with: Data(call.function.arguments.utf8)) as? [String: Any] else {
             return "Invalid tool arguments."
@@ -618,7 +666,8 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
                 guard let address else { return "Invalid URL." }
                 let (bytes, response) = try await session.bytes(from: address)
                 defer { bytes.task.cancel() }
-                try checkHTTP(response)
+                guard let http = response as? HTTPURLResponse else { throw ModelProviderError.invalidResponse }
+                if !structuredWeb { try checkHTTP(http) }
                 guard ["text/plain", "text/html"].contains(response.mimeType ?? "") else { return "Unsupported web content type." }
                 var data = Data()
                 for try await byte in bytes {
@@ -629,7 +678,13 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
                 let plain = String(decoding: data, as: UTF8.self)
                     .replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
                     .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-                return String(plain.prefix(12_000))
+                let content = String(plain.prefix(12_000))
+                if !structuredWeb { return content }
+                let result: [String: Any] = [
+                    "url": http.url?.absoluteString ?? address.absoluteString, "statusCode": http.statusCode,
+                    "body": ["kind": "text", "content": content], "truncated": plain.count > content.count
+                ]
+                return String(decoding: try JSONSerialization.data(withJSONObject: result), as: UTF8.self)
             default: return "Unsupported tool."
             }
         } catch {
@@ -697,7 +752,13 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
     }
 
     private func emit(_ method: String, _ params: [String: Any]) {
-        send(["jsonrpc": "2.0", "method": method, "params": params])
+        io.async {
+            if let handler = self.nativeNotificationHandler {
+                handler(method, params)
+            } else {
+                self.send(["jsonrpc": "2.0", "method": method, "params": params])
+            }
+        }
     }
 
     private func send(_ frame: [String: Any]) {

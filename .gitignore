@@ -19,6 +19,8 @@ ios/Resources/KernelAssets/
 
 # Generated native build dependencies and reports
 ios/Vendor/QuickJS/
+ios/Vendor/NodeMobile.xcframework/
+ios/Sources/Resources/DSHRuntime/
 dist/ipa-report.json
 
 # Generated subscription source

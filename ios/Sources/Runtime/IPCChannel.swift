@@ -77,7 +77,12 @@ public final class IPCFrameDecoder {
 public protocol IPCByteTransport: AnyObject {
     func write(_ data: Data)
     func setReceiveHandler(_ handler: @escaping (Data) -> Void)
+    func setCloseHandler(_ handler: @escaping () -> Void)
     func close()
+}
+
+public extension IPCByteTransport {
+    func setCloseHandler(_ handler: @escaping () -> Void) {}
 }
 
 /// Async/await JSON-RPC 2.0 endpoint for the app and native agent.
@@ -89,6 +94,7 @@ public actor IPCChannel {
     private var deadlines: [Int: Task<Void, Never>] = [:]
     private var requestHandlers: [String: ([String: Any]) async throws -> [String: Any]] = [:]
     private var notificationHandlers: [UUID: (String, [String: Any]) -> Void] = [:]
+    private var closeHandlers: [UUID: () -> Void] = [:]
     private var isClosed = false
     private let inboundContinuation: AsyncStream<Data>.Continuation
 
@@ -102,6 +108,9 @@ public actor IPCChannel {
         self.inboundContinuation = cont
         transport.setReceiveHandler { data in
             cont.yield(data)
+        }
+        transport.setCloseHandler { [weak self] in
+            Task { await self?.transportDidClose() }
         }
         Task { [weak self] in
             for await chunk in stream {
@@ -124,6 +133,14 @@ public actor IPCChannel {
 
     public func removeNotificationHandler(_ id: UUID) {
         notificationHandlers.removeValue(forKey: id)
+    }
+
+    @discardableResult
+    public func onClose(_ handler: @escaping () -> Void) -> UUID {
+        let id = UUID()
+        if isClosed { handler() }
+        else { closeHandlers[id] = handler }
+        return id
     }
 
     public func request(_ method: String, params: [String: Any] = [:], timeoutSeconds: UInt64 = 15) async throws -> [String: Any] {
@@ -172,6 +189,26 @@ public actor IPCChannel {
         pending.removeAll()
         for deadline in deadlines.values { deadline.cancel() }
         deadlines.removeAll()
+        notifyCloseHandlers()
+    }
+
+    private func transportDidClose() {
+        guard !isClosed else { return }
+        isClosed = true
+        inboundContinuation.finish()
+        for (_, continuation) in pending {
+            continuation.resume(throwing: IPCFrameError.channelClosed)
+        }
+        pending.removeAll()
+        for deadline in deadlines.values { deadline.cancel() }
+        deadlines.removeAll()
+        notifyCloseHandlers()
+    }
+
+    private func notifyCloseHandlers() {
+        let handlers = Array(closeHandlers.values)
+        closeHandlers.removeAll()
+        handlers.forEach { $0() }
     }
 
     private func handleIncomingData(_ data: Data) async {

@@ -105,15 +105,26 @@ export class IPCRpcEndpoint {
    * @param {number} [timeoutMs=30000]
    * @returns {Promise<any>}
    */
-  request(method, params = {}, timeoutMs = 30_000) {
+  request(method, params = {}, timeoutMs = 30_000, signal) {
     if (this.#closed) return Promise.reject(new Error('IPC endpoint is closed'))
+    if (signal?.aborted) return Promise.reject(signal.reason ?? new Error('IPC request aborted'))
     const id = this.#nextId++
     return new Promise((resolve, reject) => {
+      const abort = () => {
+        const entry = this.#pending.get(id)
+        if (!entry) return
+        clearTimeout(entry.timer)
+        signal?.removeEventListener('abort', abort)
+        this.#pending.delete(id)
+        reject(signal?.reason ?? new Error('IPC request aborted'))
+      }
       const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', abort)
         this.#pending.delete(id)
         reject(new Error(`IPC request timeout (${timeoutMs}ms): ${method}`))
       }, timeoutMs)
-      this.#pending.set(id, { resolve, reject, timer })
+      this.#pending.set(id, { resolve, reject, timer, signal, abort })
+      signal?.addEventListener('abort', abort, { once: true })
       this.#send({ jsonrpc: '2.0', id, method, params })
     })
   }
@@ -131,8 +142,9 @@ export class IPCRpcEndpoint {
   close(reason = new Error('IPC endpoint closed')) {
     if (this.#closed) return
     this.#closed = true
-    for (const { reject, timer } of this.#pending.values()) {
+    for (const { reject, timer, signal, abort } of this.#pending.values()) {
       clearTimeout(timer)
+      signal?.removeEventListener('abort', abort)
       reject(reason)
     }
     this.#pending.clear()
@@ -161,6 +173,7 @@ export class IPCRpcEndpoint {
       const entry = this.#pending.get(msg.id)
       if (!entry) return
       clearTimeout(entry.timer)
+      entry.signal?.removeEventListener('abort', entry.abort)
       this.#pending.delete(msg.id)
       if (msg.error) {
         const err = new Error(msg.error.message || 'IPC remote error')

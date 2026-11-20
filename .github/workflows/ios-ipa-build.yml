@@ -4,14 +4,23 @@ on:
   push:
     paths:
       - 'ios/**'
+      - 'kernel/runtime/**'
+      - 'kernel/src/**'
       - 'scripts/**'
       - '.github/workflows/ios-ipa-build.yml'
   pull_request:
     paths:
       - 'ios/**'
+      - 'kernel/runtime/**'
+      - 'kernel/src/**'
       - 'scripts/**'
       - '.github/workflows/ios-ipa-build.yml'
   workflow_dispatch:
+    inputs:
+      build_security_runtime:
+        description: Build the full NodeMobile 24.22.3 runtime from source
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -19,13 +28,18 @@ permissions:
 jobs:
   candidate:
     runs-on: macos-26
-    timeout-minutes: 35
+    timeout-minutes: 150
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
       DSBOT_REPOSITORY: ${{ github.repository }}
       DSBOT_COMMIT: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+      - name: Pin npm for the runtime lockfile
+        run: npm install --global npm@11.9.0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -42,10 +56,20 @@ jobs:
           xcodebuild -version
       - name: Check IPA verification regressions
         run: python3 -m unittest discover -s scripts/tests
+      - name: Compile the security NodeMobile framework
+        if: github.event_name == 'workflow_dispatch' && inputs.build_security_runtime
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/node-mobile-security.zip"
+          bash scripts/build-node-mobile-security-ios.sh "$archive"
+          echo "DSBOT_SECURITY_NODE_ARCHIVE=$archive" >> "$GITHUB_ENV"
+          echo "DSBOT_SECURITY_NODE_SHA256=$(shasum -a 256 "$archive" | cut -d' ' -f1)" >> "$GITHUB_ENV"
       - name: Build and verify the unsigned IPA
         env:
           DSBOT_OUT_DIR: ${{ runner.temp }}/dsbot-candidate
         run: bash scripts/build-unsigned-ipa.sh
+      - name: Smoke test DSH IPC and SQLite recovery
+        run: python3 scripts/smoke-dsh-runtime.py
       - name: Test the native runtime on iOS Simulator
         working-directory: ios
         run: |

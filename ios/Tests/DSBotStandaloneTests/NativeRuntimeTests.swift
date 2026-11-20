@@ -28,6 +28,30 @@ final class NativeRuntimeTests: XCTestCase {
         XCTAssertThrowsError(try ModelProvider("http://example.test/v1"))
     }
 
+    @MainActor
+    func testEmbeddedDSHRuntimeStartsInSimulator() async throws {
+        let host = LocalAgentHost.shared
+        if host.state == .idle { await host.boot() }
+        let deadline = Date().addingTimeInterval(60)
+        while host.state == .starting && Date() < deadline {
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        guard host.state == .ready, let channel = host.rpc() else {
+            throw IPCFrameError.remoteError(code: -32000, message: "The app's embedded DSH runtime did not become ready.")
+        }
+        let info = try await channel.request("agent.info", timeoutSeconds: 30)
+        _ = try await channel.request("session.list", timeoutSeconds: 30)
+        XCTAssertEqual(info["engine"] as? String, "node+dsh")
+        XCTAssertEqual(info["dshVersion"] as? String, "0.2.2-rc.5")
+        XCTAssertNotNil(info["nodeVersion"] as? String)
+        XCTAssertEqual(info["bootLifecycle"] as? String, "official-runProfile")
+        let plugins = Set(info["plugins"] as? [String] ?? [])
+        XCTAssertTrue(plugins.contains("dsh-agent"))
+        XCTAssertTrue(plugins.contains("dsbot-ios-sqlite-session-persistence"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: NodeRuntimeTransport.defaultWorkspace
+            .appendingPathComponent("dsh-sessions.sqlite").path))
+    }
+
     func testParserHandlesMultilineSSEAndKeepAlives() throws {
         var events = ServerSentEvents()
         let sample = "\u{FEFF}: keep alive\r\n"
@@ -54,7 +78,7 @@ final class NativeRuntimeTests: XCTestCase {
         let channel = IPCChannel(transport: transport)
         defer { Task { await channel.close() } }
         let info = try await channel.request("agent.info")
-        XCTAssertEqual(info["engine"] as? String, "swift")
+        XCTAssertEqual(info["engine"] as? String, "native-workspace-bridge")
         XCTAssertNil(info["dshVersion"])
         let added = try await channel.request("memory.add", params: [
             "botId": "private", "title": "Preference", "content": "Concise", "layer": "pinned"
@@ -130,33 +154,6 @@ final class NativeRuntimeTests: XCTestCase {
         XCTAssertFalse(wait.ok)
         let isolated = await runtime.evaluate("typeof fetch + ',' + typeof require + ',' + typeof process")
         XCTAssertEqual(isolated.value, "undefined,undefined,undefined")
-    }
-
-    @MainActor
-    func testProviderTranscriptReplaysReasoningAndToolResultsOnlyInOriginalProfile() throws {
-        let provider = try ModelProvider("")
-        let profile = provider.historyProfile(model: ModelProvider.thinkingModel, tools: true)
-        var assistant = ChatMessageItem(sessionId: "main", role: "assistant", content: "42")
-        assistant.providerProfile = profile
-        assistant.transcript = [
-            ProviderMessage(role: "assistant", content: nil, reasoning_content: "Calculate", tool_calls: [
-                .init(id: "call_one", function: .init(name: "js_eval", arguments: #"{"script":"6*7"}"#))
-            ]),
-            ProviderMessage(role: "tool", content: "42", tool_call_id: "call_one"),
-            ProviderMessage(role: "assistant", content: "42", reasoning_content: "Answer")
-        ]
-        let history = [
-            ChatMessageItem(sessionId: "main", role: "user", content: "6×7"),
-            assistant,
-            ChatMessageItem(sessionId: "main", role: "user", content: "Thanks")
-        ]
-        let replay = LocalAgentHost.providerHistory(history, provider: provider, model: ModelProvider.thinkingModel, tools: true)
-        XCTAssertEqual(replay.compactMap { $0["role"] as? String }, ["user", "assistant", "tool", "assistant", "user"])
-        XCTAssertEqual(replay[1]["reasoning_content"] as? String, "Calculate")
-        XCTAssertEqual(replay[2]["tool_call_id"] as? String, "call_one")
-        XCTAssertEqual(replay[3]["reasoning_content"] as? String, "Answer")
-        let switched = LocalAgentHost.providerHistory(history, provider: provider, model: ModelProvider.defaultModel, tools: true)
-        XCTAssertEqual(switched.compactMap { $0["role"] as? String }, ["user"])
     }
 
     func testOldBotAndMessageFilesDecode() throws {

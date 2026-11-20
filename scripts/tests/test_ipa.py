@@ -1,4 +1,6 @@
+import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import plistlib
 import stat
@@ -12,35 +14,153 @@ spec = importlib.util.spec_from_file_location("verify_ipa", SCRIPT)
 ipa = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ipa)
 
+PACKAGES = {
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh-agent": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-agent-loop": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-llm-deepseek": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-llm-deepseek-api-key": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-app-boot": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-official-bundles": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-http-proxy": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-cmdline": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-session": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-session-persistence": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-session-projection": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-tool-executor-native": "0.2.2-rc.5",
+}
+TOP_LEVEL = {
+    **PACKAGES,
+    "semver": "7.8.5",
+    "@dsbot/dsh-ios-profile": "file:./ios-profile-package",
+    "@dsbot/dsh-ios-host": "file:./ios-host-package",
+}
+
+
+def dylib_command(command, name):
+    raw = name.encode() + b"\0"
+    size = (24 + len(raw) + 7) & ~7
+    return struct.pack("<6I", command, size, 24, 0, 0, 0) + raw + b"\0" * (size - 24 - len(raw))
+
+
+def macho(file_type, platform, minos, extra_commands=b""):
+    build = struct.pack("<6I", 0x32, 24, platform, minos, 0, 0)
+    commands = build + extra_commands
+    header = struct.pack("<8I", 0xfeedfacf, 0x100000c, 0, file_type,
+                         1 + (len(extra_commands) > 0), len(commands), 0, 0)
+    return header + commands
+
 
 class IPARegressionTests(unittest.TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.path = Path(self.temp.name) / "DS-Bot-iOS-Standalone-v1.8.3-unsigned.ipa"
+        self.path = Path(self.temp.name) / "DS-Bot-iOS-Standalone-v1.9.0-unsigned.ipa"
 
     def make_ipa(self, *, platform=2, signature=False, executable=True, extra=None, sharing=False):
-        commands = struct.pack("<6I", 0x32, 24, platform, 0x100400, 0x1A0500, 0)
+        node_load = dylib_command(0xC, "@rpath/NodeMobile.framework/NodeMobile")
+        app_commands = struct.pack("<6I", 0x32, 24, platform, 0x100400, 0x1A0500, 0) + node_load
         if signature:
-            commands += struct.pack("<4I", 0x1D, 16, 0, 0)
-        binary = struct.pack("<8I", 0xfeedfacf, 0x100000c, 0, 2, 1 + signature, len(commands), 0, 0) + commands
-        plist = {
+            app_commands += struct.pack("<4I", 0x1D, 16, 0, 0)
+        app_binary = struct.pack("<8I", 0xfeedfacf, 0x100000c, 0, 2, 2 + signature, len(app_commands), 0, 0) + app_commands
+        node_binary = macho(6, 2, 0x000E0000, dylib_command(0xD, "@rpath/NodeMobile.framework/NodeMobile"))
+        profile_boot_entry_bytes = b"export { runProfile } from './profile-boot-QhDEDXsF.js';"
+        profile_boot_impl_bytes = b"export async function runProfile() {}"
+        app_boot_bytes = b'DS_BOT_IOS_HOST platforms.includes("ios")'
+        lock = json.dumps({
+            "name": "@dsbot/dsh-ios-runtime", "lockfileVersion": 3,
+            "packages": {"": {"dependencies": TOP_LEVEL}},
+        }, sort_keys=True).encode()
+        runtime = {
+            "dshVersion": "0.2.2-rc.5",
+            "dshSourceCommit": "9c2670d3bce5275e0d1610272958121af87787bb",
+            "nodeMinimumVersion": "24.9.0",
+            "nativePersistence": "node:sqlite DatabaseSync, WAL, synchronous=FULL",
+            "releaseEligible": False,
+            "launchLifecycle": "official @deepseek-ai/dsh/profile-boot runProfile() from 0.2.2-rc.5",
+            "officialProfileBoot": {
+                "npmPackage": "@deepseek-ai/dsh@0.2.2-rc.5", "export": "./profile-boot",
+                "desktopDependenciesExcluded": True, "license": "MIT",
+                "entrySha256": hashlib.sha256(profile_boot_entry_bytes).hexdigest(),
+                "implementationSha256": hashlib.sha256(profile_boot_impl_bytes).hexdigest(),
+            },
+            "iosPlatformLoaderPatch": {
+                "package": "@deepseek-ai/dsh-app-boot@0.2.2-rc.5",
+                "mapsIosHostToDarwinBundleDeclarations": True,
+                "sha256": hashlib.sha256(app_boot_bytes).hexdigest(),
+            },
+            "iosProfile": {"name": "dsbot-ios", "bundle": "@dsbot/dsh-ios-profile"},
+            "packageLockSha256": hashlib.sha256(lock).hexdigest(),
+            "topLevelPackages": TOP_LEVEL,
+            "enabledUpstreamPlugins": ["dsh-agent", "dsh-agent-loop", "dsh-session",
+                                       "dsh-session-projection", "dsh-llm", "dsh-llm-deepseek-api-key",
+                                       "dsh-system-prompt", "dsh-tools", "dsh-tool-executor-native"],
+            "iosHostAdapters": ["DSH SQLite SessionPersistence backed by node:sqlite",
+                                "iOS Keychain credentials provider",
+                                "DSH native tools bridged to iOS capabilities",
+                                "official DSH profile-boot runProfile lifecycle",
+                                "iOS profile bundle source discovery, install, enable, disable, and remove"],
+            "pluginSources": {
+                "indexFormat": 1,
+                "defaultSources": ["https://example.invalid/dsh-market.json", "https://example.invalid/dshfind.json"],
+                "installer": "exact NPM version, SHA-512 verified tarball, no lifecycle scripts",
+            },
+            "excludedCapabilities": ["dsh-base", "dsh-web-app", "dsh-shell", "dsh-terminal"],
+            "node": {"version": "24.22.1", "minimumReleaseVersion": "24.22.3", "releaseEligible": False, "devicePlatform": "iPhoneOS",
+                     "deviceArchitecture": "arm64", "deviceBinarySha256": hashlib.sha256(node_binary).hexdigest(),
+                     "releaseBlocker": "NodeMobile needs an updated release build."},
+        }
+        app_info = {
             "CFBundleExecutable": "DSBotStandalone", "CFBundleIdentifier": "io.github.dsbot.ios.standalone",
             "CFBundleDisplayName": "DS Bot", "CFBundlePackageType": "APPL", "CFBundleSupportedPlatforms": ["iPhoneOS"],
-            "CFBundleVersion": "26", "CFBundleShortVersionString": "1.8.3", "MinimumOSVersion": "16.4",
+            "CFBundleVersion": "27", "CFBundleShortVersionString": "1.9.0", "MinimumOSVersion": "16.4",
             "UIDeviceFamily": [1, 2], "UIFileSharingEnabled": sharing, "LSSupportsOpeningDocumentsInPlace": False,
             "ITSAppUsesNonExemptEncryption": False, "NSFaceIDUsageDescription": "Unlock private conversations.",
             "NSLocalNetworkUsageDescription": "Connect to a local service.",
         }
         base = "Payload/DSBotStandalone.app/"
+        framework = base + "Frameworks/NodeMobile.framework/"
         with ZipFile(self.path, "w") as archive:
-            app = ZipInfo(base + "DSBotStandalone")
-            app.create_system = 3
-            app.external_attr = (stat.S_IFREG | (0o755 if executable else 0o644)) << 16
-            archive.writestr(app, binary)
-            archive.writestr(base + "Info.plist", plistlib.dumps(plist, fmt=plistlib.FMT_BINARY))
+            executable_entry = ZipInfo(base + "DSBotStandalone")
+            executable_entry.create_system = 3
+            executable_entry.external_attr = (stat.S_IFREG | (0o755 if executable else 0o644)) << 16
+            archive.writestr(executable_entry, app_binary)
+            archive.writestr(base + "Info.plist", plistlib.dumps(app_info, fmt=plistlib.FMT_BINARY))
             archive.writestr(base + "Assets.car", b"asset")
             archive.writestr(base + "QuickJS-LICENSE.txt", b"NOTICE")
+            archive.writestr(base + "NodeMobile-LICENSE.txt", b"NOTICE")
+            archive.writestr(base + "DSHRuntime/runtime-manifest.json", json.dumps(runtime).encode())
+            archive.writestr(base + "DSHRuntime/package.json", json.dumps({"dependencies": TOP_LEVEL}).encode())
+            archive.writestr(base + "DSHRuntime/package-lock.json", lock)
+            archive.writestr(base + "DSHRuntime/THIRD-PARTY-NOTICES.txt", b"NOTICE")
+            archive.writestr(base + "DSHRuntime/ios-supervisor.mjs", b"// supervisor")
+            archive.writestr(base + "DSHRuntime/dsh-ios-entry.mjs", b"// runtime entry")
+            archive.writestr(base + "DSHRuntime/ios-plugin-manager.mjs", b"// plugin manager")
+            archive.writestr(base + "DSHRuntime/sqlite-session-persistence.mjs", b"// persistence")
+            archive.writestr(base + "DSHRuntime/ipc-protocol.mjs", b"// protocol")
+            archive.writestr(base + "DSHRuntime/vendor/dsh-profile-boot/lib/profile-boot.js", profile_boot_entry_bytes)
+            archive.writestr(base + "DSHRuntime/vendor/dsh-profile-boot/lib/profile-boot-QhDEDXsF.js", profile_boot_impl_bytes)
+            archive.writestr(base + "DSHRuntime/vendor/dsh-profile-boot/LICENSE", b"MIT")
+            archive.writestr(base + "DSHRuntime/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js", app_boot_bytes)
+            archive.writestr(base + "DSHRuntime/node_modules/@dsbot/dsh-ios-profile/package.json", json.dumps({
+                "name": "@dsbot/dsh-ios-profile", "dsh": {"bundle": {"patch": "./cordis.patch.yml"}},
+            }).encode())
+            archive.writestr(base + "DSHRuntime/node_modules/@dsbot/dsh-ios-profile/cordis.patch.yml",
+                             b"@deepseek-ai/dsh-agent @deepseek-ai/dsh-agent-loop @deepseek-ai/dsh-session @deepseek-ai/dsh-session-projection @deepseek-ai/dsh-llm-deepseek-api-key @dsbot/dsh-ios-host/native-tools @dsbot/dsh-ios-host/session-persistence")
+            archive.writestr(base + "DSHRuntime/node_modules/@dsbot/dsh-ios-host/package.json",
+                             json.dumps({"name": "@dsbot/dsh-ios-host"}).encode())
+            for name in ["index.mjs", "credentials.mjs", "session-persistence.mjs", "native-tools.mjs"]:
+                archive.writestr(base + "DSHRuntime/node_modules/@dsbot/dsh-ios-host/" + name, b"// adapter")
+            for package, version in PACKAGES.items():
+                archive.writestr(base + "DSHRuntime/node_modules/" + package + "/package.json", json.dumps({"version": version}).encode())
+            archive.writestr(base + "Frameworks/", b"")
+            archive.writestr(framework + "NodeMobile", node_binary)
+            archive.writestr(framework + "Info.plist", plistlib.dumps({
+                "CFBundlePackageType": "FMWK", "CFBundleExecutable": "NodeMobile", "MinimumOSVersion": "14.0",
+            }))
             if extra:
                 archive.writestr(base + extra, b"unexpected")
 
@@ -49,15 +169,17 @@ class IPARegressionTests(unittest.TestCase):
         report = ipa.inspect(self.path)
         app = ipa.source(report, "joeshu/dsh-bot", "a" * 40)["apps"][0]
         version = app["versions"][0]
-        self.assertEqual(report["build"], "26")
+        self.assertEqual(report["build"], "27")
+        self.assertFalse(report["releaseEligible"])
         self.assertEqual(version["size"], self.path.stat().st_size)
         self.assertEqual(version["sha256"], report["sha256"])
+        self.assertEqual(version["releaseEligible"], report["releaseEligible"])
         self.assertEqual(app["appPermissions"]["privacy"], report["privacy"])
         self.assertTrue(app["iconURL"].endswith("/AppIcon.png"))
 
     def test_rejects_bad_release_inputs(self):
         for fields, message in [
-            ({"platform": 7}, "iPhoneOS executable"),
+            ({"platform": 7}, "iPhoneOS binary"),
             ({"signature": True}, "code signature"),
             ({"executable": False}, "executable permissions"),
             ({"extra": "KernelAssets/dsh.bundle"}, "Unexpected payload entry"),

@@ -17,7 +17,7 @@ on:
         required: true
         type: string
       device_verification:
-        description: 'Promote only: SideStore and AltStore Classic versions, device/iOS, upgrade, chat and tool results'
+        description: 'Promote only: JSON evidence for the exact re-signed build and device scenarios'
         required: false
         type: string
 
@@ -87,6 +87,7 @@ jobs:
             $a.iconURL == $icon and $a.bundleIdentifier == $r.bundleIdentifier and $a.appPermissions.privacy == $r.privacy
             and $v.version == $r.version and $v.minOSVersion == $r.minOSVersion
             and $v.size == $r.size and $v.sha256 == $r.sha256 and $v.downloadURL == $url
+            and $v.releaseEligible == $r.releaseEligible
           ' candidate/source.json > /dev/null
           curl --fail --location --retry 2 -o /dev/null "$ICON_URL"
 
@@ -101,9 +102,13 @@ jobs:
             fi
             gh release create "$TAG" "$IPA" candidate/ipa-report.json candidate/SHA256SUMS.txt candidate/source.json \
               --target "$CANDIDATE_COMMIT" --title "DS Bot iOS $TAG" --prerelease --latest=false \
-              --notes "Swift 原生 iOS 候选版。真机侧载、升级和工具调用验证通过后转为正式版。"
+              --notes "内嵌 Node.js + DSH 0.2.2-rc.5 预览候选。当前 NodeMobile 版本尚未达到公开发布安全门槛，只供审核和真机探测。"
           else
-            [[ -n "${DEVICE_VERIFICATION//[[:space:]]/}" ]]
+            jq -e '.releaseEligible == true and .runtime.node.releaseEligible == true' candidate/ipa-report.json > /dev/null || {
+              echo "Candidate runtime has not passed the current Node security release gate." >&2
+              exit 1
+            }
+            python3 scripts/verify-ios-device-evidence.py "$CANDIDATE_COMMIT" "$IPA_SHA256" <<<"$DEVICE_VERIFICATION"
             [[ "$(gh release view "$TAG" --json isPrerelease --jq .isPrerelease)" == true ]]
             [[ "$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)" == "$CANDIDATE_COMMIT" ]]
             mkdir "$RUNNER_TEMP/published"
@@ -112,7 +117,7 @@ jobs:
               cmp "candidate/$file" "$RUNNER_TEMP/published/$file"
             done
             {
-              printf 'Swift 原生 iOS 版，提供流式对话、端侧工具与 Remote MCP。\n\n'
+              printf '内嵌 Node.js 与 DSH 0.2.2-rc.5 iOS 版。\n\n'
               printf '验证记录\n\n%s\n\nIPA SHA-256\n\n%s\n' "$DEVICE_VERIFICATION" "$IPA_SHA256"
             } > "$RUNNER_TEMP/release-notes.md"
             gh release edit "$TAG" --prerelease=false --latest --notes-file "$RUNNER_TEMP/release-notes.md"

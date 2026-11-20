@@ -18,6 +18,9 @@ public struct MainTabView: View {
             ToolsHubTabView(host: host)
                 .tabItem { Label("小工具", systemImage: "square.grid.2x2") }
 
+            PluginManagerView(host: host)
+                .tabItem { Label("探索", systemImage: "safari") }
+
             AgentSettingsView(host: host)
                 .tabItem { Label("设置", systemImage: "gearshape") }
         }
@@ -407,8 +410,10 @@ public struct ChatView: View {
         .confirmationDialog("确定清空「\(liveBot.name)」的全部聊天记录？", isPresented: $showClearConfirm, titleVisibility: .visible) {
             Button("清空记录", role: .destructive) {
                 guard !isLocked, !host.isStreaming else { return }
-                host.clearSession(bot.id)
-                DSHaptics.notify(.warning)
+                Task {
+                    await host.clearSession(bot.id)
+                    DSHaptics.notify(.warning)
+                }
             }
             Button("取消", role: .cancel) {}
         }
@@ -628,7 +633,7 @@ public struct ChatView: View {
                         Button {
                             Task { await host.regenerateLastReply(sessionId: bot.id, model: selectedModel) }
                         } label: {
-                            Label("重新生成回复", systemImage: "arrow.clockwise")
+                            Label("再次回答", systemImage: "arrow.clockwise")
                         }
                     }
                 }
@@ -871,7 +876,7 @@ public struct AgentSettingsView: View {
             Form {
                 Section("运行诊断") {
                     LabeledContent("应用", value: "\(host.appVersion) (\(host.buildNumber))")
-                    LabeledContent("引擎", value: "Swift 原生")
+                    LabeledContent("引擎", value: "Node.js + DSH 0.2.2-rc.5")
                     Button("复制诊断 JSON") {
                         Task {
                             do {
@@ -891,6 +896,9 @@ public struct AgentSettingsView: View {
                         .autocorrectionDisabled()
                         .onChange(of: host.apiBaseURL) { _ in apiKey = ""; status = "" }
                     if !host.usesOfficialModels {
+                        Text("DSH 自定义服务需兼容 Anthropic Messages API；模型 ID 可在 Bot 设置中手动填写。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                         Toggle("服务支持工具调用", isOn: $host.customTools)
                     }
                     SecureField("当前地址的 API Key", text: $apiKey)

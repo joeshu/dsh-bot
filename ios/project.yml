@@ -23,17 +23,23 @@ targets:
     deploymentTarget: "16.4"
     sources:
       - path: Sources
+        excludes: [Resources]
       - path: Resources/Assets.xcassets
         buildPhase: resources
       - path: Resources/QuickJS-LICENSE.txt
+        buildPhase: resources
+      - path: Sources/Resources/NodeMobile-LICENSE.txt
+        buildPhase: resources
+      - path: Sources/Resources/DSHRuntime
+        type: folder
         buildPhase: resources
       - path: Vendor/QuickJS/quickjs-amalgam.c
     settings:
       base:
         PRODUCT_NAME: DSBotStandalone
         PRODUCT_BUNDLE_IDENTIFIER: io.github.dsbot.ios.standalone
-        MARKETING_VERSION: "1.8.3"
-        CURRENT_PROJECT_VERSION: "26"
+        MARKETING_VERSION: "1.9.0"
+        CURRENT_PROJECT_VERSION: "27"
         INFOPLIST_FILE: Resources/Info.plist
         GENERATE_INFOPLIST_FILE: NO
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
@@ -43,6 +49,8 @@ targets:
         HEADER_SEARCH_PATHS: "$(SRCROOT)/Vendor/QuickJS"
         CLANG_C_LANGUAGE_STANDARD: gnu17
     dependencies:
+      - framework: Vendor/NodeMobile.xcframework
+        embed: true
       - sdk: LocalAuthentication.framework
       - sdk: Security.framework
       - sdk: AVFoundation.framework

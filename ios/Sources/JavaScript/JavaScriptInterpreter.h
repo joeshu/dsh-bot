@@ -2,6 +2,7 @@
 #define DS_BOT_JAVASCRIPT_INTERPRETER_H
 
 #include <stddef.h>
+#include <NodeMobile/NodeMobile.h>
 
 typedef struct {
     char *value;
