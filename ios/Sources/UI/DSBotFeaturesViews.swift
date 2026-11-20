@@ -407,21 +407,125 @@ public struct MemoryVaultView: View {
 
 // MARK: - 5. Universal Connectors & Token Usage Dashboard
 
+private struct DSHUsageTotals {
+    let calls: Int
+    let inputTokens: Int
+    let cacheReadTokens: Int
+    let cacheWriteTokens: Int
+    let outputTokens: Int
+    let totalTokens: Int
+
+    init(_ raw: [String: Any] = [:]) {
+        calls = max(0, raw["calls"] as? Int ?? 0)
+        inputTokens = max(0, raw["inputTokens"] as? Int ?? 0)
+        cacheReadTokens = max(0, raw["cacheReadTokens"] as? Int ?? 0)
+        cacheWriteTokens = max(0, raw["cacheWriteTokens"] as? Int ?? 0)
+        outputTokens = max(0, raw["outputTokens"] as? Int ?? 0)
+        totalTokens = max(0, raw["totalTokens"] as? Int ?? 0)
+    }
+}
+
+private struct DSHUsageRollup: Identifiable {
+    let id: String
+    let title: String
+    let totals: DSHUsageTotals
+}
+
 public struct ConnectorsAndUsageView: View {
     @ObservedObject var host: LocalAgentHost
-    @State private var totalTokens = 0
-    @State private var cacheHitRate = 0.0
+    @State private var usageTotals = DSHUsageTotals()
+    @State private var botUsage: [DSHUsageRollup] = []
+    @State private var modelUsage: [DSHUsageRollup] = []
+    @State private var dailyUsage: [DSHUsageRollup] = []
+    @State private var unreportedCalls = 0
+    @State private var unreadUsageSessions = 0
+    @State private var legacyTotalTokens = 0
+    @State private var legacyCacheHitRate = 0.0
     @State private var connectorName = ""
     @State private var connectorEndpoint = ""
     @State private var connectorToken = ""
     @State private var connectors: [(id: String, type: String, name: String, endpoint: String)] = []
     @State private var mcpStatus = ""
 
+    private func recentDayWindows() -> [[String: Any]] {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        return (0...6).compactMap { daysAgo in
+            guard let day = calendar.date(byAdding: .day, value: -daysAgo, to: today),
+                  let nextDay = calendar.date(byAdding: .day, value: 1, to: day) else { return nil }
+            let components = calendar.dateComponents([.year, .month, .day], from: day)
+            let id = String(format: "%04d-%02d-%02d", components.year ?? 0, components.month ?? 0, components.day ?? 0)
+            return [
+                "id": id,
+                "title": day.formatted(date: .abbreviated, time: .omitted),
+                "start": Int64(day.timeIntervalSince1970 * 1_000),
+                "end": Int64(nextDay.timeIntervalSince1970 * 1_000),
+            ]
+        }
+    }
+
+    private func decodeUsageRollups(_ value: Any?, title: (String) -> String = { $0 }) -> [DSHUsageRollup] {
+        (value as? [[String: Any]] ?? []).compactMap { raw in
+            guard let id = raw["id"] as? String else { return nil }
+            return DSHUsageRollup(
+                id: id,
+                title: title(raw["title"] as? String ?? id),
+                totals: DSHUsageTotals(raw)
+            )
+        }
+    }
+
     public var body: some View {
         Form {
-            Section("Token 用量与缓存命中") {
-                LabeledContent("累计 Tokens", value: "\(totalTokens)")
-                LabeledContent("Prompt 缓存命中率", value: String(format: "%.1f%%", cacheHitRate * 100))
+            Section("真实用量（DSH 持久事件）") {
+                LabeledContent("已报告用量的模型调用", value: usageTotals.calls.formatted())
+                LabeledContent("输入 Tokens（未缓存）", value: usageTotals.inputTokens.formatted())
+                LabeledContent("缓存读取 Tokens", value: usageTotals.cacheReadTokens.formatted())
+                LabeledContent("缓存写入 Tokens", value: usageTotals.cacheWriteTokens.formatted())
+                LabeledContent("输出 Tokens", value: usageTotals.outputTokens.formatted())
+                LabeledContent("合计 Tokens", value: usageTotals.totalTokens.formatted())
+                if unreportedCalls > 0 {
+                    Text("另有 \(unreportedCalls.formatted()) 次模型尝试没有报告用量，因此未计入 Token 总数。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if unreadUsageSessions > 0 {
+                    Text("另有 \(unreadUsageSessions.formatted()) 个会话日志无法读取，统计可能不完整。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Section("原生兼容请求（独立累计）") {
+                LabeledContent("累计 Tokens", value: legacyTotalTokens.formatted())
+                LabeledContent("Prompt 缓存命中率", value: String(format: "%.1f%%", legacyCacheHitRate * 100))
+                Text("包含 Swift 兼容路径的历史请求，不与 DSH 明细合并，也无法按 Bot、模型或日期拆分。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if !botUsage.isEmpty {
+                Section("按 Bot") {
+                    ForEach(botUsage) { item in
+                        LabeledContent(item.title, value: "\(item.totals.totalTokens.formatted()) Tokens · \(item.totals.calls.formatted()) 次")
+                    }
+                }
+            }
+
+            if !modelUsage.isEmpty {
+                Section("按模型") {
+                    ForEach(modelUsage) { item in
+                        LabeledContent(item.title, value: "\(item.totals.totalTokens.formatted()) Tokens · \(item.totals.calls.formatted()) 次")
+                    }
+                }
+            }
+
+            if !dailyUsage.isEmpty {
+                Section("最近 7 天") {
+                    ForEach(dailyUsage) { item in
+                        LabeledContent(item.title, value: "\(item.totals.totalTokens.formatted()) Tokens · \(item.totals.calls.formatted()) 次")
+                    }
+                }
             }
 
             Section("添加 Remote MCP 连接器") {
@@ -500,9 +604,19 @@ public struct ConnectorsAndUsageView: View {
     }
 
     private func reload() async {
-        if let u = try? await host.rpc()?.request("usage.summary") {
-            totalTokens = u["totalTokens"] as? Int ?? 0
-            cacheHitRate = u["cacheHitRate"] as? Double ?? 0.0
+        if let usage = try? await host.rpc()?.request("usage.summary", params: ["dayWindows": recentDayWindows()], timeoutSeconds: 120) {
+            usageTotals = DSHUsageTotals(usage["totals"] as? [String: Any] ?? [:])
+            botUsage = decodeUsageRollups(usage["byBot"]) { botId in
+                host.bots.first(where: { $0.id == botId })?.name ?? botId
+            }
+            modelUsage = decodeUsageRollups(usage["byModel"])
+            dailyUsage = decodeUsageRollups(usage["byDay"])
+            unreportedCalls = max(0, usage["unreportedCalls"] as? Int ?? 0)
+            unreadUsageSessions = max(0, usage["unreadSessions"] as? Int ?? 0)
+        }
+        if let legacy = try? await host.rpc()?.request("usage.legacySummary") {
+            legacyTotalTokens = max(0, legacy["totalTokens"] as? Int ?? 0)
+            legacyCacheHitRate = min(1, max(0, legacy["cacheHitRate"] as? Double ?? 0))
         }
         if let c = try? await host.rpc()?.request("connectors.list") {
             let raw = c["connectors"] as? [[String: Any]] ?? []

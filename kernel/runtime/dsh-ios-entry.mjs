@@ -99,6 +99,145 @@ function eventMessages(events, botId) {
   return messages
 }
 
+function usageCounts(value) {
+  if (!value || typeof value !== 'object') return undefined
+  const count = (field) => Number.isSafeInteger(value[field]) && value[field] >= 0 ? value[field] : undefined
+  const inputTokens = count('inputTokens')
+  const outputTokens = count('outputTokens')
+  const cacheReadTokens = count('cacheReadTokens')
+  const cacheWriteTokens = count('cacheWriteTokens')
+  const reportedTotal = count('totalTokens')
+  if ([inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reportedTotal].every((item) => item === undefined)) return undefined
+  const input = inputTokens ?? 0
+  const output = outputTokens ?? 0
+  const cacheRead = cacheReadTokens ?? 0
+  const cacheWrite = cacheWriteTokens ?? 0
+  return {
+    inputTokens: input,
+    outputTokens: output,
+    cacheReadTokens: cacheRead,
+    cacheWriteTokens: cacheWrite,
+    totalTokens: reportedTotal ?? input + output + cacheRead + cacheWrite,
+  }
+}
+
+function usageFromStream(stream) {
+  if (!Array.isArray(stream)) return undefined
+  let usage
+  for (const record of stream) {
+    if (record?.type === 'chunk' && record.chunk?.type === 'usage') usage = usageCounts(record.chunk.usage)
+  }
+  return usage
+}
+
+function emptyUsageTotals() {
+  return { calls: 0, inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, totalTokens: 0 }
+}
+
+function addUsageTotals(totals, usage) {
+  const add = (left, right) => left > Number.MAX_SAFE_INTEGER - right ? Number.MAX_SAFE_INTEGER : left + right
+  totals.calls = add(totals.calls, 1)
+  totals.inputTokens = add(totals.inputTokens, usage.inputTokens)
+  totals.cacheReadTokens = add(totals.cacheReadTokens, usage.cacheReadTokens)
+  totals.cacheWriteTokens = add(totals.cacheWriteTokens, usage.cacheWriteTokens)
+  totals.outputTokens = add(totals.outputTokens, usage.outputTokens)
+  totals.totalTokens = add(totals.totalTokens, usage.totalTokens)
+}
+
+function addUsageGroup(groups, id, title, usage) {
+  let group = groups.get(id)
+  if (!group) {
+    group = { id, title, ...emptyUsageTotals() }
+    groups.set(id, group)
+  }
+  addUsageTotals(group, usage)
+}
+
+async function dshUsageSummary({ dayWindows } = {}) {
+  const snapshots = await runtime.persistence.list()
+  const bySessionId = new Map(snapshots.map((snapshot) => [String(snapshot.header.id), snapshot]))
+  const ownerBotId = (snapshot) => {
+    let current = snapshot
+    const seen = new Set()
+    while (current) {
+      const sessionId = String(current.header?.id ?? '')
+      if (sessionId.startsWith('ios:')) return sessionId.slice(4)
+      if (seen.has(sessionId)) return undefined
+      seen.add(sessionId)
+      const parentSession = current.header?.parentSession
+      if (typeof parentSession !== 'string') return undefined
+      current = bySessionId.get(parentSession)
+    }
+    return undefined
+  }
+
+  const totals = emptyUsageTotals()
+  const byBot = new Map()
+  const byModel = new Map()
+  const windows = (Array.isArray(dayWindows) ? dayWindows : []).slice(0, 8).flatMap((window) => {
+    const start = Number(window?.start)
+    const end = Number(window?.end)
+    if (typeof window?.id !== 'string' || !window.id || !Number.isSafeInteger(start) || !Number.isSafeInteger(end) || end <= start) return []
+    return [{ id: window.id, title: typeof window.title === 'string' ? window.title.slice(0, 40) : window.id, start, end }]
+  })
+  const byDay = new Map(windows.map((window) => [window.id, { id: window.id, title: window.title, ...emptyUsageTotals() }]))
+  let unreportedCalls = 0
+  let unreadSessions = 0
+  for (const snapshot of snapshots) {
+    const botId = ownerBotId(snapshot)
+    if (!botId) continue
+    const sessionId = String(snapshot.header.id)
+    let handle
+    try {
+      handle = await runtime.persistence.open(sessionId, 'read')
+      const { events } = await handle.read()
+      const inheritedEventCount = Number(handle.inheritedEventCount ?? 0)
+      let model = '未知模型'
+      for (const event of events) {
+        if (event.seq < inheritedEventCount) continue
+        if (event.type === 'request/header') {
+          const configuredModel = event.data?.header?.config?.model
+          if (typeof configuredModel === 'string' && configuredModel.trim()) model = configuredModel.trim()
+          continue
+        }
+        if (event.type !== 'assistant/message' && event.type !== 'assistant/attempt') continue
+
+        const messageModel = event.data?.message?.source?.model
+        const eventModel = typeof messageModel === 'string' && messageModel.trim() ? messageModel.trim() : model
+        const usage = usageCounts(event.data?.usage) ?? usageFromStream(event.data?.stream)
+        if (!usage) {
+          unreportedCalls += 1
+          continue
+        }
+        if (!Number.isSafeInteger(event.time) || event.time < 0) continue
+        addUsageTotals(totals, usage)
+        addUsageGroup(byBot, botId, botId, usage)
+        addUsageGroup(byModel, eventModel, eventModel, usage)
+        for (const window of windows) {
+          if (event.time >= window.start && event.time < window.end) {
+            addUsageTotals(byDay.get(window.id), usage)
+            break
+          }
+        }
+      }
+    } catch (error) {
+      unreadSessions += 1
+      ctx?.logger?.warn(`Could not read DSH usage for ${sessionId}: ${String(error)}`)
+    } finally {
+      if (handle) {
+        try { await handle.close() } catch (error) {
+          ctx?.logger?.warn(`Could not close DSH usage reader for ${sessionId}: ${String(error)}`)
+        }
+      }
+    }
+  }
+  const ordered = (groups) => [...groups.values()].sort((left, right) => right.totalTokens - left.totalTokens)
+  return {
+    source: 'dsh-session-events', totals, byBot: ordered(byBot), byModel: ordered(byModel),
+    byDay: [...byDay.values()], unreportedCalls, unreadSessions,
+  }
+}
+
 function dshSessionId(botId) { return `ios:${botId}` }
 function botIdFromSession(id) { return id.startsWith('ios:') ? id.slice(4) : id }
 
@@ -404,12 +543,14 @@ rpc.handle('session.clear', async ({ sessionId }) => {
 for (const method of [
   'models.test', 'memory.add', 'memory.journal', 'memory.legacy', 'memory.assign', 'memory.undo',
   'group.state', 'group.goal.set', 'group.todo.add', 'group.todo.toggle', 'group.todo.clearCompleted',
-  'connectors.list', 'connectors.upsert', 'connectors.delete', 'usage.summary', 'tools.jsEval',
+  'connectors.list', 'connectors.upsert', 'connectors.delete', 'usage.legacySummary', 'tools.jsEval',
   'device.status', 'device.speak', 'device.stopSpeaking', 'mcp.listTools', 'mcp.callTool', 'side.ask',
   'approval.respond',
 ]) {
   rpc.handle(method, (params) => rpc.request('workspace.request', { method, params }, 120_000))
 }
+
+rpc.handle('usage.summary', (params) => dshUsageSummary(params))
 
 rpc.handle('side.cancel', async () => ({ cancelled: false, reason: 'Side-chat sessions are not included in the local DSH profile yet.' }))
 

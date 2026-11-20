@@ -261,7 +261,7 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
         let allowed: Set<String> = [
             "models.test", "memory.add", "memory.journal", "memory.legacy", "memory.assign", "memory.undo",
             "group.state", "group.goal.set", "group.todo.add", "group.todo.toggle", "group.todo.clearCompleted",
-            "connectors.list", "connectors.upsert", "connectors.delete", "usage.summary", "tools.jsEval",
+            "connectors.list", "connectors.upsert", "connectors.delete", "usage.legacySummary", "tools.jsEval",
             "device.status", "device.speak", "device.stopSpeaking", "mcp.listTools", "mcp.callTool", "side.ask",
             "approval.respond"
         ]
@@ -421,7 +421,7 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
             try await store.deleteConnector(id: id)
             _ = try keychain.deleteSecret(account: "connector:\(id)")
             return ["removed": true]
-        case "usage.summary": return await store.usageSummary()
+        case "usage.legacySummary": return await store.usageSummary()
         case "approval.respond":
             return ["found": await approvals.respond(
                 id: params["approvalId"] as? String ?? "", turnId: params["turnId"] as? String ?? "",
