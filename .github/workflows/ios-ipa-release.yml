@@ -9,7 +9,7 @@ on:
         options: [stage, promote]
         required: true
       candidate_run:
-        description: Successful iOS Native IPA run ID from main
+        description: Successful iOS Native IPA run ID for a commit included in main
         required: true
         type: string
       ipa_sha256:
@@ -41,7 +41,7 @@ jobs:
       DEVICE_VERIFICATION: ${{ inputs.device_verification }}
     steps:
       - uses: actions/checkout@v4
-      - name: Resolve a successful main-branch build
+      - name: Verify candidate build and main ancestry
         shell: bash
         run: |
           set -euo pipefail
@@ -50,10 +50,14 @@ jobs:
           RUN="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN")"
           jq -e --arg repo "$GITHUB_REPOSITORY" '
             .path == ".github/workflows/ios-ipa-build.yml" and .head_repository.full_name == $repo
-            and .head_branch == "main" and .conclusion == "success"
+            and .conclusion == "success"
             and (.event == "push" or .event == "workflow_dispatch")
           ' <<<"$RUN" > /dev/null
-          echo "CANDIDATE_COMMIT=$(jq -r .head_sha <<<"$RUN")" >> "$GITHUB_ENV"
+          CANDIDATE_COMMIT="$(jq -r .head_sha <<<"$RUN")"
+          [[ "$CANDIDATE_COMMIT" =~ ^[a-f0-9]{40}$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/compare/$CANDIDATE_COMMIT...$GITHUB_SHA" \
+            | jq -e '.status == "identical" or .status == "ahead"' > /dev/null
+          echo "CANDIDATE_COMMIT=$CANDIDATE_COMMIT" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
           name: dsbot-native-ios-candidate

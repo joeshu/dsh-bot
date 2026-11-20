@@ -23,7 +23,7 @@ bash scripts/build-unsigned-ipa.sh
 ## 候选包验收
 
 - 在 Actions 的 **iOS Native IPA** 获取通过模拟器测试的候选包和 SHA-256。
-- **iOS Native Release** 的 `stage` 接收主分支构建的 run ID 和 IPA SHA-256，将同一产物提供为预发布。
+- **iOS Native Release** 的 `stage` 接收已纳入主分支的提交对应的 run ID 和 IPA SHA-256，将同一产物提供为预发布。保留候选提交的合并历史，可直接使用已经验证的分支产物。
 - 从预发布验证 SideStore 和 AltStore Classic 的源导入、重签、安装及冷启动。以相同签名身份从 v1.8.2 升级，检查历史记录与配置，再测试官方 API 流式回复、取消、一次批准的 MCP 调用和一次拒绝的工具调用。记录设备、系统、客户端版本与 IPA 哈希。
 - 验证通过后执行 `promote`，提供相同的 run ID、哈希和真机记录。发布任务核对预发布资产字节后将其设为最新正式版。候选包有缺陷时修复并提高版本号。
 
