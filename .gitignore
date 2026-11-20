@@ -1,0 +1,18 @@
+# Dependencies & build outputs
+node_modules/
+kernel/node_modules/
+kernel/dist/
+dist/*.ipa
+dist/SHA256SUMS.txt
+
+# Generated Xcode project & build artifacts
+ios/*.xcodeproj/
+ios/build/
+ios/DerivedData/
+ios/Resources/KernelAssets/
+
+# OS & editor files
+.DS_Store
+*.swp
+.idea/
+.vscode/

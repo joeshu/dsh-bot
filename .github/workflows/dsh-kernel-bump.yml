@@ -1,0 +1,57 @@
+name: DSH Kernel Hot-Swap Bump
+
+# Upgrades the embedded DSH kernel (e.g. 0.2.2-rc.5 -> 0.2.2-rc.6) without recompiling Xcode.
+# Aligns all @deepseek-ai/dsh-* packages, compiles a single hot-swap bundle, runs all 4 contract gates,
+# and uploads the verified kernel bundle + SHA-256 kernel-manifest.json.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dsh_version:
+        description: Target @deepseek-ai/dsh version (e.g. 0.2.2-rc.5 or 0.2.2-rc.6)
+        required: true
+        default: '0.2.2-rc.5'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-dsh-kernel:
+    name: Build & Verify DSH Kernel (${{ inputs.dsh_version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+        working-directory: kernel
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Align all DSH packages to ${{ inputs.dsh_version }}
+        run: |
+          node scripts/sync-dsh-lock.mjs "${{ inputs.dsh_version }}"
+          node scripts/sync-dsh-lock.mjs --check
+
+      - name: Install aligned DSH dependencies
+        run: npm install --ignore-scripts --no-fund --no-audit
+
+      - name: Compile hot-swap kernel bundle & SHA-256 manifest
+        run: node scripts/build-kernel.mjs --mode=bundle
+
+      - name: Run 4-gate DSH contract test suite
+        env:
+          DSH_EXPECTED_VERSION: ${{ inputs.dsh_version }}
+        run: npm test
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-kernel-${{ inputs.dsh_version }}
+          path: |
+            kernel/dist/dsh-kernel-${{ inputs.dsh_version }}.bundle
+            kernel/dist/kernel-manifest.json
+          retention-days: 30

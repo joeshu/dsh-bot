@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "dshVersion": "0.2.2-rc.5",
+  "dsBotVersion": "0.3.8",
+  "ipcProtocolVersion": "1.0.0",
+  "minShellVersion": "0.1.0",
+  "alignedPackages": [
+    "@deepseek-ai/dsh",
+    "@deepseek-ai/dsh-app-boot",
+    "@deepseek-ai/dsh-base"
+  ],
+  "requiredServices": [
+    "sessionController",
+    "sessionQuery",
+    "sessionPersistence",
+    "workspaceRegistry"
+  ],
+  "disabledDesktopModules": [
+    "@deepseek-ai/dsh-web-app",
+    "@deepseek-ai/dsh-bash-local",
+    "@deepseek-ai/dsh-computer-use",
+    "@deepseek-ai/dsh-cua",
+    "@deepseek-ai/dsh-experimental-cua-macos",
+    "@deepseek-ai/dsh-experimental-computer-use-cua-driver-native",
+    "@deepseek-ai/dsh-skill-office",
+    "@deepseek-ai/dsh-tool-workspace-dependencies",
+    "@deepseek-ai/libreoffice-kit",
+    "@trycua/cua-driver",
+    "playwright-core",
+    "node-pty",
+    "sharp",
+    "koffi",
+    "pnpm"
+  ],
+  "nativeBridgeShims": {
+    "node:sqlite": "./src/shims/ios-bridges.mjs#SQLiteBridgeClient",
+    "undici": "./src/shims/ios-bridges.mjs#URLSessionFetchShim"
+  },
+  "guards": {
+    "legacyTurnEndReasonDefault": "completed"
+  }
+}

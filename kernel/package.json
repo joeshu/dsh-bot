@@ -1,0 +1,38 @@
+{
+  "name": "@ds-bot/ios-dsh-kernel",
+  "version": "1.8.2",
+  "private": true,
+  "type": "module",
+  "description": "Standalone hot-swappable DSH 0.2.2-rc.5 headless kernel bundle for DS-Bot iOS",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "node scripts/build-kernel.mjs",
+    "build:ci": "node scripts/build-kernel.mjs --mode=bundle",
+    "sync-lock": "node scripts/sync-dsh-lock.mjs",
+    "test": "node --test test/*.test.mjs",
+    "test:contract": "node --test test/contract.test.mjs"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-app-boot": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-base": "0.2.2-rc.5"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  },
+  "overrides": {
+    "@deepseek-ai/dsh-app-boot": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-base": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-session": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-session-query-sqlite": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-api-session-controller": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-agent-loop": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-session-projection-cache": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-authorization": "0.2.2-rc.5"
+  }
+}

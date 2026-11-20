@@ -1,0 +1,81 @@
+name: DSBotStandalone
+options:
+  bundleIdPrefix: io.github.dsbot
+  deploymentTarget:
+    iOS: "16.4"
+  xcodeVersion: "16.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    ENABLE_BITCODE: NO
+    CODE_SIGNING_ALLOWED: NO
+    CODE_SIGNING_REQUIRED: NO
+    CODE_SIGN_IDENTITY: ""
+    DEVELOPMENT_TEAM: ""
+
+targets:
+  DSBotStandalone:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.4"
+    sources:
+      - path: Sources
+    resources:
+      - path: Resources/Assets.xcassets
+      - path: Resources/KernelAssets
+        type: folder
+        optional: true
+    info:
+      path: Resources/Info.plist
+    settings:
+      base:
+        PRODUCT_NAME: DSBotStandalone
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.dsbot.ios.standalone
+        MARKETING_VERSION: "1.8.2"
+        CURRENT_PROJECT_VERSION: "25"
+        INFOPLIST_FILE: Resources/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        ONLY_ACTIVE_ARCH: NO
+        OTHER_LDFLAGS:
+          - "-lsqlite3"
+    dependencies:
+      - sdk: libsqlite3.tbd
+      - sdk: LocalAuthentication.framework
+      - sdk: Security.framework
+      - sdk: WebKit.framework
+      - sdk: JavaScriptCore.framework
+      - sdk: AVFoundation.framework
+      - sdk: UserNotifications.framework
+
+  DSBotStandaloneTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "16.4"
+    sources:
+      - path: Tests/DSBotStandaloneTests
+    dependencies:
+      - target: DSBotStandalone
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.dsbot.ios.standalone.tests
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  DSBotStandalone:
+    build:
+      targets:
+        DSBotStandalone: all
+        DSBotStandaloneTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - DSBotStandaloneTests
+    archive:
+      config: Release
