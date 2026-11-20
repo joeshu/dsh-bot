@@ -35,11 +35,20 @@ public struct SessionsTabView: View {
     @State private var showCreateSheet = false
 
     private var filteredBots: [BotProfile] {
-        guard !searchText.isEmpty else { return host.bots }
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return host.bots }
         return host.bots.filter { bot in
-            bot.name.localizedCaseInsensitiveContains(searchText)
-            || bot.roleLabel.localizedCaseInsensitiveContains(searchText)
-            || (!bot.isPrivate && host.messages(for: bot.id).contains { $0.content.localizedCaseInsensitiveContains(searchText) })
+            bot.name.localizedCaseInsensitiveContains(query)
+            || bot.roleLabel.localizedCaseInsensitiveContains(query)
+            || matchingMessage(for: bot, query: query) != nil
+        }
+    }
+
+    private func matchingMessage(for bot: BotProfile, query: String? = nil) -> ChatMessageItem? {
+        let searchQuery = (query ?? searchText).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !bot.isPrivate, !searchQuery.isEmpty else { return nil }
+        return host.messages(for: bot.id).last {
+            $0.content.localizedCaseInsensitiveContains(searchQuery)
         }
     }
 
@@ -54,8 +63,9 @@ public struct SessionsTabView: View {
 
                 Section("最近会话") {
                     ForEach(filteredBots) { bot in
+                        let matchedMessage = matchingMessage(for: bot)
                         NavigationLink {
-                            ChatView(bot: bot, host: host)
+                            ChatView(bot: bot, host: host, targetMessageID: matchedMessage?.id)
                         } label: {
                             HStack(spacing: 12) {
                                 DSBotAvatar(
@@ -74,15 +84,15 @@ public struct SessionsTabView: View {
                                             DSStatusBadge("群聊", color: .indigo)
                                         }
                                     }
-                                    Text(lastPreview(for: bot))
+                                    Text(lastPreview(for: bot, matching: matchedMessage))
                                         .font(.caption)
                                         .foregroundColor(.secondary)
-                                        .lineLimit(1)
+                                        .lineLimit(2)
                                 }
                                 Spacer()
                                 VStack(alignment: .trailing, spacing: 3) {
-                                    if !bot.isPrivate, let lastTs = host.messages(for: bot.id).last?.timestamp {
-                                        Text(lastTs.formatted(date: .omitted, time: .shortened))
+                                    if !bot.isPrivate, let timestamp = (matchedMessage ?? host.messages(for: bot.id).last)?.timestamp {
+                                        Text(timestamp.formatted(date: .omitted, time: .shortened))
                                             .font(.caption2)
                                             .foregroundColor(.secondary)
                                     }
@@ -95,7 +105,7 @@ public struct SessionsTabView: View {
             }
             .listStyle(.insetGrouped)
             .navigationTitle("会话")
-            .searchable(text: $searchText, prompt: "搜索 Bot 或群聊")
+            .searchable(text: $searchText, prompt: "搜索会话和消息")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { showCreateSheet = true } label: {
@@ -110,8 +120,12 @@ public struct SessionsTabView: View {
         }
     }
 
-    private func lastPreview(for bot: BotProfile) -> String {
+    private func lastPreview(for bot: BotProfile, matching message: ChatMessageItem? = nil) -> String {
         if bot.isPrivate { return "私密会话" }
+        if let message {
+            let sender = message.role == "user" ? "你" : bot.name
+            return "\(sender)：\(message.content)"
+        }
         if let last = host.messages(for: bot.id).last {
             return last.content
         }
@@ -319,6 +333,7 @@ public struct ToolsHubTabView: View {
 public struct ChatView: View {
     let bot: BotProfile
     @ObservedObject var host: LocalAgentHost
+    private let searchResultMessageID: String?
     @State private var input = ""
     @State private var selectedModel: String
     @State private var showSideChat = false
@@ -331,12 +346,15 @@ public struct ChatView: View {
     @State private var actionStatus = ""
     @State private var lastScrollAt = Date.distantPast
     @State private var expandStreamingReasoning = true
+    @State private var pendingSearchMessageID: String?
     @Environment(\.scenePhase) private var chatScenePhase
 
     @MainActor
-    public init(bot: BotProfile, host: LocalAgentHost) {
+    public init(bot: BotProfile, host: LocalAgentHost, targetMessageID: String? = nil) {
         self.bot = bot
         self.host = host
+        self.searchResultMessageID = targetMessageID
+        _pendingSearchMessageID = State(initialValue: targetMessageID)
         _selectedModel = State(initialValue: host.modelSelection(bot.model))
     }
 
@@ -468,8 +486,13 @@ public struct ChatView: View {
                         .padding()
                     }
                     .scrollDismissesKeyboard(.interactively)
+                    .onAppear {
+                        scrollToSearchResult(using: proxy)
+                    }
                     .onChange(of: sessionMessages.count) { _ in
-                        withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
+                        if !scrollToSearchResult(using: proxy) {
+                            withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
+                        }
                     }
                     .onChange(of: host.streamingContent.count) { _ in
                         let now = Date()
@@ -525,6 +548,20 @@ public struct ChatView: View {
                 }
             }
         }
+    }
+
+    @discardableResult
+    private func scrollToSearchResult(using proxy: ScrollViewProxy) -> Bool {
+        guard let messageID = pendingSearchMessageID,
+              sessionMessages.contains(where: { $0.id == messageID }) else { return false }
+        pendingSearchMessageID = nil
+        Task { @MainActor in
+            await Task.yield()
+            withAnimation(.easeInOut(duration: 0.25)) {
+                proxy.scrollTo(messageID, anchor: .center)
+            }
+        }
+        return true
     }
 
     private var starterPrompts: [String] {
@@ -646,6 +683,17 @@ public struct ChatView: View {
                 .clipShape(RoundedRectangle(cornerRadius: DSTheme.cornerBubble, style: .continuous))
         }
         .frame(maxWidth: .infinity, alignment: isUser && host.useBubbleLayout ? .trailing : .leading)
+        .padding(8)
+        .background {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(searchResultMessageID == msg.id ? DSTheme.brand.opacity(0.10) : .clear)
+        }
+        .overlay {
+            if searchResultMessageID == msg.id {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(DSTheme.brand.opacity(0.45), lineWidth: 1)
+            }
+        }
     }
 
     private var streamingRow: some View {
