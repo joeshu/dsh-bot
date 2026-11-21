@@ -929,8 +929,10 @@ public struct ChatView: View {
     }
 
     private func saveAssistantContentToWorkspace(_ content: String) {
+        let dir = LocalAgentTransport.defaultWorkspace.appendingPathComponent("files", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let fileName = "snippet-\(Int(Date().timeIntervalSince1970)).md"
-        let target = host.workspaceFilesDirectory().appendingPathComponent(fileName)
+        let target = dir.appendingPathComponent(fileName, isDirectory: false)
         if (try? content.write(to: target, atomically: true, encoding: .utf8)) != nil {
             actionStatus = "已保存到工作区：files/\(fileName)"
             DSHaptics.notify(.success)
