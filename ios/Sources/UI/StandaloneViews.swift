@@ -451,6 +451,16 @@ public struct ChatView: View {
                         Button("侧边对话 (/side)") { showSideChat = true }
                         if liveBot.isGroup { Button("群目标与待办") { showGroupWorkspace = true } }
                         if liveBot.isPrivate { Button("锁定私密会话") { lockPrivateConversation() } }
+                        if host.redteamStatus.installed {
+                            Button {
+                                Task { await host.setRedteamMode(!host.redteamModeEnabled) }
+                            } label: {
+                                Label(
+                                    host.redteamModeEnabled ? "关闭红队演练模式" : "开启红队演练模式",
+                                    systemImage: host.redteamModeEnabled ? "shield.slash" : "shield.lefthalf.filled"
+                                )
+                            }
+                        }
                         Button("会话数据诊断") { showDiagnostics = true }
                         ShareLink(item: host.exportSessionMarkdown(sessionId: liveBot.id, botName: liveBot.name)) {
                             Label("导出会话为 Markdown", systemImage: "square.and.arrow.up")

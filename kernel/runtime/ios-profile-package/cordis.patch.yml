@@ -140,6 +140,20 @@
         model: deepseek-flash
         reasoningEffort: 'off'
 
+    - id: agent-preset-registry
+      name: '@deepseek-ai/dsh-agent-preset-registry'
+      config:
+        default: default
+
+    - id: agent-preset-default
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: default
+        name: 默认模式
+        description: DS Bot iOS 默认智能体模式
+        order: 0
+        plugins: []
+
     - id: typert
       name: '@deepseek-ai/dsh-typert-registry'
 
@@ -286,6 +300,9 @@
 
     - id: ui-model-selection
       name: '@deepseek-ai/dsh-client-ui-model-selection'
+
+    - id: ui-agent-preset
+      name: '@deepseek-ai/dsh-client-ui-agent-preset'
 
     - id: ui-workspace
       name: '@deepseek-ai/dsh-client-ui-workspace'

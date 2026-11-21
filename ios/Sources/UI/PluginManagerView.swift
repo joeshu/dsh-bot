@@ -111,7 +111,10 @@ public struct PluginManagerView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
-                        Task { await host.refreshPluginState() }
+                        Task {
+                            await host.refreshPluginState()
+                            await host.refreshRedteamStatus()
+                        }
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
@@ -120,6 +123,7 @@ public struct PluginManagerView: View {
             }
             .task {
                 await host.refreshPluginState()
+                await host.refreshRedteamStatus()
                 if host.pluginSources.contains(where: { $0.enabled }) {
                     await host.discoverPlugins()
                 }
@@ -157,6 +161,7 @@ public struct PluginManagerView: View {
                                 githubRepoURL = ""
                             case .local(let url): await host.installLocalPlugin(from: url)
                             }
+                            await host.refreshRedteamStatus()
                         }
                     },
                     secondaryButton: .cancel(Text("取消"))
@@ -173,7 +178,10 @@ public struct PluginManagerView: View {
                 Button("卸载", role: .destructive) {
                     if let target = pendingRemoval {
                         pendingRemoval = nil
-                        Task { await host.removePlugin(target) }
+                        Task {
+                            await host.removePlugin(target)
+                            await host.refreshRedteamStatus()
+                        }
                     }
                 }
                 Button("取消", role: .cancel) { pendingRemoval = nil }
@@ -183,6 +191,71 @@ public struct PluginManagerView: View {
 
     @ViewBuilder
     private var installedSection: some View {
+        Section("dsh-purge-safe · 红队演练模式") {
+            if host.redteamStatus.installed {
+                Toggle(isOn: Binding(
+                    get: { host.redteamModeEnabled },
+                    set: { value in Task { await host.setRedteamMode(value) } }
+                )) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 6) {
+                            Text("红队演练模式（原生 Bot + Web 共用）").font(.subheadline.weight(.semibold))
+                            DSStatusBadge(
+                                host.redteamModeEnabled ? "已开启" : "已关闭",
+                                color: host.redteamModeEnabled ? .red : .secondary
+                            )
+                        }
+                        Text("开启后自动挂载 dsh-purge-safe/redteam/tools 工具集，并与 DSH Web 演练台共享 SQLite 事实库。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .tint(.red)
+
+                HStack(spacing: 8) {
+                    DSStatusBadge(
+                        host.redteamStatus.storeReady ? "SQLite 事实库就绪" : "事实库未加载",
+                        color: host.redteamStatus.storeReady ? DSTheme.success : .secondary
+                    )
+                    DSStatusBadge("已挂载 \(host.redteamStatus.toolCount) 工具", color: DSTheme.brand)
+                    if host.redteamStatus.skillCount > 0 {
+                        DSStatusBadge("\(host.redteamStatus.skillCount) 演练技能", color: .indigo)
+                    }
+                }
+
+                if !host.redteamStatus.tools.isEmpty {
+                    DisclosureGroup("查看已挂载的红队工具 (\(host.redteamStatus.tools.count))") {
+                        ForEach(host.redteamStatus.tools, id: \.self) { toolName in
+                            Text(toolName)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                NavigationLink {
+                    DSHWebUIView(host: host)
+                } label: {
+                    Label("打开 Web 演练台（含 RedTeam Dock 与预设）", systemImage: "shield.lefthalf.filled")
+                        .font(.subheadline)
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("未安装 CallMeGuLab/dsh-purge-safe 插件")
+                        .font(.subheadline.weight(.semibold))
+                    Text("安装后即可在原生 Bot 与 DSH Web 工作台同时开启红队演练模式、红队工具集、SQLite 事实库与预设。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Button {
+                    pendingInstall = .github("https://github.com/CallMeGuLab/dsh-purge-safe")
+                } label: {
+                    Label("一键安装 CallMeGuLab/dsh-purge-safe", systemImage: "arrow.down.circle.fill")
+                }
+                .disabled(host.state != .ready)
+            }
+        }
+
         Section("内置能力") {
             if let label = host.embeddedRuntimeLabel { LabeledContent("内嵌引擎", value: label) }
             LabeledContent("网页抓取", value: "每次访问需批准")

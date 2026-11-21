@@ -49,6 +49,28 @@ public struct DSHPluginCatalogItem: Identifiable, Decodable, Equatable {
     public var id: String { "\(sourceId):\(name)" }
 }
 
+public struct RedteamPluginStatus: Equatable {
+    public var installed: Bool = false
+    public var pluginActive: Bool = false
+    public var storeReady: Bool = false
+    public var redteamModeActive: Bool = false
+    public var toolCount: Int = 0
+    public var tools: [String] = []
+    public var skillCount: Int = 0
+
+    public init() {}
+
+    init(_ dict: [String: Any]) {
+        installed = dict["installed"] as? Bool ?? false
+        pluginActive = dict["pluginActive"] as? Bool ?? false
+        storeReady = dict["storeReady"] as? Bool ?? false
+        redteamModeActive = dict["redteamModeActive"] as? Bool ?? false
+        toolCount = dict["toolCount"] as? Int ?? 0
+        tools = dict["tools"] as? [String] ?? []
+        skillCount = dict["skillCount"] as? Int ?? 0
+    }
+}
+
 public struct DSHPluginComponent: Identifiable, Decodable, Equatable {
     public let id: String
     public let name: String
@@ -215,6 +237,10 @@ public final class LocalAgentHost: ObservableObject {
     @Published public var collapseThinkingByDefault = UserDefaults.standard.bool(forKey: "dsbot.exp.collapseThinkingByDefault") {
         didSet { UserDefaults.standard.set(collapseThinkingByDefault, forKey: "dsbot.exp.collapseThinkingByDefault") }
     }
+    @Published public var redteamModeEnabled = UserDefaults.standard.bool(forKey: "dsbot.redteamModeEnabled") {
+        didSet { UserDefaults.standard.set(redteamModeEnabled, forKey: "dsbot.redteamModeEnabled") }
+    }
+    @Published public private(set) var redteamStatus = RedteamPluginStatus()
     @Published public private(set) var autoReviewLog: [String] = []
 
     public let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
@@ -473,12 +499,40 @@ public final class LocalAgentHost: ObservableObject {
             _ = try await channel.request("chat.send", params: [
                 "sessionId": sessionId, "turnId": turnId, "model": model, "apiBaseURL": apiBaseURL,
                 "systemPrompt": bot?.systemPrompt ?? "", "isGroup": bot?.isGroup ?? false,
-                "subagentEnabled": subagentEnabled, "webSearchEnabled": webSearchEnabled, "customTools": customTools, "text": trimmed, "legacyHistory": legacyHistory
+                "subagentEnabled": subagentEnabled, "webSearchEnabled": webSearchEnabled,
+                "customTools": customTools, "redteamMode": redteamModeEnabled,
+                "text": trimmed, "legacyHistory": legacyHistory
             ])
         } catch {
             guard activeTurnId == turnId else { return }
             lastStreamError = error.localizedDescription
             finishTurn()
+        }
+    }
+
+    public func refreshRedteamStatus() async {
+        guard let rpc = rpc() else { return }
+        if let res = try? await rpc.request("redteam.status", timeoutSeconds: 15) {
+            redteamStatus = RedteamPluginStatus(res)
+            if redteamModeEnabled && redteamStatus.installed && !redteamStatus.redteamModeActive {
+                if let mounted = try? await rpc.request("redteam.setMode", params: ["enabled": true], timeoutSeconds: 30) {
+                    redteamStatus = RedteamPluginStatus(mounted)
+                }
+            }
+        }
+    }
+
+    public func setRedteamMode(_ enabled: Bool) async {
+        redteamModeEnabled = enabled
+        guard let rpc = rpc() else { return }
+        do {
+            let res = try await rpc.request("redteam.setMode", params: ["enabled": enabled], timeoutSeconds: 30)
+            redteamStatus = RedteamPluginStatus(res)
+            pluginStatus = enabled
+                ? (redteamStatus.toolCount > 0 ? "红队演练模式已开启（已挂载 \(redteamStatus.toolCount) 个工具）" : "红队演练模式已开启")
+                : "红队演练模式已关闭"
+        } catch {
+            pluginStatus = "切换红队模式失败：\(error.localizedDescription)"
         }
     }
 

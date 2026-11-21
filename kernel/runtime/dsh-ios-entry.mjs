@@ -1,7 +1,9 @@
 import { EventEmitter } from 'node:events'
+import { existsSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
 import { parentPort, workerData } from 'node:worker_threads'
 import net from 'node:net'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { configureIOSHost } from '@dsbot/dsh-ios-host'
 import { auditStartupEntries, initProfile, loadLayeredEnv, loadProfileDirectory, readProfileManifest, resolveProfileDir, writeProfileBundles } from '@deepseek-ai/dsh-app-boot'
 import { runProfile } from './vendor/dsh-profile-boot/lib/profile-boot.js'
@@ -252,7 +254,7 @@ function renderLegacyHistory(messages) {
 }
 
 const NATIVE_TOOL_NAMES = [
-  'js_eval', 'device_status', 'memory_save', 'group_todo_add', 'web_fetch', 'web_search', 'remote_mcp_call',
+  'js_eval', 'device_status', 'memory_save', 'group_todo_add', 'web_fetch', 'web_search', 'remote_mcp_list', 'remote_mcp_call',
   'workspace_list', 'workspace_read', 'workspace_write', 'workspace_search', 'workspace_edit',
 ]
 const ACTIVE_PLUGINS = [
@@ -262,15 +264,30 @@ const ACTIVE_PLUGINS = [
   'dsh-subagent', 'dsh-subagent-spawn-in-process', 'dsh-tool-subagent',
   'dsh-commands', 'dsh-token-meter', 'dsh-compaction-tool-result-pruner', 'dsh-compaction-basic',
   'dsh-time-context', 'dsh-skill', 'dsh-skill-filesystem', 'dsh-tool-skill',
+  'dsh-agent-preset-registry', 'dsh-agent-preset',
   'dsbot-ios-sqlite-session-persistence', 'dsbot-ios-keychain-credentials', 'dsbot-ios-native-tools', 'dsbot-ios-sandbox-fs',
 ]
 
-function setupAgent({ botId, systemPrompt, legacyHistory, toolsEnabled, subagentEnabled, webSearchEnabled }) {
+function registeredRedteamToolNames() {
+  try {
+    const toolsSvc = ctx?.get?.('tools')
+    if (!toolsSvc) return []
+    const list = typeof toolsSvc.list === 'function' ? toolsSvc.list() : []
+    return list
+      .map((item) => (typeof item === 'string' ? item : item?.name))
+      .filter((name) => typeof name === 'string' && name.startsWith('redteam_'))
+  } catch {
+    return []
+  }
+}
+
+function setupAgent({ botId, systemPrompt, legacyHistory, toolsEnabled, subagentEnabled, webSearchEnabled, redteamMode = false }) {
   const id = dshSessionId(botId)
   let setPersona = () => {}
   let setToolsEnabled = () => {}
   const setup = (agentCtx) => {
     let personaDisposer
+    let redteamPromptDisposer
     let toolRestriction
     setPersona = (value) => {
       personaDisposer?.()
@@ -280,15 +297,27 @@ function setupAgent({ botId, systemPrompt, legacyHistory, toolsEnabled, subagent
       }
     }
     setPersona(systemPrompt)
-    setToolsEnabled = (enabled, allowSubagent, allowWebSearch) => {
+    setToolsEnabled = (enabled, allowSubagent, allowWebSearch, allowRedteam = false) => {
       toolRestriction?.()
       toolRestriction = undefined
+      redteamPromptDisposer?.()
+      redteamPromptDisposer = undefined
       const deny = enabled ? [] : [...NATIVE_TOOL_NAMES]
       if (!allowSubagent || !enabled) deny.push('subagent')
       if (enabled && !allowWebSearch) deny.push('web_search')
+      const rtTools = registeredRedteamToolNames()
+      if (!allowRedteam || !enabled) {
+        deny.push(...rtTools)
+      } else if (rtTools.length > 0) {
+        redteamPromptDisposer = agentCtx.systemPrompt.section({
+          name: 'dsbot-ios-redteam-mode',
+          order: 850,
+          text: `dsh-purge-safe 红队演练模式已启用。你与 DSH Web 演练台共享同一份 SQLite 事实库（$DSH_HOME/redteam），可直接调用以下已注册的红队演练工具：${rtTools.join(', ')}。所有演练操作均需遵循授权边界。`,
+        })
+      }
       if (deny.length) toolRestriction = agentCtx.tools.restrict({ deny })
     }
-    setToolsEnabled(toolsEnabled, subagentEnabled, webSearchEnabled)
+    setToolsEnabled(toolsEnabled, subagentEnabled, webSearchEnabled, redteamMode)
     const importedContext = renderLegacyHistory(legacyHistory)
     if (importedContext) {
       agentCtx.systemPrompt.section({ name: 'dsbot-ios-imported-history', order: 800, text: importedContext })
@@ -304,13 +333,14 @@ function setupAgent({ botId, systemPrompt, legacyHistory, toolsEnabled, subagent
         rpc.notify('chat.delta', { sessionId: botId, turnId: active.turnId, content: '', reasoning: chunk.text })
       }
     })
-    agentCtx.effect(() => () => { personaDisposer?.(); toolRestriction?.() }, 'dsbot-ios.persona')
+    agentCtx.effect(() => () => { personaDisposer?.(); redteamPromptDisposer?.(); toolRestriction?.() }, 'dsbot-ios.persona')
     return undefined
   }
   return {
     setup,
     setPersona: (value) => setPersona(value),
-    setToolsEnabled: (enabled, allowSubagent, allowWebSearch) => setToolsEnabled(enabled, allowSubagent, allowWebSearch),
+    setToolsEnabled: (enabled, allowSubagent, allowWebSearch, allowRedteam = false) =>
+      setToolsEnabled(enabled, allowSubagent, allowWebSearch, allowRedteam),
     id,
   }
 }
@@ -430,6 +460,8 @@ async function startTurn(params, preparation) {
   const officialDeepSeek = isOfficialDeepSeekBase(runtime.apiBaseURL)
   const toolsEnabled = officialDeepSeek || params.customTools === true
   const webSearchEnabled = officialDeepSeek && params.webSearchEnabled === true
+  const redteamMode = params.redteamMode === true
+  if (redteamMode) await setRedteamToolsMounted(true).catch(() => {})
   const id = dshSessionId(botId)
   let active = runtime.activeAgents.get(id)
   const options = {
@@ -437,7 +469,7 @@ async function startTurn(params, preparation) {
     reasoningEffort: reasoningEnabled ? 'high' : 'off',
   }
   if (!active) {
-    const composition = setupAgent({ botId, systemPrompt: params.systemPrompt, legacyHistory: params.legacyHistory, toolsEnabled, subagentEnabled: params.subagentEnabled === true, webSearchEnabled })
+    const composition = setupAgent({ botId, systemPrompt: params.systemPrompt, legacyHistory: params.legacyHistory, toolsEnabled, subagentEnabled: params.subagentEnabled === true, webSearchEnabled, redteamMode })
     let handle
     try {
       if (await runtime.persistence.stat(id)) {
@@ -455,7 +487,7 @@ async function startTurn(params, preparation) {
   } else {
     active.agent.model.select(options)
     active.setPersona(params.systemPrompt)
-    active.setToolsEnabled(toolsEnabled, params.subagentEnabled === true, webSearchEnabled)
+    active.setToolsEnabled(toolsEnabled, params.subagentEnabled === true, webSearchEnabled, redteamMode)
   }
 
   if (preparation.cancelled || runtime.suspended) {
@@ -571,6 +603,67 @@ rpc.handle('session.clear', async ({ sessionId }) => {
 
 // UI-owned workspace methods (memory, connectors, approvals, speech, local JS) are routed by
 // Swift directly to its native workspace and are intentionally not reachable through this process.
+
+let redteamToolsFork = null
+
+function redteamToolsModulePath() {
+  const candidate = join(PROFILE_DIR, 'node_modules', 'dsh-purge-safe', 'lib', 'redteam', 'tools.js')
+  return existsSync(candidate) ? candidate : null
+}
+
+function redteamSkillsCount() {
+  for (const dir of [
+    join(WORKSPACE, 'redteam', 'skills'),
+    join(PROFILE_DIR, 'node_modules', 'dsh-purge-safe', 'skills', 'redteam'),
+  ]) {
+    if (existsSync(dir)) {
+      try {
+        return readdirSync(dir).filter((f) => f.endsWith('.md')).length
+      } catch { /* ignore */ }
+    }
+  }
+  return 0
+}
+
+async function setRedteamToolsMounted(enabled) {
+  if (!enabled) {
+    if (redteamToolsFork) {
+      try { await redteamToolsFork.dispose() } catch { /* ignore */ }
+      redteamToolsFork = null
+    }
+    return redteamStatus()
+  }
+  if (!redteamToolsFork) {
+    const toolsPath = redteamToolsModulePath()
+    if (!toolsPath) return redteamStatus()
+    const mod = await import(pathToFileURL(toolsPath).href)
+    const plugin = mod?.default ?? mod
+    if (plugin && ctx) {
+      redteamToolsFork = ctx.plugin(plugin)
+      try { await redteamToolsFork.await?.() } catch { /* ignore */ }
+    }
+  }
+  return redteamStatus()
+}
+
+function redteamStatus() {
+  const installed = Boolean(redteamToolsModulePath())
+  const layerActive = Boolean(runtime.profile?.layers?.some(({ packageName }) => packageName === 'dsh-purge-safe'))
+  const storeReady = Boolean(ctx?.get?.('redteam'))
+  const tools = registeredRedteamToolNames()
+  return {
+    installed,
+    pluginActive: layerActive,
+    storeReady,
+    redteamModeActive: Boolean(redteamToolsFork) || tools.length > 0,
+    toolCount: tools.length,
+    tools,
+    skillCount: redteamSkillsCount(),
+  }
+}
+
+rpc.handle('redteam.status', async () => redteamStatus())
+rpc.handle('redteam.setMode', async ({ enabled } = {}) => setRedteamToolsMounted(enabled === true))
 
 rpc.handle('usage.summary', (params) => dshUsageSummary(params))
 
