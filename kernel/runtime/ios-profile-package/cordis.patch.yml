@@ -111,8 +111,34 @@
     - id: storage
       name: '@deepseek-ai/dsh-storage'
 
+    - id: storage-sqlite
+      name: '@deepseek-ai/dsh-storage-sqlite'
+      config:
+        path: !!js process.env.DSH_HOME + '/dsh-storage.sqlite'
+        journalMode: wal
+
     - id: storage-domain
       name: '@deepseek-ai/dsh-storage-domain'
+      config:
+        backend: sqlite
+
+    - id: session-query-sqlite
+      name: '@deepseek-ai/dsh-session-query-sqlite'
+      config:
+        path: ':memory:'
+        openAt: never
+
+    - id: sandbox-policy
+      name: '@deepseek-ai/dsh-sandbox-policy'
+      config:
+        mode: workspace-write
+
+    - id: agent-default-model
+      name: '@deepseek-ai/dsh-agent-default-model'
+      config:
+        provider: deepseek-official
+        model: deepseek-flash
+        reasoningEffort: 'off'
 
     - id: typert
       name: '@deepseek-ai/dsh-typert-registry'
