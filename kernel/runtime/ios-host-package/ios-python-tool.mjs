@@ -6,8 +6,7 @@ export { cancelIOSPythonExecution, executeIOSPython, cancelAllIOSPythonExecution
 
 const outputSchema = {
   type: 'object',
-  properties: { output: { type: 'string' } },
-  required: ['output'],
+  properties: { output: { type: 'string', required: true } },
   additionalProperties: false,
 }
 

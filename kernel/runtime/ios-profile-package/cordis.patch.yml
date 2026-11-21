@@ -216,6 +216,8 @@
             name: '@deepseek-ai/dsh-agent-instructions'
             config:
               maxBytes: 65536
+              projectRootMarkers:
+                - .dsbot-ios-workspace-root
           - id: time-context
             name: '@deepseek-ai/dsh-time-context'
           - id: tool-fs
@@ -226,8 +228,9 @@
           - id: skill-filesystem
             name: '@deepseek-ai/dsh-skill-filesystem'
             config:
-              customSkillDirs:
-                - !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deepseek-ai/dsh-agent-preset/package.json')), 'skills')
+              dshHome: !!js process.env.DSH_HOME + '/files'
+              agentsHome: !!js process.env.DSH_HOME + '/files'
+              bundledSkillDir: !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deepseek-ai/dsh-agent-preset/package.json')), 'skills')
           - id: tool-skill
             name: '@deepseek-ai/dsh-tool-skill'
           - id: planning
@@ -275,6 +278,8 @@
             name: '@deepseek-ai/dsh-agent-instructions'
             config:
               maxBytes: 65536
+              projectRootMarkers:
+                - .dsbot-ios-workspace-root
           - id: time-context
             name: '@deepseek-ai/dsh-time-context'
           - id: tool-fs
@@ -285,8 +290,9 @@
           - id: skill-filesystem
             name: '@deepseek-ai/dsh-skill-filesystem'
             config:
-              customSkillDirs:
-                - !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deepseek-ai/dsh-agent-preset/package.json')), 'skills')
+              dshHome: !!js process.env.DSH_HOME + '/files'
+              agentsHome: !!js process.env.DSH_HOME + '/files'
+              bundledSkillDir: !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deepseek-ai/dsh-agent-preset/package.json')), 'skills')
           - id: tool-skill
             name: '@deepseek-ai/dsh-tool-skill'
           - id: planning
@@ -337,6 +343,8 @@
             name: '@deepseek-ai/dsh-agent-instructions'
             config:
               maxBytes: 65536
+              projectRootMarkers:
+                - .dsbot-ios-workspace-root
           - id: time-context
             name: '@deepseek-ai/dsh-time-context'
           - id: tool-fs
@@ -347,8 +355,9 @@
           - id: skill-filesystem
             name: '@deepseek-ai/dsh-skill-filesystem'
             config:
-              customSkillDirs:
-                - !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deepseek-ai/dsh-agent-preset/package.json')), 'skills')
+              dshHome: !!js process.env.DSH_HOME + '/files'
+              agentsHome: !!js process.env.DSH_HOME + '/files'
+              bundledSkillDir: !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deepseek-ai/dsh-agent-preset/package.json')), 'skills')
           - id: tool-skill
             name: '@deepseek-ai/dsh-tool-skill'
           - id: planning
@@ -409,13 +418,19 @@
               write: false
               edit: false
               applyPatch: false
-          - id: plan-mode
-            name: '@deepseek-ai/dsh-plan-mode'
+          - id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
             config:
-              section: |
-                You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode.
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                    You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode.
 
-                Explore the workspace using read-only tools first. Do not edit or write files, change settings, or execute mutation tools while plan mode is active. Give the user a decision-complete plan, then submit it through exit_plan_mode for review.
+                    Explore the workspace using read-only tools first. Do not edit or write files, change settings, or execute mutation tools while plan mode is active. Give the user a decision-complete plan, then submit it through exit_plan_mode for review.
           - id: tool-ask-user
             name: '@deepseek-ai/dsh-tool-ask-user'
           - id: tool-todo

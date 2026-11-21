@@ -45,6 +45,12 @@ process.env.DS_BOT_IOS_REDTEAM_WEB_WRITE = '0'
 process.env.DS_BOT_IOS_REDTEAM_WEB_SENSITIVE = '0'
 if (!workerData?.supervised) process.chdir(WORKSPACE)
 mkdirSync(WORKSPACE_FILES, { recursive: true })
+const WORKSPACE_ROOT_MARKER = join(WORKSPACE_FILES, '.dsbot-ios-workspace-root')
+if (!existsSync(WORKSPACE_ROOT_MARKER)) {
+  try { writeFileSync(WORKSPACE_ROOT_MARKER, '', { flag: 'wx' }) } catch (error) {
+    if (error?.code !== 'EEXIST') throw error
+  }
+}
 
 const PROFILE = 'dsbot-ios'
 const PROFILE_BUNDLE = '@dsbot/dsh-ios-profile'
@@ -441,6 +447,49 @@ function renderLegacyHistory(messages) {
   return `Earlier conversation imported from the previous DS Bot iOS chat store. Treat it as background context; the current DSH session log is authoritative for new turns.\n\n${transcript.slice(-48_000)}`
 }
 
+function collectProfileEntryRows(value, rows = []) {
+  if (Array.isArray(value)) {
+    for (const item of value) collectProfileEntryRows(item, rows)
+    return rows
+  }
+  if (!value || typeof value !== 'object') return rows
+  if (typeof value.name === 'string') {
+    rows.push(value)
+    if (value.group === true) collectProfileEntryRows(value.config, rows)
+    return rows
+  }
+  for (const key of ['insert', 'append', 'replace']) {
+    if (value[key] !== undefined) collectProfileEntryRows(value[key], rows)
+  }
+  return rows
+}
+
+async function auditExternalProfileLayers(profileLayers) {
+  const entries = [...ctx.loader.entries()]
+  for (const layer of profileLayers.filter(({ packageName }) => packageName !== PROFILE_BUNDLE)) {
+    const rows = layer.patches.flatMap((patch) => collectProfileEntryRows(patch))
+    for (const row of rows) {
+      const candidates = entries.filter((entry) =>
+        (typeof row.id === 'string' && entry.options.id === row.id)
+        || (typeof row.id !== 'string' && entry.options.name === row.name))
+      const entry = candidates.at(-1)
+      const label = `${layer.packageName}/${row.id ?? row.name}`
+      if (!entry) throw new Error(`iOS DSH profile bundle entry was not mounted: ${label}`)
+      if (entry.disabled) continue
+      if (entry.fiber?.state === 2) continue
+      const missing = entry.fiber
+        ? Object.keys(entry.fiber.inject).filter((name) => entry.fiber.ctx.get(name) === undefined)
+        : []
+      if (entry.fiber && entry.fiber.state !== 0) {
+        try { await entry.fiber.await() } catch (error) {
+          throw new Error(`iOS DSH profile bundle entry failed: ${label}`, { cause: error })
+        }
+      }
+      throw new Error(`iOS DSH profile bundle entry is inactive: ${label}${missing.length ? ` (waiting for ${missing.join(', ')})` : ''}`)
+    }
+  }
+}
+
 function excerpt(value, limit = 2_400) {
   const text = typeof value === 'string' ? value : value === undefined ? '' : JSON.stringify(value)
   let preview = ''
@@ -566,7 +615,7 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
       if (agentPreset === 'standard' || agentPreset === 'cordis') mountIOSPythonJobTool(agentCtx)
       mountIOSScheduleTools(agentCtx)
     }
-    await agentCtx.agentPresets.mount(agentCtx, agentPreset)
+    await ctx.agentPresets.mount(agentCtx, agentPreset)
     let personaDisposer
     let redteamPromptDisposer
     let toolRestriction
@@ -597,7 +646,8 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
         sensitive: allowRedteamSensitive,
         permissionMode: ['ask', 'autoReview', 'readOnly'].includes(redteamPermissionMode) ? redteamPermissionMode : 'ask',
       }
-      const deny = enabled ? [] : [...NATIVE_TOOL_NAMES]
+      const globalToolNames = new Set(ctx.tools.definitions().map((tool) => tool.name))
+      const deny = enabled ? [] : [...DISABLED_TOOL_NAMES].filter((name) => globalToolNames.has(name))
       if (!allowSubagent || !enabled) deny.push('subagent')
       if (enabled && !allowWebSearch) deny.push('web_search')
       const rtTools = registeredRedteamToolNames()
@@ -852,7 +902,8 @@ async function boot() {
     throw new Error('The iOS DSH profile did not activate its persistence and DeepSeek provider plugins')
   }
   if (!safeMode && profile.layers.some(({ packageName }) => packageName !== PROFILE_BUNDLE)) {
-    await auditStartupEntries(ctx, 'dsh', (warning) => { throw new Error(warning) })
+    await auditStartupEntries(ctx, 'dsh')
+    await auditExternalProfileLayers(profile.layers)
   }
   if (!safeMode) await settlePluginRevision(PROFILE_DIR, false)
   await cleanupPendingPluginRemovals(PROFILE_DIR)
@@ -995,12 +1046,20 @@ async function startTurn(params, preparation) {
       if (await runtime.persistence.stat(id)) {
         handle = await ctx.agents.resume({ resumeSessionId: id, agentOptions: options, setup: composition.setup })
       } else {
-        handle = await ctx.agents.create({ sessionId: id, meta: { cwd: WORKSPACE }, agentOptions: options, setup: composition.setup })
+        handle = await ctx.agents.create({ sessionId: id, meta: { cwd: WORKSPACE_FILES }, agentOptions: options, setup: composition.setup })
       }
     } catch (error) {
       if (error instanceof SessionPersistenceNotFoundError) {
-        handle = await ctx.agents.create({ sessionId: id, meta: { cwd: WORKSPACE }, agentOptions: options, setup: composition.setup })
+        handle = await ctx.agents.create({ sessionId: id, meta: { cwd: WORKSPACE_FILES }, agentOptions: options, setup: composition.setup })
       } else throw error
+    }
+    try {
+      const currentDirectory = ctx.workingDirectory.get(handle.agent.session)
+      const target = await ctx.fs.resolve(currentDirectory)
+      const info = await ctx.fs.stat(target)
+      if (info?.type !== 'directory') throw new Error('The saved working directory is unavailable')
+    } catch {
+      await ctx.workingDirectory.set(handle.agent, WORKSPACE_FILES)
     }
     const selection = ctx.agentPresets.presetForSession(handle.agent.session)
     const boundary = ctx.agents.turnBoundaryOf(handle.agent.session)

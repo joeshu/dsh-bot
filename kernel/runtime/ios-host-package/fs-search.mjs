@@ -8,6 +8,15 @@ const MAX_GREP_FILES = 500
 const MAX_FILE_BYTES = 262_144
 const MAX_GREP_MATCHES = 250
 const MAX_MATCH_LINE_CHARS = 2_000
+const OUTPUT_SCHEMA = {
+  type: 'object',
+  properties: { output: { type: 'string', required: true } },
+  additionalProperties: false,
+}
+const TOOL_OUTPUT = {
+  schema: OUTPUT_SCHEMA,
+  render: (_args, value) => [{ type: 'text', text: value.output }],
+}
 
 function hasUnsafeRegexFeatures(pattern) {
   let inCharacterClass = false
@@ -99,6 +108,7 @@ function apply(ctx) {
   const glob = defineTool({
     name: 'glob',
     description: 'Find workspace files by glob pattern. Supports *, **, ?, and {a,b} alternatives. Hidden files are included; VCS metadata and node_modules are skipped.',
+    output: TOOL_OUTPUT,
     parameters: {
       pattern: { type: 'string', required: true, description: 'Glob pattern relative to path or the current workspace.' },
       path: { type: 'string', description: 'Optional workspace directory to search.' },
@@ -123,6 +133,7 @@ function apply(ctx) {
   const grep = defineTool({
     name: 'grep',
     description: 'Search UTF-8 workspace files with a bounded regular expression. Grouping, lookarounds, backreferences, and more than two unbounded repetitions are unsupported. Results are capped; use path or include to narrow large searches.',
+    output: TOOL_OUTPUT,
     parameters: {
       pattern: { type: 'string', required: true, description: 'JavaScript-compatible regular expression.' },
       path: { type: 'string', description: 'Optional workspace directory to search.' },

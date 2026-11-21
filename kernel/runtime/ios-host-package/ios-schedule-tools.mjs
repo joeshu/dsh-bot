@@ -4,8 +4,7 @@ import { isIOSPrivateSessionId } from './private-session-access.mjs'
 
 const outputSchema = {
   type: 'object',
-  properties: { output: { type: 'string' } },
-  required: ['output'],
+  properties: { output: { type: 'string', required: true } },
   additionalProperties: false,
 }
 
