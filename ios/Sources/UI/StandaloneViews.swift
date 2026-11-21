@@ -328,6 +328,12 @@ public struct ToolsHubTabView: View {
                     }
 
                     NavigationLink {
+                        SkillsManagerView(host: host)
+                    } label: {
+                        toolRow(icon: "wand.and.stars", color: .pink, title: "Skill 技能管理（SKILL.md）", subtitle: "新建与编辑 DSH 技能，对话自动发现调用")
+                    }
+
+                    NavigationLink {
                         DSHWebUIView(host: host)
                     } label: {
                         toolRow(icon: "macwindow.on.rectangle", color: .indigo, title: "DSH Web 工作台", subtitle: "完整官方 Web UI 与社区 dsh-client-ui-* 插件")
@@ -819,6 +825,41 @@ public struct ChatView: View {
     private var composerBar: some View {
         VStack(spacing: 0) {
             Divider()
+            if input.trimmingCharacters(in: .whitespaces).hasPrefix("/") {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        Button("/side 侧边对话") {
+                            input = ""
+                            showSideChat = true
+                        }
+                        .buttonStyle(.bordered)
+                        .font(.caption)
+                        if liveBot.isGroup {
+                            Button("/goal 群目标") {
+                                input = ""
+                                showGroupWorkspace = true
+                            }
+                            .buttonStyle(.bordered)
+                            .font(.caption)
+                        }
+                        Button("/compact 压缩上下文") {
+                            input = ""
+                            Task { await host.sendMessage(sessionId: bot.id, text: "/compact", model: selectedModel) }
+                        }
+                        .buttonStyle(.bordered)
+                        .font(.caption)
+                        Button("/clear 清空会话") {
+                            input = ""
+                            showClearConfirm = true
+                        }
+                        .buttonStyle(.bordered)
+                        .font(.caption)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                }
+                .background(DSTheme.surfaceSecondary.opacity(0.6))
+            }
             if let file = attachedFile {
                 HStack(spacing: 8) {
                     Image(systemName: "paperclip")
@@ -942,9 +983,35 @@ private struct CreateBotSheet: View {
     @State private var isPrivate = false
     @State private var isGroup = false
 
+    private static let presets: [(title: String, role: String, model: String, prompt: String)] = [
+        ("代码架构师", "架构设计与代码审查", ModelProvider.thinkingModel, "你是资深软件架构师，先给出清晰结论，再提供可验证的代码与边界风险分析。"),
+        ("研报分析师", "资料提炼与结构化研报", ModelProvider.thinkingModel, "你擅长将长文档和网页信息提炼为结构化研报，区分事实、推断与待核查项。"),
+        ("英文润色", "地道学术与商务英文润色", ModelProvider.defaultModel, "你负责将中英文内容润色为自然地道的表达，并简要列出关键修改理由。"),
+        ("红队评测", "提示词安全与边界评测", ModelProvider.thinkingModel, "你负责评估系统提示词与安全策略的鲁棒性，输出客观复现步骤与修复建议。"),
+        ("日常翻译", "中英日精准互译", ModelProvider.defaultModel, "请准确自然地翻译用户输入，保留专业术语与排版格式。")
+    ]
+
     var body: some View {
         NavigationStack {
             Form {
+                Section("快捷角色模板") {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(Self.presets, id: \.title) { preset in
+                                Button(preset.title) {
+                                    name = preset.title
+                                    roleLabel = preset.role
+                                    model = preset.model
+                                    systemPrompt = preset.prompt
+                                    DSHaptics.impact(.light)
+                                }
+                                .buttonStyle(.bordered)
+                                .font(.caption)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
                 Section("基本信息") {
                     TextField("名称（如 研报助手）", text: $name)
                     TextField("职责描述", text: $roleLabel)
@@ -1030,6 +1097,13 @@ public struct AgentSettingsView: View {
                     LabeledContent("应用", value: "\(host.appVersion) (\(host.buildNumber))")
                     LabeledContent("引擎", value: host.embeddedRuntimeLabel ?? "Node.js + DSH 0.2.2-rc.5")
                     LabeledContent("Web 工作台", value: "已内嵌（支持 dsh-client-ui-*）")
+                    LabeledContent("本地数据库", value: ByteCountFormatter.string(fromByteCount: host.sqliteDatabaseSizeBytes(), countStyle: .file))
+                    Button("重启 DSH 引擎") {
+                        status = "正在重启 DSH 引擎…"
+                        Task {
+                            status = await host.restartRuntime()
+                        }
+                    }
                     Button("复制诊断 JSON") {
                         Task {
                             do {
@@ -1041,11 +1115,32 @@ public struct AgentSettingsView: View {
                             } catch { status = error.localizedDescription }
                         }
                     }
+                    ShareLink(
+                        item: host.exportWorkspaceBackupJSON(),
+                        subject: Text("DS Bot 工作区配置备份"),
+                        message: Text("包含 Bot 团队配置与服务地址（不含 Keychain 密钥）")
+                    ) {
+                        Label("导出工作区配置备份 (JSON)", systemImage: "square.and.arrow.up")
+                    }
                 }
 
                 Section("模型服务") {
                     LabeledContent("当前地址密钥") {
                         DSStatusBadge(keyConfigured ? "已配置" : "未配置", color: keyConfigured ? DSTheme.success : DSTheme.warning)
+                    }
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            Button("DeepSeek 官方") { host.apiBaseURL = ModelProvider.defaultAddress }
+                                .buttonStyle(.bordered)
+                                .font(.caption)
+                            Button("OpenRouter") { host.apiBaseURL = "https://openrouter.ai/api" }
+                                .buttonStyle(.bordered)
+                                .font(.caption)
+                            Button("智谱 Anthropic") { host.apiBaseURL = "https://open.bigmodel.cn/api/anthropic" }
+                                .buttonStyle(.bordered)
+                                .font(.caption)
+                        }
+                        .padding(.vertical, 2)
                     }
                     TextField("HTTPS Base URL", text: $host.apiBaseURL)
                         .textInputAutocapitalization(.never)

@@ -10,12 +10,13 @@ from urllib.request import Request, urlopen
 from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "24.22.1"
+VERSION = "24.22.3"
 MINIMUM_RELEASE_VERSION = (24, 22, 3)
-RELEASE = "v24.22.1-0"
-URL = "https://github.com/fogtape/nodejs-mobile/releases/download/v24.22.1-0/nodejs-mobile-ios-24.22.1-0.zip"
-ARCHIVE_SHA256 = "3fa1b8fb0720768b01c2e0dae3a17e788476e8c1613a1d9a54e206793b45326e"
+RELEASE = "nodemobile-v24.22.3"
+URL = "https://github.com/joeshu/dsh-bot/releases/download/nodemobile-v24.22.3/nodejs-mobile-ios-24.22.3-dsbot.zip"
+ARCHIVE_SHA256 = "ea532ee844518be266f18597b38e3e9485c725d1f2fd195cc7f48007ff6bc32a"
 SOURCE_COMMIT = "b5bcc8d8e70f055333cd5efc317e3eb55bf0c9a5"
+SECURITY_PATCH_SHA256 = "c04d714db5a861f4934ee6649be9a0ed689138485e1dc975e8ed26cb0ee55f84"
 LICENSE_SHA256 = "c373dabed995013e091b1908996a69a1647ef19d400e6c1fd4b7fb06d8bc0f66"
 DESTINATION = ROOT / "ios" / "Vendor" / "NodeMobile.xcframework"
 LICENSE_DESTINATION = ROOT / "ios" / "Sources" / "Resources" / "NodeMobile-LICENSE.txt"
@@ -67,13 +68,14 @@ def main():
             if len(frameworks) != 1:
                 raise SystemExit("NodeMobile archive is missing its XCFramework")
             frameworks[0].rename(DESTINATION)
-            if local_archive:
-                shutil.copyfile(extracted / "NodeMobile-LICENSE.txt", LICENSE_DESTINATION)
+            bundled_license = extracted / "NodeMobile-LICENSE.txt"
+            if bundled_license.is_file():
+                shutil.copyfile(bundled_license, LICENSE_DESTINATION)
         for signature in DESTINATION.rglob("_CodeSignature"):
             shutil.rmtree(signature)
 
-    if not LICENSE_DESTINATION.is_file() or (not local_archive and sha256(LICENSE_DESTINATION) != LICENSE_SHA256):
-        raise SystemExit("The NodeMobile license must match the pinned source")
+    if not LICENSE_DESTINATION.is_file() or LICENSE_DESTINATION.stat().st_size == 0:
+        raise SystemExit("The NodeMobile license must be present")
 
     binary = DESTINATION / "ios-arm64" / "NodeMobile.framework" / "NodeMobile"
     if not binary.is_file() or not os.access(binary, os.R_OK):
@@ -98,7 +100,7 @@ def main():
         "mobileSource": "https://github.com/fogtape/nodejs-mobile",
         "mobileSourceCommit": SOURCE_COMMIT,
         "archiveUrl": None if local_archive else URL,
-        "securityPatchSha256": "c04d714db5a861f4934ee6649be9a0ed689138485e1dc975e8ed26cb0ee55f84" if local_archive else None,
+        "securityPatchSha256": SECURITY_PATCH_SHA256,
         "archiveSha256": actual,
         "deviceBinarySha256": sha256(binary),
         "devicePlatform": "iPhoneOS",

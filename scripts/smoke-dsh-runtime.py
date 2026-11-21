@@ -202,8 +202,8 @@ def main():
     if not node or not ENTRY.is_file():
         raise SystemExit("Stage DSHRuntime and install Node.js before running the runtime smoke probe")
     node_version = subprocess.check_output([node, "--version"], text=True).strip()
-    if node_version != "v24.22.1":
-        raise SystemExit(f"Expected host Node v24.22.1 for the pinned smoke environment; found {node_version}")
+    if node_version != "v24.22.3":
+        raise SystemExit(f"Expected host Node v24.22.3 for the pinned smoke environment; found {node_version}")
 
     with tempfile.TemporaryDirectory(prefix="dsbot-dsh-smoke-") as temporary:
         workspace = Path(temporary) / "dsh-home"
@@ -214,7 +214,7 @@ def main():
             peer.start()
             info = peer.request("agent.info")
             if (info.get("engine"), info.get("dshVersion"), info.get("nodeVersion")) != (
-                "node+dsh", "0.2.2-rc.5", "24.22.1",
+                "node+dsh", "0.2.2-rc.5", "24.22.3",
             ):
                 raise AssertionError(f"Unexpected runtime identity: {info}")
             plugins = set(info.get("plugins", []))

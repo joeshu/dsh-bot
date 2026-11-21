@@ -202,6 +202,49 @@ public final class LocalAgentHost: ObservableObject {
         return (try? await keychain.modelKey(provider: provider, migrateOfficialKey: migrateOfficialKey)) != nil
     }
 
+    public func restartRuntime() async -> String {
+        guard let channel else { return "DSH 运行时尚未连接。" }
+        do {
+            let result = try await channel.request("runtime.restart", timeoutSeconds: 115)
+            await refreshPluginState(on: channel)
+            if result["rolledBack"] as? Bool == true {
+                return "DSH 已重启，但回滚了异常插件变更。"
+            }
+            return "DSH 引擎已重启就绪。"
+        } catch {
+            return "重启失败：\(error.localizedDescription)"
+        }
+    }
+
+    public func sqliteDatabaseSizeBytes() -> Int64 {
+        let fm = FileManager.default
+        let names = ["dsh-sessions.sqlite", "dsh-sessions.sqlite-wal", "dsh-storage.sqlite", "dsh-storage.sqlite-wal"]
+        return names.reduce(Int64(0)) { total, name in
+            let path = workspace.appendingPathComponent(name).path
+            let size = (try? fm.attributesOfItem(atPath: path)[.size] as? NSNumber)?.int64Value ?? 0
+            return total + size
+        }
+    }
+
+    public func exportWorkspaceBackupJSON() -> String {
+        struct BackupPayload: Encodable {
+            let exportedAt: String
+            let appVersion: String
+            let apiBaseURL: String
+            let bots: [BotProfile]
+        }
+        let payload = BackupPayload(
+            exportedAt: ISO8601DateFormatter().string(from: Date()),
+            appVersion: appVersion,
+            apiBaseURL: apiBaseURL,
+            bots: bots
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(payload) else { return "{}" }
+        return String(decoding: data, as: UTF8.self)
+    }
+
     func refreshModels() async throws -> (latency: Int, count: Int) {
         guard channel != nil else { throw IPCFrameError.channelClosed }
         let address = apiBaseURL

@@ -45,7 +45,18 @@ public struct DSHWebUIView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .tabBar)
         .toolbar {
-            ToolbarItem(placement: .navigationBarTrailing) {
+            ToolbarItemGroup(placement: .navigationBarTrailing) {
+                Button {
+                    Task {
+                        launchURL = nil
+                        _ = await host.restartRuntime()
+                        reloadToken = UUID()
+                        await loadWebUIInfo()
+                    }
+                } label: {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                }
+                .help("重启 DSH 引擎并刷新")
                 Button {
                     reloadToken = UUID()
                     Task { await loadWebUIInfo() }

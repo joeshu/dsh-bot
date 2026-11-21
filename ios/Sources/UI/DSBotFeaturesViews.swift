@@ -1,3 +1,4 @@
+import Charts
 import LocalAuthentication
 import SwiftUI
 import UniformTypeIdentifiers
@@ -592,6 +593,18 @@ public struct ConnectorsAndUsageView: View {
 
             if !dailyUsage.isEmpty {
                 Section("最近 7 天") {
+                    if dailyUsage.contains(where: { $0.totals.totalTokens > 0 }) {
+                        Chart(dailyUsage.reversed()) { item in
+                            BarMark(
+                                x: .value("日期", item.title),
+                                y: .value("Tokens", item.totals.totalTokens)
+                            )
+                            .foregroundStyle(DSTheme.brand.gradient)
+                            .cornerRadius(4)
+                        }
+                        .frame(height: 150)
+                        .padding(.vertical, 6)
+                    }
                     ForEach(dailyUsage) { item in
                         LabeledContent(item.title, value: "\(item.totals.totalTokens.formatted()) Tokens · \(item.totals.calls.formatted()) 次")
                     }
@@ -837,8 +850,11 @@ public struct WorkspaceFilesView: View {
     }
 
     @State private var entries: [FileEntry] = []
-    @State private var selectedPreview: (name: String, content: String)?
+    @State private var selectedPreview: (url: URL, name: String, content: String)?
     @State private var showImporter = false
+    @State private var showNewFile = false
+    @State private var newFileName = ""
+    @State private var newFileContent = ""
     @State private var status = ""
 
     private var filesRoot: URL {
@@ -856,7 +872,7 @@ public struct WorkspaceFilesView: View {
             }
             Section("工作区文件（files/）") {
                 if entries.isEmpty {
-                    Text("暂无文件，可点击右上角导入文档或图片。")
+                    Text("暂无文件，可点击右上角新建或导入文档/图片。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
@@ -890,8 +906,44 @@ public struct WorkspaceFilesView: View {
         }
         .navigationTitle("工作区文件")
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button { showImporter = true } label: { Label("导入", systemImage: "plus") }
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button { showNewFile = true } label: { Image(systemName: "doc.badge.plus") }
+                Button { showImporter = true } label: { Image(systemName: "square.and.arrow.down") }
+            }
+        }
+        .sheet(isPresented: $showNewFile) {
+            NavigationStack {
+                Form {
+                    TextField("文件名（如 notes.md）", text: $newFileName)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    TextEditor(text: $newFileContent)
+                        .font(.caption.monospaced())
+                        .frame(minHeight: 160)
+                }
+                .navigationTitle("新建工作区文件")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) { Button("取消") { showNewFile = false } }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("保存") {
+                            let clean = newFileName.trimmingCharacters(in: .whitespacesAndNewlines)
+                                .replacingOccurrences(of: "/", with: "_")
+                                .replacingOccurrences(of: "..", with: "_")
+                            guard !clean.isEmpty else { return }
+                            let dest = filesRoot.appendingPathComponent(clean, isDirectory: false)
+                            do {
+                                try Data(newFileContent.utf8).write(to: dest, options: .atomic)
+                                status = "已创建：files/\(clean)"
+                                newFileName = ""
+                                newFileContent = ""
+                                showNewFile = false
+                                reload()
+                            } catch { status = "创建失败：\(error.localizedDescription)" }
+                        }
+                        .disabled(newFileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                }
             }
         }
         .fileImporter(isPresented: $showImporter, allowedContentTypes: [.item]) { result in
@@ -922,7 +974,10 @@ public struct WorkspaceFilesView: View {
                     .navigationTitle(preview.name)
                     .navigationBarTitleDisplayMode(.inline)
                     .toolbar {
-                        ToolbarItem(placement: .topBarTrailing) {
+                        ToolbarItemGroup(placement: .topBarTrailing) {
+                            ShareLink(item: preview.url) {
+                                Image(systemName: "square.and.arrow.up")
+                            }
                             Button("完成") { selectedPreview = nil }
                         }
                     }
@@ -956,9 +1011,171 @@ public struct WorkspaceFilesView: View {
         }
         let slice = data.prefix(65_536)
         if let text = String(data: slice, encoding: .utf8) {
-            selectedPreview = (entry.name, data.count > 65_536 ? text + "\n…(已截断)" : text)
+            selectedPreview = (entry.url, entry.name, data.count > 65_536 ? text + "\n…(已截断)" : text)
         } else {
-            selectedPreview = (entry.name, "二进制文件（\(data.count) 字节），暂不支持文本预览。")
+            selectedPreview = (entry.url, entry.name, "二进制文件（\(data.count) 字节），可使用右上角分享导出。")
         }
+    }
+}
+
+// MARK: - 9. DSH Skills Manager (`Documents/dsh-home/skills/<name>/SKILL.md`)
+
+public struct SkillsManagerView: View {
+    @ObservedObject var host: LocalAgentHost
+    private struct SkillEntry: Identifiable {
+        let id: String
+        let name: String
+        let fileURL: URL
+        let content: String
+    }
+
+    @State private var skills: [SkillEntry] = []
+    @State private var editingSkill: SkillEntry?
+    @State private var editContent = ""
+    @State private var showCreate = false
+    @State private var newName = ""
+    @State private var newContent = """
+    ---
+    name: my-skill
+    description: 描述这个技能何时触发以及完成什么任务
+    ---
+
+    # 使用说明
+    1. 步骤一
+    2. 步骤二
+    """
+    @State private var status = ""
+
+    private var skillsRoot: URL {
+        let dir = LocalAgentTransport.defaultWorkspace.appendingPathComponent("skills", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    public var body: some View {
+        List {
+            Section {
+                Text("管理本机 DSH Skill 技能（skills/<名称>/SKILL.md）。已挂载官方 dsh-skill-filesystem 与 dsh-tool-skill，智能体可在对话中自动发现并调用。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Section("已安装技能（\(skills.count)）") {
+                if skills.isEmpty {
+                    Text("暂无自定义技能，点右上角 + 新建一个 SKILL.md。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(skills) { skill in
+                        Button {
+                            editingSkill = skill
+                            editContent = skill.content
+                        } label: {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(skill.name).font(.subheadline.weight(.semibold))
+                                Text(skill.content.split(separator: "\n").prefix(2).joined(separator: " "))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                        }
+                        .swipeActions(edge: .trailing) {
+                            Button("删除", role: .destructive) {
+                                try? FileManager.default.removeItem(at: skill.fileURL.deletingLastPathComponent())
+                                reload()
+                            }
+                        }
+                    }
+                }
+            }
+            if !status.isEmpty {
+                Section { Text(status).font(.caption).foregroundStyle(.secondary) }
+            }
+        }
+        .navigationTitle("Skill 技能管理")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button { showCreate = true } label: { Label("新建", systemImage: "plus") }
+            }
+        }
+        .sheet(isPresented: $showCreate) {
+            NavigationStack {
+                Form {
+                    TextField("技能目录名（英文/数字/连字符）", text: $newName)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    TextEditor(text: $newContent)
+                        .font(.caption.monospaced())
+                        .frame(minHeight: 200)
+                }
+                .navigationTitle("新建 SKILL.md")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) { Button("取消") { showCreate = false } }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("保存") {
+                            let safe = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+                                .lowercased()
+                                .map { ($0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_")) ? $0 : "-" }
+                            let folder = String(safe).trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+                            guard !folder.isEmpty else { return }
+                            let dir = skillsRoot.appendingPathComponent(folder, isDirectory: true)
+                            let file = dir.appendingPathComponent("SKILL.md", isDirectory: false)
+                            do {
+                                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                                try Data(newContent.utf8).write(to: file, options: .atomic)
+                                status = "已保存技能：\(folder)/SKILL.md"
+                                newName = ""
+                                showCreate = false
+                                reload()
+                            } catch { status = "保存失败：\(error.localizedDescription)" }
+                        }
+                        .disabled(newName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                }
+            }
+        }
+        .sheet(item: $editingSkill) { target in
+            NavigationStack {
+                Form {
+                    TextEditor(text: $editContent)
+                        .font(.caption.monospaced())
+                        .frame(minHeight: 260)
+                }
+                .navigationTitle(target.name)
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) { Button("取消") { editingSkill = nil } }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("保存") {
+                            do {
+                                try Data(editContent.utf8).write(to: target.fileURL, options: .atomic)
+                                status = "已更新技能：\(target.name)"
+                                editingSkill = nil
+                                reload()
+                            } catch { status = "更新失败：\(error.localizedDescription)" }
+                        }
+                    }
+                }
+            }
+        }
+        .onAppear { reload() }
+    }
+
+    private func reload() {
+        let fm = FileManager.default
+        guard let dirs = try? fm.contentsOfDirectory(
+            at: skillsRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            skills = []
+            return
+        }
+        skills = dirs.compactMap { dir in
+            let file = dir.appendingPathComponent("SKILL.md")
+            guard fm.fileExists(atPath: file.path),
+                  let content = try? String(contentsOf: file, encoding: .utf8) else { return nil }
+            return SkillEntry(id: dir.lastPathComponent, name: dir.lastPathComponent, fileURL: file, content: content)
+        }.sorted { $0.name < $1.name }
     }
 }
