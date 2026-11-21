@@ -318,6 +318,9 @@
           - id: tool-cordis
             name: '@deepseek-ai/dsh-tool-cordis'
 
+    # The official dsh-tool-executor-ptc writes tool/ptc-dispatch and
+    # tool/ptc-dispatch-start into the owning session; the iOS adapter below
+    # preserves that event contract while adding native approval/cancellation.
     - id: agent-preset-ptc-python
       name: '@deepseek-ai/dsh-agent-preset'
       config:
