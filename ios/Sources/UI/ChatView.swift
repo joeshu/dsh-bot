@@ -436,187 +436,208 @@ public struct ChatView: View {
         ScrollViewReader { proxy in
             ZStack(alignment: .top) {
                 VStack(spacing: 0) {
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 14) {
-                            Color.clear.frame(height: 1).id("chat_top")
-
-                            if bot.isPrivate {
-                                DSBannerCard(
-                                    icon: "lock.shield.fill",
-                                    tint: DSTheme.warning,
-                                    message: "私密会话保存在本机并受 Web API / 导出全链路隔离。发送消息后，当前上下文会发给设置中选定的模型服务。"
-                                )
-                            }
-
-                            if host.loadingHistoryIDs.contains(bot.id) {
-                                HStack {
-                                    Spacer()
-                                    ProgressView("正在读取持久记录…")
-                                        .font(.caption)
-                                    Spacer()
-                                }
-                                .padding(.vertical, 6)
-                            } else if let historyError {
-                                DSBannerCard(
-                                    icon: "exclamationmark.circle.fill",
-                                    tint: DSTheme.warning,
-                                    message: historyError,
-                                    actionTitle: "重试"
-                                ) {
-                                    Task { await loadHistory(older: host.hasOlderHistory(bot.id)) }
-                                }
-                            } else if host.hasOlderHistory(bot.id) {
-                                HStack {
-                                    Spacer()
-                                    Button {
-                                        Task { await loadHistory(older: true) }
-                                    } label: {
-                                        Label("加载更早记录", systemImage: "clock.arrow.circlepath")
-                                            .font(.caption.weight(.medium))
-                                    }
-                                    .buttonStyle(.bordered)
-                                    Spacer()
-                                }
-                            }
-
-                            if sessionMessages.isEmpty && !host.hasSessionHistory(bot.id)
-                                && !host.loadingHistoryIDs.contains(bot.id) && !host.isStreaming {
-                                emptyWelcomeView
-                            }
-
-                            ForEach(transcriptRows) { row in
-                                switch row {
-                                case .message(let msg):
-                                    messageRow(msg).id(msg.id)
-                                case .tool(let activity):
-                                    DSHToolActivityCard(activity: activity) {
-                                        historyPresentation = .tool(activity)
-                                    }
-                                    .id(activity.id)
-                                case .approval(let audit):
-                                    DSHApprovalAuditCard(audit: audit).id(audit.id)
-                                }
-                            }
-
-                            if host.isStreaming && host.streamingSessionId == bot.id {
-                                streamingRow
-                            }
-
-                            ForEach(host.pendingApprovals.filter { $0.sessionId == bot.id }) { approval in
-                                DSHPendingApprovalCard(approval: approval) { approved in
-                                    Task { await host.respondToApproval(id: approval.id, approved: approved) }
-                                }
-                            }
-
-                            ForEach(host.pendingDSHQuestions.filter { $0.sessionId == bot.id }) { request in
-                                DSHUserQuestionCard(request: request) { answers in
-                                    Task { await host.respondToDSHQuestion(id: request.id, answers: answers) }
-                                }
-                            }
-
-                            if host.smartActionCardsEnabled,
-                               !host.isStreaming,
-                               let lastAssistant = sessionMessages.last(where: { $0.role == "assistant" }),
-                               !lastAssistant.content.isEmpty {
-                                smartActionCardsBar(for: lastAssistant)
-                            }
-
-                            Color.clear.frame(height: 1).id("chat_bottom")
-                                .onAppear { followsLiveOutput = true }
-                                .onDisappear { followsLiveOutput = false }
-                        }
-                        .padding()
-                    }
-                    .scrollDismissesKeyboard(.interactively)
-                    .onAppear {
-                        scrollToSearchResult(using: proxy)
-                    }
-                    .onChange(of: sessionMessages.count) { _ in
-                        if restoringOlderHistory {
-                            restoringOlderHistory = false
-                            return
-                        }
-                        if !scrollToSearchResult(using: proxy) {
-                            withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
-                        }
-                    }
-                    .onChange(of: host.streamingContent.count) { _ in
-                        guard followsLiveOutput, host.streamingSessionId == bot.id else { return }
-                        let now = Date()
-                        if now.timeIntervalSince(lastScrollAt) >= 0.12 {
-                            lastScrollAt = now
-                            proxy.scrollTo("chat_bottom", anchor: .bottom)
-                        }
-                    }
-                    .onChange(of: host.streamingReasoning.count) { _ in
-                        guard followsLiveOutput, host.streamingSessionId == bot.id else { return }
-                        let now = Date()
-                        if now.timeIntervalSince(lastScrollAt) >= 0.12 {
-                            lastScrollAt = now
-                            proxy.scrollTo("chat_bottom", anchor: .bottom)
-                        }
-                    }
-                    .onChange(of: host.pendingApprovals.count) { _ in
-                        withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
-                    }
-                    .onChange(of: host.pendingDSHQuestions.count) { _ in
-                        withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
-                    }
-                    .onChange(of: host.dshToolActivities.count) { _ in
-                        withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
-                    }
-                    .onChange(of: host.dshApprovalAudits.count) { _ in
-                        withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
-                    }
-                    .onDisappear {
-                        speechInput.stop()
-                    }
-
-                    if host.lastErrorSessionId == bot.id, let errMsg = host.lastStreamError, !host.isStreaming {
-                        DSBannerCard(
-                            icon: "exclamationmark.triangle.fill",
-                            tint: DSTheme.danger,
-                            message: errMsg,
-                            actionTitle: "重试"
-                        ) {
-                            Task { await host.regenerateLastReply(sessionId: liveBot.id, model: selectedModel) }
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.bottom, 6)
-                    }
-
-                    if !host.isStreaming, host.lastCancelledSessionId == bot.id {
-                        Text("已停止生成")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .padding(.bottom, 4)
-                    }
-                    if !actionStatus.isEmpty {
-                        Text(actionStatus)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .padding(.bottom, 4)
-                    }
+                    conversationScrollView(proxy: proxy)
+                    conversationFooterNotices
                     composerBar
                 }
-
-                // Mounted LongReplyReadingPill whenever latest reply has >= 2 Markdown headings
-                if latestHeadings.count >= 2 {
-                    LongReplyReadingPill(
-                        currentSection: activeSectionTitle.isEmpty ? (latestHeadings.first?.title ?? "章节导航") : activeSectionTitle,
-                        headings: latestHeadings,
-                        onJumpTop: {
-                            withAnimation { proxy.scrollTo("chat_top", anchor: .top) }
-                        },
-                        onJumpHeading: { heading in
-                            activeSectionTitle = heading.title
-                            let targetId = sessionMessages.last(where: { $0.role == "assistant" })?.id ?? "chat_bottom"
-                            withAnimation { proxy.scrollTo(targetId, anchor: .top) }
-                        }
-                    )
-                    .padding(.top, 8)
-                }
+                conversationReadingPill(proxy: proxy)
             }
+        }
+    }
+
+    private func conversationScrollView(proxy: ScrollViewProxy) -> some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 14) {
+                Color.clear.frame(height: 1).id("chat_top")
+                conversationHeaderSection
+                conversationTranscriptSection
+                conversationPendingSection
+                Color.clear.frame(height: 1).id("chat_bottom")
+                    .onAppear { followsLiveOutput = true }
+                    .onDisappear { followsLiveOutput = false }
+            }
+            .padding()
+        }
+        .scrollDismissesKeyboard(.interactively)
+        .onAppear {
+            scrollToSearchResult(using: proxy)
+        }
+        .onChange(of: sessionMessages.count) { _ in
+            if restoringOlderHistory {
+                restoringOlderHistory = false
+                return
+            }
+            if !scrollToSearchResult(using: proxy) {
+                withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
+            }
+        }
+        .onChange(of: host.streamingContent.count) { _ in
+            scrollToBottomIfFollowing(proxy: proxy)
+        }
+        .onChange(of: host.streamingReasoning.count) { _ in
+            scrollToBottomIfFollowing(proxy: proxy)
+        }
+        .onChange(of: host.pendingApprovals.count) { _ in
+            withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
+        }
+        .onChange(of: host.pendingDSHQuestions.count) { _ in
+            withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
+        }
+        .onChange(of: host.dshToolActivities.count) { _ in
+            withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
+        }
+        .onChange(of: host.dshApprovalAudits.count) { _ in
+            withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
+        }
+        .onDisappear {
+            speechInput.stop()
+        }
+    }
+
+    private func scrollToBottomIfFollowing(proxy: ScrollViewProxy) {
+        guard followsLiveOutput, host.streamingSessionId == bot.id else { return }
+        let now = Date()
+        if now.timeIntervalSince(lastScrollAt) >= 0.12 {
+            lastScrollAt = now
+            proxy.scrollTo("chat_bottom", anchor: .bottom)
+        }
+    }
+
+    @ViewBuilder
+    private var conversationHeaderSection: some View {
+        if bot.isPrivate {
+            DSBannerCard(
+                icon: "lock.shield.fill",
+                tint: DSTheme.warning,
+                message: "私密会话保存在本机并受 Web API / 导出全链路隔离。发送消息后，当前上下文会发给设置中选定的模型服务。"
+            )
+        }
+
+        if host.loadingHistoryIDs.contains(bot.id) {
+            HStack {
+                Spacer()
+                ProgressView("正在读取持久记录…")
+                    .font(.caption)
+                Spacer()
+            }
+            .padding(.vertical, 6)
+        } else if let historyError {
+            DSBannerCard(
+                icon: "exclamationmark.circle.fill",
+                tint: DSTheme.warning,
+                message: historyError,
+                actionTitle: "重试"
+            ) {
+                Task { await loadHistory(older: host.hasOlderHistory(bot.id)) }
+            }
+        } else if host.hasOlderHistory(bot.id) {
+            HStack {
+                Spacer()
+                Button {
+                    Task { await loadHistory(older: true) }
+                } label: {
+                    Label("加载更早记录", systemImage: "clock.arrow.circlepath")
+                        .font(.caption.weight(.medium))
+                }
+                .buttonStyle(.bordered)
+                Spacer()
+            }
+        }
+
+        if sessionMessages.isEmpty && !host.hasSessionHistory(bot.id)
+            && !host.loadingHistoryIDs.contains(bot.id) && !host.isStreaming {
+            emptyWelcomeView
+        }
+    }
+
+    @ViewBuilder
+    private var conversationTranscriptSection: some View {
+        ForEach(transcriptRows) { row in
+            switch row {
+            case .message(let msg):
+                messageRow(msg).id(msg.id)
+            case .tool(let activity):
+                DSHToolActivityCard(activity: activity) {
+                    historyPresentation = .tool(activity)
+                }
+                .id(activity.id)
+            case .approval(let audit):
+                DSHApprovalAuditCard(audit: audit).id(audit.id)
+            }
+        }
+
+        if host.isStreaming && host.streamingSessionId == bot.id {
+            streamingRow
+        }
+    }
+
+    @ViewBuilder
+    private var conversationPendingSection: some View {
+        ForEach(host.pendingApprovals.filter { $0.sessionId == bot.id }) { approval in
+            DSHPendingApprovalCard(approval: approval) { approved in
+                Task { await host.respondToApproval(id: approval.id, approved: approved) }
+            }
+        }
+
+        ForEach(host.pendingDSHQuestions.filter { $0.sessionId == bot.id }) { request in
+            DSHUserQuestionCard(request: request) { answers in
+                Task { await host.respondToDSHQuestion(id: request.id, answers: answers) }
+            }
+        }
+
+        if host.smartActionCardsEnabled,
+           !host.isStreaming,
+           let lastAssistant = sessionMessages.last(where: { $0.role == "assistant" }),
+           !lastAssistant.content.isEmpty {
+            smartActionCardsBar(for: lastAssistant)
+        }
+    }
+
+    @ViewBuilder
+    private var conversationFooterNotices: some View {
+        if host.lastErrorSessionId == bot.id, let errMsg = host.lastStreamError, !host.isStreaming {
+            DSBannerCard(
+                icon: "exclamationmark.triangle.fill",
+                tint: DSTheme.danger,
+                message: errMsg,
+                actionTitle: "重试"
+            ) {
+                Task { await host.regenerateLastReply(sessionId: liveBot.id, model: selectedModel) }
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 6)
+        }
+
+        if !host.isStreaming, host.lastCancelledSessionId == bot.id {
+            Text("已停止生成")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 4)
+        }
+        if !actionStatus.isEmpty {
+            Text(actionStatus)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 4)
+        }
+    }
+
+    @ViewBuilder
+    private func conversationReadingPill(proxy: ScrollViewProxy) -> some View {
+        if latestHeadings.count >= 2 {
+            LongReplyReadingPill(
+                currentSection: activeSectionTitle.isEmpty ? (latestHeadings.first?.title ?? "章节导航") : activeSectionTitle,
+                headings: latestHeadings,
+                onJumpTop: {
+                    withAnimation { proxy.scrollTo("chat_top", anchor: .top) }
+                },
+                onJumpHeading: { heading in
+                    activeSectionTitle = heading.title
+                    let targetId = sessionMessages.last(where: { $0.role == "assistant" })?.id ?? "chat_bottom"
+                    withAnimation { proxy.scrollTo(targetId, anchor: .top) }
+                }
+            )
+            .padding(.top, 8)
         }
     }
 
