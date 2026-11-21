@@ -447,19 +447,21 @@ function renderLegacyHistory(messages) {
   return `Earlier conversation imported from the previous DS Bot iOS chat store. Treat it as background context; the current DSH session log is authoritative for new turns.\n\n${transcript.slice(-48_000)}`
 }
 
-function collectProfileEntryRows(value, rows = []) {
+function collectProfileEntryRows(value, rows = [], insideMutation = false) {
   if (Array.isArray(value)) {
-    for (const item of value) collectProfileEntryRows(item, rows)
+    for (const item of value) collectProfileEntryRows(item, rows, insideMutation)
     return rows
   }
   if (!value || typeof value !== 'object') return rows
   if (typeof value.name === 'string') {
-    rows.push(value)
-    if (value.group === true) collectProfileEntryRows(value.config, rows)
+    if (insideMutation && value.disabled !== true) {
+      rows.push(value)
+      if (value.group === true) collectProfileEntryRows(value.config, rows, true)
+    }
     return rows
   }
   for (const key of ['insert', 'append', 'replace']) {
-    if (value[key] !== undefined) collectProfileEntryRows(value[key], rows)
+    if (value[key] !== undefined) collectProfileEntryRows(value[key], rows, true)
   }
   return rows
 }
@@ -469,6 +471,7 @@ async function auditExternalProfileLayers(profileLayers) {
   for (const layer of profileLayers.filter(({ packageName }) => packageName !== PROFILE_BUNDLE)) {
     const rows = layer.patches.flatMap((patch) => collectProfileEntryRows(patch))
     for (const row of rows) {
+      if (row.disabled === true) continue
       const candidates = entries.filter((entry) =>
         (typeof row.id === 'string' && entry.options.id === row.id)
         || (typeof row.id !== 'string' && entry.options.name === row.name))
@@ -519,6 +522,7 @@ function fullToolResultText(message, error) {
 const NATIVE_TOOL_NAMES = [
   'js_eval', 'python_exec', 'python_job_start', 'device_status', 'memory_save', 'group_todo_add', 'web_fetch', 'web_search', 'remote_mcp_list', 'remote_mcp_call',
   'workspace_list', 'workspace_read', 'workspace_write', 'workspace_search', 'workspace_edit',
+  'terminal_exec', 'git_workspace',
   'schedule_create', 'schedule_list', 'schedule_view', 'schedule_history', 'schedule_edit',
   'job_output', 'job_list', 'job_kill',
 ]
@@ -1157,7 +1161,7 @@ async function preparePurgeSafeIOSOverlay(enabled) {
     rows.push([
       '- id: dsh-purge-safe',
       '  config:',
-      '    enabled: false',
+      '    enabled: true',
       '    autoApplyOnStart: false',
       '    autoUpdateOnStart: false',
       '    autoRevertOnMissing: false',
@@ -1888,6 +1892,760 @@ rpc.handle('side.cancel', async (params = {}) => {
   } catch {
     return { cancelled: false }
   }
+})
+
+// ── iOS Experimental Desktop Capabilities: Sandboxed Virtual Terminal (PTY), Git Worktree & PR Tracker, and Cordis/Node DevTools Inspector ──
+
+import { copyFileSync, lstatSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path'
+import vm from 'node:vm'
+
+const virtualTerminals = new Map()
+const devtoolsLogs = []
+const MAX_DEVTOOLS_LOGS = 200
+
+function pushDevtoolsLog(level, category, message) {
+  devtoolsLogs.push({
+    id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    timestamp: new Date().toISOString(),
+    level,
+    category,
+    message: String(message ?? '').slice(0, 4_000),
+  })
+  if (devtoolsLogs.length > MAX_DEVTOOLS_LOGS) devtoolsLogs.splice(0, devtoolsLogs.length - MAX_DEVTOOLS_LOGS)
+}
+
+function getVirtualTerminalSession(sessionId = 'default') {
+  const key = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : 'default'
+  let term = virtualTerminals.get(key)
+  if (!term) {
+    term = {
+      id: key,
+      cwd: '/',
+      env: {
+        USER: 'ios-sandbox',
+        HOME: '/workspace',
+        PWD: '/workspace',
+        SHELL: '/bin/dsbot-vsh',
+        LANG: 'zh_CN.UTF-8',
+      },
+      history: [],
+    }
+    virtualTerminals.set(key, term)
+  }
+  return term
+}
+
+function resolveInsideWorkspaceFiles(virtualCwd, targetPath = '.') {
+  const root = resolve(WORKSPACE_FILES)
+  const raw = String(targetPath || '.').trim()
+  const baseVirtual = virtualCwd.startsWith('/') ? virtualCwd.slice(1) : virtualCwd
+  const combined = raw.startsWith('/workspace')
+    ? resolve(root, raw.slice('/workspace'.length).replace(/^\/+/, ''))
+    : raw.startsWith('/')
+      ? resolve(root, raw.replace(/^\/+/, ''))
+      : resolve(root, baseVirtual, raw)
+  const rel = relative(root, combined)
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error(`权限拒绝：路径越出 iOS 沙盒工作区 (${targetPath})`)
+  }
+  return {
+    abs: combined,
+    rel: rel ? rel.split(sep).join('/') : '',
+    virtual: rel ? `/${rel.split(sep).join('/')}` : '/',
+  }
+}
+
+function tokenizeShellWords(input) {
+  const tokens = []
+  let current = ''
+  let quote = null
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i]
+    if (quote) {
+      if (ch === quote) quote = null
+      else if (ch === '\\' && quote === '"' && i + 1 < input.length) current += input[++i]
+      else current += ch
+    } else if (ch === '"' || ch === "'") {
+      quote = ch
+    } else if (/\s/.test(ch)) {
+      if (current) { tokens.push(current); current = '' }
+    } else {
+      current += ch
+    }
+  }
+  if (current) tokens.push(current)
+  return tokens
+}
+
+function walkWorkspaceTree(dirAbs, baseAbs = resolve(WORKSPACE_FILES), out = []) {
+  let entries = []
+  try { entries = readdirSync(dirAbs, { withFileTypes: true }) } catch { return out }
+  for (const entry of entries) {
+    if (entry.name === '.DS_Store' || entry.name === '.dsbot-ios-workspace-root' || entry.name === '.dsbot-git-tracker.json') continue
+    const full = join(dirAbs, entry.name)
+    const rel = relative(baseAbs, full).split(sep).join('/')
+    if (entry.isDirectory()) {
+      walkWorkspaceTree(full, baseAbs, out)
+    } else if (entry.isFile()) {
+      try {
+        const st = statSync(full)
+        const buf = st.size <= 524_288 ? readFileSync(full) : null
+        const sha = buf ? createHash('sha1').update(buf).digest('hex') : `size:${st.size}`
+        out.push({
+          path: rel,
+          size: st.size,
+          mtimeMs: Math.round(st.mtimeMs),
+          sha,
+          content: buf && !buf.includes(0) ? buf.toString('utf8') : null,
+        })
+      } catch { /* ignore */ }
+    }
+  }
+  return out.sort((a, b) => a.path.localeCompare(b.path))
+}
+
+function gitTrackerFilePath() {
+  return join(WORKSPACE, 'git-worktree-tracker.json')
+}
+
+function loadGitTrackerState() {
+  const fp = gitTrackerFilePath()
+  try {
+    if (existsSync(fp)) return JSON.parse(readFileSync(fp, 'utf8'))
+  } catch { /* ignore */ }
+  return {
+    repo: '',
+    branch: 'main',
+    snapshotAt: null,
+    commits: [],
+    files: {},
+  }
+}
+
+function saveGitTrackerState(state) {
+  writeFileSync(gitTrackerFilePath(), JSON.stringify(state, null, 2), 'utf8')
+}
+
+function computeWorkspaceGitStatus() {
+  const tracker = loadGitTrackerState()
+  const currentFiles = walkWorkspaceTree(resolve(WORKSPACE_FILES))
+  const currentMap = new Map(currentFiles.map((f) => [f.path, f]))
+  const baseline = tracker.files || {}
+  const changes = []
+
+  for (const file of currentFiles) {
+    const prev = baseline[file.path]
+    if (!prev) {
+      changes.push({ path: file.path, status: 'A', label: '新增', size: file.size })
+    } else if (prev.sha !== file.sha) {
+      changes.push({ path: file.path, status: 'M', label: '修改', size: file.size })
+    }
+  }
+  for (const oldPath of Object.keys(baseline)) {
+    if (!currentMap.has(oldPath)) {
+      changes.push({ path: oldPath, status: 'D', label: '删除', size: 0 })
+    }
+  }
+  return {
+    repo: tracker.repo || '',
+    branch: tracker.branch || 'main',
+    snapshotAt: tracker.snapshotAt,
+    commits: Array.isArray(tracker.commits) ? tracker.commits.slice(0, 30) : [],
+    totalTracked: Object.keys(baseline).length,
+    totalWorkspaceFiles: currentFiles.length,
+    changes,
+  }
+}
+
+function computeWorkspaceGitDiff(targetRelPath) {
+  const tracker = loadGitTrackerState()
+  const currentFiles = walkWorkspaceTree(resolve(WORKSPACE_FILES))
+  const currentMap = new Map(currentFiles.map((f) => [f.path, f]))
+  const baseline = tracker.files || {}
+  const paths = targetRelPath
+    ? [targetRelPath.replace(/^\/+/, '')]
+    : [...new Set([...Object.keys(baseline), ...currentMap.keys()])].sort()
+  const chunks = []
+  for (const p of paths) {
+    const prev = baseline[p]
+    const curr = currentMap.get(p)
+    if (!prev && curr) {
+      const lines = (curr.content ?? '[二进制文件]').split(/\r?\n/).slice(0, 120)
+      chunks.push(`--- /dev/null\n+++ b/${p}\n@@ -0,0 +1,${lines.length} @@\n` + lines.map((l) => `+${l}`).join('\n'))
+    } else if (prev && !curr) {
+      const lines = (prev.content ?? '[二进制文件]').split(/\r?\n/).slice(0, 120)
+      chunks.push(`--- a/${p}\n+++ /dev/null\n@@ -1,${lines.length} +0,0 @@\n` + lines.map((l) => `-${l}`).join('\n'))
+    } else if (prev && curr && prev.sha !== curr.sha) {
+      const oldLines = (prev.content ?? '').split(/\r?\n/)
+      const newLines = (curr.content ?? '').split(/\r?\n/)
+      const diffLines = [`--- a/${p}`, `+++ b/${p}`, `@@ -1,${oldLines.length} +1,${newLines.length} @@`]
+      const maxLen = Math.min(120, Math.max(oldLines.length, newLines.length))
+      for (let i = 0; i < maxLen; i++) {
+        const o = oldLines[i]
+        const n = newLines[i]
+        if (o === n) diffLines.push(` ${o ?? ''}`)
+        else {
+          if (o !== undefined) diffLines.push(`-${o}`)
+          if (n !== undefined) diffLines.push(`+${n}`)
+        }
+      }
+      chunks.push(diffLines.join('\n'))
+    }
+  }
+  return chunks.join('\n\n') || '工作树干净，与基线快照无差异。'
+}
+
+function takeWorkspaceGitSnapshot(message = 'Update workspace snapshot') {
+  const tracker = loadGitTrackerState()
+  const currentFiles = walkWorkspaceTree(resolve(WORKSPACE_FILES))
+  const filesObj = {}
+  for (const f of currentFiles) {
+    filesObj[f.path] = {
+      sha: f.sha,
+      size: f.size,
+      mtimeMs: f.mtimeMs,
+      content: typeof f.content === 'string' && f.content.length <= 65_536 ? f.content : null,
+    }
+  }
+  const commitId = createHash('sha1').update(`${Date.now()}:${message}:${currentFiles.length}`).digest('hex').slice(0, 7)
+  const now = new Date().toISOString()
+  tracker.snapshotAt = now
+  tracker.files = filesObj
+  tracker.commits = [
+    { id: commitId, message: String(message || 'Workspace snapshot').slice(0, 160), timestamp: now, fileCount: currentFiles.length },
+    ...(Array.isArray(tracker.commits) ? tracker.commits : []).slice(0, 29),
+  ]
+  saveGitTrackerState(tracker)
+  return computeWorkspaceGitStatus()
+}
+
+async function fetchGithubPullRequests(repoInput) {
+  const tracker = loadGitTrackerState()
+  const repo = String(repoInput || tracker.repo || '').trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\.git$/i, '').replace(/^\/+|\/+$/g, '')
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
+    throw new Error('请输入有效的 GitHub 仓库标识（格式：owner/repo）')
+  }
+  if (repo !== tracker.repo) {
+    tracker.repo = repo
+    saveGitTrackerState(tracker)
+  }
+  const headers = {
+    'Accept': 'application/vnd.github+json',
+    'User-Agent': 'DSBot-iOS-GitTracker/1.0',
+  }
+  const [prsRes, commitsRes] = await Promise.all([
+    fetch(`https://api.github.com/repos/${repo}/pulls?state=all&per_page=15`, { headers }),
+    fetch(`https://api.github.com/repos/${repo}/commits?per_page=10`, { headers }),
+  ])
+  if (!prsRes.ok) {
+    throw new Error(`GitHub API 请求失败 (${prsRes.status})：请确认仓库 ${repo} 为公开仓库或网络可达`)
+  }
+  const prsData = await prsRes.json()
+  const commitsData = commitsRes.ok ? await commitsRes.json() : []
+  const pullRequests = Array.isArray(prsData) ? prsData.map((pr) => ({
+    number: pr.number,
+    title: String(pr.title ?? ''),
+    state: pr.merged_at ? 'merged' : String(pr.state ?? 'open'),
+    author: String(pr.user?.login ?? ''),
+    branch: `${pr.head?.ref ?? ''} → ${pr.base?.ref ?? ''}`,
+    updatedAt: String(pr.updated_at ?? ''),
+    url: String(pr.html_url ?? ''),
+  })) : []
+  const remoteCommits = Array.isArray(commitsData) ? commitsData.map((c) => ({
+    sha: String(c.sha ?? '').slice(0, 7),
+    message: String(c.commit?.message ?? '').split('\n')[0],
+    author: String(c.commit?.author?.name ?? c.author?.login ?? ''),
+    date: String(c.commit?.author?.date ?? ''),
+  })) : []
+  return { repo, pullRequests, remoteCommits }
+}
+
+async function runSingleVirtualCommand(term, rawSegment) {
+  const line = rawSegment.trim()
+  if (!line) return ''
+  const tokens = tokenizeShellWords(line)
+  if (!tokens.length) return ''
+  const cmd = tokens[0]
+  const args = tokens.slice(1)
+
+  switch (cmd) {
+    case 'help':
+      return [
+        'DS Bot iOS 沙盒持久终端 (Virtual PTY) 支持命令：',
+        '  pwd, cd <dir>, ls [-la] [dir], cat <file>, head [-n N] <file>, tail [-n N] <file>',
+        '  mkdir <dir>, touch <file>, cp <src> <dst>, mv <src> <dst>, rm [-r] <path>',
+        '  find [dir] [-name pat], grep <pattern> [file/dir], wc <file>, echo <text>',
+        '  env, export KEY=VAL, date, uname -a, whoami, clear',
+        '  node -e "<js>"  — 在沙盒 VM 中运行 JavaScript',
+        '  python -c "<py>" — 在本机离线 Python 3.13/NumPy 中执行代码',
+        '  git status | git diff [path] | git log | git commit -m "<msg>"',
+      ].join('\n')
+
+    case 'pwd':
+      return `/workspace${term.cwd === '/' ? '' : term.cwd}`
+
+    case 'whoami':
+      return term.env.USER || 'ios-sandbox'
+
+    case 'uname':
+      return `Darwin DSBot-iOS-Sandbox 24.0.0 arm64 Node/${process.versions.node} DSH/0.2.2-rc.5`
+
+    case 'date':
+      return new Date().toISOString()
+
+    case 'env':
+      return Object.entries(term.env).map(([k, v]) => `${k}=${v}`).join('\n')
+
+    case 'export': {
+      for (const item of args) {
+        const eq = item.indexOf('=')
+        if (eq > 0) {
+          const k = item.slice(0, eq).trim()
+          const v = item.slice(eq + 1)
+          if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) term.env[k] = v
+        }
+      }
+      return ''
+    }
+
+    case 'cd': {
+      const target = args[0] || '/'
+      const resolved = resolveInsideWorkspaceFiles(term.cwd, target)
+      if (!existsSync(resolved.abs) || !statSync(resolved.abs).isDirectory()) {
+        throw new Error(`cd: 目录不存在: ${target}`)
+      }
+      term.cwd = resolved.virtual
+      term.env.PWD = `/workspace${term.cwd === '/' ? '' : term.cwd}`
+      return ''
+    }
+
+    case 'ls':
+    case 'll': {
+      const flags = args.filter((a) => a.startsWith('-')).join('')
+      const longFmt = cmd === 'll' || flags.includes('l')
+      const showHidden = cmd === 'll' || flags.includes('a')
+      const targetArg = args.find((a) => !a.startsWith('-')) || '.'
+      const resolved = resolveInsideWorkspaceFiles(term.cwd, targetArg)
+      if (!existsSync(resolved.abs)) throw new Error(`ls: 路径不存在: ${targetArg}`)
+      const st = statSync(resolved.abs)
+      if (!st.isDirectory()) return basename(resolved.abs)
+      const entries = readdirSync(resolved.abs, { withFileTypes: true })
+        .filter((e) => showHidden || !e.name.startsWith('.'))
+        .sort((a, b) => a.name.localeCompare(b.name))
+      if (!longFmt) return entries.map((e) => e.isDirectory() ? `${e.name}/` : e.name).join('  ')
+      return entries.map((e) => {
+        const full = join(resolved.abs, e.name)
+        let size = 0
+        let mtime = ''
+        try {
+          const s = lstatSync(full)
+          size = s.size
+          mtime = s.mtime.toISOString().slice(0, 16).replace('T', ' ')
+        } catch { /* ignore */ }
+        const typeChar = e.isDirectory() ? 'd' : '-'
+        return `${typeChar}rw-r--r--  ${String(size).padStart(8)}  ${mtime}  ${e.name}${e.isDirectory() ? '/' : ''}`
+      }).join('\n')
+    }
+
+    case 'cat': {
+      if (!args.length) throw new Error('cat: 请指定文件名')
+      const outputs = []
+      for (const arg of args) {
+        const resolved = resolveInsideWorkspaceFiles(term.cwd, arg)
+        if (!existsSync(resolved.abs) || statSync(resolved.abs).isDirectory()) {
+          throw new Error(`cat: 无法读取文件: ${arg}`)
+        }
+        outputs.push(readFileSync(resolved.abs, 'utf8').slice(0, 32_000))
+      }
+      return outputs.join('\n')
+    }
+
+    case 'head':
+    case 'tail': {
+      let count = 10
+      const fileArgs = []
+      for (let i = 0; i < args.length; i++) {
+        if (args[i] === '-n' && args[i + 1]) {
+          count = Math.max(1, Math.min(500, Number(args[++i]) || 10))
+        } else if (/^-\d+$/.test(args[i])) {
+          count = Math.max(1, Math.min(500, Number(args[i].slice(1)) || 10))
+        } else {
+          fileArgs.push(args[i])
+        }
+      }
+      if (!fileArgs.length) throw new Error(`${cmd}: 请指定文件名`)
+      const resolved = resolveInsideWorkspaceFiles(term.cwd, fileArgs[0])
+      const lines = readFileSync(resolved.abs, 'utf8').split(/\r?\n/)
+      return (cmd === 'head' ? lines.slice(0, count) : lines.slice(-count)).join('\n')
+    }
+
+    case 'wc': {
+      if (!args.length) throw new Error('wc: 请指定文件名')
+      const fileArg = args.find((a) => !a.startsWith('-'))
+      const resolved = resolveInsideWorkspaceFiles(term.cwd, fileArg)
+      const content = readFileSync(resolved.abs, 'utf8')
+      const lines = content.split(/\r?\n/).length
+      const words = content.trim() ? content.trim().split(/\s+/).length : 0
+      const bytes = Buffer.byteLength(content, 'utf8')
+      return `  ${lines}  ${words}  ${bytes} ${fileArg}`
+    }
+
+    case 'mkdir': {
+      const dirs = args.filter((a) => !a.startsWith('-'))
+      if (!dirs.length) throw new Error('mkdir: 请指定目录名')
+      for (const d of dirs) {
+        const resolved = resolveInsideWorkspaceFiles(term.cwd, d)
+        mkdirSync(resolved.abs, { recursive: true })
+      }
+      return ''
+    }
+
+    case 'touch': {
+      const files = args.filter((a) => !a.startsWith('-'))
+      if (!files.length) throw new Error('touch: 请指定文件名')
+      for (const f of files) {
+        const resolved = resolveInsideWorkspaceFiles(term.cwd, f)
+        mkdirSync(dirname(resolved.abs), { recursive: true })
+        if (!existsSync(resolved.abs)) writeFileSync(resolved.abs, '', 'utf8')
+      }
+      return ''
+    }
+
+    case 'cp': {
+      const paths = args.filter((a) => !a.startsWith('-'))
+      if (paths.length < 2) throw new Error('cp: 用法 cp <src> <dst>')
+      const src = resolveInsideWorkspaceFiles(term.cwd, paths[0])
+      const dst = resolveInsideWorkspaceFiles(term.cwd, paths[1])
+      mkdirSync(dirname(dst.abs), { recursive: true })
+      copyFileSync(src.abs, dst.abs)
+      return ''
+    }
+
+    case 'mv': {
+      const paths = args.filter((a) => !a.startsWith('-'))
+      if (paths.length < 2) throw new Error('mv: 用法 mv <src> <dst>')
+      const src = resolveInsideWorkspaceFiles(term.cwd, paths[0])
+      const dst = resolveInsideWorkspaceFiles(term.cwd, paths[1])
+      mkdirSync(dirname(dst.abs), { recursive: true })
+      copyFileSync(src.abs, dst.abs)
+      rmSync(src.abs, { recursive: true, force: true })
+      return ''
+    }
+
+    case 'rm': {
+      const recursive = args.some((a) => a.startsWith('-') && (a.includes('r') || a.includes('R')))
+      const targets = args.filter((a) => !a.startsWith('-'))
+      if (!targets.length) throw new Error('rm: 请指定要删除的路径')
+      for (const t of targets) {
+        const resolved = resolveInsideWorkspaceFiles(term.cwd, t)
+        if (resolved.abs === resolve(WORKSPACE_FILES)) throw new Error('rm: 禁止删除工作区根目录')
+        rmSync(resolved.abs, { recursive, force: true })
+      }
+      return ''
+    }
+
+    case 'echo': {
+      const redirectIdx = args.findIndex((a) => a === '>' || a === '>>')
+      if (redirectIdx >= 0 && args[redirectIdx + 1]) {
+        const op = args[redirectIdx]
+        const text = args.slice(0, redirectIdx).join(' ') + '\n'
+        const target = resolveInsideWorkspaceFiles(term.cwd, args[redirectIdx + 1])
+        mkdirSync(dirname(target.abs), { recursive: true })
+        const existing = op === '>>' && existsSync(target.abs) ? readFileSync(target.abs, 'utf8') : ''
+        writeFileSync(target.abs, existing + text, 'utf8')
+        return ''
+      }
+      return args.join(' ')
+    }
+
+    case 'find': {
+      const startArg = args[0] && !args[0].startsWith('-') ? args[0] : '.'
+      const nameIdx = args.indexOf('-name')
+      const pattern = nameIdx >= 0 && args[nameIdx + 1] ? args[nameIdx + 1].replace(/\*/g, '.*') : null
+      const regex = pattern ? new RegExp(`^${pattern}$`, 'i') : null
+      const resolved = resolveInsideWorkspaceFiles(term.cwd, startArg)
+      const files = walkWorkspaceTree(resolved.abs, resolved.abs)
+      return files
+        .filter((f) => !regex || regex.test(basename(f.path)))
+        .map((f) => `./${f.path}`)
+        .join('\n') || '(无匹配文件)'
+    }
+
+    case 'grep': {
+      const nonFlags = args.filter((a) => !a.startsWith('-'))
+      if (!nonFlags.length) throw new Error('grep: 用法 grep <pattern> [path]')
+      const query = nonFlags[0]
+      const targetArg = nonFlags[1] || '.'
+      const resolved = resolveInsideWorkspaceFiles(term.cwd, targetArg)
+      const st = statSync(resolved.abs)
+      const hits = []
+      const scanFile = (absPath, display) => {
+        try {
+          const text = readFileSync(absPath, 'utf8')
+          text.split(/\r?\n/).forEach((l, idx) => {
+            if (l.toLowerCase().includes(query.toLowerCase()) && hits.length < 100) {
+              hits.push(`${display}:${idx + 1}: ${l.slice(0, 300)}`)
+            }
+          })
+        } catch { /* ignore */ }
+      }
+      if (st.isFile()) {
+        scanFile(resolved.abs, targetArg)
+      } else {
+        for (const f of walkWorkspaceTree(resolved.abs, resolved.abs)) {
+          scanFile(join(resolved.abs, f.path), f.path)
+          if (hits.length >= 100) break
+        }
+      }
+      return hits.join('\n') || `(未找到匹配 "${query}" 的行)`
+    }
+
+    case 'node':
+    case 'js': {
+      const code = cmd === 'node' && (args[0] === '-e' || args[0] === '-p')
+        ? args.slice(1).join(' ')
+        : args.join(' ')
+      if (!code.trim()) throw new Error('用法: node -e "<JavaScript 表达式>"')
+      const logs = []
+      const sandbox = {
+        console: {
+          log: (...items) => logs.push(items.map((x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')),
+          error: (...items) => logs.push(items.map((x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')),
+        },
+        Math, Date, JSON, Number, String, Boolean, Array, Object,
+      }
+      const result = vm.runInNewContext(code, sandbox, { timeout: 3_000 })
+      if (result !== undefined) logs.push(typeof result === 'string' ? result : JSON.stringify(result, null, 2))
+      return logs.join('\n')
+    }
+
+    case 'python':
+    case 'python3': {
+      let code = ''
+      if (args[0] === '-c') {
+        code = args.slice(1).join(' ')
+      } else if (args[0]) {
+        const resolved = resolveInsideWorkspaceFiles(term.cwd, args[0])
+        code = readFileSync(resolved.abs, 'utf8')
+      } else {
+        throw new Error('用法: python -c "<Python 代码>" 或 python <file.py>')
+      }
+      const res = await executeIOSPython({
+        code,
+        botId: 'terminal',
+        turnId: `term_${Date.now()}`,
+      })
+      return String(res?.output ?? '')
+    }
+
+    case 'git': {
+      const sub = args[0] || 'status'
+      if (sub === 'status') {
+        const st = computeWorkspaceGitStatus()
+        const lines = [
+          `On branch ${st.branch}${st.repo ? ` (${st.repo})` : ''}`,
+          st.snapshotAt ? `Baseline snapshot: ${st.snapshotAt}` : '尚未建立基线快照（可运行 git commit -m "init" 创建基线）',
+        ]
+        if (!st.changes.length) {
+          lines.push('nothing to commit, working tree clean')
+        } else {
+          lines.push('Changes not staged for commit:')
+          for (const c of st.changes) lines.push(`  ${c.status}  ${c.path}`)
+        }
+        return lines.join('\n')
+      }
+      if (sub === 'diff') {
+        return computeWorkspaceGitDiff(args[1])
+      }
+      if (sub === 'log') {
+        const st = computeWorkspaceGitStatus()
+        if (!st.commits.length) return '尚无本地快照提交记录。'
+        return st.commits.map((c) => `commit ${c.id} (${c.timestamp})\n    ${c.message} [${c.fileCount} files]`).join('\n\n')
+      }
+      if (sub === 'commit' || sub === 'snapshot') {
+        const mIdx = args.indexOf('-m')
+        const msg = mIdx >= 0 && args[mIdx + 1] ? args.slice(mIdx + 1).join(' ') : 'Workspace snapshot'
+        const st = takeWorkspaceGitSnapshot(msg)
+        return `[${st.branch} ${st.commits[0]?.id ?? ''}] ${msg} (${st.totalWorkspaceFiles} files snapshotted)`
+      }
+      throw new Error(`git: 支持子命令 status | diff [file] | log | commit -m "<msg>"`)
+    }
+
+    default:
+      throw new Error(`${cmd}: 未找到命令（输入 help 查看 iOS 沙盒持久终端支持的命令）`)
+  }
+}
+
+async function executeVirtualTerminalCommand(sessionId, commandLine) {
+  const term = getVirtualTerminalSession(sessionId)
+  const raw = String(commandLine ?? '').trim()
+  if (!raw) return { cwd: term.cwd, output: '', exitCode: 0 }
+  term.history.push({ command: raw, timestamp: new Date().toISOString() })
+  if (term.history.length > 100) term.history.splice(0, term.history.length - 100)
+  pushDevtoolsLog('info', 'terminal', `[${term.id}] $ ${raw}`)
+
+  const segments = raw.split(/\s*&&\s*/).filter(Boolean)
+  const outputs = []
+  let exitCode = 0
+  for (const seg of segments) {
+    try {
+      const out = await runSingleVirtualCommand(term, seg)
+      if (out) outputs.push(out)
+    } catch (error) {
+      outputs.push(error instanceof Error ? error.message : String(error))
+      exitCode = 1
+      break
+    }
+  }
+  return {
+    sessionId: term.id,
+    cwd: `/workspace${term.cwd === '/' ? '' : term.cwd}`,
+    output: outputs.join('\n'),
+    exitCode,
+    historyCount: term.history.length,
+  }
+}
+
+runtime.executeVirtualTerminal = async (args, exec) => {
+  const sessionId = exec?.agent?.session?.id ?? 'default'
+  const command = String(args?.command ?? '').trim()
+  if (!command) throw new Error('terminal_exec requires a non-empty command')
+  const active = runtime.activeTurns.get(sessionId)
+  if (active && active.permissionMode !== 'autoReview') {
+    const isMutating = /\b(rm|mv|cp|mkdir|touch|export|commit|node|python|python3)\b|>/.test(command)
+    if (isMutating || active.permissionMode === 'readOnly') {
+      if (active.permissionMode === 'readOnly' && isMutating) {
+        throw new Error(`Read-only mode blocked terminal command: ${command}`)
+      }
+      const outcome = await ctx.approval.request({
+        agent: exec.agent,
+        toolName: 'terminal_exec',
+        ...(exec.callId ? { callId: exec.callId } : {}),
+        reason: `Execute sandboxed virtual terminal command: ${command}`,
+        displayReason: `允许在 iOS 沙盒持久终端执行命令？\n$ ${command}`,
+        signal: exec.signal,
+      })
+      if (outcome !== 'allowed-once') throw new Error('User did not approve terminal_exec command')
+    }
+  }
+  const res = await executeVirtualTerminalCommand(sessionId, command)
+  return { output: `[cwd: ${res.cwd}] (exit ${res.exitCode})\n${res.output || '(done)'}` }
+}
+
+runtime.executeGitWorkspaceTool = async (args) => {
+  const action = String(args?.action ?? 'status')
+  if (action === 'status') {
+    const st = computeWorkspaceGitStatus()
+    return { output: JSON.stringify(st, null, 2) }
+  }
+  if (action === 'diff') {
+    return { output: computeWorkspaceGitDiff(args?.path) }
+  }
+  if (action === 'snapshot') {
+    const st = takeWorkspaceGitSnapshot('Agent workspace snapshot')
+    return { output: JSON.stringify(st, null, 2) }
+  }
+  if (action === 'pr_list') {
+    const prs = await fetchGithubPullRequests(args?.repo)
+    return { output: JSON.stringify(prs, null, 2) }
+  }
+  throw new Error(`Unsupported git_workspace action: ${action}`)
+}
+
+rpc.handle('terminal.exec', async ({ sessionId = 'default', command }) => {
+  return await executeVirtualTerminalCommand(sessionId, command)
+})
+
+rpc.handle('terminal.state', async ({ sessionId = 'default' } = {}) => {
+  const term = getVirtualTerminalSession(sessionId)
+  return {
+    sessionId: term.id,
+    cwd: `/workspace${term.cwd === '/' ? '' : term.cwd}`,
+    env: term.env,
+    history: term.history.slice(-30),
+  }
+})
+
+rpc.handle('terminal.reset', async ({ sessionId = 'default' } = {}) => {
+  virtualTerminals.delete(sessionId)
+  const term = getVirtualTerminalSession(sessionId)
+  return {
+    sessionId: term.id,
+    cwd: `/workspace${term.cwd === '/' ? '' : term.cwd}`,
+    reset: true,
+  }
+})
+
+rpc.handle('git.status', async () => computeWorkspaceGitStatus())
+rpc.handle('git.diff', async ({ path } = {}) => ({ diff: computeWorkspaceGitDiff(path) }))
+rpc.handle('git.snapshot', async ({ message } = {}) => takeWorkspaceGitSnapshot(message))
+rpc.handle('git.pullRequests', async ({ repo } = {}) => await fetchGithubPullRequests(repo))
+
+rpc.handle('devtools.inspect', async () => {
+  const mem = process.memoryUsage()
+  const entries = [...(ctx?.loader?.entries?.() ?? [])].map((entry) => ({
+    id: String(entry.options?.id ?? ''),
+    name: String(entry.options?.name ?? ''),
+    disabled: Boolean(entry.disabled),
+    state: entry.fiber?.state === 2 ? 'active' : entry.fiber?.state === 1 ? 'loading' : 'inactive',
+  }))
+  const tools = (ctx?.tools?.definitions?.() ?? []).map((t) => ({
+    name: String(t.name ?? ''),
+    description: String(t.description ?? '').slice(0, 140),
+  }))
+  return {
+    nodeVersion: process.versions.node,
+    dshVersion: '0.2.2-rc.5',
+    uptimeSeconds: Math.round(process.uptime()),
+    memory: {
+      rssMB: Math.round((mem.rss / 1048576) * 10) / 10,
+      heapUsedMB: Math.round((mem.heapUsed / 1048576) * 10) / 10,
+      heapTotalMB: Math.round((mem.heapTotal / 1048576) * 10) / 10,
+      externalMB: Math.round((mem.external / 1048576) * 10) / 10,
+    },
+    activeSessions: runtime.activeAgents.size,
+    activeTurns: runtime.activeTurns.size,
+    webPort: ctx?.webServer?.port ?? 0,
+    cordisEntries: entries,
+    registeredTools: tools,
+    recentLogs: devtoolsLogs.slice(-60).reverse(),
+  }
+})
+
+rpc.handle('devtools.eval', async ({ expression } = {}) => {
+  const expr = String(expression ?? '').trim()
+  if (!expr) throw new Error('请输入要评估的诊断表达式')
+  pushDevtoolsLog('info', 'devtools.eval', expr)
+  const sandbox = {
+    process: {
+      version: process.version,
+      versions: process.versions,
+      platform: process.platform,
+      arch: process.arch,
+      uptime: () => process.uptime(),
+      memoryUsage: () => process.memoryUsage(),
+      env: {
+        DSH_HOME: process.env.DSH_HOME,
+        DSH_BASE: process.env.DSH_BASE,
+        DS_BOT_IOS_HOST: process.env.DS_BOT_IOS_HOST,
+      },
+    },
+    runtime: {
+      activePlugins: runtime.activePlugins,
+      activePluginRows: runtime.activePluginRows,
+      activeAgents: [...runtime.activeAgents.keys()],
+      activeTurns: [...runtime.activeTurns.keys()],
+      redteamToolsEnabled: runtime.redteamToolsEnabled,
+    },
+    tools: (ctx?.tools?.definitions?.() ?? []).map((t) => t.name),
+    cordisEntries: [...(ctx?.loader?.entries?.() ?? [])].map((e) => ({ id: e.options?.id, name: e.options?.name, state: e.fiber?.state })),
+    JSON, Math, Date, Object, Array, String, Number, Boolean,
+  }
+  const result = vm.runInNewContext(expr, sandbox, { timeout: 2_000 })
+  const formatted = typeof result === 'string' ? result : JSON.stringify(result, null, 2)
+  return { output: String(formatted ?? 'undefined').slice(0, 16_000) }
 })
 
 // Approval notifications stay inside Swift and do not transit Node.

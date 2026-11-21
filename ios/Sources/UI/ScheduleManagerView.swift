@@ -16,10 +16,13 @@ public struct ScheduleBotPickerView: View {
                         ScheduleManagerView(host: host, botId: bot.id)
                     } label: {
                         HStack(spacing: 10) {
-                            DSBotAvatar(initials: bot.name, color: bot.isMain ? DSTheme.brand : .teal,
-                                        isPrivate: false, size: 34)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(bot.name).font(.subheadline.weight(.semibold))
+                            DSBotAvatar(initials: bot.name, color: DSTheme.botAvatarColor(bot),
+                                        isPrivate: false, size: 36)
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 6) {
+                                    Text(bot.name).font(.subheadline.weight(.semibold))
+                                    DSPresetBadge(presetId: bot.agentPreset, label: bot.agentPresetLabel)
+                                }
                                 Text(bot.roleLabel).font(.caption).foregroundStyle(.secondary)
                             }
                         }
@@ -43,6 +46,11 @@ public struct ScheduleManagerView: View {
     @State private var pendingDeletion: [String: Any]?
     @State private var presentation: SchedulePresentation?
 
+    public init(host: LocalAgentHost, botId: String) {
+        self.host = host
+        self.botId = botId
+    }
+
     public var body: some View {
         List {
             Section {
@@ -54,18 +62,11 @@ public struct ScheduleManagerView: View {
             if isLoading && tasks.isEmpty {
                 ProgressView("正在读取定时任务…")
             } else if tasks.isEmpty {
-                VStack(spacing: 10) {
-                    Image(systemName: "calendar.badge.clock")
-                        .font(.system(size: 30))
-                        .foregroundStyle(.secondary)
-                    Text("暂无定时任务").font(.headline)
-                    Text("你可以在 Bot 对话中要求创建一个定时提醒。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 24)
+                DSEmptyStateView(
+                    icon: "calendar.badge.clock",
+                    title: "暂无定时任务",
+                    subtitle: "你可以在智能体对话中直接要求创建一个单次或周期性（RRULE）定时提醒。"
+                )
                 .listRowBackground(Color.clear)
             }
 

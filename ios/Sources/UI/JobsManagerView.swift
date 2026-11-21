@@ -18,16 +18,11 @@ public struct JobsBotPickerView: View {
             }
             Section("选择 Bot") {
                 if eligibleBots.isEmpty {
-                    VStack(spacing: 8) {
-                        Image(systemName: "hourglass").font(.system(size: 28)).foregroundStyle(.secondary)
-                        Text("没有可管理的 Bot").font(.headline)
-                        Text("新建或编辑一个 Bot，并选择标准模式或创造模式。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 22)
+                    DSEmptyStateView(
+                        icon: "hourglass",
+                        title: "没有可管理的智能体",
+                        subtitle: "新建或编辑一个非私密智能体，并选择标准模式或创造模式。"
+                    )
                     .listRowBackground(Color.clear)
                 } else {
                     ForEach(eligibleBots) { bot in
@@ -35,11 +30,14 @@ public struct JobsBotPickerView: View {
                             JobsManagerView(host: host, botId: bot.id)
                         } label: {
                             HStack(spacing: 10) {
-                                DSBotAvatar(initials: bot.name, color: bot.isMain ? DSTheme.brand : .purple,
-                                            isPrivate: false, size: 34)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(bot.name).font(.subheadline.weight(.semibold))
-                                    Text("\(bot.agentPresetLabel) · \(bot.roleLabel)")
+                                DSBotAvatar(initials: bot.name, color: DSTheme.botAvatarColor(bot),
+                                            isPrivate: false, size: 36)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    HStack(spacing: 6) {
+                                        Text(bot.name).font(.subheadline.weight(.semibold))
+                                        DSPresetBadge(presetId: bot.agentPreset, label: bot.agentPresetLabel)
+                                    }
+                                    Text(bot.roleLabel)
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
@@ -66,6 +64,11 @@ public struct JobsManagerView: View {
     @State private var selectedJob: JobOutputRoute?
     @State private var pendingKill: [String: Any]?
 
+    public init(host: LocalAgentHost, botId: String) {
+        self.host = host
+        self.botId = botId
+    }
+
     public var body: some View {
         List {
             Section {
@@ -77,18 +80,11 @@ public struct JobsManagerView: View {
             if isLoading && jobs.isEmpty {
                 ProgressView("正在读取后台任务…")
             } else if jobs.isEmpty {
-                VStack(spacing: 10) {
-                    Image(systemName: "hourglass")
-                        .font(.system(size: 30))
-                        .foregroundStyle(.secondary)
-                    Text("暂无后台任务").font(.headline)
-                    Text("可以在标准或创造模式的对话中要求 Bot 把较长的离线 Python/NumPy 计算作为后台任务运行。Python Worker 在整个 App 中单任务运行。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 24)
+                DSEmptyStateView(
+                    icon: "hourglass",
+                    title: "暂无后台任务",
+                    subtitle: "可以在标准或创造模式的对话中要求智能体将较长的离线 Python/NumPy 计算作为后台任务运行。"
+                )
                 .listRowBackground(Color.clear)
             }
 

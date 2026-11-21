@@ -35,6 +35,13 @@ public struct LongReplyReadingPill: View {
     let onJumpHeading: (MarkdownHeading) -> Void
     @State private var showOutline = false
 
+    public init(currentSection: String, headings: [MarkdownHeading], onJumpTop: @escaping () -> Void, onJumpHeading: @escaping (MarkdownHeading) -> Void) {
+        self.currentSection = currentSection
+        self.headings = headings
+        self.onJumpTop = onJumpTop
+        self.onJumpHeading = onJumpHeading
+    }
+
     public var body: some View {
         HStack(spacing: 8) {
             Button(action: onJumpTop) {
@@ -93,6 +100,14 @@ public struct SideChatSheet: View {
     @State private var includeRecentContext = false
     @State private var messages: [(role: String, text: String)] = []
 
+    public init(host: LocalAgentHost, model: String, botId: String, botName: String, isPrivate: Bool) {
+        self.host = host
+        self.model = model
+        self.botId = botId
+        self.botName = botName
+        self.isPrivate = isPrivate
+    }
+
     private var recentContext: [[String: String]] {
         guard includeRecentContext else { return [] }
         return host.messages(for: botId).suffix(8).compactMap { message in
@@ -119,25 +134,36 @@ public struct SideChatSheet: View {
                             .foregroundColor(.secondary)
                     }
                 }
-                .padding(10)
+                .padding(12)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color(.secondarySystemBackground))
 
                 ScrollViewReader { proxy in
                     ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 10) {
-                            ForEach(Array(messages.enumerated()), id: \.offset) { idx, msg in
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(msg.role).font(.caption2).foregroundColor(.secondary)
-                                    DSMarkdownText(msg.text)
-                                        .padding(10)
-                                        .background(msg.role == "You" ? Color.accentColor.opacity(0.14) : Color(.secondarySystemBackground))
-                                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        if messages.isEmpty {
+                            DSEmptyStateView(
+                                icon: "bubble.left.and.exclamationmark.bubble.right",
+                                title: "开启旁白追问",
+                                subtitle: "在不污染当前主线上下文的前提下，随时查询概念、验证代码或做快速推演。"
+                            )
+                            .padding(.top, 28)
+                        } else {
+                            LazyVStack(alignment: .leading, spacing: 10) {
+                                ForEach(Array(messages.enumerated()), id: \.offset) { idx, msg in
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(msg.role == "You" ? "你" : "侧边助手")
+                                            .font(.caption2.weight(.semibold))
+                                            .foregroundColor(.secondary)
+                                        DSMarkdownText(msg.text)
+                                            .padding(10)
+                                            .background(msg.role == "You" ? DSTheme.brand.opacity(0.14) : Color(.secondarySystemBackground))
+                                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                    }
+                                    .id(idx)
                                 }
-                                .id(idx)
                             }
+                            .padding()
                         }
-                        .padding()
                     }
                     .onChange(of: messages.count) { count in
                         if count > 0 {
@@ -146,10 +172,15 @@ public struct SideChatSheet: View {
                     }
                 }
 
-                if !status.isEmpty { Text(status).font(.caption).foregroundStyle(.secondary) }
+                if !status.isEmpty {
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.vertical, 4)
+                }
                 Divider()
                 HStack(spacing: 8) {
-                    TextField("顺手问一句...", text: $question)
+                    TextField("顺手问一句…", text: $question)
                         .textFieldStyle(.roundedBorder)
                     Button("发送") {
                         let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -179,13 +210,13 @@ public struct SideChatSheet: View {
                             }
                         }
                     }
-                    .disabled(sending)
+                    .disabled(sending || question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     .buttonStyle(.borderedProminent)
                 }
                 .padding()
             }
             .scrollDismissesKeyboard(.interactively)
-            .navigationTitle("侧边对话")
+            .navigationTitle("侧边对话 (/side)")
             .onDisappear {
                 request?.cancel()
                 if let sideId { Task { _ = try? await host.rpc()?.request("side.cancel", params: ["sideId": sideId]) } }
@@ -227,13 +258,26 @@ public struct GroupWorkspaceSheet: View {
     @State private var newGoalInput = ""
     @State private var status = ""
 
+    public init(host: LocalAgentHost, groupId: String) {
+        self.host = host
+        self.groupId = groupId
+    }
+
     public var body: some View {
         NavigationStack {
             List {
-                Section("群 Goal 进度") {
-                    Text(goalTitle).font(.subheadline.weight(.medium))
+                Section("当前群 Goal 目标") {
+                    HStack(spacing: 10) {
+                        Image(systemName: "target")
+                            .foregroundStyle(DSTheme.brand)
+                            .font(.title3)
+                        Text(goalTitle)
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    .padding(.vertical, 4)
+
                     HStack {
-                        TextField("设定或更新群目标...", text: $newGoalInput)
+                        TextField("设定或更新群目标…", text: $newGoalInput)
                         Button("保存") {
                             let g = newGoalInput.trimmingCharacters(in: .whitespacesAndNewlines)
                             guard !g.isEmpty else { return }
@@ -247,13 +291,15 @@ public struct GroupWorkspaceSheet: View {
                                 } catch { status = error.localizedDescription }
                             }
                         }
+                        .buttonStyle(.borderedProminent)
+                        .font(.caption.weight(.semibold))
                         .disabled(newGoalInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                 }
 
-                Section("共享待办") {
+                Section("共享待办清单 (\(todos.filter { !$0.done }.count) 待完成 / 共 \(todos.count))") {
                     HStack {
-                        TextField("添加群待办...", text: $newTodoText)
+                        TextField("添加群待办事项…", text: $newTodoText)
                         Button("添加") {
                             let t = newTodoText.trimmingCharacters(in: .whitespacesAndNewlines)
                             guard !t.isEmpty else { return }
@@ -267,18 +313,28 @@ public struct GroupWorkspaceSheet: View {
                                 } catch { status = error.localizedDescription }
                             }
                         }
+                        .buttonStyle(.bordered)
+                        .font(.caption.weight(.semibold))
                         .disabled(newTodoText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
+                    if todos.isEmpty {
+                        Text("暂无群待办，可在上方添加或在群对话中使用工具创建。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     ForEach(todos, id: \.id) { todo in
-                        HStack {
+                        HStack(spacing: 10) {
                             Image(systemName: todo.done ? "checkmark.circle.fill" : "circle")
-                                .foregroundColor(todo.done ? .green : .secondary)
+                                .foregroundColor(todo.done ? DSTheme.success : .secondary)
                             Text(todo.text)
                                 .strikethrough(todo.done)
+                                .foregroundStyle(todo.done ? .secondary : .primary)
                         }
+                        .contentShape(Rectangle())
                         .onTapGesture {
                             Task {
                                 _ = try? await host.rpc()?.request("group.todo.toggle", params: ["groupId": groupId, "id": todo.id, "done": !todo.done])
+                                DSHaptics.impact(.light)
                                 await reload()
                             }
                         }
@@ -297,7 +353,7 @@ public struct GroupWorkspaceSheet: View {
                     Section { Text(status).font(.caption).foregroundStyle(.secondary) }
                 }
             }
-            .navigationTitle("群协作面板")
+            .navigationTitle("群协作面板 (/goal)")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -321,11 +377,14 @@ public struct GroupWorkspaceSheet: View {
     }
 }
 
-// MARK: - 4. 4-Layer Memory & Reversible Journal View
+// MARK: - 4. 4-Layer Memory & Reversible Journal View (with optional Public Bot Switcher)
 
 public struct MemoryVaultView: View {
     @ObservedObject var host: LocalAgentHost
-    let botId: String
+    let initialBotId: String
+    let allowsSwitchingBot: Bool
+    @State private var activeBotId: String
+
     private struct Record: Identifiable {
         let id: String
         let title: String
@@ -353,6 +412,21 @@ public struct MemoryVaultView: View {
     @State private var layerFilter = "all"
     @Environment(\.scenePhase) private var phase
 
+    public init(host: LocalAgentHost, botId: String, allowsSwitchingBot: Bool = false) {
+        self.host = host
+        self.initialBotId = botId
+        self.allowsSwitchingBot = allowsSwitchingBot
+        _activeBotId = State(initialValue: botId)
+    }
+
+    private var publicBots: [BotProfile] {
+        host.bots.filter { !$0.isPrivate }
+    }
+
+    private var activeBotName: String {
+        host.bots.first(where: { $0.id == activeBotId })?.name ?? activeBotId
+    }
+
     private var filteredJournal: [Record] {
         journal.filter { row in
             let matchesLayer = layerFilter == "all" || row.layer == layerFilter
@@ -364,32 +438,77 @@ public struct MemoryVaultView: View {
 
     public var body: some View {
         List {
+            if allowsSwitchingBot && publicBots.count > 1 {
+                Section("选择智能体记忆空间") {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(publicBots) { bot in
+                                let selected = bot.id == activeBotId
+                                Button {
+                                    activeBotId = bot.id
+                                    DSHaptics.impact(.light)
+                                    Task { await reload() }
+                                } label: {
+                                    HStack(spacing: 6) {
+                                        Circle()
+                                            .fill(selected ? .white : DSTheme.botAvatarColor(bot))
+                                            .frame(width: 8, height: 8)
+                                        Text(bot.name)
+                                            .font(.caption.weight(selected ? .semibold : .medium))
+                                    }
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 7)
+                                    .background(selected ? DSTheme.brand : DSTheme.surfaceSecondary)
+                                    .foregroundStyle(selected ? .white : .primary)
+                                    .clipShape(Capsule())
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                    Text("私密智能体的记忆受独立硬件锁保护，请直接从私密会话右上角工作抽屉查看。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             Section {
                 Picker("筛选", selection: $layerFilter) {
                     Text("全部 (\(journal.count))").tag("all")
-                    Text("常驻").tag("pinned")
-                    Text("仅本机").tag("delta")
+                    Text("常驻 (随对话发送)").tag("pinned")
+                    Text("仅本机 (Delta)").tag("delta")
                 }
                 .pickerStyle(.segmented)
             }
-            Section("当前 Bot") {
+
+            Section("「\(activeBotName)」的记忆 (\(filteredJournal.count))") {
                 if filteredJournal.isEmpty {
-                    Text(journal.isEmpty ? "暂无记忆记录" : "无匹配记忆").foregroundStyle(.secondary)
-                }
-                ForEach(filteredJournal) { row in
-                    HStack {
-                        memoryRow(row)
-                        Spacer()
-                        Button("撤销", role: .destructive) {
-                            Task { await mutate("memory.undo", id: row.id) }
+                    DSEmptyStateView(
+                        icon: "brain.head.profile",
+                        title: journal.isEmpty ? "暂无记忆记录" : "无匹配记忆",
+                        subtitle: journal.isEmpty ? "你可以点击右上角手动新增常驻或本机记忆，或在长对话中将助手回复一键存入。" : "尝试切换上方分类筛选或清空搜索词。"
+                    )
+                    .listRowBackground(Color.clear)
+                } else {
+                    ForEach(filteredJournal) { row in
+                        HStack(alignment: .top, spacing: 10) {
+                            memoryRow(row)
+                            Spacer()
+                            Button("撤销", role: .destructive) {
+                                Task { await mutate("memory.undo", id: row.id) }
+                            }
+                            .buttonStyle(.bordered)
+                            .font(.caption)
                         }
-                        .buttonStyle(.bordered)
+                        .padding(.vertical, 3)
                     }
                 }
             }
-            Section("升级前的记忆") {
+
+            Section("升级前的未归属记忆") {
                 if !showsLegacy {
-                    Button("验证设备身份并查看") {
+                    Button {
                         Task {
                             let context = LAContext()
                             do {
@@ -398,17 +517,22 @@ public struct MemoryVaultView: View {
                                 await reload()
                             } catch { status = "无法验证设备身份。" }
                         }
+                    } label: {
+                        Label("验证设备身份并查看旧记忆", systemImage: "faceid")
                     }
                 } else {
-                    Text("选择归属后，这条记忆将移到当前 Bot。常驻记忆会随请求发给模型服务。")
+                    Text("选择归属后，这条记忆将移到「\(activeBotName)」。常驻记忆会随请求发给模型服务。")
                         .font(.caption).foregroundStyle(.secondary)
-                    if legacy.isEmpty { Text("暂无未归属记忆").foregroundStyle(.secondary) }
+                    if legacy.isEmpty {
+                        Text("暂无未归属记忆").font(.caption).foregroundStyle(.secondary)
+                    }
                     ForEach(legacy) { row in
                         HStack {
                             memoryRow(row)
                             Spacer()
                             Button("分配给当前 Bot") { Task { await mutate("memory.assign", id: row.id) } }
                                 .buttonStyle(.bordered)
+                                .font(.caption)
                         }
                     }
                 }
@@ -417,7 +541,7 @@ public struct MemoryVaultView: View {
         }
         .searchable(text: $searchText, prompt: "搜索记忆标题或内容")
         .refreshable { await reload() }
-        .navigationTitle("记忆")
+        .navigationTitle("记忆中心")
         .onChange(of: phase) { phase in
             if phase == .background { showsLegacy = false; legacy = [] }
         }
@@ -429,12 +553,14 @@ public struct MemoryVaultView: View {
         .sheet(isPresented: $showAddMemory) {
             NavigationStack {
                 Form {
-                    TextField("记忆标题", text: $newMemTitle)
-                    Picker("用途", selection: $newMemLayer) {
-                        Text("常驻 · 随聊天发送给模型").tag("pinned")
-                        Text("手动查阅 · 仅本机").tag("delta")
+                    Section("归属智能体：\(activeBotName)") {
+                        TextField("记忆标题", text: $newMemTitle)
+                        Picker("记忆层级", selection: $newMemLayer) {
+                            Text("常驻 · 随聊天自动发送给模型").tag("pinned")
+                            Text("手动查阅 · 仅保存在本机").tag("delta")
+                        }
+                        TextField("记忆内容", text: $newMemContent, axis: .vertical).lineLimit(3...6)
                     }
-                    TextField("记忆内容", text: $newMemContent, axis: .vertical).lineLimit(3...6)
                     if !status.isEmpty { Text(status).font(.caption) }
                 }
                 .navigationTitle("新增记忆")
@@ -447,7 +573,7 @@ public struct MemoryVaultView: View {
                                 do {
                                     guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
                                     _ = try await rpc.request("memory.add", params: [
-                                        "botId": botId, "title": newMemTitle, "content": newMemContent, "layer": newMemLayer
+                                        "botId": activeBotId, "title": newMemTitle, "content": newMemContent, "layer": newMemLayer
                                     ])
                                     newMemTitle = ""
                                     newMemContent = ""
@@ -465,21 +591,29 @@ public struct MemoryVaultView: View {
                 }
             }
         }
-        .task { await reload() }
+        .task(id: activeBotId) { await reload() }
     }
 
     private func memoryRow(_ row: Record) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(row.title)
-            if row.layer == "pinned" { Text("常驻").font(.caption2).foregroundStyle(.secondary) }
-            Text(row.content).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Text(row.title).font(.subheadline.weight(.semibold))
+                DSStatusBadge(
+                    row.layer == "pinned" ? "常驻" : "本机",
+                    color: row.layer == "pinned" ? DSTheme.brand : .secondary
+                )
+            }
+            Text(row.content)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
         }
     }
 
     private func mutate(_ method: String, id: String) async {
         do {
             guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
-            let result = try await rpc.request(method, params: ["botId": botId, "journalId": id])
+            let result = try await rpc.request(method, params: ["botId": activeBotId, "journalId": id])
             status = (result["assigned"] as? Bool == true || result["undone"] as? Bool == true) ? "" : "这条记忆已变更。"
             await reload()
         } catch { status = error.localizedDescription }
@@ -488,7 +622,7 @@ public struct MemoryVaultView: View {
     private func reload() async {
         do {
             guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
-            let current = try await rpc.request("memory.journal", params: ["botId": botId])
+            let current = try await rpc.request("memory.journal", params: ["botId": activeBotId])
             journal = (current["records"] as? [[String: Any]] ?? []).compactMap(Record.init)
             if showsLegacy {
                 let previous = try await rpc.request("memory.legacy")
@@ -498,7 +632,7 @@ public struct MemoryVaultView: View {
     }
 }
 
-// MARK: - 5. Universal Connectors & Token Usage Dashboard
+// MARK: - 5. Multi-dimensional Token Usage & Cache Dashboard
 
 private struct DSHUsageTotals {
     let calls: Int
@@ -534,12 +668,11 @@ public struct ConnectorsAndUsageView: View {
     @State private var unreadUsageSessions = 0
     @State private var legacyTotalTokens = 0
     @State private var legacyCacheHitRate = 0.0
-    @State private var connectorName = ""
-    @State private var connectorEndpoint = ""
-    @State private var connectorToken = ""
-    @State private var connectors: [(id: String, type: String, name: String, endpoint: String)] = []
-    @State private var mcpStatus = ""
     @State private var usageDimension = "day"
+
+    public init(host: LocalAgentHost) {
+        self.host = host
+    }
 
     private func recentDayWindows() -> [[String: Any]] {
         let calendar = Calendar.current
@@ -579,26 +712,7 @@ public struct ConnectorsAndUsageView: View {
 
     public var body: some View {
         Form {
-            Section("连接器市场") {
-                NavigationLink {
-                    ConnectorMarketplaceView(host: host)
-                } label: {
-                    Label {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("浏览 38 个官方 Remote MCP 连接器")
-                                .font(.subheadline.weight(.semibold))
-                            Text("GitHub、Notion、Sentry、Vercel、DeepWiki、Context7、高德地图等")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    } icon: {
-                        Image(systemName: "puzzlepiece.extension.fill")
-                            .foregroundStyle(.indigo)
-                    }
-                }
-            }
-
-            Section("真实用量（DSH 持久事件）") {
+            Section("真实用量概览（DSH 持久事件）") {
                 LabeledContent("已报告用量的模型调用", value: usageTotals.calls.formatted())
                 LabeledContent("输入 Tokens（未缓存）", value: usageTotals.inputTokens.formatted())
                 LabeledContent("缓存读取 Tokens", value: usageTotals.cacheReadTokens.formatted())
@@ -620,7 +734,7 @@ public struct ConnectorsAndUsageView: View {
             Section("多维用量分析") {
                 Picker("统计维度", selection: $usageDimension) {
                     Text("最近 7 天").tag("day")
-                    Text("按 Bot").tag("bot")
+                    Text("按智能体").tag("bot")
                     Text("按模型").tag("model")
                 }
                 .pickerStyle(.segmented)
@@ -635,7 +749,7 @@ public struct ConnectorsAndUsageView: View {
                         .foregroundStyle(DSTheme.brand.gradient)
                         .cornerRadius(4)
                     }
-                    .frame(height: 155)
+                    .frame(height: 165)
                     .padding(.vertical, 6)
                 }
                 if activeRollups.isEmpty {
@@ -647,7 +761,7 @@ public struct ConnectorsAndUsageView: View {
                 }
             }
 
-            Section("原生兼容请求（独立累计）") {
+            Section("原生兼容请求（历史累计）") {
                 LabeledContent("累计 Tokens", value: legacyTotalTokens.formatted())
                 LabeledContent("Prompt 缓存命中率", value: String(format: "%.1f%%", legacyCacheHitRate * 100))
                 Text("包含 Swift 兼容路径的历史请求，不与 DSH 明细合并，也无法按 Bot、模型或日期拆分。")
@@ -655,84 +769,29 @@ public struct ConnectorsAndUsageView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("添加 Remote MCP 连接器") {
-                TextField("名称（如 Office MCP）", text: $connectorName)
-                TextField("Endpoint / URL", text: $connectorEndpoint)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                SecureField("Bearer Token（可选，存 Keychain）", text: $connectorToken)
-                Button("保存连接器") {
-                    let trimmedName = connectorName.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let trimmedEndpoint = connectorEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !trimmedName.isEmpty, !trimmedEndpoint.isEmpty else { return }
-                    Task {
-                        do {
-                            guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
-                            _ = try await rpc.request("connectors.upsert", params: [
-                                "name": trimmedName, "endpoint": trimmedEndpoint,
-                                "token": connectorToken.trimmingCharacters(in: .whitespacesAndNewlines)
-                            ])
-                            connectorName = ""
-                            connectorEndpoint = ""
-                            connectorToken = ""
-                            mcpStatus = "已保存连接器：\(trimmedName)"
-                            await reload()
-                        } catch { mcpStatus = error.localizedDescription }
-                    }
-                }
-                .disabled(
-                    connectorName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    || connectorEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                )
-            }
-
-            if !connectors.isEmpty {
-                Section("已配置连接器") {
-                    ForEach(connectors, id: \.id) { c in
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("\(c.name) (\(c.type))").font(.subheadline.weight(.medium))
-                                Text(c.endpoint).font(.caption2).foregroundColor(.secondary)
-                            }
-                            Spacer()
-                            if c.type == "remote-mcp" {
-                                Button("发现工具") {
-                                    Task {
-                                        do {
-                                            guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
-                                            let result = try await rpc.request("mcp.listTools", params: ["connectorId": c.id], timeoutSeconds: 180)
-                                            let tools = result["tools"] as? [[String: Any]] ?? []
-                                            mcpStatus = "\(c.name)：已发现 \(tools.count) 个远程工具"
-                                        } catch { mcpStatus = error.localizedDescription }
-                                    }
-                                }
-                                .buttonStyle(.bordered)
+            Section("Remote MCP 连接器") {
+                NavigationLink {
+                    ConnectorMarketplaceView(host: host)
+                } label: {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("前往 Remote MCP 连接器市场")
+                                .font(.subheadline.weight(.semibold))
+                            Text("管理已配置连接器或浏览 38 个官方 MCP 服务目录")
                                 .font(.caption)
-                            }
+                                .foregroundStyle(.secondary)
                         }
-                        .swipeActions(edge: .trailing) {
-                            Button("删除", role: .destructive) {
-                                Task {
-                                    do {
-                                        guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
-                                        _ = try await rpc.request("connectors.delete", params: ["id": c.id])
-                                        await reload()
-                                    } catch { mcpStatus = error.localizedDescription }
-                                }
-                            }
-                        }
+                    } icon: {
+                        Image(systemName: "puzzlepiece.extension.fill")
+                            .foregroundStyle(.indigo)
                     }
-                }
-            }
-            if !mcpStatus.isEmpty {
-                Section("MCP 探测结果") {
-                    Text(mcpStatus).font(.caption).foregroundColor(.secondary)
                 }
             }
         }
         .refreshable { await reload() }
         .scrollDismissesKeyboard(.interactively)
-        .navigationTitle("连接器与用量")
+        .navigationTitle("Token 用量与缓存")
+        .navigationBarTitleDisplayMode(.inline)
         .task { await reload() }
     }
 
@@ -751,21 +810,8 @@ public struct ConnectorsAndUsageView: View {
             legacyTotalTokens = max(0, legacy["totalTokens"] as? Int ?? 0)
             legacyCacheHitRate = min(1, max(0, legacy["cacheHitRate"] as? Double ?? 0))
         }
-        if let c = try? await host.rpc()?.request("connectors.list") {
-            let raw = c["connectors"] as? [[String: Any]] ?? []
-            connectors = raw.compactMap { d in
-                guard let id = d["id"] as? String else { return nil }
-                return (
-                    id: id,
-                    type: d["type"] as? String ?? "",
-                    name: d["name"] as? String ?? "",
-                    endpoint: d["endpoint"] as? String ?? ""
-                )
-            }
-        }
     }
 }
-
 
 // MARK: - 6. Native Widget Blueprint Renderer (`2026-10-20-widget-views.md`)
 
@@ -790,8 +836,14 @@ public struct WidgetBlueprintCardView: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(title)
-                .font(.subheadline.weight(.semibold))
+            HStack {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                Image(systemName: "waveform.path.ecg")
+                    .font(.caption)
+                    .foregroundStyle(DSTheme.brand)
+            }
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
                 ForEach(metrics) { item in
                     VStack(alignment: .leading, spacing: 3) {
@@ -815,7 +867,6 @@ public struct WidgetBlueprintCardView: View {
     }
 }
 
-
 // MARK: - 7. On-Device QuickJS Sandbox Playground
 
 public struct JSSandboxPlaygroundView: View {
@@ -825,12 +876,16 @@ public struct JSSandboxPlaygroundView: View {
     @State private var deviceInfo = ""
     @State private var isRunning = false
 
+    public init(host: LocalAgentHost) {
+        self.host = host
+    }
+
     public var body: some View {
         Form {
-            Section("QuickJS 离线沙盒（免 JIT / 零体积增量）") {
+            Section("QuickJS 离线沙盒（免 JIT · 2 秒超时 · 16 MiB 上限）") {
                 TextEditor(text: $script)
                     .font(.caption.monospaced())
-                    .frame(minHeight: 110)
+                    .frame(minHeight: 120)
                 HStack {
                     Button(isRunning ? "运行中…" : "在 iOS 沙盒中运行") {
                         isRunning = true
@@ -858,27 +913,35 @@ public struct JSSandboxPlaygroundView: View {
 
             if !output.isEmpty {
                 Section("执行输出") {
-                    Text(output).font(.caption.monospaced()).textSelection(.enabled)
+                    Text(output)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
                 }
             }
 
-            Section("本机设备状态探针") {
-                Button("读取电量与温控状态") {
+            Section("本机设备状态探针 (device.status)") {
+                Button {
                     Task {
                         if let st = try? await host.rpc()?.request("device.status"),
                            let d = try? JSONSerialization.data(withJSONObject: st, options: [.prettyPrinted, .sortedKeys]),
                            let s = String(data: d, encoding: .utf8) {
                             deviceInfo = s
+                            DSHaptics.impact(.light)
                         }
                     }
+                } label: {
+                    Label("读取本机电量与温控状态", systemImage: "battery.100.bolt")
                 }
                 if !deviceInfo.isEmpty {
-                    Text(deviceInfo).font(.caption2.monospaced()).textSelection(.enabled)
+                    Text(deviceInfo)
+                        .font(.caption2.monospaced())
+                        .textSelection(.enabled)
                 }
             }
         }
         .scrollDismissesKeyboard(.interactively)
         .navigationTitle("端侧 JS 沙盒")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 
@@ -901,6 +964,10 @@ public struct WorkspaceFilesView: View {
     @State private var newFileContent = ""
     @State private var status = ""
 
+    public init(host: LocalAgentHost) {
+        self.host = host
+    }
+
     private var filesRoot: URL {
         let dir = LocalAgentTransport.defaultWorkspace.appendingPathComponent("files", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -910,29 +977,39 @@ public struct WorkspaceFilesView: View {
     public var body: some View {
         List {
             Section {
-                Text("此目录供智能体通过 workspace_list / workspace_read / workspace_search / workspace_write / workspace_edit 安全读写（写入与编辑均需原生审批）。")
+                Text("此目录供智能体通过 read / write / edit / apply_patch / glob / grep 安全读写（写入与修改均需经过原生审批）。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Section("工作区文件（files/）") {
+            Section("工作区文件（files/ · \(entries.count) 项）") {
                 if entries.isEmpty {
-                    Text("暂无文件，可点击右上角新建或导入文档/图片。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    DSEmptyStateView(
+                        icon: "folder.badge.plus",
+                        title: "工作区暂无文件",
+                        subtitle: "点击右上角新建文本/代码文件，或从系统文件 App 导入文档与图片。",
+                        actionTitle: "新建文件"
+                    ) {
+                        showNewFile = true
+                    }
+                    .listRowBackground(Color.clear)
                 } else {
                     ForEach(entries) { entry in
                         Button {
                             preview(entry)
                         } label: {
-                            HStack {
-                                Image(systemName: "doc.text")
+                            HStack(spacing: 12) {
+                                Image(systemName: "doc.text.fill")
                                     .foregroundStyle(DSTheme.brand)
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(entry.name).font(.subheadline)
+                                    Text(entry.name).font(.subheadline.weight(.medium))
                                     Text(ByteCountFormatter.string(fromByteCount: Int64(entry.byteCount), countStyle: .file))
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
                                 }
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
                             }
                         }
                         .swipeActions(edge: .trailing) {
@@ -949,6 +1026,7 @@ public struct WorkspaceFilesView: View {
             }
         }
         .navigationTitle("工作区文件")
+        .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 Button { showNewFile = true } label: { Image(systemName: "doc.badge.plus") }
@@ -1090,6 +1168,10 @@ public struct SkillsManagerView: View {
     """
     @State private var status = ""
 
+    public init(host: LocalAgentHost) {
+        self.host = host
+    }
+
     private var skillsRoot: URL {
         let dir = LocalAgentTransport.defaultWorkspace.appendingPathComponent("skills", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -1105,9 +1187,15 @@ public struct SkillsManagerView: View {
             }
             Section("已安装技能（\(skills.count)）") {
                 if skills.isEmpty {
-                    Text("暂无自定义技能，点右上角 + 新建一个 SKILL.md。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    DSEmptyStateView(
+                        icon: "wand.and.stars",
+                        title: "暂无自定义技能",
+                        subtitle: "点击右上角 + 新建一个 SKILL.md，赋予智能体可复用的标准作业流程。",
+                        actionTitle: "新建 SKILL.md"
+                    ) {
+                        showCreate = true
+                    }
+                    .listRowBackground(Color.clear)
                 } else {
                     ForEach(skills) { skill in
                         Button {
@@ -1136,6 +1224,7 @@ public struct SkillsManagerView: View {
             }
         }
         .navigationTitle("Skill 技能管理")
+        .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button { showCreate = true } label: { Label("新建", systemImage: "plus") }

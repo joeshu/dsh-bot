@@ -1,6 +1,15 @@
 import { parentPort, workerData } from 'node:worker_threads'
+import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
+
+if (typeof globalThis.require !== 'function') {
+  globalThis.require = createRequire(import.meta.url)
+}
+if (typeof globalThis.__dirname !== 'string' && typeof workerData?.runtimeDirectory === 'string') {
+  globalThis.__dirname = workerData.runtimeDirectory
+  globalThis.__filename = join(workerData.runtimeDirectory, 'pyodide.asm.js')
+}
 
 const MAX_OUTPUT_CHARACTERS = 32_000
 const MAX_WASM_MEMORY_PAGES = 4_096
@@ -62,9 +71,9 @@ parentPort?.on('message', (message) => {
 function pythonBootstrap() {
   return String.raw`
 import asyncio
-import json as __dsh_json
-import math as __dsh_math
-import textwrap as __dsh_textwrap
+import json as _dsh_json
+import math as _dsh_math
+import textwrap as _dsh_textwrap
 from js import __dsh_host_call__
 
 class ToolCallError(Exception):
@@ -99,15 +108,15 @@ class __DshNamespace:
             raise AttributeError(f"Tool {name!r} is not available in this run.")
         async def invoke(args=None):
             try:
-                value_json = await __dsh_host_call__(namespace, name, __dsh_json.dumps(args, ensure_ascii=False, allow_nan=False, separators=(",", ":")))
-                return __dsh_json.loads(value_json)
+                value_json = await __dsh_host_call__(namespace, name, _dsh_json.dumps(args, ensure_ascii=False, allow_nan=False, separators=(",", ":")))
+                return _dsh_json.loads(value_json)
             except Exception as error:
                 if error_type is None or isinstance(error, error_type):
                     raise
                 raise error_type(name, str(error)) from error
         return invoke
 
-for __dsh_binding in __dsh_json.loads(__dsh_binding_specs_json__):
+for __dsh_binding in _dsh_json.loads(__dsh_binding_specs_json__):
     __dsh_namespace = __dsh_binding["global"]
     __dsh_error_spec = __dsh_binding.get("errorClass")
     __dsh_error_type = None
@@ -141,7 +150,7 @@ def __dsh_validate_json(value, depth=0, ancestors=None):
             raise TypeError("return value contains an integer outside the exact JSON number range")
         return
     if type(value) is float:
-        if not __dsh_math.isfinite(value):
+        if not _dsh_math.isfinite(value):
             raise TypeError("return value contains a non-finite number")
         return
     if type(value) not in (list, dict):
@@ -180,12 +189,12 @@ try {
     indexURL: `${runtimeDirectory}/`,
     packageBaseUrl: `${runtimeDirectory}/full/`,
     lockFileURL: join(runtimeDirectory, 'pyodide-lock.json'),
-    fullStdLib: true,
+    fullStdLib: false,
     jsglobals,
     wasmMemory: memory,
     stdin: () => null,
-    stdout: appendOutput,
-    stderr: appendOutput,
+    stdout: () => {},
+    stderr: () => {},
   })
   await pyodide.loadPackage('numpy')
   pyodide.setStdout({ batched: appendOutput })
@@ -207,7 +216,7 @@ try {
       parentPort.postMessage({ type: 'completed', hasValue: false, outputTruncated })
     } else {
       pyodide.globals.set('__dsh_result__', result)
-      const json = pyodide.runPython('__dsh_validate_json(__dsh_result__)\n__dsh_json.dumps(__dsh_result__, ensure_ascii=False, allow_nan=False, separators=(",", ":"))')
+      const json = pyodide.runPython('__dsh_validate_json(__dsh_result__)\n_dsh_json.dumps(__dsh_result__, ensure_ascii=False, allow_nan=False, separators=(",", ":"))')
       const value = JSON.parse(String(json))
       if (!isJsonValue(value)) throw new Error('PTC Python result is not lossless JSON.')
       parentPort.postMessage({ type: 'completed', hasValue: true, value, outputTruncated })

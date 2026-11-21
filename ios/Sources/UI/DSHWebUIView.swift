@@ -4,6 +4,20 @@ import WebKit
 import UIKit
 #endif
 
+private enum DSHWebViewportMode: String, CaseIterable, Identifiable {
+    case responsive = "移动自适应"
+    case desktop1280 = "桌面工作台 (1280px)"
+    var id: String { rawValue }
+    var viewportContent: String {
+        switch self {
+        case .responsive:
+            return "width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes"
+        case .desktop1280:
+            return "width=1280, initial-scale=0.32, minimum-scale=0.25, maximum-scale=5.0, user-scalable=yes"
+        }
+    }
+}
+
 /// Hosts the embedded official DSH Web UI (`@deepseek-ai/dsh-web-app` + `@deepseek-ai/dsh-web-frontend`)
 /// and any installed community `dsh-client-ui-*` plugins over the private loopback port.
 public struct DSHWebUIView: View {
@@ -12,19 +26,29 @@ public struct DSHWebUIView: View {
     @State private var allowedPort: Int = 0
     @State private var errorMessage: String?
     @State private var reloadToken = UUID()
+    @AppStorage("dsbot.web.viewportMode") private var viewportModeRaw: String = DSHWebViewportMode.responsive.rawValue
 
     public init(host: LocalAgentHost) {
         self.host = host
     }
 
+    private var viewportMode: DSHWebViewportMode {
+        DSHWebViewportMode(rawValue: viewportModeRaw) ?? .responsive
+    }
+
     public var body: some View {
         Group {
             if let url = launchURL, allowedPort > 0 {
-                LoopbackWebView(url: url, allowedPort: allowedPort, reloadToken: reloadToken) {
+                LoopbackWebView(
+                    url: url,
+                    allowedPort: allowedPort,
+                    reloadToken: reloadToken,
+                    viewportMode: viewportMode
+                ) {
                     launchURL = nil
                     errorMessage = "本机 Web 连接已断开，请重新连接。"
                 }
-                    .ignoresSafeArea(edges: .bottom)
+                .ignoresSafeArea(edges: .bottom)
             } else if let errorMessage {
                 VStack(spacing: 12) {
                     Image(systemName: "globe.badge.chevron.backward")
@@ -49,22 +73,35 @@ public struct DSHWebUIView: View {
         .toolbar(.hidden, for: .tabBar)
         .toolbar {
             ToolbarItemGroup(placement: .navigationBarTrailing) {
-                Button {
-                    Task {
-                        launchURL = nil
-                        _ = await host.restartRuntime()
+                Menu {
+                    Picker("布局视口", selection: $viewportModeRaw) {
+                        ForEach(DSHWebViewportMode.allCases) { mode in
+                            Label(
+                                mode.rawValue,
+                                systemImage: mode == .desktop1280 ? "desktopcomputer" : "iphone"
+                            )
+                            .tag(mode.rawValue)
+                        }
+                    }
+                    Divider()
+                    Button {
                         reloadToken = UUID()
-                        await loadWebUIInfo()
+                        Task { await loadWebUIInfo() }
+                    } label: {
+                        Label("刷新页面", systemImage: "arrow.clockwise")
+                    }
+                    Button {
+                        Task {
+                            launchURL = nil
+                            _ = await host.restartRuntime()
+                            reloadToken = UUID()
+                            await loadWebUIInfo()
+                        }
+                    } label: {
+                        Label("重启 DSH 引擎并刷新", systemImage: "power")
                     }
                 } label: {
-                    Image(systemName: "power")
-                }
-                .help("重启 DSH 引擎并刷新")
-                Button {
-                    reloadToken = UUID()
-                    Task { await loadWebUIInfo() }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
+                    Image(systemName: viewportMode == .desktop1280 ? "desktopcomputer" : "ellipsis.circle")
                 }
             }
         }
@@ -108,10 +145,11 @@ private struct LoopbackWebView: UIViewRepresentable {
     let url: URL
     let allowedPort: Int
     let reloadToken: UUID
+    let viewportMode: DSHWebViewportMode
     let onDisconnect: () -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(allowedPort: allowedPort, onDisconnect: onDisconnect)
+        Coordinator(allowedPort: allowedPort, viewportMode: viewportMode, onDisconnect: onDisconnect)
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -120,9 +158,11 @@ private struct LoopbackWebView: UIViewRepresentable {
         config.allowsInlineMediaPlayback = true
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
+        webView.uiDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = true
         context.coordinator.lastLoadedURL = url
         context.coordinator.lastLoadedToken = reloadToken
+        context.coordinator.viewportMode = viewportMode
         webView.load(URLRequest(url: url))
         return webView
     }
@@ -130,6 +170,10 @@ private struct LoopbackWebView: UIViewRepresentable {
     func updateUIView(_ webView: WKWebView, context: Context) {
         context.coordinator.allowedPort = allowedPort
         context.coordinator.onDisconnect = onDisconnect
+        if context.coordinator.viewportMode != viewportMode {
+            context.coordinator.viewportMode = viewportMode
+            context.coordinator.applyViewport(to: webView)
+        }
         if context.coordinator.lastLoadedToken != reloadToken || context.coordinator.lastLoadedURL != url {
             context.coordinator.lastLoadedURL = url
             context.coordinator.lastLoadedToken = reloadToken
@@ -137,15 +181,37 @@ private struct LoopbackWebView: UIViewRepresentable {
         }
     }
 
-    final class Coordinator: NSObject, WKNavigationDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         var allowedPort: Int
+        var viewportMode: DSHWebViewportMode
         var lastLoadedToken: UUID?
         var lastLoadedURL: URL?
         var onDisconnect: () -> Void
 
-        init(allowedPort: Int, onDisconnect: @escaping () -> Void) {
+        init(allowedPort: Int, viewportMode: DSHWebViewportMode, onDisconnect: @escaping () -> Void) {
             self.allowedPort = allowedPort
+            self.viewportMode = viewportMode
             self.onDisconnect = onDisconnect
+        }
+
+        func applyViewport(to webView: WKWebView) {
+            let content = viewportMode.viewportContent
+            let script = """
+            (function() {
+                var meta = document.querySelector('meta[name="viewport"]');
+                if (!meta) {
+                    meta = document.createElement('meta');
+                    meta.name = 'viewport';
+                    document.head.appendChild(meta);
+                }
+                meta.setAttribute('content', '\(content)');
+            })();
+            """
+            webView.evaluateJavaScript(script, completionHandler: nil)
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            applyViewport(to: webView)
         }
 
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
@@ -155,6 +221,15 @@ private struct LoopbackWebView: UIViewRepresentable {
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
             guard (error as NSError).code != NSURLErrorCancelled else { return }
             onDisconnect()
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            runJavaScriptConfirmPanelWithMessage message: String,
+            initiatedByFrame frame: WKFrameInfo,
+            completionHandler: @escaping (Bool) -> Void
+        ) {
+            completionHandler(true)
         }
 
         func webView(

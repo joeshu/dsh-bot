@@ -7,7 +7,7 @@ import {
   RESERVED_BINDING_GLOBALS,
   RESERVED_ERROR_MEMBERS,
 } from '@deepseek-ai/dsh-ptc-runtime'
-import { claimIOSPythonWorker } from './python-worker-gate.mjs'
+import { acquireIOSPythonWorker } from './python-worker-gate.mjs'
 
 const PYTHON_RUNTIME_DIRECTORY = fileURLToPath(new URL('../../../python-runtime/', import.meta.url))
 const MAX_PROGRAM_CHARACTERS = 16_000
@@ -82,10 +82,9 @@ function failure(kind, message, logs = '') {
 
 /** Offline Python/NumPy PTC backend. It gives Python only the approved PTC binding bridge. */
 export class IOSPythonPtcRuntime extends PtcRuntime {
-  #jobs = new Set()
-
   constructor(ctx) {
     super(ctx)
+    this._jobs = new Set()
   }
 
   get language() { return 'python' }
@@ -126,14 +125,19 @@ export class IOSPythonPtcRuntime extends PtcRuntime {
 
   async run(spec) {
     if (spec.signal?.aborted) return failure('abort', String(spec.signal.reason ?? 'PTC run cancelled.'))
-    const releaseSlot = claimIOSPythonWorker()
-    if (!releaseSlot) return failure('exception', 'The local Python runtime is busy with another isolated execution; retry after it finishes.')
+    const releaseSlot = await acquireIOSPythonWorker({ signal: spec.signal, timeoutMs: 30_000 })
+    if (!releaseSlot) {
+      if (spec.signal?.aborted) return failure('abort', String(spec.signal.reason ?? 'PTC run cancelled.'))
+      return failure('exception', 'The local Python runtime is busy with another isolated execution; retry after it finishes.')
+    }
 
     let safeBindings
     try { safeBindings = pythonBindings(spec.bindings) } catch (error) {
       releaseSlot()
       return failure('protocol', error instanceof Error ? error.message : String(error))
     }
+
+    const jobs = this._jobs ?? (this._jobs = new Set())
 
     return new Promise((resolve) => {
       let worker
@@ -148,7 +152,7 @@ export class IOSPythonPtcRuntime extends PtcRuntime {
         clearTimeout(timer)
         spec.signal?.removeEventListener('abort', onAbort)
         try { await worker?.terminate() } catch { /* worker teardown must not mask its PTC outcome */ }
-        this.#jobs.delete(job)
+        jobs.delete(job)
         releaseSlot()
       }
       const settle = (result) => {
@@ -163,73 +167,70 @@ export class IOSPythonPtcRuntime extends PtcRuntime {
           workerData: { program: spec.program, bindings: safeBindings, runtimeDirectory: PYTHON_RUNTIME_DIRECTORY },
           resourceLimits: { maxOldGenerationSizeMb: 128, maxYoungGenerationSizeMb: 32, stackSizeMb: 4 },
         })
-      } catch (error) {
-        releaseSlot()
-        resolve(failure('worker-exit', error instanceof Error ? error.message : String(error)))
-        return
-      }
-
-      this.#jobs.add(job)
-      worker.on('message', (message) => {
-        if (message?.type === 'stdout') {
-          const text = String(message.text ?? '')
-          const remaining = MAX_OUTPUT_CHARACTERS - logs.length
-          if (remaining > 0) logs += text.slice(0, remaining)
-          if (text.length > remaining) logsTruncated = true
-          return
-        }
-        if (message?.type === 'completed') {
-          const combined = logsTruncated || message.outputTruncated === true
-            ? `${logs.slice(0, Math.max(0, MAX_OUTPUT_CHARACTERS - 28))}\n[输出已截断至 32,000 字符]`
-            : logs
-          if (message.error) settle(failure(message.error.kind === 'protocol' ? 'protocol' : 'exception', message.error.message, combined))
-          else if (message.hasValue && !isJsonValue(message.value)) settle(failure('invalid-output', 'PTC Python returned a value outside the lossless JSON contract.', combined))
-          else if (message.hasValue && jsonByteLength(message.value) > MAX_BINDING_VALUE_BYTES) settle(failure('output-limit', 'PTC Python return value exceeds the 96 KiB result limit.', combined))
-          else settle({ logs: combined ? [combined] : [], ...(message.hasValue ? { value: message.value } : {}) })
-          return
-        }
-        if (message?.type !== 'binding.call') return
-        bindingCalls += 1
-        if (bindingCalls > MAX_BINDING_CALLS) {
-          worker.postMessage({ type: 'binding.error', id: message.id, message: 'run_code exceeded the iOS limit of 60 nested tool calls.' })
-          return
-        }
-        void (async () => {
-          try {
-            const namespace = spec.bindings.find((candidate) => candidate.global === message.global)
-            const binding = namespace && Object.hasOwn(namespace.functions, message.name) ? namespace.functions[message.name] : undefined
-            if (typeof binding !== 'function') throw new Error('This tool binding is not available to the current PTC run.')
-            if (typeof message.argsJSON !== 'string' || Buffer.byteLength(message.argsJSON, 'utf8') > MAX_BINDING_VALUE_BYTES) {
-              throw new Error('PTC tool arguments must be JSON under the 96 KiB per-call limit.')
-            }
-            const args = JSON.parse(message.argsJSON)
-            if (!isJsonValue(args)) throw new Error('PTC tool arguments must be lossless JSON.')
-            const argumentBytes = Buffer.byteLength(message.argsJSON, 'utf8')
-            bridgeBytes += argumentBytes
-            if (!Number.isFinite(argumentBytes) || bridgeBytes > MAX_BRIDGE_BYTES) throw new Error('PTC tool calls exceeded the 256 KiB total binding traffic limit.')
-            const value = await binding(args)
-            if (!isJsonValue(value)) throw new Error('PTC tool returned a value outside the lossless JSON contract.')
-            const valueJSON = JSON.stringify(value)
-            const valueBytes = Buffer.byteLength(valueJSON, 'utf8')
-            bridgeBytes += valueBytes
-            if (!Number.isFinite(valueBytes) || valueBytes > MAX_BINDING_VALUE_BYTES || bridgeBytes > MAX_BRIDGE_BYTES) {
-              throw new Error('PTC tool result exceeded the iOS per-call or total binding traffic limit. Use a narrower search or read smaller files.')
-            }
-            try { worker.postMessage({ type: 'binding.result', id: message.id, valueJSON }) } catch { /* run is already settling */ }
-          } catch (error) {
-            const text = error instanceof Error ? error.message : String(error)
-            try { worker.postMessage({ type: 'binding.error', id: message.id, message: text.slice(0, 4_000) }) } catch { /* run is already settling */ }
+        jobs.add(job)
+        worker.on('message', (message) => {
+          if (message?.type === 'stdout') {
+            const text = String(message.text ?? '')
+            const remaining = MAX_OUTPUT_CHARACTERS - logs.length
+            if (remaining > 0) logs += text.slice(0, remaining)
+            if (text.length > remaining) logsTruncated = true
+            return
           }
-        })()
-      })
-      worker.once('error', (error) => settle(failure('worker-exit', error.message, logs)))
-      worker.once('exit', (code) => {
-        if (!settled) settle(failure('worker-exit', `Local PTC Python worker exited unexpectedly (${code}).`, logs))
-      })
-      timer = setTimeout(() => settle(failure('timeout', `PTC Python exceeded its ${spec.timeoutMs / 1_000}-second execution limit.`, logs)), spec.timeoutMs)
-      timer.unref?.()
-      spec.signal?.addEventListener('abort', onAbort, { once: true })
-      if (spec.signal?.aborted) onAbort()
+          if (message?.type === 'completed') {
+            const combined = logsTruncated || message.outputTruncated === true
+              ? `${logs.slice(0, Math.max(0, MAX_OUTPUT_CHARACTERS - 28))}\n[输出已截断至 32,000 字符]`
+              : logs
+            if (message.error) settle(failure(message.error.kind === 'protocol' ? 'protocol' : 'exception', message.error.message, combined))
+            else if (message.hasValue && !isJsonValue(message.value)) settle(failure('invalid-output', 'PTC Python returned a value outside the lossless JSON contract.', combined))
+            else if (message.hasValue && jsonByteLength(message.value) > MAX_BINDING_VALUE_BYTES) settle(failure('output-limit', 'PTC Python return value exceeds the 96 KiB result limit.', combined))
+            else settle({ logs: combined ? [combined] : [], ...(message.hasValue ? { value: message.value } : {}) })
+            return
+          }
+          if (message?.type !== 'binding.call') return
+          bindingCalls += 1
+          if (bindingCalls > MAX_BINDING_CALLS) {
+            worker.postMessage({ type: 'binding.error', id: message.id, message: 'run_code exceeded the iOS limit of 60 nested tool calls.' })
+            return
+          }
+          void (async () => {
+            try {
+              const namespace = spec.bindings.find((candidate) => candidate.global === message.global)
+              const binding = namespace && Object.hasOwn(namespace.functions, message.name) ? namespace.functions[message.name] : undefined
+              if (typeof binding !== 'function') throw new Error('This tool binding is not available to the current PTC run.')
+              if (typeof message.argsJSON !== 'string' || Buffer.byteLength(message.argsJSON, 'utf8') > MAX_BINDING_VALUE_BYTES) {
+                throw new Error('PTC tool arguments must be JSON under the 96 KiB per-call limit.')
+              }
+              const args = JSON.parse(message.argsJSON)
+              if (!isJsonValue(args)) throw new Error('PTC tool arguments must be lossless JSON.')
+              const argumentBytes = Buffer.byteLength(message.argsJSON, 'utf8')
+              bridgeBytes += argumentBytes
+              if (!Number.isFinite(argumentBytes) || bridgeBytes > MAX_BRIDGE_BYTES) throw new Error('PTC tool calls exceeded the 256 KiB total binding traffic limit.')
+              const value = await binding(args)
+              if (!isJsonValue(value)) throw new Error('PTC tool returned a value outside the lossless JSON contract.')
+              const valueJSON = JSON.stringify(value)
+              const valueBytes = Buffer.byteLength(valueJSON, 'utf8')
+              bridgeBytes += valueBytes
+              if (!Number.isFinite(valueBytes) || valueBytes > MAX_BINDING_VALUE_BYTES || bridgeBytes > MAX_BRIDGE_BYTES) {
+                throw new Error('PTC tool result exceeded the iOS per-call or total binding traffic limit. Use a narrower search or read smaller files.')
+              }
+              try { worker.postMessage({ type: 'binding.result', id: message.id, valueJSON }) } catch { /* run is already settling */ }
+            } catch (error) {
+              const text = error instanceof Error ? error.message : String(error)
+              try { worker.postMessage({ type: 'binding.error', id: message.id, message: text.slice(0, 4_000) }) } catch { /* run is already settling */ }
+            }
+          })()
+        })
+        worker.once('error', (error) => settle(failure('worker-exit', error.message, logs)))
+        worker.once('exit', (code) => {
+          if (!settled) settle(failure('worker-exit', `Local PTC Python worker exited unexpectedly (${code}).`, logs))
+        })
+        timer = setTimeout(() => settle(failure('timeout', `PTC Python exceeded its ${spec.timeoutMs / 1_000}-second execution limit.`, logs)), spec.timeoutMs)
+        timer.unref?.()
+        spec.signal?.addEventListener('abort', onAbort, { once: true })
+        if (spec.signal?.aborted) onAbort()
+      } catch (error) {
+        settle(failure('worker-exit', error instanceof Error ? error.message : String(error), logs))
+      }
     })
   }
 
@@ -238,8 +239,9 @@ export class IOSPythonPtcRuntime extends PtcRuntime {
   }
 
   async dispose() {
-    for (const job of [...this.#jobs]) job.stop('PTC Python runtime stopped.')
-    while (this.#jobs.size) await new Promise((resolve) => setTimeout(resolve, 0))
+    const jobs = this._jobs ?? new Set()
+    for (const job of [...jobs]) job.stop('PTC Python runtime stopped.')
+    while (jobs.size) await new Promise((resolve) => setTimeout(resolve, 0))
   }
 }
 

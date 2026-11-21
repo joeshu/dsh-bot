@@ -1,6 +1,15 @@
 import { parentPort, workerData } from 'node:worker_threads'
+import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
+
+if (typeof globalThis.require !== 'function') {
+  globalThis.require = createRequire(import.meta.url)
+}
+if (typeof globalThis.__dirname !== 'string' && typeof workerData?.runtimeDirectory === 'string') {
+  globalThis.__dirname = workerData.runtimeDirectory
+  globalThis.__filename = join(workerData.runtimeDirectory, 'pyodide.asm.js')
+}
 
 const MAX_OUTPUT_CHARACTERS = 32_000
 const MAX_WASM_MEMORY_PAGES = 4_096 // 256 MiB (64 KiB pages)
@@ -45,12 +54,12 @@ try {
     indexURL: `${runtimeDirectory}/`,
     packageBaseUrl: `${runtimeDirectory}/full/`,
     lockFileURL: join(runtimeDirectory, 'pyodide-lock.json'),
-    fullStdLib: true,
+    fullStdLib: false,
     jsglobals: pythonGlobals,
     wasmMemory: memory,
     stdin: () => null,
-    stdout: appendOutput,
-    stderr: appendOutput,
+    stdout: () => {},
+    stderr: () => {},
   })
   await pyodide.loadPackage('numpy')
   pyodide.setStdout({ batched: appendOutput })

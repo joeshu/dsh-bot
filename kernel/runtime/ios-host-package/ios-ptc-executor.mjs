@@ -3,22 +3,25 @@ import { iosHost } from './index.mjs'
 
 /** PTC executor with a full-source native approval and preset-unload cancellation. */
 export class IOSPtcExecutor extends PtcExecutor {
-  #transport
-  #runs = new Set()
+  constructor(ctx, config) {
+    super(ctx, config)
+    this._transport = undefined
+    this._runs = new Set()
+  }
 
   requirePtcTransport() {
-    if (this.#transport) return this.#transport
+    if (this._transport) return this._transport
     const base = super.requirePtcTransport()
     const wrapper = Object.create(base)
     Object.defineProperty(wrapper, 'execute', {
       enumerable: true,
-      value: (args, exec) => this.#execute(base, args, exec),
+      value: (args, exec) => this._execute(base, args, exec),
     })
-    this.#transport = wrapper
+    this._transport = wrapper
     return wrapper
   }
 
-  async #execute(base, args, exec) {
+  async _execute(base, args, exec) {
     const sessionId = exec?.agent?.session?.id
     if (typeof sessionId !== 'string' || !sessionId) throw new Error('PTC Python requires an Agent session.')
     if (exec.agent.session.header?.parentSession != null) {
@@ -39,6 +42,7 @@ export class IOSPtcExecutor extends PtcExecutor {
     const controller = new AbortController()
     const signal = AbortSignal.any([exec.signal, controller.signal])
     const run = { controller, task: undefined }
+    const runs = this._runs ?? (this._runs = new Set())
     const task = (async () => {
       const outcome = await this.ctx.approval.request({
         agent: exec.agent,
@@ -58,13 +62,14 @@ export class IOSPtcExecutor extends PtcExecutor {
       return base.execute(args, { ...exec, signal })
     })()
     run.task = task
-    this.#runs.add(run)
-    try { return await task } finally { this.#runs.delete(run) }
+    runs.add(run)
+    try { return await task } finally { runs.delete(run) }
   }
 
   async dispose() {
-    for (const run of this.#runs) run.controller.abort(new Error('PTC executor scope ended.'))
-    await Promise.allSettled([...this.#runs].map((run) => run.task))
+    const runs = this._runs ?? new Set()
+    for (const run of runs) run.controller.abort(new Error('PTC executor scope ended.'))
+    await Promise.allSettled([...runs].map((run) => run.task))
   }
 }
 

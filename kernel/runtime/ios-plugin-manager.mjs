@@ -1,6 +1,7 @@
 import { randomUUID, createHash } from 'node:crypto'
 import { copyFile, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { gunzipSync } from 'node:zlib'
 import semver from 'semver'
 import {
@@ -135,12 +136,119 @@ function replaceCompatibilityAnchor(source, before, after, label) {
   return `${source.slice(0, first)}${after}${source.slice(first + before.length)}`
 }
 
+const IOS_CORE_WRITABLE_MARKER = 'DSBOT_IOS_WRITABLE_AI_BASE_V1'
+
+async function stageWritablePurgeSafeAiBase(pluginRoot) {
+  const dshHome = process.env.DSH_HOME || resolve(pluginRoot, '..', '..', '..', '..')
+  const bundledNodeModules = fileURLToPath(new URL('./node_modules', import.meta.url))
+  const bundledAiBase = join(bundledNodeModules, '@deepseek-ai')
+  const writableRoot = join(dshHome, 'dsh-purge-safe', 'writable-host', 'node_modules')
+  const writableAiBase = join(writableRoot, '@deepseek-ai')
+  await mkdir(join(writableAiBase, 'dsh-agent-instructions', 'lib'), { recursive: true })
+  process.env.DSH_BASE = writableAiBase
+
+  let coreMod
+  try {
+    coreMod = await import(pathToFileURL(join(pluginRoot, 'lib', 'core.js')).href)
+  } catch {
+    return writableAiBase
+  }
+  if (typeof coreMod?.targetFiles !== 'function') return writableAiBase
+
+  const targetMap = coreMod.targetFiles(bundledAiBase, dshHome)
+  const relFiles = new Set(['@deepseek-ai/dsh-agent-instructions/lib/index.js'])
+  for (const val of Object.values(targetMap || {})) {
+    const list = Array.isArray(val) ? val : [val]
+    for (const filePath of list) {
+      if (typeof filePath === 'string' && filePath.startsWith(bundledNodeModules)) {
+        const rel = relative(bundledNodeModules, filePath)
+        if (rel && !rel.startsWith('..')) {
+          relFiles.add(rel)
+          const parts = rel.split(sep)
+          if (parts.length >= 2) {
+            relFiles.add(join(parts[0], parts[1], 'package.json'))
+          }
+        }
+      }
+    }
+  }
+  for (const apiFile of ['openai-completions.js', 'openai-responses-shared.js', 'anthropic-messages.js']) {
+    relFiles.add(join('@earendil-works', 'pi-ai', 'dist', 'api', apiFile))
+  }
+
+  for (const rel of relFiles) {
+    const src = join(bundledNodeModules, rel)
+    const dst = join(writableRoot, rel)
+    try {
+      await lstat(src)
+    } catch {
+      continue
+    }
+    let dstExists = false
+    try {
+      await lstat(dst)
+      dstExists = true
+    } catch {
+      dstExists = false
+    }
+    if (!dstExists) {
+      await mkdir(dirname(dst), { recursive: true })
+      await copyFile(src, dst)
+    }
+  }
+  return writableAiBase
+}
+
+async function adaptPurgeSafeCoreForIOS(pluginRoot) {
+  const corePath = resolve(pluginRoot, 'lib', 'core.js')
+  let source
+  try { source = await readFile(corePath, 'utf8') } catch (error) {
+    if (error.code !== 'ENOENT') throw error
+  }
+  if (source && !source.includes(IOS_CORE_WRITABLE_MARKER)) {
+    const thisProcAnchor = 'function thisProcessAiBase() {'
+    if (source.includes(thisProcAnchor)) {
+      source = source.replace(
+        thisProcAnchor,
+        `function thisProcessAiBase() {\n  /* ${IOS_CORE_WRITABLE_MARKER} */\n  if (process.env.DS_BOT_IOS_HOST === '1' && process.env.DSH_BASE && isAiBase(path.normalize(process.env.DSH_BASE))) return path.normalize(process.env.DSH_BASE);`,
+      )
+    }
+    const webNpmAnchor = 'export function findAiBaseWebNpm() {'
+    if (source.includes(webNpmAnchor)) {
+      source = source.replace(
+        webNpmAnchor,
+        `export function findAiBaseWebNpm() {\n  if (process.env.DS_BOT_IOS_HOST === '1' && process.env.DSH_BASE && isAiBase(path.normalize(process.env.DSH_BASE))) return path.normalize(process.env.DSH_BASE);`,
+      )
+    }
+    await writeFile(corePath, source, 'utf8')
+  }
+
+  const toolsPath = resolve(pluginRoot, 'lib', 'redteam', 'tools.js')
+  let toolsSource
+  try { toolsSource = await readFile(toolsPath, 'utf8') } catch (error) {
+    if (error.code !== 'ENOENT') throw error
+  }
+  if (toolsSource && !toolsSource.includes(IOS_CORE_WRITABLE_MARKER)) {
+    const toolsAnchor = 'function loadDefineTool() {\n  const candidates = []'
+    if (toolsSource.includes(toolsAnchor)) {
+      const runtimePackageJson = JSON.stringify(fileURLToPath(new URL('./package.json', import.meta.url)))
+      toolsSource = toolsSource.replace(
+        toolsAnchor,
+        `function loadDefineTool() {\n  /* ${IOS_CORE_WRITABLE_MARKER} */\n  const candidates = [${runtimePackageJson}]`,
+      )
+      await writeFile(toolsPath, toolsSource, 'utf8')
+    }
+  }
+}
+
 /** Apply host-only routing/privacy changes without altering the upstream plugin on disk. */
 export async function ensurePurgeSafeIOSCompatibility(pluginRoot) {
+  await adaptPurgeSafeCoreForIOS(pluginRoot)
+  const writableAiBase = await stageWritablePurgeSafeAiBase(pluginRoot)
   const uiPath = resolve(pluginRoot, 'lib', 'redteam', 'ui.js')
   let source
   try { source = await readFile(uiPath, 'utf8') } catch (error) {
-    if (error.code === 'ENOENT') return { webWorkbenchAvailable: false, reason: '插件包未包含 lib/redteam/ui.js' }
+    if (error.code === 'ENOENT') return { webWorkbenchAvailable: false, reason: '插件包未包含 lib/redteam/ui.js', writableAiBase }
     throw error
   }
   if (!source.includes(IOS_PRIVATE_API_MARKER)) {
@@ -211,7 +319,7 @@ export async function ensurePurgeSafeIOSCompatibility(pluginRoot) {
     )
   }
   await writeFile(uiPath, source, 'utf8')
-  return { webWorkbenchAvailable: true }
+  return { webWorkbenchAvailable: true, writableAiBase }
 }
 
 function parsePax(data) {

@@ -1,6 +1,12 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+private enum ExploreRootMode: String, CaseIterable, Identifiable {
+    case settings = "引擎与设置"
+    case plugins = "插件与红队"
+    var id: String { rawValue }
+}
+
 private enum PluginManagerSection: String, CaseIterable, Identifiable {
     case installed = "已安装"
     case discover = "发现"
@@ -24,6 +30,7 @@ private enum PendingPluginInstall: Identifiable {
 
 public struct PluginManagerView: View {
     @ObservedObject var host: LocalAgentHost
+    @State private var rootMode: ExploreRootMode = .settings
     @State private var section: PluginManagerSection = .installed
     @State private var searchText = ""
     @State private var newSourceURL = ""
@@ -32,93 +39,70 @@ public struct PluginManagerView: View {
     @State private var pendingInstall: PendingPluginInstall?
     @State private var pendingRemoval: DSHInstalledPlugin?
 
+    public init(host: LocalAgentHost) {
+        self.host = host
+    }
+
     public var body: some View {
         NavigationStack {
             Form {
-                Section("Web 工作台与连接器") {
-                    NavigationLink {
-                        DSHWebUIView(host: host)
-                    } label: {
-                        Label {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("打开 DSH Web 工作台")
-                                    .font(.headline)
-                                Text("内嵌官方 Web UI，支持社区 dsh-client-ui-* 界面插件")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        } icon: {
-                            Image(systemName: "macwindow.on.rectangle")
-                                .foregroundStyle(DSTheme.brand)
-                        }
-                    }
-                    NavigationLink {
-                        ConnectorMarketplaceView(host: host)
-                    } label: {
-                        Label {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("连接器市场")
-                                    .font(.headline)
-                                Text("38 个标准 Remote MCP 服务（GitHub / Notion / DeepWiki / Exa 等）")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        } icon: {
-                            Image(systemName: "puzzlepiece.extension.fill")
-                                .foregroundStyle(.indigo)
-                        }
-                    }
-                }
-
                 Section {
-                    Label {
-                        Text("第三方插件由其作者维护，DS Bot 不审核插件代码。插件在本机 DSH Node 进程内运行，可访问应用沙盒和网络。只安装你信任的来源。")
-                            .font(.footnote)
-                    } icon: {
-                        Image(systemName: "exclamationmark.shield.fill")
-                            .foregroundStyle(.orange)
-                    }
-                    Text("iOS 安装会检查 DSH bundle、平台声明、纯 JS 依赖树和本机二进制；不会执行 npm 安装脚本。检查不能代替对作者和代码的信任判断。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                Section {
-                    Picker("插件", selection: $section) {
-                        ForEach(PluginManagerSection.allCases) { item in
-                            Text(item.rawValue).tag(item)
+                    Picker("模块", selection: $rootMode) {
+                        ForEach(ExploreRootMode.allCases) { mode in
+                            Text(mode.rawValue).tag(mode)
                         }
                     }
                     .pickerStyle(.segmented)
                 }
 
-                switch section {
-                case .installed:
-                    installedSection
-                case .discover:
-                    discoverSection
-                case .sources:
-                    sourcesSection
-                }
+                switch rootMode {
+                case .settings:
+                    AgentSettingsFormSections(host: host)
 
-                if let status = host.pluginStatus, !status.isEmpty {
-                    Section { Text(status).font(.caption).foregroundStyle(.secondary) }
+                case .plugins:
+                    pluginSecurityNoticeSection
+
+                    Section {
+                        Picker("插件视图", selection: $section) {
+                            ForEach(PluginManagerSection.allCases) { item in
+                                Text(item.rawValue).tag(item)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                    }
+
+                    switch section {
+                    case .installed:
+                        installedSection
+                    case .discover:
+                        discoverSection
+                    case .sources:
+                        sourcesSection
+                    }
+
+                    if let status = host.pluginStatus, !status.isEmpty {
+                        Section("插件操作状态") {
+                            Text(status).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
                 }
             }
             .scrollDismissesKeyboard(.interactively)
-            .navigationTitle("探索与插件")
+            .navigationTitle("探索与设置")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        Task {
-                            await host.refreshPluginState()
-                            await host.refreshRedteamStatus()
+                if rootMode == .plugins {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            Task {
+                                await host.refreshPluginState()
+                                await host.refreshRedteamStatus()
+                            }
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
                         }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
+                        .disabled(host.state != .ready)
                     }
-                    .disabled(host.state != .ready)
                 }
             }
             .task {
@@ -189,6 +173,21 @@ public struct PluginManagerView: View {
         }
     }
 
+    private var pluginSecurityNoticeSection: some View {
+        Section {
+            Label {
+                Text("第三方插件由其作者维护，DS Bot 不审核插件代码。插件在本机 DSH Node 进程内运行，可访问应用沙盒和网络。只安装你信任的来源。")
+                    .font(.footnote)
+            } icon: {
+                Image(systemName: "exclamationmark.shield.fill")
+                    .foregroundStyle(.orange)
+            }
+            Text("iOS 安装会检查 DSH bundle、平台声明、纯 JS 依赖树和本机二进制；不会执行 npm 安装脚本。检查不能代替对作者和代码的信任判断。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
     @ViewBuilder
     private var installedSection: some View {
         Section("dsh-purge-safe · iOS 适配与授权") {
@@ -230,19 +229,21 @@ public struct PluginManagerView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                HStack(spacing: 8) {
-                    DSStatusBadge(
-                        host.redteamStatus.storeReady ? "SQLite 事实库就绪" : "事实库未加载",
-                        color: host.redteamStatus.storeReady ? DSTheme.success : .secondary
-                    )
-                    DSStatusBadge("已挂载 \(host.redteamStatus.toolCount) 工具", color: DSTheme.brand)
-                    DSStatusBadge("iOS 补丁旁路已关闭", color: DSTheme.success)
-                    if host.redteamStatus.skillCount > 0 {
-                        DSStatusBadge("\(host.redteamStatus.skillCount) 演练技能", color: .indigo)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        DSStatusBadge(
+                            host.redteamStatus.storeReady ? "SQLite 事实库就绪" : "事实库未加载",
+                            color: host.redteamStatus.storeReady ? DSTheme.success : .secondary
+                        )
+                        DSStatusBadge("已挂载 \(host.redteamStatus.toolCount) 工具", color: DSTheme.brand)
+                        DSStatusBadge("沙盒补丁区可写", color: DSTheme.success)
+                        if host.redteamStatus.skillCount > 0 {
+                            DSStatusBadge("\(host.redteamStatus.skillCount) 演练技能", color: .indigo)
+                        }
                     }
                 }
 
-                Text("iOS 保留 RedTeam SQLite、工具、技能和 Web 演练台；关闭 dsh-purge-safe 根层的应用包修改、自动放行和子代理审批接管。文件修改仍走 DSH 原生审批。")
+                Text("iOS 已在沙盒内挂载独立可写的宿主镜像（支持 dsh-purge-safe 补丁应用与还原、提示词覆盖、规则集、RedTeam SQLite、工具、技能与 Web 演练台）；敏感工具与文件修改仍受 iOS 会话权限保护。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -284,79 +285,29 @@ public struct PluginManagerView: View {
                 }
             } else {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("未安装 joeshu/dsh-purge-safe 插件")
+                    Text("未安装 CallMeGuLab/dsh-purge-safe 插件")
                         .font(.subheadline.weight(.semibold))
-                    Text("安装后可启用 RedTeam 工具、SQLite 事实库、技能与 Web 演练台；每个 Bot 的权限分别配置。")
+                    Text("安装后可启用沙盒补丁清洗、提示词覆盖、规则集、RedTeam 工具、SQLite 事实库、技能与 Web 演练台；每个 Bot 的权限分别配置。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Button {
-                    pendingInstall = .github("https://github.com/joeshu/dsh-purge-safe")
+                    pendingInstall = .github("https://github.com/CallMeGuLab/dsh-purge-safe")
                 } label: {
-                    Label("安装 joeshu/dsh-purge-safe", systemImage: "arrow.down.circle.fill")
+                    Label("一键安装 CallMeGuLab/dsh-purge-safe", systemImage: "arrow.down.circle.fill")
                 }
                 .disabled(host.state != .ready)
             }
         }
 
-        Section("内置功能") {
-            if let label = host.embeddedRuntimeLabel { LabeledContent("内嵌引擎", value: label) }
-            NavigationLink {
-                SubagentSettingsView(host: host)
-            } label: {
-                HStack(spacing: 12) {
-                    Image(systemName: "person.2.fill")
-                        .foregroundStyle(DSTheme.brand)
-                        .frame(width: 26)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("子智能体").font(.subheadline.weight(.semibold))
-                        Text("递归深度 \(host.subagentMaxDepth) · 并行上限 \(host.subagentMaxActive) · \(host.subagentEnabled ? "已启用" : "已停用")")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-            NavigationLink {
-                WebSearchSettingsView(host: host)
-            } label: {
-                HStack(spacing: 12) {
-                    Image(systemName: "magnifyingglass")
-                        .foregroundStyle(.blue)
-                        .frame(width: 26)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("网页搜索与获取").font(.subheadline.weight(.semibold))
-                        Text("单次 \(host.webSearchCount) 条 · \(host.webSearchEnabled ? "搜索已启用" : "搜索未开启")")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-            NavigationLink {
-                SmartRecommendationsSettingsView(host: host)
-            } label: {
-                HStack(spacing: 12) {
-                    Image(systemName: "square.grid.2x2.fill")
-                        .foregroundStyle(.indigo)
-                        .frame(width: 26)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("个性化推荐与操作卡片").font(.subheadline.weight(.semibold))
-                        Text(host.smartActionCardsEnabled ? "回答下方展示上下文操作卡片" : "已停用")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-        }
-        Section("已安装插件") {
+        Section("已安装插件 (\(host.installedPlugins.count))") {
             if host.installedPlugins.isEmpty {
-                VStack(spacing: 8) {
-                    Label("还没有安装插件", systemImage: "shippingbox")
-                    Text("从“发现”浏览索引，或导入本地 DSH bundle。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity)
-                    .listRowBackground(Color.clear)
+                DSEmptyStateView(
+                    icon: "shippingbox",
+                    title: "还没有安装第三方插件",
+                    subtitle: "从「发现」浏览索引，或在下方直接输入 GitHub 仓库地址安装。"
+                )
+                .listRowBackground(Color.clear)
             } else {
                 ForEach(host.installedPlugins) { plugin in
                     NavigationLink {
@@ -406,12 +357,12 @@ public struct PluginManagerView: View {
                 }
             }
             Button {
-                section = .discover
                 showFolderPicker = true
             } label: {
-                Label("从本地文件夹安装", systemImage: "folder")
+                Label("从本地文件夹导入 DSH Bundle", systemImage: "folder")
             }
         }
+
         Section("从 GitHub 仓库直接安装") {
             TextField("https://github.com/owner/repo 或 owner/repo", text: $githubRepoURL)
                 .textInputAutocapitalization(.never)
@@ -444,7 +395,7 @@ public struct PluginManagerView: View {
                         .disabled(host.isLoadingPlugins)
                 }
                 if host.pluginSourceName == nil && !host.pluginSources.contains(where: { $0.enabled }) {
-                    Text("先到“索引源”启用一个目录。")
+                    Text("请先切换到“索引源”启用一个插件目录。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -510,7 +461,7 @@ public struct PluginManagerView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("示例索引源") {
+            Section("可用索引源") {
                 ForEach(host.pluginSources) { source in
                     Toggle(isOn: Binding(
                         get: { host.pluginSources.first(where: { $0.id == source.id })?.enabled ?? source.enabled },
@@ -524,7 +475,9 @@ public struct PluginManagerView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             HStack(spacing: 7) {
                                 Text(source.name).font(.subheadline.weight(.semibold))
-                                if source.builtIn { Text("第三方").font(.caption2).padding(.horizontal, 6).padding(.vertical, 2).background(.quaternary, in: Capsule()) }
+                                if source.builtIn {
+                                    Text("第三方").font(.caption2).padding(.horizontal, 6).padding(.vertical, 2).background(.quaternary, in: Capsule())
+                                }
                             }
                             Text(source.url)
                                 .font(.caption2)
@@ -542,12 +495,12 @@ public struct PluginManagerView: View {
                 }
             }
 
-            Section("添加索引源") {
+            Section("添加自定义 HTTPS 索引源") {
                 TextField("https://example.com/index.json", text: $newSourceURL)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .keyboardType(.URL)
-                Button("添加") {
+                Button("添加索引源") {
                     let value = newSourceURL.trimmingCharacters(in: .whitespacesAndNewlines)
                     Task {
                         await host.addPluginSource(url: value)
@@ -565,6 +518,11 @@ public struct PluginDetailView: View {
     @ObservedObject var host: LocalAgentHost
     let pluginId: String
     @State private var confirmUninstall = false
+
+    public init(host: LocalAgentHost, pluginId: String) {
+        self.host = host
+        self.pluginId = pluginId
+    }
 
     private var plugin: DSHInstalledPlugin? {
         host.installedPlugins.first(where: { $0.id == pluginId })
@@ -684,4 +642,3 @@ public struct PluginDetailView: View {
         }
     }
 }
-

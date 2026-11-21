@@ -25,6 +25,12 @@ export default class IosSandboxedFileSystem extends LocalFileSystem {
     super(ctx, { ...config, cwd: sandboxRoot })
     this.runtimeRoot = home
     this.sandboxRoot = canonicalize(sandboxRoot)
+    if (ctx && typeof ctx.provide === 'function' && ctx.get?.('subprocess') === undefined) {
+      ctx.provide('subprocess', {
+        resolveExecutable: async () => { throw new Error('Subprocess spawning is disabled in the iOS sandbox') },
+        spawn: () => { throw new Error('Subprocess spawning is disabled in the iOS sandbox') },
+      })
+    }
   }
 
   assertAllowed(candidatePath) {

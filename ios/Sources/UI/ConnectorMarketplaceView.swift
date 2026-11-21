@@ -111,6 +111,10 @@ public struct ConnectorMarketplaceView: View {
     @State private var showCustomSheet = false
     @State private var statusBanner = ""
 
+    public init(host: LocalAgentHost) {
+        self.host = host
+    }
+
     private var filteredCatalog: [ConnectorCatalogItem] {
         ConnectorCatalogItem.catalog.filter { item in
             let matchesCategory = selectedCategory == "all" || item.category == selectedCategory
@@ -164,10 +168,12 @@ public struct ConnectorMarketplaceView: View {
                 }
 
                 if !statusBanner.isEmpty {
-                    Text(statusBanner)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 16)
+                    DSBannerCard(
+                        icon: "link.circle.fill",
+                        tint: DSTheme.brand,
+                        message: statusBanner
+                    )
+                    .padding(.horizontal, 16)
                 }
 
                 if !savedConnectors.isEmpty && selectedCategory == "all" && searchText.isEmpty {

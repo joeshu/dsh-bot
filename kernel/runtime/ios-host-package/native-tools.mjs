@@ -119,6 +119,38 @@ function apply(context) {
       },
       timeoutMs: 70_000, execute: (args, exec) => bridge('workspace_edit', args, exec),
     }),
+    defineTool({
+      ...common, name: 'terminal_exec',
+      description: 'Run a command inside the persistent iOS Sandboxed Virtual Terminal (PTY) rooted at the workspace files/ directory. Retains cwd, env, and command history across calls. Supports pwd, cd, ls, ll, cat, head, tail, mkdir, touch, cp, mv, rm, find, grep, wc, echo, env, export, date, uname, whoami, node -e, python -c, and git status/diff/log.',
+      parameters: {
+        command: { type: 'string', required: true, description: 'Shell command to execute inside the sandboxed virtual terminal.' },
+      },
+      timeoutMs: 70_000,
+      async execute(args, exec) {
+        const { runtime } = iosHost()
+        if (typeof runtime.executeVirtualTerminal !== 'function') {
+          throw new Error('The iOS Sandboxed Virtual Terminal is not initialized.')
+        }
+        return await runtime.executeVirtualTerminal(args, exec)
+      },
+    }),
+    defineTool({
+      ...common, name: 'git_workspace',
+      description: 'Inspect or synchronize the iOS Git Worktree & PR Tracker inside the workspace files/ directory. Supports actions: status (list modified/added/deleted files vs snapshot), diff (unified diff of workspace changes), snapshot (record current workspace as clean baseline), and pr_list (fetch open pull requests for a bound GitHub owner/repo).',
+      parameters: {
+        action: { type: 'string', required: true, enum: ['status', 'diff', 'snapshot', 'pr_list'], description: 'Git workspace action to run.' },
+        repo: { type: 'string', description: 'Optional GitHub repository in owner/repo format for pr_list.' },
+        path: { type: 'string', description: 'Optional relative file path for diff.' },
+      },
+      timeoutMs: 60_000,
+      async execute(args, exec) {
+        const { runtime } = iosHost()
+        if (typeof runtime.executeGitWorkspaceTool !== 'function') {
+          throw new Error('The iOS Git Worktree & PR Tracker is not initialized.')
+        }
+        return await runtime.executeGitWorkspaceTool(args, exec)
+      },
+    }),
   ]
   const removers = definitions.map((definition) => context.tools.register(definition))
   context.effect(() => () => { unregisterFetch(); removers.reverse().forEach((remove) => remove()) }, 'dsbot-ios.nativeTools')

@@ -1,6 +1,6 @@
 import { Worker } from 'node:worker_threads'
 import { fileURLToPath } from 'node:url'
-import { claimIOSPythonWorker } from './python-worker-gate.mjs'
+import { acquireIOSPythonWorker } from './python-worker-gate.mjs'
 
 const MAX_CODE_CHARACTERS = 16_000
 const MAX_CODE_BYTES = 64_000
@@ -13,20 +13,22 @@ function executionKey(botId, turnId) {
   return `${botId}\u0000${turnId}`
 }
 
-export function executeIOSPython({ code, botId, turnId }) {
+export async function executeIOSPython({ code, botId, turnId }) {
   if (typeof code !== 'string' || !code.trim() || code.length > MAX_CODE_CHARACTERS
       || Buffer.byteLength(code, 'utf8') > MAX_CODE_BYTES || code.includes('\u0000')) {
-    return Promise.reject(new TypeError('Python code must be non-empty, contain no NUL, and fit within 16,000 characters.'))
+    throw new TypeError('Python code must be non-empty, contain no NUL, and fit within 16,000 characters.')
   }
   if (typeof botId !== 'string' || !botId || typeof turnId !== 'string' || !turnId) {
-    return Promise.reject(new TypeError('Python execution requires an active Bot turn.'))
+    throw new TypeError('Python execution requires an active Bot turn.')
   }
-  if (executions.size) return Promise.reject(new Error('Only one local Python execution can run at a time.'))
 
   const key = executionKey(botId, turnId)
-  if (executions.has(key)) return Promise.reject(new Error('This Bot turn already has an active Python execution.'))
-  const releaseWorkerSlot = claimIOSPythonWorker()
-  if (!releaseWorkerSlot) return Promise.reject(new Error('The local Python runtime is busy with another isolated execution.'))
+  const releaseWorkerSlot = await acquireIOSPythonWorker({ timeoutMs: 30_000 })
+  if (!releaseWorkerSlot) throw new Error('The local Python runtime is busy with another isolated execution.')
+  if (executions.has(key)) {
+    releaseWorkerSlot()
+    throw new Error('This Bot turn already has an active Python execution.')
+  }
 
   return new Promise((resolve, reject) => {
     let worker

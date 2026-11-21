@@ -182,6 +182,24 @@
     - id: command-feedback
       name: '@deepseek-ai/dsh-command-feedback'
 
+    - id: command-compact
+      name: '@deepseek-ai/dsh-command-compact'
+
+    - id: goal
+      name: '@deepseek-ai/dsh-goal'
+
+    - id: command-goal
+      name: '@deepseek-ai/dsh-command-goal'
+
+    - id: tool-goal
+      name: '@deepseek-ai/dsh-tool-goal'
+
+    - id: session-title
+      name: '@deepseek-ai/dsh-session-title'
+
+    - id: agent-tool-presentation
+      name: '@deepseek-ai/dsh-agent-tool-presentation'
+
     - id: message-feedback
       name: '@deepseek-ai/dsh-message-feedback'
       config:
@@ -469,6 +487,9 @@
         printUrl: false
         surfaceContext: false
 
+    - id: harness-dev-context
+      name: '@deepseek-ai/dsh-harness-dev-context'
+
     - id: workspace
       name: '@deepseek-ai/dsh-workspace'
 
@@ -493,6 +514,9 @@
     - id: session-controller
       name: '@deepseek-ai/dsh-api-session-controller'
 
+    - id: job-controller
+      name: '@deepseek-ai/dsh-api-job-controller'
+
     # Durable task records use the already configured SQLite storage-domain.
     # Delivery is driven by the foreground DSH host; iOS background timing is not guaranteed.
     - id: ios-schedule
@@ -503,6 +527,10 @@
 
     - id: settings-controller
       name: '@deepseek-ai/dsh-api-settings-controller'
+
+    - id: mcp-manager
+      name: '@deepseek-ai/dsh-mcp-manager'
+      inject: [credentials]
 
     - id: workspace-controller
       name: '@deepseek-ai/dsh-api-workspace-controller'
@@ -581,6 +609,9 @@
     - id: ui-approval
       name: '@deepseek-ai/dsh-client-ui-approval'
 
+    - id: message-quotes
+      name: '@deepseek-ai/dsh-message-quotes'
+
     - id: ui-chat
       name: '@deepseek-ai/dsh-client-ui-chat'
 
@@ -620,8 +651,14 @@
     - id: ui-model-selection
       name: '@deepseek-ai/dsh-client-ui-model-selection'
 
+    - id: ui-permission
+      name: '@deepseek-ai/dsh-client-ui-permission-presets'
+
     - id: ui-agent-preset
       name: '@deepseek-ai/dsh-client-ui-agent-preset'
+
+    - id: entry-customization
+      name: '@deepseek-ai/dsh-client-ui-entry-customization'
 
     - id: ui-reference
       name: '@deepseek-ai/dsh-client-ui-reference'
@@ -635,6 +672,15 @@
     - id: ui-plan
       name: '@deepseek-ai/dsh-client-ui-plan'
 
+    - id: ui-goal
+      name: '@deepseek-ai/dsh-client-ui-goal'
+
+    - id: ui-jobs
+      name: '@deepseek-ai/dsh-client-ui-jobs'
+
+    - id: ui-workflow-run
+      name: '@deepseek-ai/dsh-client-ui-workflow-run'
+
     - id: ui-workspace
       name: '@deepseek-ai/dsh-client-ui-workspace'
 
@@ -643,6 +689,9 @@
 
     - id: ui-sidebar-documentpreview
       name: '@deepseek-ai/dsh-client-ui-sidebar-documentpreview'
+
+    - id: workspace-changes
+      name: '@deepseek-ai/dsh-workspace-changes'
 
     - id: ui-deliverables
       name: '@deepseek-ai/dsh-client-ui-deliverables'
@@ -659,14 +708,21 @@
     - id: ui-settings-models
       name: '@deepseek-ai/dsh-client-ui-settings-models'
 
+    - id: ui-settings-session-log
+      name: '@deepseek-ai/dsh-client-ui-settings-session-log'
+
     - id: ui-settings-plugins
       name: '@deepseek-ai/dsh-client-ui-settings-plugins'
 
     - id: ui-settings-plugin-inventory
       name: '@deepseek-ai/dsh-client-ui-settings-plugin-inventory'
 
+    - id: ui-settings-agent-loop
+      name: '@deepseek-ai/dsh-client-ui-settings-agent-loop'
+
     - id: ui-settings-subagent
       name: '@deepseek-ai/dsh-client-ui-settings-subagent'
 
     - id: ui-settings-web-search
       name: '@deepseek-ai/dsh-client-ui-settings-web-search'
+
