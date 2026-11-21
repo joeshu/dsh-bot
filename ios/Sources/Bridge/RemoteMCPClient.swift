@@ -4,30 +4,44 @@ public struct MCPToolDescriptor: Identifiable, Equatable {
     public let id: String
     public let name: String
     public let description: String
+    public let inputSchemaJSON: String
+
+    public init(id: String, name: String, description: String, inputSchemaJSON: String = "{}") {
+        self.id = id
+        self.name = name
+        self.description = description
+        self.inputSchemaJSON = inputSchemaJSON
+    }
 }
 
 enum RemoteMCPError: Error, LocalizedError {
     case http(Int)
     case invalidResponse
-    case unsupportedVersion
-    case toolError
+    case unsupportedVersion(String)
+    case toolError(String)
 
     var errorDescription: String? {
         switch self {
         case .http(let status): return "MCP 服务返回 HTTP \(status)。"
         case .invalidResponse: return "MCP 服务返回了无效响应。"
-        case .unsupportedVersion: return "连接器不支持 MCP 2025-03-26 Streamable HTTP。"
-        case .toolError: return "MCP 工具报告执行失败。"
+        case .unsupportedVersion(let ver): return "连接器返回不支持的 MCP 协议版本（\(ver)）。"
+        case .toolError(let detail): return detail.isEmpty ? "MCP 工具报告执行失败。" : "MCP 工具执行失败：\(detail)"
         }
     }
 }
 
 public actor RemoteMCPClient {
-    private static let protocolVersion = "2025-03-26"
+    private static let defaultProtocolVersion = "2025-03-26"
+
+    private struct SessionState {
+        let sessionID: String
+        let protocolVersion: String
+    }
+
     private let session: URLSession
     private let keychain: KeychainBridge
-    private var connections: [String: String] = [:]
-    private var handshakes: [String: Task<String, Error>] = [:]
+    private var connections: [String: SessionState] = [:]
+    private var handshakes: [String: Task<SessionState, Error>] = [:]
 
     public init(keychain: KeychainBridge = KeychainBridge(), session: URLSession? = nil) {
         self.session = session ?? isolatedHTTPSession(timeout: 30)
@@ -46,14 +60,27 @@ public actor RemoteMCPClient {
         guard let tools = result["tools"] as? [[String: Any]] else { throw RemoteMCPError.invalidResponse }
         return tools.compactMap { tool in
             guard let name = tool["name"] as? String, !name.isEmpty else { return nil }
-            return MCPToolDescriptor(id: name, name: name, description: tool["description"] as? String ?? "")
+            var schemaStr = "{}"
+            if let schema = tool["inputSchema"],
+               let data = try? JSONSerialization.data(withJSONObject: schema, options: [.sortedKeys]) {
+                schemaStr = String(decoding: data, as: UTF8.self)
+            }
+            return MCPToolDescriptor(
+                id: name,
+                name: name,
+                description: tool["description"] as? String ?? "",
+                inputSchemaJSON: schemaStr
+            )
         }
     }
 
     public func callTool(endpoint: String, name: String, arguments: [String: Any], keychainAccount: String? = nil) async throws -> String {
         let result = try await request(endpoint: endpoint, keychainAccount: keychainAccount,
                                        method: "tools/call", params: ["name": name, "arguments": arguments])
-        if result["isError"] as? Bool == true { throw RemoteMCPError.toolError }
+        if result["isError"] as? Bool == true {
+            let texts = (result["content"] as? [[String: Any]] ?? []).compactMap { $0["text"] as? String }
+            throw RemoteMCPError.toolError(texts.joined(separator: "\n"))
+        }
         if let content = result["content"] as? [[String: Any]] {
             let texts = content.compactMap { $0["text"] as? String }
             if !texts.isEmpty { return texts.joined(separator: "\n") }
@@ -68,45 +95,56 @@ public actor RemoteMCPClient {
             token = try await keychain.getSecret(account: keychainAccount, requireBiometrics: false)["value"] as? String
         }
         let connection = "\(keychainAccount ?? "")|\(url.absoluteString)"
-        let sessionID = try await connect(url: url, token: token, connection: connection)
+        let state = try await connect(url: url, token: token, connection: connection)
         try Task.checkCancellation()
         do {
-            return try await send(url, token: token, sessionID: sessionID, method: method, params: params).result
+            return try await send(url, token: token, sessionID: state.sessionID, protocolVersion: state.protocolVersion, method: method, params: params).result
         } catch RemoteMCPError.http(404) {
+            // Streamable HTTP spec: 404 indicates expired session — re-initialize once and retry.
             connections.removeValue(forKey: connection)
-            throw RemoteMCPError.http(404)
+            let refreshed = try await connect(url: url, token: token, connection: connection)
+            try Task.checkCancellation()
+            return try await send(url, token: token, sessionID: refreshed.sessionID, protocolVersion: refreshed.protocolVersion, method: method, params: params).result
         }
     }
 
-    private func connect(url: URL, token: String?, connection: String) async throws -> String {
+    private func connect(url: URL, token: String?, connection: String) async throws -> SessionState {
         if let current = connections[connection] { return current }
         if let pending = handshakes[connection] { return try await pending.value }
 
         let task = Task {
-            let initialization = try await send(url, token: token, sessionID: "", method: "initialize", params: [
-                "protocolVersion": Self.protocolVersion,
-                "capabilities": [:],
-                "clientInfo": ["name": "DS Bot iOS", "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1"]
-            ])
-            guard initialization.result["protocolVersion"] as? String == Self.protocolVersion else {
-                throw RemoteMCPError.unsupportedVersion
+            let initialization = try await send(
+                url,
+                token: token,
+                sessionID: "",
+                protocolVersion: Self.defaultProtocolVersion,
+                method: "initialize",
+                params: [
+                    "protocolVersion": Self.defaultProtocolVersion,
+                    "capabilities": [:],
+                    "clientInfo": ["name": "DS Bot iOS", "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.0"]
+                ]
+            )
+            let negotiated = (initialization.result["protocolVersion"] as? String ?? Self.defaultProtocolVersion).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard negotiated.hasPrefix("2024-") || negotiated.hasPrefix("2025-") || negotiated.hasPrefix("2026-") else {
+                throw RemoteMCPError.unsupportedVersion(negotiated)
             }
             let sessionID = initialization.sessionID ?? ""
-            _ = try await send(url, token: token, sessionID: sessionID, method: "notifications/initialized", params: [:], notification: true)
-            return sessionID
+            _ = try? await send(url, token: token, sessionID: sessionID, protocolVersion: negotiated, method: "notifications/initialized", params: [:], notification: true)
+            return SessionState(sessionID: sessionID, protocolVersion: negotiated)
         }
         handshakes[connection] = task
         defer { handshakes.removeValue(forKey: connection) }
-        let sessionID = try await withTaskCancellationHandler {
+        let state = try await withTaskCancellationHandler {
             try await task.value
         } onCancel: {
             task.cancel()
         }
-        connections[connection] = sessionID
-        return sessionID
+        connections[connection] = state
+        return state
     }
 
-    private func send(_ url: URL, token: String?, sessionID: String, method: String,
+    private func send(_ url: URL, token: String?, sessionID: String, protocolVersion: String, method: String,
                       params: [String: Any], notification: Bool = false) async throws -> (result: [String: Any], sessionID: String?) {
         let id = UUID().uuidString
         var payload: [String: Any] = ["jsonrpc": "2.0", "method": method, "params": params]
@@ -116,7 +154,7 @@ public actor RemoteMCPClient {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
-        if method != "initialize" { request.setValue(Self.protocolVersion, forHTTPHeaderField: "MCP-Protocol-Version") }
+        if method != "initialize" { request.setValue(protocolVersion, forHTTPHeaderField: "MCP-Protocol-Version") }
         if !sessionID.isEmpty { request.setValue(sessionID, forHTTPHeaderField: "Mcp-Session-Id") }
         if let token, !token.isEmpty { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
@@ -127,18 +165,18 @@ public actor RemoteMCPClient {
         guard (200..<300).contains(http.statusCode) else { throw RemoteMCPError.http(http.statusCode) }
         let responseSessionID = http.value(forHTTPHeaderField: "Mcp-Session-Id")
         if notification {
-            guard http.statusCode == 202 else { throw RemoteMCPError.invalidResponse }
             return ([:], responseSessionID)
         }
 
-        if http.mimeType == "text/event-stream" {
+        let mime = (http.mimeType ?? "").lowercased()
+        if mime.contains("text/event-stream") {
             var events = ServerSentEvents()
             for try await byte in bytes {
                 try Task.checkCancellation()
                 guard let event = try events.append(byte: byte) else { continue }
                 if let result = try decode(Data(event.utf8), id: id) { return (result, responseSessionID) }
             }
-        } else if http.mimeType == "application/json" {
+        } else if mime.contains("application/json") || mime.isEmpty {
             var data = Data()
             for try await byte in bytes {
                 try Task.checkCancellation()
@@ -154,7 +192,10 @@ public actor RemoteMCPClient {
         guard let message = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               message["jsonrpc"] as? String == "2.0" else { throw RemoteMCPError.invalidResponse }
         guard message["id"] as? String == id else { return nil }
-        if message["error"] != nil { throw RemoteMCPError.toolError }
+        if let err = message["error"] as? [String: Any] {
+            let msg = err["message"] as? String ?? ""
+            throw RemoteMCPError.toolError(msg)
+        }
         guard let result = message["result"] as? [String: Any] else { throw RemoteMCPError.invalidResponse }
         return result
     }

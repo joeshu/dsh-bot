@@ -662,6 +662,19 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
         case "group_todo_add":
             guard isGroup, !text("text").isEmpty else { return "This tool requires a group and a todo." }
         case "device_status": break
+        case "remote_mcp_list":
+            let targetName = text("connectorName")
+            if targetName.isEmpty {
+                let items = await store.listConnectors().map { c -> [String: Any] in
+                    ["name": c["name"] as? String ?? "", "endpoint": c["endpoint"] as? String ?? "", "type": c["type"] as? String ?? ""]
+                }
+                if items.isEmpty { return "No Remote MCP connectors are configured yet. Ask the user to add one in Explore → Connector Marketplace." }
+                return String(decoding: (try? JSONSerialization.data(withJSONObject: items, options: [.sortedKeys])) ?? Data(), as: UTF8.self)
+            }
+            let matches = await store.listConnectors().filter { ($0["name"] as? String)?.caseInsensitiveCompare(targetName) == .orderedSame }
+            if matches.count == 1, let id = matches[0]["id"] as? String { connector = await store.connector(id: id) }
+            guard let connector, connector.type == "remote-mcp" else { return "Connector '\(targetName)' not found. Call remote_mcp_list without arguments to see configured names." }
+            summary = "发现远程 MCP 工具列表：\(connector.name)\n\(connector.endpoint)"
         case "remote_mcp_call":
             let matches = await store.listConnectors().filter { ($0["name"] as? String)?.caseInsensitiveCompare(text("connectorName")) == .orderedSame }
             if matches.count == 1, let id = matches[0]["id"] as? String { connector = await store.connector(id: id) }
@@ -727,6 +740,13 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
             case "device_status":
                 let status = await device.deviceStatus()
                 return String(decoding: try JSONSerialization.data(withJSONObject: status), as: UTF8.self)
+            case "remote_mcp_list":
+                guard let connector, await store.connector(id: connector.id)?.endpoint == connector.endpoint else { return "Connector changed." }
+                let tools = try await mcp.listTools(endpoint: connector.endpoint, keychainAccount: "connector:\(connector.id)")
+                let payload = tools.prefix(60).map { t -> [String: Any] in
+                    ["name": t.name, "description": String(t.description.prefix(240)), "inputSchema": String(t.inputSchemaJSON.prefix(800))]
+                }
+                return String(decoding: try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]), as: UTF8.self)
             case "remote_mcp_call":
                 guard let connector, await store.connector(id: connector.id)?.endpoint == connector.endpoint else { return "Connector changed." }
                 return try await mcp.callTool(endpoint: connector.endpoint, name: text("toolName"),

@@ -95,6 +95,12 @@ function apply(context) {
       },
     }),
     defineTool({
+      ...common, name: 'remote_mcp_list',
+      description: 'List configured Remote MCP connectors, or pass connectorName to discover its available tools and input schemas.',
+      parameters: { connectorName: { type: 'string', description: 'Optional connector name to list tools for.' } },
+      timeoutMs: 70_000, execute: (args, exec) => bridge('remote_mcp_list', args, exec),
+    }),
+    defineTool({
       ...common, name: 'remote_mcp_call', description: 'Call a user-configured Remote MCP tool after the user approves the connector and tool.',
       parameters: { connectorName: { type: 'string', required: true }, toolName: { type: 'string', required: true }, arguments: { type: 'json' } },
       timeoutMs: 70_000, execute: (args, exec) => bridge('remote_mcp_call', args, exec),

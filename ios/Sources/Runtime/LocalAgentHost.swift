@@ -1220,7 +1220,7 @@ public final class LocalAgentHost: ObservableObject {
         let botMode = bots.first(where: { $0.id == sessionId })?.permissionMode ?? "ask"
         let lowerTool = tool.lowercased()
         let isWriteOrMutate = lowerTool.contains("write") || lowerTool.contains("edit") || lowerTool.contains("delete") || lowerTool.contains("memory")
-        let isLowRiskReadOnly = lowerTool.contains("workspace_list") || lowerTool.contains("workspace_read") || lowerTool.contains("workspace_search") || lowerTool.contains("device_status") || lowerTool.contains("device.status")
+        let isLowRiskReadOnly = lowerTool.contains("workspace_list") || lowerTool.contains("workspace_read") || lowerTool.contains("workspace_search") || lowerTool.contains("device_status") || lowerTool.contains("device.status") || lowerTool.contains("remote_mcp_list")
 
         let approval = PendingApproval(id: id, sessionId: sessionId, turnId: turnId, tool: tool, summary: summary)
         pendingApprovals.append(approval)
