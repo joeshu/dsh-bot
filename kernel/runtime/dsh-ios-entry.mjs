@@ -376,6 +376,9 @@ async function boot() {
   runtime.persistence = ctx.get('sessionPersistence')
   const mountedRows = new Map([...ctx.loader.entries()].map((entry) => [entry.options.id, entry.fiber]))
   runtime.providerFiber = mountedRows.get('llm-deepseek')
+  runtime.subagentFiber = mountedRows.get('ios-subagent')
+  runtime.toolSubagentFiber = mountedRows.get('ios-tool-subagent')
+  runtime.webSearchFiber = mountedRows.get('ios-web-search')
   const requiredRows = ['session', 'session-projection', 'llm', 'llm-deepseek', 'system-prompt', 'tools',
     'agent', 'agent-loop', 'tool-executor-native', 'ios-web', 'ios-web-search', 'ios-fs', 'ios-working-directory', 'ios-subagent', 'ios-subagent-in-process', 'ios-tool-subagent',
     'commands', 'token-meter', 'compaction-pruner', 'compaction-basic', 'time-context', 'skill', 'skill-filesystem', 'tool-skill',
@@ -664,6 +667,59 @@ function redteamStatus() {
 
 rpc.handle('redteam.status', async () => redteamStatus())
 rpc.handle('redteam.setMode', async ({ enabled } = {}) => setRedteamToolsMounted(enabled === true))
+
+const liveConfig = {
+  subagentMaxDepth: 1,
+  subagentMaxActive: 1,
+  subagentModelSelection: false,
+  webSearchCount: 5,
+  webSearchSendOriginalQuestion: false,
+}
+
+rpc.handle('runtime.config.get', async () => ({ ...liveConfig }))
+
+rpc.handle('runtime.config.update', async (params = {}) => {
+  if (typeof params.subagentMaxDepth === 'number' && Number.isInteger(params.subagentMaxDepth)) {
+    liveConfig.subagentMaxDepth = Math.max(0, Math.min(3, params.subagentMaxDepth))
+  }
+  if (typeof params.subagentMaxActive === 'number' && Number.isInteger(params.subagentMaxActive)) {
+    liveConfig.subagentMaxActive = Math.max(1, Math.min(8, params.subagentMaxActive))
+  }
+  if (typeof params.subagentModelSelection === 'boolean') {
+    liveConfig.subagentModelSelection = params.subagentModelSelection
+  }
+  if (typeof params.webSearchCount === 'number' && Number.isInteger(params.webSearchCount)) {
+    liveConfig.webSearchCount = Math.max(1, Math.min(20, params.webSearchCount))
+  }
+  if (typeof params.webSearchSendOriginalQuestion === 'boolean') {
+    liveConfig.webSearchSendOriginalQuestion = params.webSearchSendOriginalQuestion
+  }
+
+  if (runtime.subagentFiber) {
+    await runtime.subagentFiber.update({
+      maxDepth: liveConfig.subagentMaxDepth,
+      maxActiveSubagents: liveConfig.subagentMaxActive,
+    }).catch(() => {})
+  }
+  if (runtime.toolSubagentFiber) {
+    await runtime.toolSubagentFiber.update({
+      provider: 'spawn',
+      toolName: 'subagent',
+      maxDepth: liveConfig.subagentMaxDepth,
+      modelSelection: liveConfig.subagentModelSelection,
+    }).catch(() => {})
+  }
+  if (runtime.webSearchFiber) {
+    await runtime.webSearchFiber.update({
+      searchBaseURL: 'https://api.deepseek.com/v1/tools',
+      searchApiKeyEnv: 'DEEPSEEK_API_KEY',
+      searchBilling: 'api-key',
+      sendOriginalQuestion: liveConfig.webSearchSendOriginalQuestion,
+      count: liveConfig.webSearchCount,
+    }).catch(() => {})
+  }
+  return { ok: true, config: { ...liveConfig } }
+})
 
 rpc.handle('usage.summary', (params) => dshUsageSummary(params))
 

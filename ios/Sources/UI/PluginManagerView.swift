@@ -256,18 +256,53 @@ public struct PluginManagerView: View {
             }
         }
 
-        Section("内置能力") {
+        Section("内置功能") {
             if let label = host.embeddedRuntimeLabel { LabeledContent("内嵌引擎", value: label) }
-            LabeledContent("网页抓取", value: "每次访问需批准")
-            Toggle("启用 DeepSeek 网页搜索", isOn: $host.webSearchEnabled)
-                .disabled(!host.usesOfficialModels)
-            Text(host.usesOfficialModels ? "每次搜索前确认关键词，可能产生 API 费用。" : "网页搜索需要 DeepSeek 官方 API 地址。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Toggle("启用子智能体", isOn: $host.subagentEnabled)
-            Text("最多一层、同时运行一个子智能体。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            NavigationLink {
+                SubagentSettingsView(host: host)
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "person.2.fill")
+                        .foregroundStyle(DSTheme.brand)
+                        .frame(width: 26)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("子智能体").font(.subheadline.weight(.semibold))
+                        Text("递归深度 \(host.subagentMaxDepth) · 并行上限 \(host.subagentMaxActive) · \(host.subagentEnabled ? "已启用" : "已停用")")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            NavigationLink {
+                WebSearchSettingsView(host: host)
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.blue)
+                        .frame(width: 26)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("网页搜索与获取").font(.subheadline.weight(.semibold))
+                        Text("单次 \(host.webSearchCount) 条 · \(host.webSearchEnabled ? "搜索已启用" : "搜索未开启")")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            NavigationLink {
+                SmartRecommendationsSettingsView(host: host)
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "square.grid.2x2.fill")
+                        .foregroundStyle(.indigo)
+                        .frame(width: 26)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("个性化推荐与操作卡片").font(.subheadline.weight(.semibold))
+                        Text(host.smartActionCardsEnabled ? "回答下方展示上下文操作卡片" : "已停用")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
         }
         Section("已安装插件") {
             if host.installedPlugins.isEmpty {

@@ -240,6 +240,32 @@ public final class LocalAgentHost: ObservableObject {
     @Published public var redteamModeEnabled = UserDefaults.standard.bool(forKey: "dsbot.redteamModeEnabled") {
         didSet { UserDefaults.standard.set(redteamModeEnabled, forKey: "dsbot.redteamModeEnabled") }
     }
+    @Published public var smartActionCardsEnabled: Bool = {
+        UserDefaults.standard.object(forKey: "dsbot.exp.smartActionCardsEnabled") as? Bool ?? true
+    }() {
+        didSet { UserDefaults.standard.set(smartActionCardsEnabled, forKey: "dsbot.exp.smartActionCardsEnabled") }
+    }
+    @Published public var subagentMaxDepth: Int = {
+        UserDefaults.standard.object(forKey: "dsbot.cfg.subagentMaxDepth") as? Int ?? 1
+    }() {
+        didSet { UserDefaults.standard.set(subagentMaxDepth, forKey: "dsbot.cfg.subagentMaxDepth") }
+    }
+    @Published public var subagentMaxActive: Int = {
+        UserDefaults.standard.object(forKey: "dsbot.cfg.subagentMaxActive") as? Int ?? 1
+    }() {
+        didSet { UserDefaults.standard.set(subagentMaxActive, forKey: "dsbot.cfg.subagentMaxActive") }
+    }
+    @Published public var subagentModelSelection = UserDefaults.standard.bool(forKey: "dsbot.cfg.subagentModelSelection") {
+        didSet { UserDefaults.standard.set(subagentModelSelection, forKey: "dsbot.cfg.subagentModelSelection") }
+    }
+    @Published public var webSearchCount: Int = {
+        UserDefaults.standard.object(forKey: "dsbot.cfg.webSearchCount") as? Int ?? 5
+    }() {
+        didSet { UserDefaults.standard.set(webSearchCount, forKey: "dsbot.cfg.webSearchCount") }
+    }
+    @Published public var webSearchSendOriginalQuestion = UserDefaults.standard.bool(forKey: "dsbot.cfg.webSearchSendOriginalQuestion") {
+        didSet { UserDefaults.standard.set(webSearchSendOriginalQuestion, forKey: "dsbot.cfg.webSearchSendOriginalQuestion") }
+    }
     @Published public private(set) var redteamStatus = RedteamPluginStatus()
     @Published public private(set) var autoReviewLog: [String] = []
 
@@ -533,6 +559,22 @@ public final class LocalAgentHost: ObservableObject {
                 : "红队演练模式已关闭"
         } catch {
             pluginStatus = "切换红队模式失败：\(error.localizedDescription)"
+        }
+    }
+
+    public func applyLiveRuntimeConfig() async -> String {
+        guard let rpc = rpc() else { return "已保存到本地，等待 DSH 运行时就绪后生效。" }
+        do {
+            _ = try await rpc.request("runtime.config.update", params: [
+                "subagentMaxDepth": subagentMaxDepth,
+                "subagentMaxActive": subagentMaxActive,
+                "subagentModelSelection": subagentModelSelection,
+                "webSearchCount": webSearchCount,
+                "webSearchSendOriginalQuestion": webSearchSendOriginalQuestion
+            ], timeoutSeconds: 15)
+            return "已通过 Cordis 热更新生效（无需重启）。"
+        } catch {
+            return "已保存到本地，热更新失败：\(error.localizedDescription)"
         }
     }
 

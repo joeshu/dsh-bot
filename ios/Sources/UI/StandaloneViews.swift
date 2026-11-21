@@ -599,6 +599,74 @@ public struct ChatView: View {
                                 approvalCard(approval)
                             }
 
+                            if host.smartActionCardsEnabled,
+                               !host.isStreaming,
+                               let lastAssistant = sessionMessages.last(where: { $0.role == "assistant" }),
+                               !lastAssistant.content.isEmpty {
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 8) {
+                                        Button {
+                                            showSideChat = true
+                                        } label: {
+                                            Label("旁白追问", systemImage: "bubble.left.and.exclamationmark.bubble.right")
+                                                .font(.caption)
+                                        }
+                                        .buttonStyle(.bordered)
+
+                                        if lastAssistant.content.count >= 600 {
+                                            Button {
+                                                Task {
+                                                    do {
+                                                        guard let rpc = host.rpc() else { return }
+                                                        let summary = String(lastAssistant.content.prefix(600))
+                                                        _ = try await rpc.request("memory.add", params: [
+                                                            "botId": liveBot.id,
+                                                            "title": "对话要点 · \(Date().formatted(date: .abbreviated, time: .shortened))",
+                                                            "content": summary,
+                                                            "layer": "delta"
+                                                        ])
+                                                        actionStatus = "已存入 Bot 记忆"
+                                                        DSHaptics.notify(.success)
+                                                    } catch {
+                                                        actionStatus = error.localizedDescription
+                                                    }
+                                                }
+                                            } label: {
+                                                Label("存为记忆", systemImage: "brain")
+                                                    .font(.caption)
+                                            }
+                                            .buttonStyle(.bordered)
+                                        }
+
+                                        if sessionMessages.count >= 8 {
+                                            Button {
+                                                Task { await host.sendMessage(sessionId: bot.id, text: "/compact", model: selectedModel) }
+                                            } label: {
+                                                Label("压缩上下文", systemImage: "arrow.down.right.and.arrow.up.left")
+                                                    .font(.caption)
+                                            }
+                                            .buttonStyle(.bordered)
+                                        }
+
+                                        if lastAssistant.content.contains("```") {
+                                            Button {
+                                                let fileName = "snippet-\(Int(Date().timeIntervalSince1970)).md"
+                                                let target = host.workspaceFilesDirectory().appendingPathComponent(fileName)
+                                                if (try? lastAssistant.content.write(to: target, atomically: true, encoding: .utf8)) != nil {
+                                                    actionStatus = "已保存到工作区：files/\(fileName)"
+                                                    DSHaptics.notify(.success)
+                                                }
+                                            } label: {
+                                                Label("存为工作区文件", systemImage: "doc.badge.plus")
+                                                    .font(.caption)
+                                            }
+                                            .buttonStyle(.bordered)
+                                        }
+                                    }
+                                    .padding(.vertical, 2)
+                                }
+                            }
+
                             Color.clear.frame(height: 1).id("chat_bottom")
                         }
                         .padding()
