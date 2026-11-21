@@ -11,8 +11,8 @@ OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 BUILD="$(mktemp -d)"
 trap 'rm -rf "$BUILD"' EXIT
 
-if [[ "$(node --version)" != "v24.22.1" || "$(npm --version)" != "11.9.0" ]]; then
-  echo "Build requires Node v24.22.1 with npm 11.9.0" >&2
+if [[ "$(node --version)" != "v24.22.3" || "$(npm --version)" != "11.9.0" ]]; then
+  echo "Build requires Node v24.22.3 with npm 11.9.0" >&2
   exit 1
 fi
 npm --prefix "$ROOT/kernel/runtime" ci --ignore-scripts --omit=optional --no-audit --no-fund

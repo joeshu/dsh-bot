@@ -10,26 +10,26 @@ The supplied Fish Pocket 1.2.0 IPA was inspected as a read-only reference. It de
 
 ## Runtime status
 
-The only verified NodeMobile iOS binary currently available in this workspace is Node 24.22.1. Upstream Node 24.22.3 was published on 2026-11-10, so the build marks this as a preview probe and the release workflow refuses to promote it. A public release needs a NodeMobile framework rebuilt from the mobile source patches at a current security release, followed by locally re-signed device acceptance. The generated IPA report records these blockers.
+The embedded NodeMobile iOS XCFramework is pinned to the self-built Node **24.22.3** security release hosted permanently on GitHub Releases (`nodemobile-v24.22.3`, SHA-256 verified), so builds report `releaseEligible: true` without recompiling Node. Public promotion still requires locally re-signed physical device acceptance.
 
 The existing app accepted Chat Completions endpoints. The upstream DSH DeepSeek adapter uses the Anthropic Messages protocol. The official DeepSeek endpoint is translated to its `/anthropic` route; a custom endpoint must support that protocol. API keys remain in Keychain and are resolved when DSH makes a request. Existing Swift chat archives remain in `chats.json`; the most recent archived messages are imported as bounded context into a new DSH session.
 
 ## Use
 
-1. Install a preview IPA only for runtime/device evaluation. Do not use a preview candidate for public distribution while its report says `releaseEligible: false`.
+1. Re-sign and install the unsigned IPA (SideStore / AltStore / LCSign / `scripts/resign-ios-ipa.sh`).
 2. In Settings, enter the HTTPS service address and save its API key. Choose a model supported by the service.
 3. DSH tools run through the iOS bridge. Memory writes, group tasks, device status, web fetch and Remote MCP request approval. JavaScript evaluation runs in the existing bounded QuickJS sandbox. DSH owns new chat turns and durable event history.
-4. Open **探索 → 插件** to manage the dedicated iOS DSH profile. A catalog entry is not automatically considered iOS-compatible: its package is checked again at install time, and missing dependencies or desktop-only capabilities are rejected.
+4. Open **探索 → 插件** to manage the dedicated iOS DSH profile (format 1 registries, direct GitHub repo install, or local folder import). A catalog entry is not automatically considered iOS-compatible: its package is checked again at install time, and missing dependencies or desktop-only capabilities are rejected.
 
 ## Build
 
-On macOS, install Xcode 26.6, XcodeGen 2.46.0, Python 3.12, Node 24.22.1/npm 11.9.0, then run:
+On macOS, install Xcode 26.6, XcodeGen 2.46.0, Python 3.12, Node 24.22.3/npm 11.9.0, then run:
 
 ```bash
 bash scripts/build-unsigned-ipa.sh
 ```
 
-The build uses Node.js 24.22.1/npm 11.9.0 and `npm ci` against `kernel/runtime/package-lock.json`, stages the pinned upstream JS packages, downloads the SHA-256-pinned NodeMobile XCFramework, removes upstream code signatures, and archives the arm64 iPhoneOS app. The verifier inspects the embedded framework Mach-O, DSH package versions and lock digest, the app's NodeMobile load command, privacy metadata and unsigned status. Outputs include the IPA, `ipa-report.json`, `source.json` and `SHA256SUMS.txt` under `dist/` (or `DSBOT_OUT_DIR`). The IPA is expected to be much larger than the previous Swift-only 900 KB package because it contains Node and the upstream JavaScript runtime.
+The build uses Node.js 24.22.3/npm 11.9.0 and `npm ci` against `kernel/runtime/package-lock.json`, stages the pinned upstream JS packages, downloads the SHA-256-pinned NodeMobile 24.22.3 XCFramework, removes upstream code signatures, and archives the arm64 iPhoneOS app. The verifier inspects the embedded framework Mach-O, DSH package versions and lock digest, the app's NodeMobile load command, privacy metadata and unsigned status. Outputs include the IPA, `ipa-report.json`, `source.json` and `SHA256SUMS.txt` under `dist/` (or `DSBOT_OUT_DIR`). The IPA is expected to be much larger than the previous Swift-only 900 KB package because it contains Node and the upstream JavaScript runtime.
 
 After staging the runtime, run `python3 scripts/smoke-dsh-runtime.py` to exercise the app's socket protocol, native credential bridge, provider endpoint update, DSH turn lifecycle and SQLite recovery across a Node restart without contacting a model service.
 
