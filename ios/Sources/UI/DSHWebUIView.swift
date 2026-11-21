@@ -43,6 +43,7 @@ public struct DSHWebUIView: View {
         }
         .navigationTitle("DSH Web 工作台")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.hidden, for: .tabBar)
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
                 Button {

@@ -10,11 +10,13 @@ private enum PluginManagerSection: String, CaseIterable, Identifiable {
 
 private enum PendingPluginInstall: Identifiable {
     case catalog(DSHPluginCatalogItem)
+    case github(String)
     case local(URL)
 
     var id: String {
         switch self {
         case .catalog(let plugin): return "catalog:\(plugin.id)"
+        case .github(let url): return "github:\(url)"
         case .local(let url): return "local:\(url.path)"
         }
     }
@@ -25,6 +27,7 @@ public struct PluginManagerView: View {
     @State private var section: PluginManagerSection = .installed
     @State private var searchText = ""
     @State private var newSourceURL = ""
+    @State private var githubRepoURL = ""
     @State private var showFolderPicker = false
     @State private var pendingInstall: PendingPluginInstall?
     @State private var pendingRemoval: DSHInstalledPlugin?
@@ -32,7 +35,7 @@ public struct PluginManagerView: View {
     public var body: some View {
         NavigationStack {
             Form {
-                Section {
+                Section("Web 工作台") {
                     NavigationLink {
                         DSHWebUIView(host: host)
                     } label: {
@@ -87,7 +90,8 @@ public struct PluginManagerView: View {
                 }
             }
             .scrollDismissesKeyboard(.interactively)
-            .navigationTitle("插件")
+            .navigationTitle("探索与插件")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -102,6 +106,14 @@ public struct PluginManagerView: View {
                 await host.refreshPluginState()
                 if host.pluginSources.contains(where: { $0.enabled }) {
                     await host.discoverPlugins()
+                }
+            }
+            .onChange(of: section) { nextSection in
+                if nextSection == .discover,
+                   host.pluginSources.contains(where: { $0.enabled }),
+                   host.pluginCatalog.isEmpty,
+                   !host.isLoadingPlugins {
+                    Task { await host.discoverPlugins(query: searchText) }
                 }
             }
             .fileImporter(
@@ -124,6 +136,9 @@ public struct PluginManagerView: View {
                         Task {
                             switch target {
                             case .catalog(let plugin): await host.installPlugin(plugin)
+                            case .github(let url):
+                                await host.installGithubPlugin(url: url)
+                                githubRepoURL = ""
                             case .local(let url): await host.installLocalPlugin(from: url)
                             }
                         }
@@ -210,6 +225,23 @@ public struct PluginManagerView: View {
                 Label("从本地文件夹安装", systemImage: "folder")
             }
         }
+        Section("从 GitHub 仓库直接安装") {
+            TextField("https://github.com/owner/repo 或 owner/repo", text: $githubRepoURL)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(.URL)
+            Button {
+                let target = githubRepoURL.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !target.isEmpty else { return }
+                pendingInstall = .github(target)
+            } label: {
+                Label("下载并安装 GitHub 插件", systemImage: "arrow.down.circle")
+            }
+            .disabled(githubRepoURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || host.state != .ready)
+            Text("适用于尚未收录到公共索引源的 DSH 插件仓库（如 joeshu/dsh-purge-safe）。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
     }
 
     private var discoverSection: some View {
@@ -234,7 +266,7 @@ public struct PluginManagerView: View {
 
             Section(host.pluginSourceName.map { "来自 \($0)" } ?? "插件目录") {
                 if host.pluginCatalog.isEmpty && !host.isLoadingPlugins {
-                    Text("没有匹配结果。可刷新索引或更换来源。")
+                    Text("没有匹配结果。可刷新索引、更换来源，或在“已安装”页直接粘贴 GitHub 仓库地址安装。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -286,7 +318,7 @@ public struct PluginManagerView: View {
     private var sourcesSection: some View {
         Group {
             Section {
-                Text("一次启用一个插件索引源。新添加的地址默认关闭；关闭所有来源后，发现页不会联网读取插件目录。")
+                Text("一次启用一个插件索引源；启用后会自动加载插件列表并跳转到“发现”页。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -295,7 +327,12 @@ public struct PluginManagerView: View {
                 ForEach(host.pluginSources) { source in
                     Toggle(isOn: Binding(
                         get: { host.pluginSources.first(where: { $0.id == source.id })?.enabled ?? source.enabled },
-                        set: { value in Task { await host.setPluginSourceEnabled(id: source.id, enabled: value) } }
+                        set: { value in
+                            Task {
+                                await host.setPluginSourceEnabled(id: source.id, enabled: value)
+                                if value { section = .discover }
+                            }
+                        }
                     )) {
                         VStack(alignment: .leading, spacing: 4) {
                             HStack(spacing: 7) {

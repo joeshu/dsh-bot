@@ -97,7 +97,7 @@ function tarNumber(header, start, length) {
   return parsed
 }
 
-async function unpackNpmTarball(compressed, destination) {
+async function unpackNpmTarball(compressed, destination, { stripSingleRoot = false } = {}) {
   if (compressed.byteLength > MAX_ARCHIVE_BYTES) throw new RangeError('插件压缩包超过 48 MiB')
   const tar = gunzipSync(compressed, { maxOutputLength: MAX_UNPACKED_BYTES })
   let offset = 0
@@ -105,6 +105,7 @@ async function unpackNpmTarball(compressed, destination) {
   let fileCount = 0
   let paxPath
   let longPath
+  let detectedRoot
   while (offset + 512 <= tar.length) {
     const header = tar.subarray(offset, offset + 512)
     if (header.every((byte) => byte === 0)) break
@@ -137,7 +138,13 @@ async function unpackNpmTarball(compressed, destination) {
     }
     name = name.replace(/\\/g, '/')
     const parts = name.split('/').filter(Boolean)
-    if (parts[0] !== 'package' || parts.some((part) => part === '.' || part === '..')) {
+    if (!parts.length || parts.some((part) => part === '.' || part === '..')) {
+      throw new Error('插件包包含非法路径条目')
+    }
+    if (stripSingleRoot) {
+      if (detectedRoot === undefined) detectedRoot = parts[0]
+      else if (parts[0] !== detectedRoot) throw new Error('GitHub 压缩包必须包含单一顶层目录')
+    } else if (parts[0] !== 'package') {
       throw new Error('NPM 插件包条目必须位于 package/ 目录内')
     }
     const output = resolve(destination, ...parts.slice(1))
@@ -509,7 +516,7 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
         if (info.isFile() && ['.js', '.mjs', '.cjs'].includes(extension)) {
           if (info.size > 8 * 1024 * 1024) throw new RangeError('iOS 插件单个 JavaScript 文件不得超过 8 MiB')
           const source = await readFile(filePath, 'utf8')
-          if (/(?:from\s*|import\s*\(?\s*|require\s*\(\s*)['"](?:node:)?(?:child_process|worker_threads|cluster|inspector|vm)(?:\/[^'"]*)?['"]/.test(source)) {
+          if (/(?:from\s*|import\s*\(?\s*|require\s*\(\s*)['"](?:node:)?(?:inspector|vm)(?:\/[^'"]*)?['"]/.test(source)) {
             unsupportedImports.push(relative(root, filePath))
           }
         }
@@ -518,7 +525,7 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
     }
     await walk(root)
     if (nativeFiles.length) throw new Error(`iOS 不支持该包中的本机二进制：${nativeFiles.slice(0, 3).join(', ')}`)
-    if (unsupportedImports.length) throw new Error(`iOS profile 不接纳进程、工作线程或 VM API：${unsupportedImports.slice(0, 3).join(', ')}`)
+    if (unsupportedImports.length) throw new Error(`iOS profile 不接纳 inspector 或 VM API：${unsupportedImports.slice(0, 3).join(', ')}`)
     return { manifest, patchPath }
   }
 
@@ -818,9 +825,62 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
     const count = Math.min(100, Math.max(1, Number.isSafeInteger(limit) ? limit : 40))
     return { source: source.name, total: entries.length, plugins: entries.slice(start, start + count) }
   })
+  function parseGithubSpec(raw) {
+    const trimmed = String(raw ?? '').trim()
+    if (!trimmed) throw new Error('请输入 GitHub 仓库地址（如 https://github.com/owner/repo）')
+    let owner = ''
+    let repo = ''
+    let ref = ''
+    if (/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:[@#][A-Za-z0-9._/-]+)?$/.test(trimmed)) {
+      const [slug, explicitRef = ''] = trimmed.split(/[@#]/, 2)
+      ;[owner, repo] = slug.split('/', 2)
+      ref = explicitRef
+    } else {
+      const url = httpsURL(trimmed)
+      if (url.hostname !== 'github.com' && url.hostname !== 'www.github.com') {
+        throw new Error('只支持 https://github.com/<owner>/<repo> 仓库地址')
+      }
+      const parts = url.pathname.replace(/\/+$/, '').split('/').filter(Boolean)
+      if (parts.length < 2) throw new Error('无效的 GitHub 仓库地址，需要包含 owner/repo')
+      owner = parts[0]
+      repo = parts[1].replace(/\.git$/i, '')
+      if (parts.length >= 4 && parts[2] === 'tree') ref = parts.slice(3).join('/')
+      else if (url.hash && url.hash.length > 1) ref = decodeURIComponent(url.hash.slice(1))
+    }
+    if (!/^[A-Za-z0-9_.-]{1,100}$/.test(owner) || !/^[A-Za-z0-9_.-]{1,100}$/.test(repo)) {
+      throw new Error('GitHub 仓库名称包含非法字符')
+    }
+    if (ref && !/^[A-Za-z0-9._/-]{1,120}$/.test(ref)) throw new Error('GitHub 分支或标签名无效')
+    return { owner, repo, ref }
+  }
+
+  async function installFromGithub(rawSpec) {
+    const { owner, repo, ref } = parseGithubSpec(rawSpec)
+    let targetRef = ref
+    if (!targetRef) {
+      const metaBuf = await fetchBuffer(`https://api.github.com/repos/${owner}/${repo}`, 2 * 1024 * 1024, 15_000)
+      let meta
+      try { meta = JSON.parse(metaBuf.toString('utf8')) } catch { throw new Error('GitHub API 返回了无效数据') }
+      targetRef = typeof meta.default_branch === 'string' && meta.default_branch ? meta.default_branch : 'main'
+    }
+    const tarballUrl = `https://codeload.github.com/${owner}/${repo}/tar.gz/${encodeURIComponent(targetRef)}`
+    const bytes = await fetchBuffer(tarballUrl, MAX_ARCHIVE_BYTES, 45_000)
+    const staging = join(profileDir, `.ios-plugin-github-${randomUUID()}`)
+    await mkdir(staging)
+    try {
+      await unpackNpmTarball(bytes, staging, { stripSingleRoot: true })
+      await resolvePureJsDependencies(staging)
+      return await installDirectory(staging)
+    } finally {
+      await rm(staging, { recursive: true, force: true })
+    }
+  }
+
   rpc.handle('plugins.installed.list', async () => ({ plugins: await installedPlugins() }))
   rpc.handle('plugins.install.npm', async (params) => mutateProfile(() =>
     installFromNpm(String(params.name ?? ''), String(params.version ?? ''), String(params.sourceId ?? ''))))
+  rpc.handle('plugins.install.github', async ({ url }) => mutateProfile(() =>
+    installFromGithub(String(url ?? ''))))
   rpc.handle('plugins.install.local', async ({ path }) => {
     const resolved = resolve(String(path ?? ''))
     const allowed = resolve(importRoot) + sep

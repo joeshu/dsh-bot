@@ -617,7 +617,12 @@ public final class LocalAgentHost: ObservableObject {
             let result = try await channel.request("plugins.sources.enable", params: ["id": id, "enabled": enabled])
             pluginSources = Self.decodeRows(result["sources"], as: DSHPluginSource.self)
             invalidatePluginCatalog()
-            pluginStatus = enabled ? "索引源已启用。" : "索引源已停用。"
+            if enabled {
+                pluginStatus = "索引源已启用，正在读取插件目录…"
+                await discoverPlugins(forceRefresh: true)
+            } else {
+                pluginStatus = "索引源已停用。"
+            }
         } catch { pluginStatus = error.localizedDescription }
     }
 
@@ -648,6 +653,20 @@ public final class LocalAgentHost: ObservableObject {
             ], timeoutSeconds: 180)
             await refreshPluginState(on: channel)
             pluginStatus = try await pluginMutationStatus(outcome, on: channel, applied: "\(item.name) 已安装并启用。")
+        } catch { pluginStatus = error.localizedDescription }
+    }
+
+    public func installGithubPlugin(url: String) async {
+        let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let channel else { return }
+        pluginStatus = "正在从 GitHub 下载并检查 \(trimmed)…"
+        do {
+            let outcome = try await channel.request("plugins.install.github", params: [
+                "url": trimmed
+            ], timeoutSeconds: 180)
+            let name = outcome["name"] as? String ?? trimmed
+            await refreshPluginState(on: channel)
+            pluginStatus = try await pluginMutationStatus(outcome, on: channel, applied: "\(name) 已从 GitHub 安装并启用。")
         } catch { pluginStatus = error.localizedDescription }
     }
 
