@@ -43,7 +43,7 @@ globalThis.fetch = async (input, init) => {
       ? { type: 'tool_use', id: 'fixture-tool', name: 'web_search', input: {} }
       : { type: 'text', text: '' } }),
     event('content_block_delta', { index: 0, delta: useTool
-      ? { type: 'input_json_delta', partial_json: JSON.stringify({ query: 'DSH fixture query' }) }
+      ? { type: 'input_json_delta', partial_json: JSON.stringify({ queries: ['DSH fixture query'] }) }
       : { type: 'text_delta', text: 'Fixture completed' } }),
     event('content_block_stop', { index: 0 }),
     event('message_delta', { delta: { stop_reason: useTool ? 'tool_use' : 'end_turn' }, usage: { output_tokens: 6 } }),
@@ -66,16 +66,37 @@ def main():
         peer, process = smoke.start_runtime(node, directory, directory / "sessions.sqlite")
         expected_approval = None
         approvals = []
+        completed_events = []
         original = peer.answer_runtime
+        original_wait = peer.wait_for_chat_done
+
+        def wait_for_chat_done():
+            if completed_events:
+                return completed_events.pop(0)
+            return original_wait()
+
+        peer.wait_for_chat_done = wait_for_chat_done
 
         def answer(message):
+            if message.get('method') is None:
+                return
             method = message.get("method")
-            if method == "native.tool.execute":
+            if method == "chat.done":
+                completed_events.append(message.get("params", {}))
+                return
+            if method == "approval.request":
                 params = message["params"]
-                assert params["name"] == "web_search" and params["args"] == {"query": "DSH fixture query"}, params
+                assert params["tool"] == "web_search", params
                 assert params["turnId"] == expected_approval, params
-                approvals.append(params["turnId"])
-                result = {"output": "approved" if expected_approval == "allowed" else "User declined"}
+                assert "DSH fixture query" in params["summary"] and "fixture human prompt" not in params["summary"], params
+                approvals.append(params)
+                response_id = peer.next_id
+                peer.next_id += 1
+                peer.send({"jsonrpc": "2.0", "id": response_id, "method": "approval.respond", "params": {
+                    "approvalId": params["approvalId"], "turnId": params["turnId"],
+                    "sessionId": params["sessionId"], "approved": expected_approval == "allowed",
+                }})
+                return
             elif method == "credential.resolve":
                 result = {"value": "fixture-key"}
             elif method == "credential.describe":
@@ -87,6 +108,9 @@ def main():
         peer.answer_runtime = answer
         try:
             peer.start()
+            peer.request("runtime.config.update", {
+                "webSearchCount": 5, "webSearchSendOriginalQuestion": False,
+            })
             for label, enabled in (("off", False), ("denied", True), ("allowed", True)):
                 expected_approval = label
                 peer.request("chat.send", {
@@ -103,7 +127,7 @@ def main():
 
             off = next(row for row in entries if row.get("label") == "fixture human prompt:off")
             assert "web_search" not in off["toolNames"]
-            assert approvals == ["denied", "allowed"], approvals
+            assert [row["turnId"] for row in approvals] == ["denied", "allowed"], approvals
             assert len(requests) == 1
             assert requests[0]["request"] == {
                 "query": "DSH fixture query", "count": 5, "need_content": False,

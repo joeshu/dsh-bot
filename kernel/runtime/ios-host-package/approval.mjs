@@ -34,22 +34,60 @@ function apply(ctx) {
   }
 
   const disposers = [
+    ctx.on('tools/pre-execute', async (execution, next) => {
+      const downstream = typeof next === 'function' ? await next() : { kind: 'allow' }
+      if (String(execution?.name ?? '') !== 'web_search' || downstream?.kind && downstream.kind !== 'allow') {
+        return downstream ?? { kind: 'allow' }
+      }
+
+      const { runtime } = iosHost()
+      const sessionId = execution?.agent?.session?.id
+      const active = typeof sessionId === 'string' ? runtime.activeTurns.get(sessionId) : undefined
+      // Browser sessions keep their own approval UI. Native Bot turns are
+      // confirmed here before the official DSH search provider can make a request.
+      if (!active) return downstream ?? { kind: 'allow' }
+      if (active.done || !active.webSearchEnabled) {
+        return { kind: 'deny', reason: 'Web search is disabled for this iOS turn.' }
+      }
+      if (!runtime.webSearchConfigSynced) {
+        return { kind: 'deny', reason: 'Web search settings are not synchronized with the iOS host.' }
+      }
+
+      const queries = execution.arguments?.queries
+      if (!Array.isArray(queries) || queries.length < 1 || queries.length > 5
+        || queries.some((query) => typeof query !== 'string' || query.trim().length === 0
+          || [...query].length > 300 || /[\x00-\x1f\x7f]/.test(query))) {
+        return { kind: 'deny', reason: 'Use 1–5 non-empty web search queries, each at most 300 characters.' }
+      }
+
+      const exactQueries = JSON.stringify(queries, null, 2)
+      return {
+        kind: 'ask',
+        reason: `The official DeepSeek Search API will receive exactly these queries; the original user prompt is not sent: ${exactQueries}`,
+        displayReason: {
+          en: `Allow the official DeepSeek Search API to receive exactly these queries? The original prompt is not sent.\n${exactQueries}`,
+          zh: `允许 DeepSeek 官方搜索 API 接收以下准确查询词吗？不会发送原始提问。\n${exactQueries}`,
+        },
+      }
+    }, { global: true, prepend: true }),
     ctx.on('fs/write-intent', intent('write')),
     ctx.on('fs/edit-intent', intent('edit')),
     ctx.on('fs/delete-intent', intent('delete')),
     ctx.on('approval/request', (request, next) => {
       const { rpc, runtime } = iosHost()
       const active = runtime.activeTurns.get(request?.agent?.session?.id)
+      const toolName = String(request?.toolName ?? '')
       // The DSH Web client owns approvals for browser sessions. The bridge only
-      // answers requests belonging to a native iOS Bot turn.
+      // answers requests belonging to a native iOS Bot turn. The iOS entry's
+      // outer redteam handler records its one-shot grant after this answerer returns.
       if (!active || active.done) return next()
-      if (active.permissionMode === 'readOnly' && request.toolName !== 'run_code') return 'rejected'
+      if (active.permissionMode === 'readOnly' && toolName !== 'run_code') return 'rejected'
 
       const approvalId = `dsh_${Date.now()}_${Math.random().toString(36).slice(2)}`
       const display = request.displayReason
       const localized = typeof display === 'string' ? display : display?.zh ?? display?.en
-      const maxSummary = request.toolName === 'run_code' ? 20_000 : 4_000
-      const summary = String(localized ?? request.reason ?? `DSH 需要执行 ${request.toolName}。`).slice(0, maxSummary)
+      const maxSummary = toolName === 'run_code' ? 20_000 : 4_000
+      const summary = String(localized ?? request.reason ?? `DSH 需要执行 ${toolName || 'DSH 工具'}。`).slice(0, maxSummary)
       let settle
       const answer = new Promise((resolveAnswer) => { settle = resolveAnswer })
       const pending = { sessionId: active.botId, turnId: active.turnId, settle }
@@ -70,11 +108,11 @@ function apply(ctx) {
         request.signal?.addEventListener('abort', abort, { once: true })
         rpc.notify('approval.request', {
           source: 'dsh', approvalId, sessionId: active.botId, turnId: active.turnId,
-          tool: String(request.toolName ?? 'DSH 工具'), summary,
+          tool: toolName || 'DSH 工具', summary,
         })
       }
       return answer.finally(cleanup)
-    }),
+    }, { global: true, prepend: true }),
   ]
   ctx.effect(() => () => disposers.reverse().forEach((dispose) => dispose()), 'dsbot-ios.approval')
 }
