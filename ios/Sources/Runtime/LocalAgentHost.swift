@@ -1535,7 +1535,7 @@ public final class LocalAgentHost: ObservableObject {
 
     public func refreshSessionSummaries() async {
         guard let rpc = rpc() else { return }
-        await loadDSHSessions(on: rpc)
+        await loadDSHSessions(on: rpc.channel)
     }
 
     public func hasSessionHistory(_ id: String) -> Bool {
