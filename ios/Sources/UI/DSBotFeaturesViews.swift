@@ -349,13 +349,34 @@ public struct MemoryVaultView: View {
     @State private var newMemTitle = ""
     @State private var newMemContent = ""
     @State private var newMemLayer = "pinned"
+    @State private var searchText = ""
+    @State private var layerFilter = "all"
     @Environment(\.scenePhase) private var phase
+
+    private var filteredJournal: [Record] {
+        journal.filter { row in
+            let matchesLayer = layerFilter == "all" || row.layer == layerFilter
+            let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let matchesSearch = q.isEmpty || row.title.lowercased().contains(q) || row.content.lowercased().contains(q)
+            return matchesLayer && matchesSearch
+        }
+    }
 
     public var body: some View {
         List {
+            Section {
+                Picker("筛选", selection: $layerFilter) {
+                    Text("全部 (\(journal.count))").tag("all")
+                    Text("常驻").tag("pinned")
+                    Text("仅本机").tag("delta")
+                }
+                .pickerStyle(.segmented)
+            }
             Section("当前 Bot") {
-                if journal.isEmpty { Text("暂无记忆记录").foregroundStyle(.secondary) }
-                ForEach(journal) { row in
+                if filteredJournal.isEmpty {
+                    Text(journal.isEmpty ? "暂无记忆记录" : "无匹配记忆").foregroundStyle(.secondary)
+                }
+                ForEach(filteredJournal) { row in
                     HStack {
                         memoryRow(row)
                         Spacer()
@@ -394,6 +415,7 @@ public struct MemoryVaultView: View {
             }
             if !status.isEmpty { Section("状态") { Text(status).font(.caption) } }
         }
+        .searchable(text: $searchText, prompt: "搜索记忆标题或内容")
         .refreshable { await reload() }
         .navigationTitle("记忆")
         .onChange(of: phase) { phase in
@@ -517,6 +539,7 @@ public struct ConnectorsAndUsageView: View {
     @State private var connectorToken = ""
     @State private var connectors: [(id: String, type: String, name: String, endpoint: String)] = []
     @State private var mcpStatus = ""
+    @State private var usageDimension = "day"
 
     private func recentDayWindows() -> [[String: Any]] {
         let calendar = Calendar.current
@@ -546,8 +569,35 @@ public struct ConnectorsAndUsageView: View {
         }
     }
 
+    private var activeRollups: [DSHUsageRollup] {
+        switch usageDimension {
+        case "bot": return botUsage
+        case "model": return modelUsage
+        default: return dailyUsage
+        }
+    }
+
     public var body: some View {
         Form {
+            Section("连接器市场") {
+                NavigationLink {
+                    ConnectorMarketplaceView(host: host)
+                } label: {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("浏览 38 个官方 Remote MCP 连接器")
+                                .font(.subheadline.weight(.semibold))
+                            Text("GitHub、Notion、Sentry、Vercel、DeepWiki、Context7、高德地图等")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "puzzlepiece.extension.fill")
+                            .foregroundStyle(.indigo)
+                    }
+                }
+            }
+
             Section("真实用量（DSH 持久事件）") {
                 LabeledContent("已报告用量的模型调用", value: usageTotals.calls.formatted())
                 LabeledContent("输入 Tokens（未缓存）", value: usageTotals.inputTokens.formatted())
@@ -567,48 +617,42 @@ public struct ConnectorsAndUsageView: View {
                 }
             }
 
+            Section("多维用量分析") {
+                Picker("统计维度", selection: $usageDimension) {
+                    Text("最近 7 天").tag("day")
+                    Text("按 Bot").tag("bot")
+                    Text("按模型").tag("model")
+                }
+                .pickerStyle(.segmented)
+
+                let items = usageDimension == "day" ? Array(activeRollups.reversed()) : activeRollups
+                if items.contains(where: { $0.totals.totalTokens > 0 }) {
+                    Chart(items.prefix(8)) { item in
+                        BarMark(
+                            x: .value("维度", item.title),
+                            y: .value("Tokens", item.totals.totalTokens)
+                        )
+                        .foregroundStyle(DSTheme.brand.gradient)
+                        .cornerRadius(4)
+                    }
+                    .frame(height: 155)
+                    .padding(.vertical, 6)
+                }
+                if activeRollups.isEmpty {
+                    Text("当前维度暂无用量数据。").font(.caption).foregroundStyle(.secondary)
+                } else {
+                    ForEach(activeRollups) { item in
+                        LabeledContent(item.title, value: "\(item.totals.totalTokens.formatted()) Tokens · \(item.totals.calls.formatted()) 次")
+                    }
+                }
+            }
+
             Section("原生兼容请求（独立累计）") {
                 LabeledContent("累计 Tokens", value: legacyTotalTokens.formatted())
                 LabeledContent("Prompt 缓存命中率", value: String(format: "%.1f%%", legacyCacheHitRate * 100))
                 Text("包含 Swift 兼容路径的历史请求，不与 DSH 明细合并，也无法按 Bot、模型或日期拆分。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            }
-
-            if !botUsage.isEmpty {
-                Section("按 Bot") {
-                    ForEach(botUsage) { item in
-                        LabeledContent(item.title, value: "\(item.totals.totalTokens.formatted()) Tokens · \(item.totals.calls.formatted()) 次")
-                    }
-                }
-            }
-
-            if !modelUsage.isEmpty {
-                Section("按模型") {
-                    ForEach(modelUsage) { item in
-                        LabeledContent(item.title, value: "\(item.totals.totalTokens.formatted()) Tokens · \(item.totals.calls.formatted()) 次")
-                    }
-                }
-            }
-
-            if !dailyUsage.isEmpty {
-                Section("最近 7 天") {
-                    if dailyUsage.contains(where: { $0.totals.totalTokens > 0 }) {
-                        Chart(dailyUsage.reversed()) { item in
-                            BarMark(
-                                x: .value("日期", item.title),
-                                y: .value("Tokens", item.totals.totalTokens)
-                            )
-                            .foregroundStyle(DSTheme.brand.gradient)
-                            .cornerRadius(4)
-                        }
-                        .frame(height: 150)
-                        .padding(.vertical, 6)
-                    }
-                    ForEach(dailyUsage) { item in
-                        LabeledContent(item.title, value: "\(item.totals.totalTokens.formatted()) Tokens · \(item.totals.calls.formatted()) 次")
-                    }
-                }
             }
 
             Section("添加 Remote MCP 连接器") {

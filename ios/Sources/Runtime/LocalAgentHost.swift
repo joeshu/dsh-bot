@@ -49,13 +49,56 @@ public struct DSHPluginCatalogItem: Identifiable, Decodable, Equatable {
     public var id: String { "\(sourceId):\(name)" }
 }
 
+public struct DSHPluginComponent: Identifiable, Decodable, Equatable {
+    public let id: String
+    public let name: String
+    public let description: String
+    public let active: Bool
+
+    enum CodingKeys: String, CodingKey { case id, name, description, active }
+
+    public init(id: String, name: String, description: String = "", active: Bool = false) {
+        self.id = id
+        self.name = name
+        self.description = description
+        self.active = active
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? id
+        description = try c.decodeIfPresent(String.self, forKey: .description) ?? ""
+        active = try c.decodeIfPresent(Bool.self, forKey: .active) ?? false
+    }
+}
+
 public struct DSHInstalledPlugin: Identifiable, Decodable, Equatable {
     public let name: String
     public let version: String
     public let enabled: Bool
     public let desiredEnabled: Bool
     public let compatibility: String
+    public let description: String
+    public let sourceLabel: String
+    public let components: [DSHPluginComponent]
     public var id: String { name }
+
+    enum CodingKeys: String, CodingKey {
+        case name, version, enabled, desiredEnabled, compatibility, description, sourceLabel, components
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        version = try c.decodeIfPresent(String.self, forKey: .version) ?? "0.0.0"
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        desiredEnabled = try c.decodeIfPresent(Bool.self, forKey: .desiredEnabled) ?? enabled
+        compatibility = try c.decodeIfPresent(String.self, forKey: .compatibility) ?? "unverified"
+        description = try c.decodeIfPresent(String.self, forKey: .description) ?? ""
+        sourceLabel = try c.decodeIfPresent(String.self, forKey: .sourceLabel) ?? "npm"
+        components = try c.decodeIfPresent([DSHPluginComponent].self, forKey: .components) ?? []
+    }
 
     var compatibilityLabel: String {
         switch compatibility {
@@ -98,12 +141,13 @@ public struct BotProfile: Identifiable, Codable, Equatable {
     public var isPrivate: Bool
     public var isGroup: Bool
     public var section: String
+    public var permissionMode: String // "ask" | "autoReview" | "readOnly"
 
     enum CodingKeys: String, CodingKey {
-        case id, name, roleLabel, model, systemPrompt, isMain, isPrivate, isGroup, section
+        case id, name, roleLabel, model, systemPrompt, isMain, isPrivate, isGroup, section, permissionMode
     }
 
-    public init(id: String, name: String, roleLabel: String, model: String = "deepseek-flash", systemPrompt: String = "", isMain: Bool = false, isPrivate: Bool = false, isGroup: Bool = false, section: String = "默认团队") {
+    public init(id: String, name: String, roleLabel: String, model: String = "deepseek-flash", systemPrompt: String = "", isMain: Bool = false, isPrivate: Bool = false, isGroup: Bool = false, section: String = "默认团队", permissionMode: String = "ask") {
         self.id = id
         self.name = name
         self.roleLabel = roleLabel
@@ -113,6 +157,7 @@ public struct BotProfile: Identifiable, Codable, Equatable {
         self.isPrivate = isPrivate
         self.isGroup = isGroup
         self.section = section
+        self.permissionMode = permissionMode
     }
 
     public init(from decoder: Decoder) throws {
@@ -126,6 +171,15 @@ public struct BotProfile: Identifiable, Codable, Equatable {
         isPrivate = try c.decodeIfPresent(Bool.self, forKey: .isPrivate) ?? false
         isGroup = try c.decodeIfPresent(Bool.self, forKey: .isGroup) ?? false
         section = try c.decodeIfPresent(String.self, forKey: .section) ?? "默认团队"
+        permissionMode = try c.decodeIfPresent(String.self, forKey: .permissionMode) ?? "ask"
+    }
+
+    public var permissionModeLabel: String {
+        switch permissionMode {
+        case "autoReview": return "自动审查"
+        case "readOnly": return "只读模式"
+        default: return "每次询问"
+        }
     }
 }
 
@@ -152,6 +206,16 @@ public final class LocalAgentHost: ObservableObject {
     @Published public var customTools = UserDefaults.standard.bool(forKey: "dsbot.customTools") {
         didSet { UserDefaults.standard.set(customTools, forKey: "dsbot.customTools") }
     }
+    @Published public var autoReviewEnabled = UserDefaults.standard.bool(forKey: "dsbot.exp.autoReviewEnabled") {
+        didSet { UserDefaults.standard.set(autoReviewEnabled, forKey: "dsbot.exp.autoReviewEnabled") }
+    }
+    @Published public var sessionDiagnosticsEnabled = UserDefaults.standard.bool(forKey: "dsbot.exp.sessionDiagnosticsEnabled") {
+        didSet { UserDefaults.standard.set(sessionDiagnosticsEnabled, forKey: "dsbot.exp.sessionDiagnosticsEnabled") }
+    }
+    @Published public var collapseThinkingByDefault = UserDefaults.standard.bool(forKey: "dsbot.exp.collapseThinkingByDefault") {
+        didSet { UserDefaults.standard.set(collapseThinkingByDefault, forKey: "dsbot.exp.collapseThinkingByDefault") }
+    }
+    @Published public private(set) var autoReviewLog: [String] = []
 
     public let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
     public let buildNumber = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
@@ -305,11 +369,77 @@ public final class LocalAgentHost: ObservableObject {
         messagesBySession[sessionId] ?? []
     }
 
-    public func addBot(name: String, roleLabel: String, model: String, systemPrompt: String = "", isPrivate: Bool, isGroup: Bool) {
+    public func addBot(name: String, roleLabel: String, model: String, systemPrompt: String = "", isPrivate: Bool, isGroup: Bool, permissionMode: String = "ask") {
         let id = (isGroup ? "grp_" : "bot_") + String(UUID().uuidString.prefix(6)).lowercased()
-        let section = isPrivate ? "私密空间" : (isGroup ? "协作群聊" : "核心团队")
-        bots.append(BotProfile(id: id, name: name, roleLabel: roleLabel, model: model, systemPrompt: systemPrompt, isPrivate: isPrivate, isGroup: isGroup, section: section))
+        let effectiveGroup = isPrivate ? false : isGroup
+        let section = isPrivate ? "私密空间" : (effectiveGroup ? "协作群聊" : "核心团队")
+        bots.append(BotProfile(id: id, name: name, roleLabel: roleLabel, model: model, systemPrompt: systemPrompt, isPrivate: isPrivate, isGroup: effectiveGroup, section: section, permissionMode: permissionMode))
         persistWorkspace()
+    }
+
+    public func steerActiveTurn(sessionId: String, text: String, model: String) async {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if isStreaming {
+            await abortActiveTurn()
+            for _ in 0..<25 {
+                if !isStreaming { break }
+                try? await Task.sleep(nanoseconds: 80_000_000)
+            }
+        }
+        await sendMessage(sessionId: sessionId, text: "[插话引导] \(trimmed)", model: model)
+    }
+
+    public func importConversation(from url: URL) throws -> BotProfile {
+        let accessed = url.startAccessingSecurityScopedResource()
+        defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+        let data = try Data(contentsOf: url)
+        guard data.count <= 4 * 1024 * 1024 else {
+            throw NSError(domain: "DSBotImport", code: 1, userInfo: [NSLocalizedDescriptionKey: "导入文件超过 4 MB 限制。"])
+        }
+        let baseName = url.deletingPathExtension().lastPathComponent
+        var title = baseName.isEmpty ? "导入会话" : baseName
+        var parsed: [(role: String, content: String)] = []
+
+        if let json = try? JSONSerialization.jsonObject(with: data) {
+            if let dict = json as? [String: Any] {
+                if let t = dict["title"] as? String, !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    title = t
+                }
+                let rawMsgs = (dict["messages"] as? [[String: Any]]) ?? (dict["mapping"] as? [[String: Any]]) ?? []
+                for m in rawMsgs {
+                    let role = ((m["role"] as? String) ?? (m["author"] as? String) ?? "user").lowercased()
+                    let content = (m["content"] as? String) ?? (m["text"] as? String) ?? ""
+                    if !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        parsed.append((role.contains("assistant") || role.contains("bot") ? "assistant" : "user", content))
+                    }
+                }
+            } else if let arr = json as? [[String: Any]] {
+                for m in arr {
+                    let role = ((m["role"] as? String) ?? "user").lowercased()
+                    let content = (m["content"] as? String) ?? (m["text"] as? String) ?? ""
+                    if !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        parsed.append((role.contains("assistant") || role.contains("bot") ? "assistant" : "user", content))
+                    }
+                }
+            }
+        }
+
+        if parsed.isEmpty, let text = String(data: data, encoding: .utf8), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            parsed.append(("user", "以下为导入的外部对话记录（\(title)）：\n\n" + String(text.prefix(40_000))))
+        }
+        guard !parsed.isEmpty else {
+            throw NSError(domain: "DSBotImport", code: 2, userInfo: [NSLocalizedDescriptionKey: "未能在文件中识别到有效对话内容。"])
+        }
+
+        let id = "imp_" + String(UUID().uuidString.prefix(6)).lowercased()
+        let bot = BotProfile(id: id, name: String(title.prefix(24)), roleLabel: "导入会话 · \(parsed.count) 条消息", model: ModelProvider.defaultModel, section: "核心团队")
+        bots.append(bot)
+        let items = parsed.prefix(200).map { ChatMessageItem(sessionId: id, role: $0.role, content: $0.content) }
+        messagesBySession[id] = items
+        legacyMessagesBySession[id] = items
+        persistWorkspace()
+        return bot
     }
 
     public func sendMessage(sessionId: String, text: String, model: String) async {
@@ -352,12 +482,13 @@ public final class LocalAgentHost: ObservableObject {
         }
     }
 
-    public func updateBot(id: String, name: String, roleLabel: String, model: String, systemPrompt: String = "") {
+    public func updateBot(id: String, name: String, roleLabel: String, model: String, systemPrompt: String = "", permissionMode: String? = nil) {
         guard let idx = bots.firstIndex(where: { $0.id == id }) else { return }
         bots[idx].name = name
         bots[idx].roleLabel = roleLabel
         bots[idx].model = model
         bots[idx].systemPrompt = systemPrompt
+        if let permissionMode { bots[idx].permissionMode = permissionMode }
         persistWorkspace()
         DSHaptics.notify(.success)
     }
@@ -1085,6 +1216,27 @@ public final class LocalAgentHost: ObservableObject {
               let id = params["approvalId"] as? String,
               let tool = params["tool"] as? String,
               let summary = params["summary"] as? String else { return }
-        pendingApprovals.append(PendingApproval(id: id, sessionId: sessionId, turnId: turnId, tool: tool, summary: summary))
+
+        let botMode = bots.first(where: { $0.id == sessionId })?.permissionMode ?? "ask"
+        let lowerTool = tool.lowercased()
+        let isWriteOrMutate = lowerTool.contains("write") || lowerTool.contains("edit") || lowerTool.contains("delete") || lowerTool.contains("memory")
+        let isLowRiskReadOnly = lowerTool.contains("workspace_list") || lowerTool.contains("workspace_read") || lowerTool.contains("workspace_search") || lowerTool.contains("device_status") || lowerTool.contains("device.status")
+
+        let approval = PendingApproval(id: id, sessionId: sessionId, turnId: turnId, tool: tool, summary: summary)
+        pendingApprovals.append(approval)
+
+        if botMode == "readOnly" && isWriteOrMutate {
+            autoReviewLog.insert("[\(Date().formatted(date: .omitted, time: .shortened))] 只读拦截：\(tool)", at: 0)
+            if autoReviewLog.count > 40 { autoReviewLog = Array(autoReviewLog.prefix(40)) }
+            Task { await respondToApproval(id: id, approved: false) }
+            return
+        }
+
+        if (autoReviewEnabled || botMode == "autoReview") && isLowRiskReadOnly {
+            autoReviewLog.insert("[\(Date().formatted(date: .omitted, time: .shortened))] 自动放行：\(tool)", at: 0)
+            if autoReviewLog.count > 40 { autoReviewLog = Array(autoReviewLog.prefix(40)) }
+            Task { await respondToApproval(id: id, approved: true) }
+            return
+        }
     }
 }

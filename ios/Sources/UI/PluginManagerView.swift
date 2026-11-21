@@ -35,7 +35,7 @@ public struct PluginManagerView: View {
     public var body: some View {
         NavigationStack {
             Form {
-                Section("Web 工作台") {
+                Section("Web 工作台与连接器") {
                     NavigationLink {
                         DSHWebUIView(host: host)
                     } label: {
@@ -50,6 +50,22 @@ public struct PluginManagerView: View {
                         } icon: {
                             Image(systemName: "macwindow.on.rectangle")
                                 .foregroundStyle(DSTheme.brand)
+                        }
+                    }
+                    NavigationLink {
+                        ConnectorMarketplaceView(host: host)
+                    } label: {
+                        Label {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("连接器市场")
+                                    .font(.headline)
+                                Text("38 个标准 Remote MCP 服务（GitHub / Notion / DeepWiki / Exa 等）")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } icon: {
+                            Image(systemName: "puzzlepiece.extension.fill")
+                                .foregroundStyle(.indigo)
                         }
                     }
                 }
@@ -192,30 +208,50 @@ public struct PluginManagerView: View {
                     .listRowBackground(Color.clear)
             } else {
                 ForEach(host.installedPlugins) { plugin in
-                    VStack(alignment: .leading, spacing: 7) {
-                        Toggle(isOn: Binding(
-                            get: { host.installedPlugins.first(where: { $0.id == plugin.id })?.desiredEnabled ?? plugin.desiredEnabled },
-                            set: { value in Task { await host.setPluginEnabled(plugin, enabled: value) } }
-                        )) {
+                    NavigationLink {
+                        PluginDetailView(host: host, pluginId: plugin.id)
+                    } label: {
+                        HStack(spacing: 12) {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .fill(DSTheme.brand.opacity(0.12))
+                                    .frame(width: 38, height: 38)
+                                Image(systemName: "puzzlepiece.fill")
+                                    .foregroundStyle(DSTheme.brand)
+                            }
                             VStack(alignment: .leading, spacing: 3) {
-                                Text(plugin.name).font(.subheadline.weight(.semibold))
-                                if plugin.desiredEnabled && !plugin.enabled {
-                                    Text(host.isDSHRecoveryMode ? "恢复模式下未加载" : "等待生效")
-                                        .font(.caption)
+                                HStack(spacing: 6) {
+                                    Text(plugin.name).font(.subheadline.weight(.semibold))
+                                    Text("v\(plugin.version)")
+                                        .font(.caption2)
                                         .foregroundStyle(.secondary)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(Color(.tertiarySystemFill))
+                                        .clipShape(Capsule())
                                 }
-                                Text("版本 \(plugin.version) · \(plugin.compatibilityLabel)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                HStack(spacing: 6) {
+                                    Circle()
+                                        .fill(plugin.enabled ? DSTheme.success : Color.secondary)
+                                        .frame(width: 7, height: 7)
+                                    Text(plugin.enabled ? "运行中" : (plugin.desiredEnabled ? (host.isDSHRecoveryMode ? "恢复模式下未加载" : "等待生效") : "已停用"))
+                                        .font(.caption)
+                                        .foregroundStyle(plugin.enabled ? DSTheme.success : .secondary)
+                                    if plugin.components.count > 1 {
+                                        Text("· \(plugin.components.count) 个组件")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
                             }
                         }
-                        .disabled(host.isDSHRecoveryMode && !plugin.desiredEnabled)
+                        .padding(.vertical, 3)
+                    }
+                    .swipeActions(edge: .trailing) {
                         Button("卸载", role: .destructive) {
                             pendingRemoval = plugin
                         }
-                        .font(.caption)
                     }
-                    .padding(.vertical, 3)
                 }
             }
             Button {
@@ -372,3 +408,129 @@ public struct PluginManagerView: View {
         }
     }
 }
+
+public struct PluginDetailView: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var host: LocalAgentHost
+    let pluginId: String
+    @State private var confirmUninstall = false
+
+    private var plugin: DSHInstalledPlugin? {
+        host.installedPlugins.first(where: { $0.id == pluginId })
+    }
+
+    public var body: some View {
+        Form {
+            if let plugin {
+                Section {
+                    HStack(spacing: 12) {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(Color(.tertiarySystemFill))
+                                .frame(width: 48, height: 48)
+                            Image(systemName: "puzzlepiece.extension")
+                                .font(.title2)
+                                .foregroundStyle(.primary)
+                        }
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(plugin.name).font(.headline)
+                            HStack(spacing: 6) {
+                                Text("v\(plugin.version)")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color(.tertiarySystemFill))
+                                    .clipShape(Capsule())
+                                Text(plugin.compatibilityLabel)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color(.tertiarySystemFill))
+                                    .clipShape(Capsule())
+                            }
+                        }
+                        Spacer()
+                        Toggle("", isOn: Binding(
+                            get: { plugin.desiredEnabled },
+                            set: { value in Task { await host.setPluginEnabled(plugin, enabled: value) } }
+                        ))
+                        .labelsHidden()
+                        .disabled(host.isDSHRecoveryMode && !plugin.desiredEnabled)
+                    }
+                    .padding(.vertical, 4)
+
+                    if !plugin.description.isEmpty {
+                        Text(plugin.description)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                let components = plugin.components.isEmpty
+                    ? [DSHPluginComponent(id: plugin.name, name: plugin.name, description: plugin.description, active: plugin.enabled)]
+                    : plugin.components
+                let runningCount = components.filter(\.active).count
+
+                Section {
+                    ForEach(components) { comp in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(comp.name)
+                                .font(.subheadline.weight(.semibold))
+                            if !comp.description.isEmpty && comp.description != "子模块 \(comp.name)" {
+                                Text(comp.description)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                            HStack(spacing: 5) {
+                                Circle()
+                                    .fill(comp.active ? DSTheme.success : Color.secondary)
+                                    .frame(width: 7, height: 7)
+                                Text(comp.active ? "运行中" : "已关闭")
+                                    .font(.caption)
+                                    .foregroundStyle(comp.active ? DSTheme.success : .secondary)
+                            }
+                        }
+                        .padding(.vertical, 3)
+                    }
+                } header: {
+                    Text("包含的组件")
+                } footer: {
+                    Text("共 \(components.count) 个 · \(runningCount) 运行中")
+                }
+
+                Section("高级") {
+                    LabeledContent("包名", value: plugin.name)
+                    LabeledContent("代码来源", value: plugin.sourceLabel)
+                    LabeledContent("当前版本", value: plugin.version)
+                    LabeledContent("兼容性", value: plugin.compatibilityLabel)
+                }
+
+                Section {
+                    Button("卸载此插件", role: .destructive) {
+                        confirmUninstall = true
+                    }
+                }
+            } else {
+                Text("该插件已卸载或不可用。")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .navigationTitle(plugin?.name ?? "插件详情")
+        .navigationBarTitleDisplayMode(.inline)
+        .confirmationDialog("确定卸载插件「\(plugin?.name ?? "")」？", isPresented: $confirmUninstall, titleVisibility: .visible) {
+            Button("卸载", role: .destructive) {
+                if let target = plugin {
+                    Task {
+                        await host.removePlugin(target)
+                        dismiss()
+                    }
+                }
+            }
+            Button("取消", role: .cancel) {}
+        }
+    }
+}
+

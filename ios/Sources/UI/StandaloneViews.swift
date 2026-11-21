@@ -380,6 +380,9 @@ public struct ChatView: View {
     @State private var showEditBot = false
     @State private var showMemory = false
     @State private var showFileImporter = false
+    @State private var showDiagnostics = false
+    @State private var showReferenceChatPicker = false
+    @State private var referencedBot: BotProfile?
     @State private var attachedFile: LocalAgentHost.AttachedWorkspaceFile?
     @StateObject private var speechInput = SpeechInputController()
     @State private var actionStatus = ""
@@ -395,6 +398,7 @@ public struct ChatView: View {
         self.searchResultMessageID = targetMessageID
         _pendingSearchMessageID = State(initialValue: targetMessageID)
         _selectedModel = State(initialValue: host.modelSelection(bot.model))
+        _expandStreamingReasoning = State(initialValue: !host.collapseThinkingByDefault)
     }
 
     private var liveBot: BotProfile {
@@ -432,6 +436,14 @@ public struct ChatView: View {
         .toolbar {
             if !isLocked {
                 ToolbarItemGroup(placement: .topBarTrailing) {
+                    if host.sessionDiagnosticsEnabled {
+                        Button {
+                            showDiagnostics = true
+                        } label: {
+                            Image(systemName: "waveform.path.ecg")
+                        }
+                        .help("会话数据诊断")
+                    }
                     Menu {
                         if host.usesOfficialModels || !host.models.isEmpty {
                             ModelSelectionView(host: host, model: $selectedModel, allowsTyping: false)
@@ -439,6 +451,7 @@ public struct ChatView: View {
                         Button("侧边对话 (/side)") { showSideChat = true }
                         if liveBot.isGroup { Button("群目标与待办") { showGroupWorkspace = true } }
                         if liveBot.isPrivate { Button("锁定私密会话") { lockPrivateConversation() } }
+                        Button("会话数据诊断") { showDiagnostics = true }
                         ShareLink(item: host.exportSessionMarkdown(sessionId: liveBot.id, botName: liveBot.name)) {
                             Label("导出会话为 Markdown", systemImage: "square.and.arrow.up")
                         }
@@ -466,6 +479,40 @@ public struct ChatView: View {
         }
         .sheet(isPresented: $showEditBot) {
             if !isLocked { EditBotSheet(bot: liveBot, host: host) }
+        }
+        .sheet(isPresented: $showDiagnostics) {
+            if !isLocked { SessionDiagnosticsSheet(host: host, bot: liveBot) }
+        }
+        .sheet(isPresented: $showReferenceChatPicker) {
+            NavigationStack {
+                List {
+                    let candidates = host.bots.filter { $0.id != liveBot.id && !$0.isPrivate }
+                    if candidates.isEmpty {
+                        Text("暂无可引用的其他会话").foregroundStyle(.secondary)
+                    } else {
+                        ForEach(candidates) { candidate in
+                            Button {
+                                referencedBot = candidate
+                                showReferenceChatPicker = false
+                            } label: {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(candidate.name).font(.subheadline.weight(.semibold))
+                                    Text("\(host.messages(for: candidate.id).count) 条消息 · \(candidate.roleLabel)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                }
+                .navigationTitle("引用历史对话")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("取消") { showReferenceChatPicker = false }
+                    }
+                }
+            }
         }
         .confirmationDialog("确定清空「\(liveBot.name)」的全部聊天记录？", isPresented: $showClearConfirm, titleVisibility: .visible) {
             Button("清空记录", role: .destructive) {
@@ -882,9 +929,31 @@ public struct ChatView: View {
                 .padding(.vertical, 6)
                 .background(DSTheme.surfaceSecondary.opacity(0.7))
             }
+            if let ref = referencedBot {
+                HStack(spacing: 8) {
+                    Image(systemName: "quote.bubble.fill")
+                        .font(.caption)
+                        .foregroundColor(.indigo)
+                    Text("引用会话：\(ref.name)")
+                        .font(.caption)
+                        .lineLimit(1)
+                    Spacer()
+                    Button {
+                        referencedBot = nil
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 6)
+                .background(Color.indigo.opacity(0.08))
+            }
             HStack(spacing: 8) {
                 Menu {
                     Button { showFileImporter = true } label: { Label("附加文件到工作区", systemImage: "paperclip") }
+                    Button { showReferenceChatPicker = true } label: { Label("引用历史对话作为上下文", systemImage: "quote.bubble") }
                     Button { showSideChat = true } label: { Label("/side 侧边对话", systemImage: "bubble.left.and.exclamationmark.bubble.right") }
                     if liveBot.isGroup { Button { showGroupWorkspace = true } label: { Label("/goal 群目标与待办", systemImage: "target") } }
                     Button { showClearConfirm = true } label: { Label("/clear 清空当前会话", systemImage: "trash") }
@@ -901,7 +970,7 @@ public struct ChatView: View {
                         .foregroundColor(.secondary)
                 }
 
-                TextField("给 \(liveBot.name) 发消息（支持 /side、/goal）…", text: $input, axis: .vertical)
+                TextField(host.isStreaming && host.streamingSessionId == bot.id ? "输入插话引导内容（Steer）…" : "给 \(liveBot.name) 发消息（支持 /side、/goal）…", text: $input, axis: .vertical)
                     .lineLimit(1...4)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
@@ -923,6 +992,19 @@ public struct ChatView: View {
                 .disabled(host.isStreaming)
 
                 if host.isStreaming && host.streamingSessionId == bot.id {
+                    let steerText = input.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !steerText.isEmpty {
+                        Button {
+                            let toSend = steerText
+                            input = ""
+                            Task { await host.steerActiveTurn(sessionId: bot.id, text: toSend, model: selectedModel) }
+                        } label: {
+                            Image(systemName: "arrow.triangle.turn.up.right.circle.fill")
+                                .font(.title2)
+                                .foregroundColor(.orange)
+                        }
+                        .help("插话引导（Steer）")
+                    }
                     Button {
                         Task { await host.abortActiveTurn() }
                     } label: {
@@ -950,11 +1032,21 @@ public struct ChatView: View {
                             showClearConfirm = true
                             return
                         }
-                        let prefix = attachedFile?.promptPrefix() ?? ""
+                        var refPrefix = ""
+                        if let ref = referencedBot {
+                            let snippet = host.messages(for: ref.id).suffix(6).map { msg in
+                                "\(msg.role == "user" ? "用户" : ref.name): \(String(msg.content.prefix(600)))"
+                            }.joined(separator: "\n")
+                            if !snippet.isEmpty {
+                                refPrefix = "[引用历史会话「\(ref.name)」]\n\(snippet)\n\n"
+                            }
+                        }
+                        let prefix = refPrefix + (attachedFile?.promptPrefix() ?? "")
                         let body = text.isEmpty ? "请查看我刚附加的工作区文件。" : text
                         let payload = prefix + body
                         input = ""
                         attachedFile = nil
+                        referencedBot = nil
                         Task { await host.sendMessage(sessionId: bot.id, text: payload, model: selectedModel) }
                     } label: {
                         Image(systemName: "arrow.up.circle.fill")
@@ -982,6 +1074,7 @@ private struct CreateBotSheet: View {
     @State private var systemPrompt = ""
     @State private var isPrivate = false
     @State private var isGroup = false
+    @State private var permissionMode = "ask"
 
     private static let presets: [(title: String, role: String, model: String, prompt: String)] = [
         ("代码架构师", "架构设计与代码审查", ModelProvider.thinkingModel, "你是资深软件架构师，先给出清晰结论，再提供可验证的代码与边界风险分析。"),
@@ -1021,10 +1114,15 @@ private struct CreateBotSheet: View {
                     TextEditor(text: $systemPrompt)
                         .frame(minHeight: 72)
                 }
-                Section("形态与隔离") {
+                Section("权限预设与隔离") {
+                    Picker("工具审批策略", selection: $permissionMode) {
+                        Text("每次询问").tag("ask")
+                        Text("自动审查").tag("autoReview")
+                        Text("只读模式").tag("readOnly")
+                    }
                     Toggle("创建群会话与待办", isOn: $isGroup)
                         .onChange(of: isGroup) { v in if v { isPrivate = false } }
-                    Toggle("锁定私密会话", isOn: $isPrivate)
+                    Toggle("锁定私密会话（独立隔离，禁止入群）", isOn: $isPrivate)
                         .onChange(of: isPrivate) { v in if v { isGroup = false } }
                 }
             }
@@ -1040,7 +1138,8 @@ private struct CreateBotSheet: View {
                             model: model,
                             systemPrompt: systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines),
                             isPrivate: isPrivate,
-                            isGroup: isGroup
+                            isGroup: isGroup,
+                            permissionMode: permissionMode
                         )
                         DSHaptics.notify(.success)
                         dismiss()
@@ -1183,7 +1282,22 @@ public struct AgentSettingsView: View {
                     }
                 }
 
-                Section("界面") {
+                Section("实验性与界面") {
+                    NavigationLink {
+                        ExperimentalFeaturesView(host: host)
+                    } label: {
+                        Label {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("实验性插件与能力")
+                                Text("自动授权审查、会话诊断统计、DeepSeek 会话导入等")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } icon: {
+                            Image(systemName: "flask.fill")
+                                .foregroundStyle(.indigo)
+                        }
+                    }
                     Toggle("消息气泡布局", isOn: $host.useBubbleLayout)
                 }
                 if !status.isEmpty { Section { Text(status).font(.caption) } }
@@ -1205,6 +1319,7 @@ private struct EditBotSheet: View {
     @State private var roleLabel: String
     @State private var model: String
     @State private var systemPrompt: String
+    @State private var permissionMode: String
 
     @MainActor
     init(bot: BotProfile, host: LocalAgentHost) {
@@ -1214,6 +1329,7 @@ private struct EditBotSheet: View {
         _roleLabel = State(initialValue: bot.roleLabel)
         _model = State(initialValue: host.modelSelection(bot.model))
         _systemPrompt = State(initialValue: bot.systemPrompt)
+        _permissionMode = State(initialValue: bot.permissionMode)
     }
 
     var body: some View {
@@ -1223,6 +1339,16 @@ private struct EditBotSheet: View {
                     TextField("名称", text: $name)
                     TextField("职责描述", text: $roleLabel)
                     ModelSelectionView(host: host, model: $model)
+                }
+                Section("权限预设") {
+                    Picker("工具审批策略", selection: $permissionMode) {
+                        Text("每次询问").tag("ask")
+                        Text("自动审查").tag("autoReview")
+                        Text("只读模式").tag("readOnly")
+                    }
+                    Text("自动审查会放行只读查询工具；只读模式会拦截写入/修改类工具。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
                 Section("系统提示词（人设与指令）") {
                     TextEditor(text: $systemPrompt)
@@ -1240,7 +1366,8 @@ private struct EditBotSheet: View {
                             name: name.trimmingCharacters(in: .whitespacesAndNewlines),
                             roleLabel: roleLabel.trimmingCharacters(in: .whitespacesAndNewlines),
                             model: model,
-                            systemPrompt: systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                            systemPrompt: systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines),
+                            permissionMode: permissionMode
                         )
                         dismiss()
                     }

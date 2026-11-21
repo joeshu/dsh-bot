@@ -451,13 +451,62 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
       binName: 'dsh', profileDir, installAnchor,
     })
     const embedded = await embeddedPackages()
+    const profilePkg = await readFile(join(profileDir, 'package.json'), 'utf8').then(JSON.parse).catch(() => ({}))
+    const profileDeps = profilePkg.dependencies || {}
     return Promise.all(dependencies.filter((item) => item.bundle && !embedded.has(item.name) && packageName(item.name))
       .map(async (item) => {
         const enabled = !safeMode && runtime.profile.layers.some(({ packageName }) => packageName === item.name)
-        const manifestPath = join(profileDir, 'node_modules', ...item.name.split('/'), 'package.json')
+        const pkgDir = join(profileDir, 'node_modules', ...item.name.split('/'))
+        const manifestPath = join(pkgDir, 'package.json')
         const manifest = await readFile(manifestPath, 'utf8').then(JSON.parse).catch(() => ({}))
+        const description = typeof manifest.description === 'string' ? manifest.description : ''
+        const depSpec = typeof profileDeps[item.name] === 'string' ? profileDeps[item.name] : ''
+        const repoUrl = typeof manifest.repository === 'string'
+          ? manifest.repository
+          : (typeof manifest.repository?.url === 'string' ? manifest.repository.url : '')
+        let sourceLabel = 'npm'
+        if (depSpec.startsWith('file:')) {
+          const ghMatch = repoUrl.match(/github\.com[/:]([^/]+\/[^/.]+)/i)
+          sourceLabel = ghMatch ? `github:${ghMatch[1]}` : '本地导入'
+        } else if (repoUrl.includes('github.com')) {
+          const ghMatch = repoUrl.match(/github\.com[/:]([^/]+\/[^/.]+)/i)
+          if (ghMatch) sourceLabel = `github:${ghMatch[1]}`
+        }
+
+        // Extract component submodules from manifest.exports or dsh.bundle.patch
+        const components = []
+        const seenComp = new Set()
+        if (manifest.exports && typeof manifest.exports === 'object' && !Array.isArray(manifest.exports)) {
+          for (const key of Object.keys(manifest.exports)) {
+            if (key === './package.json' || key.endsWith('.json')) continue
+            const compName = key === '.' ? item.name : `${item.name}/${key.replace(/^\.\//, '')}`
+            if (seenComp.has(compName)) continue
+            seenComp.add(compName)
+            components.push({
+              id: compName,
+              name: compName,
+              description: key === '.' ? description : `子模块 ${compName}`,
+              active: enabled,
+            })
+          }
+        }
+        if (components.length === 0) {
+          components.push({
+            id: item.name,
+            name: item.name,
+            description,
+            active: enabled,
+          })
+        }
+
         return {
-          name: item.name, version: item.version, enabled, desiredEnabled: item.enabled,
+          name: item.name,
+          version: item.version,
+          enabled,
+          desiredEnabled: item.enabled,
+          description,
+          sourceLabel,
+          components,
           compatibility: manifest.dsh?.client?.platform === 'web' ? 'web-ui' : (enabled ? 'verified' : 'unverified'),
         }
       }))
