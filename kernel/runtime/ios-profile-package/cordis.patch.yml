@@ -224,6 +224,9 @@
     - id: ui-file-actions
       name: '@deepseek-ai/dsh-client-ui-file-actions'
 
+    - id: ui-file-drag
+      name: '@deepseek-ai/dsh-client-ui-file-drag'
+
     - id: ui-theme
       name: '@deepseek-ai/dsh-client-ui-theme'
 

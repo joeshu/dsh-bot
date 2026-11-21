@@ -54,7 +54,7 @@ public struct DSHWebUIView: View {
                         await loadWebUIInfo()
                     }
                 } label: {
-                    Image(systemName: "arrow.triangle.2.circlepath")
+                    Image(systemName: "power")
                 }
                 .help("重启 DSH 引擎并刷新")
                 Button {
