@@ -47,9 +47,6 @@
     - id: ios-approval
       name: '@dsbot/dsh-ios-host/approval'
 
-    - id: ios-fs-search
-      name: '@dsbot/dsh-ios-host/fs-search'
-
     - id: ios-questions
       name: '@dsbot/dsh-ios-host/questions'
 
@@ -84,6 +81,9 @@
       name: '@deepseek-ai/dsh-working-directory'
       config:
         defaultDirectory: !!js process.env.DSH_HOME + '/files'
+
+    - id: ios-fs-search
+      name: '@dsbot/dsh-ios-host/fs-search'
 
     - id: ios-subagent
       name: '@deepseek-ai/dsh-subagent'
