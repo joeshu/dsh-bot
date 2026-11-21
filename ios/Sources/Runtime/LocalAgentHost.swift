@@ -23,6 +23,93 @@ public struct PendingApproval: Identifiable, Equatable {
     public let turnId: String
     public let tool: String
     public let summary: String
+    public let isDSH: Bool
+}
+
+public struct DSHQuestionOption: Identifiable, Equatable {
+    public let label: String
+    public let description: String
+    public var id: String { label }
+}
+
+public struct DSHQuestionItem: Identifiable, Equatable {
+    public let id: String
+    public let question: String
+    public let detail: String
+    public let header: String
+    public let multiSelect: Bool
+    public let options: [DSHQuestionOption]
+}
+
+public struct PendingDSHQuestion: Identifiable, Equatable {
+    public let id: String
+    public let sessionId: String
+    public let turnId: String
+    public let questions: [DSHQuestionItem]
+}
+
+public struct DSHAgentPresetOption: Identifiable, Equatable {
+    public let id: String
+    public let name: String
+    public let description: String
+    public let broken: String?
+
+    public var isAvailable: Bool { broken == nil }
+}
+
+public struct DSHToolActivity: Identifiable, Equatable {
+    public let id: String
+    public let callId: String
+    public let sessionId: String
+    public let turnId: String
+    public let toolName: String
+    public var phase: String
+    public var arguments: String
+    public var result: String
+    public var fileSummary: String? = nil
+    public var timestamp: Date
+    public var sequence: Int?
+    public var callSequence: Int?
+
+    public var phaseLabel: String {
+        switch phase {
+        case "started": return "运行中"
+        case "completed": return "已完成"
+        case "failed": return "失败"
+        case "cancelled": return "已取消"
+        case "unknown": return "结果未知"
+        default: return phase
+        }
+    }
+}
+
+public struct DSHToolActivityHistoryPage: Equatable {
+    public let arguments: String
+    public let argumentsNext: Int
+    public let argumentsTotalBytes: Int
+    public let result: String
+    public let resultNext: Int
+    public let resultTotalBytes: Int
+    public let phase: String
+}
+
+public struct DSHApprovalAudit: Identifiable, Equatable {
+    public let id: String
+    public let sessionId: String
+    public var toolName: String
+    public var outcome: String
+    public var timestamp: Date
+    public var sequence: Int?
+
+    public var outcomeLabel: String {
+        switch outcome {
+        case "allowed-once": return "已批准"
+        case "rejected": return "已拒绝"
+        case "cancelled": return "已取消"
+        case "unavailable": return "审批不可用，已拒绝"
+        default: return "结果未知"
+        }
+    }
 }
 
 public struct DSHPluginSource: Identifiable, Decodable, Equatable {
@@ -57,6 +144,13 @@ public struct RedteamPluginStatus: Equatable {
     public var toolCount: Int = 0
     public var tools: [String] = []
     public var skillCount: Int = 0
+    public var rootPatchDisabled: Bool = true
+    public var hostEnabled: Bool = false
+    public var webWorkbenchSupported: Bool = false
+    public var compatibilityWarning: String = ""
+    public var webReadAllowed: Bool = false
+    public var webWriteAllowed: Bool = false
+    public var webSensitiveAllowed: Bool = false
 
     public init() {}
 
@@ -68,6 +162,14 @@ public struct RedteamPluginStatus: Equatable {
         toolCount = dict["toolCount"] as? Int ?? 0
         tools = dict["tools"] as? [String] ?? []
         skillCount = dict["skillCount"] as? Int ?? 0
+        rootPatchDisabled = dict["rootPatchDisabled"] as? Bool ?? true
+        hostEnabled = dict["hostEnabled"] as? Bool ?? false
+        webWorkbenchSupported = dict["webWorkbenchSupported"] as? Bool ?? false
+        compatibilityWarning = dict["compatibilityWarning"] as? String ?? ""
+        let webPermissions = dict["webPermissions"] as? [String: Any] ?? [:]
+        webReadAllowed = webPermissions["read"] as? Bool ?? false
+        webWriteAllowed = webPermissions["write"] as? Bool ?? false
+        webSensitiveAllowed = webPermissions["sensitive"] as? Bool ?? false
     }
 }
 
@@ -139,17 +241,20 @@ public struct ChatMessageItem: Identifiable, Codable, Equatable {
     public let content: String
     public let reasoning: String
     public let timestamp: Date
+    public var sequence: Int?
+    var historyPreview: Bool?
     var transcript: [ProviderMessage]?
     var providerProfile: String?
     var incomplete: Bool?
 
-    public init(id: String = UUID().uuidString, sessionId: String, role: String, content: String, reasoning: String = "", timestamp: Date = Date()) {
+    public init(id: String = UUID().uuidString, sessionId: String, role: String, content: String, reasoning: String = "", timestamp: Date = Date(), sequence: Int? = nil) {
         self.id = id
         self.sessionId = sessionId
         self.role = role
         self.content = content
         self.reasoning = reasoning
         self.timestamp = timestamp
+        self.sequence = sequence
     }
 }
 
@@ -164,12 +269,17 @@ public struct BotProfile: Identifiable, Codable, Equatable {
     public var isGroup: Bool
     public var section: String
     public var permissionMode: String // "ask" | "autoReview" | "readOnly"
+    public var agentPreset: String // "standard" | "cordis"
+    public var redteamToolsEnabled: Bool
+    public var redteamWriteEnabled: Bool
+    public var redteamSensitiveDataEnabled: Bool
 
     enum CodingKeys: String, CodingKey {
-        case id, name, roleLabel, model, systemPrompt, isMain, isPrivate, isGroup, section, permissionMode
+        case id, name, roleLabel, model, systemPrompt, isMain, isPrivate, isGroup, section, permissionMode, agentPreset
+        case redteamToolsEnabled, redteamWriteEnabled, redteamSensitiveDataEnabled
     }
 
-    public init(id: String, name: String, roleLabel: String, model: String = "deepseek-flash", systemPrompt: String = "", isMain: Bool = false, isPrivate: Bool = false, isGroup: Bool = false, section: String = "默认团队", permissionMode: String = "ask") {
+    public init(id: String, name: String, roleLabel: String, model: String = "deepseek-flash", systemPrompt: String = "", isMain: Bool = false, isPrivate: Bool = false, isGroup: Bool = false, section: String = "默认团队", permissionMode: String = "ask", agentPreset: String = "standard", redteamToolsEnabled: Bool = false, redteamWriteEnabled: Bool = false, redteamSensitiveDataEnabled: Bool = false) {
         self.id = id
         self.name = name
         self.roleLabel = roleLabel
@@ -180,6 +290,10 @@ public struct BotProfile: Identifiable, Codable, Equatable {
         self.isGroup = isGroup
         self.section = section
         self.permissionMode = permissionMode
+        self.agentPreset = agentPreset
+        self.redteamToolsEnabled = !isPrivate && redteamToolsEnabled
+        self.redteamWriteEnabled = !isPrivate && redteamToolsEnabled && redteamWriteEnabled
+        self.redteamSensitiveDataEnabled = !isPrivate && redteamToolsEnabled && redteamSensitiveDataEnabled
     }
 
     public init(from decoder: Decoder) throws {
@@ -194,6 +308,13 @@ public struct BotProfile: Identifiable, Codable, Equatable {
         isGroup = try c.decodeIfPresent(Bool.self, forKey: .isGroup) ?? false
         section = try c.decodeIfPresent(String.self, forKey: .section) ?? "默认团队"
         permissionMode = try c.decodeIfPresent(String.self, forKey: .permissionMode) ?? "ask"
+        agentPreset = try c.decodeIfPresent(String.self, forKey: .agentPreset) ?? "standard"
+        let storedRedteamToolsEnabled = try c.decodeIfPresent(Bool.self, forKey: .redteamToolsEnabled) ?? false
+        let storedRedteamWriteEnabled = try c.decodeIfPresent(Bool.self, forKey: .redteamWriteEnabled) ?? false
+        let storedRedteamSensitiveDataEnabled = try c.decodeIfPresent(Bool.self, forKey: .redteamSensitiveDataEnabled) ?? false
+        redteamToolsEnabled = !isPrivate && storedRedteamToolsEnabled
+        redteamWriteEnabled = !isPrivate && redteamToolsEnabled && storedRedteamWriteEnabled
+        redteamSensitiveDataEnabled = !isPrivate && redteamToolsEnabled && storedRedteamSensitiveDataEnabled
     }
 
     public var permissionModeLabel: String {
@@ -201,6 +322,16 @@ public struct BotProfile: Identifiable, Codable, Equatable {
         case "autoReview": return "自动审查"
         case "readOnly": return "只读模式"
         default: return "每次询问"
+        }
+    }
+
+    public var agentPresetLabel: String {
+        switch agentPreset {
+        case "cordis": return "创造模式"
+        case "ptc-python": return "PTC 开发模式"
+        case "minimal": return "轻量模式"
+        case "standard": return "标准模式"
+        default: return agentPreset
         }
     }
 }
@@ -216,6 +347,7 @@ public final class LocalAgentHost: ObservableObject {
         BotProfile(id: "private_vault", name: "私密助理", roleLabel: "私密会话 · 设备解锁", model: ModelProvider.defaultModel, isPrivate: true, section: "私密空间")
     ]
 
+    @Published public private(set) var runtimeGeneration = UUID()
     @Published public private(set) var state: LocalAgentState = .idle
     @Published public private(set) var workspaceError: String?
     @Published public private(set) var models: [String] = []
@@ -239,6 +371,15 @@ public final class LocalAgentHost: ObservableObject {
     }
     @Published public var redteamModeEnabled = UserDefaults.standard.bool(forKey: "dsbot.redteamModeEnabled") {
         didSet { UserDefaults.standard.set(redteamModeEnabled, forKey: "dsbot.redteamModeEnabled") }
+    }
+    @Published public var redteamWebReadEnabled = UserDefaults.standard.bool(forKey: "dsbot.redteamWebReadEnabled") {
+        didSet { UserDefaults.standard.set(redteamWebReadEnabled, forKey: "dsbot.redteamWebReadEnabled") }
+    }
+    @Published public var redteamWebWriteEnabled = UserDefaults.standard.bool(forKey: "dsbot.redteamWebWriteEnabled") {
+        didSet { UserDefaults.standard.set(redteamWebWriteEnabled, forKey: "dsbot.redteamWebWriteEnabled") }
+    }
+    @Published public var redteamWebSensitiveEnabled = UserDefaults.standard.bool(forKey: "dsbot.redteamWebSensitiveEnabled") {
+        didSet { UserDefaults.standard.set(redteamWebSensitiveEnabled, forKey: "dsbot.redteamWebSensitiveEnabled") }
     }
     @Published public var smartActionCardsEnabled: Bool = {
         UserDefaults.standard.object(forKey: "dsbot.exp.smartActionCardsEnabled") as? Bool ?? true
@@ -266,6 +407,7 @@ public final class LocalAgentHost: ObservableObject {
     @Published public var webSearchSendOriginalQuestion = UserDefaults.standard.bool(forKey: "dsbot.cfg.webSearchSendOriginalQuestion") {
         didSet { UserDefaults.standard.set(webSearchSendOriginalQuestion, forKey: "dsbot.cfg.webSearchSendOriginalQuestion") }
     }
+    private var effectiveWebSearchSendOriginalQuestion = false
     @Published public private(set) var redteamStatus = RedteamPluginStatus()
     @Published public private(set) var autoReviewLog: [String] = []
 
@@ -273,6 +415,14 @@ public final class LocalAgentHost: ObservableObject {
     public let buildNumber = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
     @Published public var bots: [BotProfile] = []
     @Published public private(set) var messagesBySession: [String: [ChatMessageItem]] = [:]
+    @Published private var persistedSessionIDs: Set<String> = []
+    @Published private var historyCursors: [String: Int] = [:]
+    private var persistedSessionActivityByID: [String: Date] = [:]
+    private var persistedSessionPreviewByID: [String: String] = [:]
+    private var refreshingSessionSummaries = false
+    private var loadedHistoryIDs: Set<String> = []
+    @Published public private(set) var loadingHistoryIDs: Set<String> = []
+    private var historyEpochs: [String: UUID] = [:]
     private var legacyMessagesBySession: [String: [ChatMessageItem]] = [:]
     @Published public private(set) var streamingSessionId: String?
     @Published public private(set) var streamingReasoning: String = ""
@@ -283,6 +433,16 @@ public final class LocalAgentHost: ObservableObject {
     @Published public private(set) var lastErrorSessionId: String?
     @Published public private(set) var lastCancelledSessionId: String?
     @Published public private(set) var pendingApprovals: [PendingApproval] = []
+    @Published public private(set) var pendingDSHQuestions: [PendingDSHQuestion] = []
+    @Published public private(set) var dshToolActivities: [DSHToolActivity] = []
+    @Published public private(set) var dshApprovalAudits: [DSHApprovalAudit] = []
+    @Published public private(set) var dshAgentPresets: [DSHAgentPresetOption] = [
+        DSHAgentPresetOption(id: "standard", name: "标准模式", description: "DSH 标准编码工具集。", broken: nil),
+        DSHAgentPresetOption(id: "cordis", name: "创造模式", description: "面向 DSH / Cordis 扩展的工具集。", broken: nil),
+        DSHAgentPresetOption(id: "ptc-python", name: "PTC 开发模式", description: "使用本机 Python/NumPy 编排 DSH 工具。", broken: nil),
+        DSHAgentPresetOption(id: "minimal", name: "轻量模式", description: "只读文件与轻量对话。", broken: nil),
+    ]
+    @Published public private(set) var defaultAgentPreset = "standard"
     @Published public private(set) var pluginSources: [DSHPluginSource] = []
     @Published public private(set) var pluginCatalog: [DSHPluginCatalogItem] = []
     @Published public private(set) var installedPlugins: [DSHInstalledPlugin] = []
@@ -320,9 +480,21 @@ public final class LocalAgentHost: ObservableObject {
 
     public func restartRuntime() async -> String {
         guard let channel else { return "DSH 运行时尚未连接。" }
+        runtimeRestartInProgress = true
+        defer { runtimeRestartInProgress = false }
+        effectiveWebSearchSendOriginalQuestion = false
         do {
             let result = try await channel.request("runtime.restart", timeoutSeconds: 115)
             await refreshPluginState(on: channel)
+            if result["safeMode"] as? Bool == true {
+                return "DSH 已进入恢复模式，第三方插件未加载。"
+            }
+            do {
+                try await syncLiveRuntimeConfig(on: channel)
+            } catch {
+                workspaceError = "DSH 已重启，但运行时设置同步失败：\(error.localizedDescription)"
+                return "DSH 已重启；运行时设置同步失败，请重新保存设置。"
+            }
             if result["rolledBack"] as? Bool == true {
                 return "DSH 已重启，但回滚了异常插件变更。"
             }
@@ -375,6 +547,7 @@ public final class LocalAgentHost: ObservableObject {
     private var runtimeStartupError: IPCFrameError?
     private var runtimeReadyContinuation: CheckedContinuation<Void, Error>?
     private var runtimeReadyTimeoutTask: Task<Void, Never>?
+    private var runtimeRestartInProgress = false
     private let migrateOfficialKey: Bool
     private let keychain: KeychainBridge
     private let workspaceCapabilities: LocalAgentTransport
@@ -421,12 +594,72 @@ public final class LocalAgentHost: ObservableObject {
         messagesBySession[sessionId] ?? []
     }
 
-    public func addBot(name: String, roleLabel: String, model: String, systemPrompt: String = "", isPrivate: Bool, isGroup: Bool, permissionMode: String = "ask") {
+    public func sessionActivityDate(for sessionId: String) -> Date? {
+        let stored = persistedSessionActivityByID[sessionId]
+        let loaded = messagesBySession[sessionId]?.last?.timestamp
+        switch (stored, loaded) {
+        case let (stored?, loaded?): return max(stored, loaded)
+        case let (stored?, nil): return stored
+        case let (nil, loaded?): return loaded
+        case (nil, nil): return nil
+        }
+    }
+
+    public func sessionPreview(for sessionId: String) -> String? {
+        guard bots.first(where: { $0.id == sessionId })?.isPrivate != true else { return nil }
+        let message = messagesBySession[sessionId]?.last
+        if let message,
+           let activity = persistedSessionActivityByID[sessionId], activity > message.timestamp,
+           let preview = persistedSessionPreviewByID[sessionId] {
+            return preview
+        }
+        if let message, !message.content.isEmpty {
+            return message.content
+        }
+        return persistedSessionPreviewByID[sessionId]
+    }
+
+    public func sortBySessionActivity(_ candidates: [BotProfile]) -> [BotProfile] {
+        let originalOrder = Dictionary(
+            candidates.enumerated().map { ($0.element.id, $0.offset) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        return candidates.sorted { left, right in
+            let leftDate = sessionActivityDate(for: left.id) ?? .distantPast
+            let rightDate = sessionActivityDate(for: right.id) ?? .distantPast
+            if leftDate != rightDate { return leftDate > rightDate }
+            return originalOrder[left.id, default: 0] < originalOrder[right.id, default: 0]
+        }
+    }
+
+    public var recentlyActiveBots: [BotProfile] {
+        sortBySessionActivity(bots)
+    }
+
+    func matchingImportedMessage(botId: String, query: String) -> ChatMessageItem? {
+        guard bots.contains(where: { $0.id == botId && !$0.isPrivate }) else { return nil }
+        return legacyMessagesBySession[botId]?.last { $0.content.localizedCaseInsensitiveContains(query) }
+    }
+
+    public func setAgentPreset(sessionId: String, presetId: String) {
+        guard dshAgentPresets.contains(where: { $0.id == presetId && $0.isAvailable }),
+              let index = bots.firstIndex(where: { $0.id == sessionId }) else { return }
+        guard messagesBySession[sessionId]?.isEmpty != false else {
+            pluginStatus = "DSH 模式在会话开始后固定；请新建 Bot 会话再切换模式。"
+            return
+        }
+        guard bots[index].agentPreset != presetId else { return }
+        bots[index].agentPreset = presetId
+        persistWorkspace()
+    }
+
+    public func addBot(name: String, roleLabel: String, model: String, systemPrompt: String = "", isPrivate: Bool, isGroup: Bool, permissionMode: String = "ask", agentPreset: String = "standard", redteamToolsEnabled: Bool = false, redteamWriteEnabled: Bool = false, redteamSensitiveDataEnabled: Bool = false) {
         let id = (isGroup ? "grp_" : "bot_") + String(UUID().uuidString.prefix(6)).lowercased()
         let effectiveGroup = isPrivate ? false : isGroup
         let section = isPrivate ? "私密空间" : (effectiveGroup ? "协作群聊" : "核心团队")
-        bots.append(BotProfile(id: id, name: name, roleLabel: roleLabel, model: model, systemPrompt: systemPrompt, isPrivate: isPrivate, isGroup: effectiveGroup, section: section, permissionMode: permissionMode))
+        bots.append(BotProfile(id: id, name: name, roleLabel: roleLabel, model: model, systemPrompt: systemPrompt, isPrivate: isPrivate, isGroup: effectiveGroup, section: section, permissionMode: permissionMode, agentPreset: agentPreset, redteamToolsEnabled: redteamToolsEnabled, redteamWriteEnabled: redteamWriteEnabled, redteamSensitiveDataEnabled: redteamSensitiveDataEnabled))
         persistWorkspace()
+        schedulePrivateSessionAccessSync()
     }
 
     public func steerActiveTurn(sessionId: String, text: String, model: String) async {
@@ -502,6 +735,11 @@ public final class LocalAgentHost: ObservableObject {
             lastStreamError = "消息超过 256 KB。"
             return
         }
+        if bots.first(where: { $0.id == sessionId })?.isPrivate == true,
+           !(await syncPrivateSessionAccess(on: channel)) {
+            lastStreamError = "私密会话 Web API 隔离尚未同步；请稍后重试。"
+            return
+        }
         lastCancelledSessionId = nil
         let turnId = UUID().uuidString
         messagesBySession[sessionId, default: []].append(ChatMessageItem(sessionId: sessionId, role: "user", content: trimmed))
@@ -525,8 +763,12 @@ public final class LocalAgentHost: ObservableObject {
             _ = try await channel.request("chat.send", params: [
                 "sessionId": sessionId, "turnId": turnId, "model": model, "apiBaseURL": apiBaseURL,
                 "systemPrompt": bot?.systemPrompt ?? "", "isGroup": bot?.isGroup ?? false,
+                "agentPreset": bot?.agentPreset ?? "standard", "permissionMode": bot?.permissionMode ?? "ask",
                 "subagentEnabled": subagentEnabled, "webSearchEnabled": webSearchEnabled,
-                "customTools": customTools, "redteamMode": redteamModeEnabled,
+                "customTools": customTools,
+                "redteamMode": bot?.redteamToolsEnabled ?? false,
+                "redteamWriteEnabled": bot?.redteamWriteEnabled ?? false,
+                "redteamSensitiveDataEnabled": bot?.redteamSensitiveDataEnabled ?? false,
                 "text": trimmed, "legacyHistory": legacyHistory
             ])
         } catch {
@@ -540,6 +782,13 @@ public final class LocalAgentHost: ObservableObject {
         guard let rpc = rpc() else { return }
         if let res = try? await rpc.request("redteam.status", timeoutSeconds: 15) {
             redteamStatus = RedteamPluginStatus(res)
+            if let synced = try? await rpc.request("redteam.setWebPermissions", params: [
+                "read": redteamWebReadEnabled,
+                "write": redteamWebWriteEnabled,
+                "sensitive": redteamWebSensitiveEnabled
+            ], timeoutSeconds: 15) {
+                redteamStatus = RedteamPluginStatus(synced)
+            }
             if redteamModeEnabled && redteamStatus.installed && !redteamStatus.redteamModeActive {
                 if let mounted = try? await rpc.request("redteam.setMode", params: ["enabled": true], timeoutSeconds: 30) {
                     redteamStatus = RedteamPluginStatus(mounted)
@@ -548,45 +797,178 @@ public final class LocalAgentHost: ObservableObject {
         }
     }
 
+    private func synchronizeRedteamHost(on rpc: IPCChannel) async {
+        do {
+            let permissions = try await rpc.request("redteam.setWebPermissions", params: [
+                "read": redteamWebReadEnabled,
+                "write": redteamWebWriteEnabled,
+                "sensitive": redteamWebSensitiveEnabled
+            ], timeoutSeconds: 15)
+            redteamStatus = RedteamPluginStatus(permissions)
+            if redteamModeEnabled {
+                let mounted = try await rpc.request("redteam.setMode", params: ["enabled": true], timeoutSeconds: 30)
+                redteamStatus = RedteamPluginStatus(mounted)
+            }
+        } catch {
+            pluginStatus = "同步 dsh-purge-safe iOS 权限失败：\(error.localizedDescription)"
+        }
+    }
+
     public func setRedteamMode(_ enabled: Bool) async {
+        let previous = redteamModeEnabled
         redteamModeEnabled = enabled
         guard let rpc = rpc() else { return }
         do {
             let res = try await rpc.request("redteam.setMode", params: ["enabled": enabled], timeoutSeconds: 30)
             redteamStatus = RedteamPluginStatus(res)
+            if let synced = try? await rpc.request("redteam.setWebPermissions", params: [
+                "read": redteamWebReadEnabled,
+                "write": redteamWebWriteEnabled,
+                "sensitive": redteamWebSensitiveEnabled
+            ], timeoutSeconds: 15) {
+                redteamStatus = RedteamPluginStatus(synced)
+            }
             pluginStatus = enabled
                 ? (redteamStatus.toolCount > 0 ? "红队演练模式已开启（已挂载 \(redteamStatus.toolCount) 个工具）" : "红队演练模式已开启")
                 : "红队演练模式已关闭"
         } catch {
+            redteamModeEnabled = previous
             pluginStatus = "切换红队模式失败：\(error.localizedDescription)"
         }
     }
 
-    public func applyLiveRuntimeConfig() async -> String {
-        guard let rpc = rpc() else { return "已保存到本地，等待 DSH 运行时就绪后生效。" }
+    public func setRedteamWebPermissions(readEnabled: Bool? = nil, writeEnabled: Bool? = nil, sensitiveEnabled: Bool? = nil) async {
+        let previous = (redteamWebReadEnabled, redteamWebWriteEnabled, redteamWebSensitiveEnabled)
+        if let readEnabled { redteamWebReadEnabled = readEnabled }
+        if let writeEnabled { redteamWebWriteEnabled = writeEnabled }
+        if let sensitiveEnabled { redteamWebSensitiveEnabled = sensitiveEnabled }
+        if !redteamWebReadEnabled {
+            redteamWebWriteEnabled = false
+            redteamWebSensitiveEnabled = false
+        }
+        guard let rpc = rpc() else { return }
         do {
-            _ = try await rpc.request("runtime.config.update", params: [
-                "subagentMaxDepth": subagentMaxDepth,
-                "subagentMaxActive": subagentMaxActive,
-                "subagentModelSelection": subagentModelSelection,
-                "webSearchCount": webSearchCount,
-                "webSearchSendOriginalQuestion": webSearchSendOriginalQuestion
+            let result = try await rpc.request("redteam.setWebPermissions", params: [
+                "read": redteamWebReadEnabled,
+                "write": redteamWebWriteEnabled,
+                "sensitive": redteamWebSensitiveEnabled
             ], timeoutSeconds: 15)
+            redteamStatus = RedteamPluginStatus(result)
+        } catch {
+            redteamWebReadEnabled = previous.0
+            redteamWebWriteEnabled = previous.1
+            redteamWebSensitiveEnabled = previous.2
+            pluginStatus = "更新 Web 演练台权限失败：\(error.localizedDescription)"
+        }
+    }
+
+    public func applyLiveRuntimeConfig() async -> String {
+        guard let channel else { return "已保存到本地，等待 DSH 运行时就绪后生效。" }
+        guard !isStreaming else { return "当前会话仍在运行，结束后再保存运行时设置。" }
+        effectiveWebSearchSendOriginalQuestion = false
+        do {
+            try await syncLiveRuntimeConfig(on: channel)
             return "已通过 Cordis 热更新生效（无需重启）。"
         } catch {
+            effectiveWebSearchSendOriginalQuestion = false
             return "已保存到本地，热更新失败：\(error.localizedDescription)"
         }
     }
 
-    public func updateBot(id: String, name: String, roleLabel: String, model: String, systemPrompt: String = "", permissionMode: String? = nil) {
+    private func syncLiveRuntimeConfig(on rpc: IPCChannel) async throws {
+        effectiveWebSearchSendOriginalQuestion = false
+        subagentMaxDepth = min(3, max(0, subagentMaxDepth))
+        subagentMaxActive = min(8, max(1, subagentMaxActive))
+        webSearchCount = min(20, max(1, webSearchCount))
+        let result = try await rpc.request("runtime.config.update", params: [
+            "subagentMaxDepth": subagentMaxDepth,
+            "subagentMaxActive": subagentMaxActive,
+            "subagentModelSelection": subagentModelSelection,
+            "webSearchCount": webSearchCount,
+            "webSearchSendOriginalQuestion": webSearchSendOriginalQuestion
+        ], timeoutSeconds: 30)
+        guard result["ok"] as? Bool == true,
+              let applied = result["config"] as? [String: Any] else {
+            throw IPCFrameError.remoteError(code: -32000, message: "DSH 未确认应用运行时设置。")
+        }
+        effectiveWebSearchSendOriginalQuestion = applied["webSearchSendOriginalQuestion"] as? Bool ?? false
+        guard
+              applied["subagentMaxDepth"] as? Int == subagentMaxDepth,
+              applied["subagentMaxActive"] as? Int == subagentMaxActive,
+              applied["subagentModelSelection"] as? Bool == subagentModelSelection,
+              applied["webSearchCount"] as? Int == webSearchCount,
+              applied["webSearchSendOriginalQuestion"] as? Bool == webSearchSendOriginalQuestion else {
+            throw IPCFrameError.remoteError(code: -32000, message: "DSH 未确认应用全部运行时设置。")
+        }
+        workspaceError = nil
+    }
+
+    public func updateBot(id: String, name: String, roleLabel: String, model: String, systemPrompt: String = "", permissionMode: String? = nil, agentPreset: String? = nil, redteamToolsEnabled: Bool? = nil, redteamWriteEnabled: Bool? = nil, redteamSensitiveDataEnabled: Bool? = nil) {
         guard let idx = bots.firstIndex(where: { $0.id == id }) else { return }
         bots[idx].name = name
         bots[idx].roleLabel = roleLabel
         bots[idx].model = model
         bots[idx].systemPrompt = systemPrompt
         if let permissionMode { bots[idx].permissionMode = permissionMode }
+        if streamingSessionId == id,
+           (redteamToolsEnabled != nil || redteamWriteEnabled != nil || redteamSensitiveDataEnabled != nil) {
+            pluginStatus = "当前 Bot 正在执行；红队权限会在本轮完成后修改。"
+        } else {
+            if let redteamToolsEnabled {
+                bots[idx].redteamToolsEnabled = !bots[idx].isPrivate && redteamToolsEnabled
+                if !bots[idx].redteamToolsEnabled {
+                    bots[idx].redteamWriteEnabled = false
+                    bots[idx].redteamSensitiveDataEnabled = false
+                }
+            }
+            if let redteamWriteEnabled {
+                bots[idx].redteamWriteEnabled = !bots[idx].isPrivate && bots[idx].redteamToolsEnabled && redteamWriteEnabled
+            }
+            if let redteamSensitiveDataEnabled {
+                bots[idx].redteamSensitiveDataEnabled = !bots[idx].isPrivate && bots[idx].redteamToolsEnabled && redteamSensitiveDataEnabled
+            }
+        }
+        if let agentPreset, agentPreset != bots[idx].agentPreset {
+            if !dshAgentPresets.contains(where: { $0.id == agentPreset && $0.isAvailable }) {
+                pluginStatus = "所选 DSH 模式不可用；请刷新运行时模式列表后重试。"
+            } else if hasSessionHistory(id) {
+                pluginStatus = "DSH 模式在会话开始后固定；请新建 Bot 会话再切换模式。"
+            } else {
+                bots[idx].agentPreset = agentPreset
+            }
+        }
         persistWorkspace()
         DSHaptics.notify(.success)
+    }
+
+    public func setRedteamPermissions(sessionId: String, toolsEnabled: Bool? = nil, writeEnabled: Bool? = nil, sensitiveDataEnabled: Bool? = nil) {
+        guard let index = bots.firstIndex(where: { $0.id == sessionId }) else { return }
+        guard streamingSessionId != sessionId else {
+            pluginStatus = "当前 Bot 正在执行；红队权限会在本轮完成后修改。"
+            return
+        }
+        guard !bots[index].isPrivate else {
+            bots[index].redteamToolsEnabled = false
+            bots[index].redteamWriteEnabled = false
+            bots[index].redteamSensitiveDataEnabled = false
+            persistWorkspace()
+            pluginStatus = "私密会话禁止使用 dsh-purge-safe 红队工具。"
+            return
+        }
+        if let toolsEnabled {
+            bots[index].redteamToolsEnabled = toolsEnabled
+            if !toolsEnabled {
+                bots[index].redteamWriteEnabled = false
+                bots[index].redteamSensitiveDataEnabled = false
+            }
+        }
+        if let writeEnabled {
+            bots[index].redteamWriteEnabled = bots[index].redteamToolsEnabled && writeEnabled
+        }
+        if let sensitiveDataEnabled {
+            bots[index].redteamSensitiveDataEnabled = bots[index].redteamToolsEnabled && sensitiveDataEnabled
+        }
+        persistWorkspace()
     }
 
     public func regenerateLastReply(sessionId: String, model: String) async {
@@ -598,31 +980,27 @@ public final class LocalAgentHost: ObservableObject {
         await sendMessage(sessionId: sessionId, text: lastUser.content, model: model)
     }
 
-    public func exportSessionMarkdown(sessionId: String, botName: String) -> String {
+    public func exportSessionMarkdown(sessionId: String, botName: String) async throws -> String {
+        guard let rpc = rpc() else { throw IPCFrameError.channelClosed }
+        let payload = try await rpc.request("session.history.markdown", params: ["sessionId": sessionId], timeoutSeconds: 30)
+        guard let markdown = payload["markdown"] as? String else { throw IPCFrameError.invalidJSON }
         let formatter = ISO8601DateFormatter()
-        var lines: [String] = [
-            "# DS Bot 会话导出：\(botName)",
-            "",
-            "- 导出时间：\(formatter.string(from: Date()))",
-            "- 应用版本：\(appVersion)",
-            ""
-        ]
-        for msg in messages(for: sessionId) {
-            let speaker = msg.role == "user" ? "用户" : botName
-            lines.append("## \(speaker) (\(formatter.string(from: msg.timestamp)))")
-            lines.append("")
-            if !msg.reasoning.isEmpty {
-                lines.append("<details><summary>深度思考过程</summary>")
-                lines.append("")
-                lines.append(msg.reasoning)
-                lines.append("")
-                lines.append("</details>")
-                lines.append("")
-            }
-            lines.append(msg.content)
-            lines.append("")
+        let legacy = (legacyMessagesBySession[sessionId] ?? []).map { message in
+            let speaker = message.role == "user" ? "用户" : "助手"
+            return "## \(speaker) · \(formatter.string(from: message.timestamp))\n\n\(message.content)\n\n"
+        }.joined()
+        return "# DS Bot 会话导出：\(botName)\n\n" + legacy + markdown
+    }
+
+    func loadFullHistoryMessage(_ preview: ChatMessageItem) async throws -> (content: String, reasoning: String) {
+        guard let sequence = preview.sequence, let rpc = rpc() else { throw IPCFrameError.channelClosed }
+        let response = try await rpc.request("session.history.message", params: [
+            "sessionId": preview.sessionId, "sequence": sequence
+        ])
+        guard response["id"] as? String == preview.id, let content = response["content"] as? String else {
+            throw IPCFrameError.invalidJSON
         }
-        return lines.joined(separator: "\n")
+        return (content, response["reasoning"] as? String ?? "")
     }
 
     public struct AttachedWorkspaceFile: Equatable, Sendable {
@@ -727,10 +1105,21 @@ public final class LocalAgentHost: ObservableObject {
 
     public func deleteBot(id: String) {
         guard let target = bots.first(where: { $0.id == id }), !target.isMain else { return }
+        if target.isPrivate {
+            var privateTombstones = Set(UserDefaults.standard.stringArray(forKey: "dsbot.privateSessionTombstones") ?? [])
+            privateTombstones.insert(id)
+            UserDefaults.standard.set(privateTombstones.sorted(), forKey: "dsbot.privateSessionTombstones")
+        }
         bots.removeAll { $0.id == id }
-        messagesBySession.removeValue(forKey: id)
+        discardSessionHistoryCache(id)
+        persistedSessionIDs.remove(id)
+        persistedSessionActivityByID.removeValue(forKey: id)
+        persistedSessionPreviewByID.removeValue(forKey: id)
         legacyMessagesBySession.removeValue(forKey: id)
-        Task { [weak self] in await self?.deleteDSHSession(id) }
+        Task { [weak self] in
+            await self?.syncPrivateSessionAccess()
+            await self?.deleteDSHSession(id)
+        }
         persistWorkspace()
         DSHaptics.impact(.medium)
     }
@@ -746,18 +1135,28 @@ public final class LocalAgentHost: ObservableObject {
         workspaceError = nil
         do {
             try loadPersistedWorkspace()
-            let transport = try NodeRuntimeTransport.prepare(apiBaseURL: apiBaseURL)
+            let privateIds = Self.privateSessionIDs(
+                bots: bots,
+                tombstones: UserDefaults.standard.stringArray(forKey: "dsbot.privateSessionTombstones") ?? []
+            )
+            let transport = try NodeRuntimeTransport.prepare(apiBaseURL: apiBaseURL, privateSessionIDs: privateIds)
             let rpc = IPCChannel(transport: transport)
             channel = rpc
             await rpc.onClose { [weak self] in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
+                    self.effectiveWebSearchSendOriginalQuestion = false
                     self.resolveRuntimeReadiness(.channelClosed)
                     guard self.state == .ready else { return }
                     if let turnId = self.activeTurnId, let sessionId = self.streamingSessionId {
-                        Task { await self.workspaceCapabilities.cancelNativeTool(botId: sessionId, turnId: turnId) }
+                        Task {
+                            await self.workspaceCapabilities.cancelNativeTool(botId: sessionId, turnId: turnId) { botId, turnId in
+                                _ = try? await rpc.request("python.cancel", params: ["botId": botId, "turnId": turnId], timeoutSeconds: 5)
+                            }
+                        }
                     }
                     self.pendingApprovals.removeAll()
+                    self.pendingDSHQuestions.removeAll()
                     let message = "内嵌 DSH 运行时已退出，请重新启动应用。"
                     if self.isStreaming {
                         self.lastStreamError = message
@@ -770,13 +1169,27 @@ public final class LocalAgentHost: ObservableObject {
             await registerRuntimeBridge(on: rpc)
             transport.launch()
             try await waitForRuntimeReady(timeoutSeconds: 60)
+            await syncPrivateSessionAccess(on: rpc)
             let readiness = try await rpc.request("agent.info", timeoutSeconds: 10)
             guard try EmbeddedRuntimeManifest.load().matches(readiness) else { throw IPCFrameError.invalidJSON }
             if let dsh = readiness["dshVersion"] as? String, let node = readiness["nodeVersion"] as? String {
                 embeddedRuntimeLabel = "DSH \(dsh) · Node \(node)"
             }
+            await loadDSHAgentPresets(on: rpc)
             await loadDSHSessions(on: rpc)
+            if readiness["safeMode"] as? Bool == true {
+                effectiveWebSearchSendOriginalQuestion = false
+            } else {
+                do {
+                    try await syncLiveRuntimeConfig(on: rpc)
+                    workspaceError = nil
+                } catch {
+                    effectiveWebSearchSendOriginalQuestion = false
+                    workspaceError = "DSH 运行时设置同步失败：\(error.localizedDescription)"
+                }
+            }
             await refreshPluginState(on: rpc)
+            await synchronizeRedteamHost(on: rpc)
             state = .ready
         } catch {
             resolveRuntimeReadiness(.remoteError(code: -32000, message: error.localizedDescription))
@@ -792,6 +1205,7 @@ public final class LocalAgentHost: ObservableObject {
         if activeTurnId != nil {
             sentCancellation = true
             pendingApprovals.removeAll()
+            pendingDSHQuestions.removeAll()
         }
         _ = try? await channel.request("agent.suspend")
     }
@@ -804,6 +1218,7 @@ public final class LocalAgentHost: ObservableObject {
         guard let turnId = activeTurnId, !sentCancellation else { return }
         sentCancellation = true
         pendingApprovals.removeAll { $0.turnId == turnId }
+        pendingDSHQuestions.removeAll { $0.turnId == turnId }
         do {
             let response = try await channel?.request("chat.abort", params: ["turnId": turnId])
             if response?["aborted"] as? Bool != true, activeTurnId == turnId { finishTurn() }
@@ -818,10 +1233,29 @@ public final class LocalAgentHost: ObservableObject {
     public func respondToApproval(id: String, approved: Bool) async {
         guard let approval = pendingApprovals.first(where: { $0.id == id }),
               approval.turnId == activeTurnId, !sentCancellation else { return }
-        pendingApprovals.removeAll { $0.id == id }
-        _ = try? await workspaceCapabilities.nativeWorkspaceRequest(method: "approval.respond", params: [
+        let params: [String: Any] = [
             "approvalId": id, "turnId": approval.turnId, "sessionId": approval.sessionId, "approved": approved
+        ]
+        let receipt: [String: Any]?
+        if approval.isDSH {
+            receipt = try? await channel?.request("approval.respond", params: params)
+        } else {
+            receipt = try? await workspaceCapabilities.nativeWorkspaceRequest(method: "approval.respond", params: params)
+        }
+        if receipt?["found"] as? Bool == true {
+            pendingApprovals.removeAll { $0.id == id }
+        }
+    }
+
+    public func respondToDSHQuestion(id: String, answers: [[String: Any]]) async {
+        guard let question = pendingDSHQuestions.first(where: { $0.id == id }),
+              question.turnId == activeTurnId, !sentCancellation else { return }
+        let receipt = try? await channel?.request("user-question.respond", params: [
+            "questionId": id, "turnId": question.turnId, "sessionId": question.sessionId, "answers": answers
         ])
+        if receipt?["found"] as? Bool == true {
+            pendingDSHQuestions.removeAll { $0.id == id }
+        }
     }
 
     public func rpc() -> HostRPC? {
@@ -979,9 +1413,21 @@ public final class LocalAgentHost: ObservableObject {
     private func pluginMutationStatus(_ outcome: [String: Any], on channel: IPCChannel, applied: String) async throws -> String {
         guard outcome["restartRequired"] as? Bool == true else { return applied }
         pluginStatus = "正在重启 DSH 引擎并检查插件。"
+        runtimeRestartInProgress = true
+        defer { runtimeRestartInProgress = false }
+        effectiveWebSearchSendOriginalQuestion = false
         let result = try await channel.request("runtime.restart", timeoutSeconds: 115)
+        if result["safeMode"] as? Bool == true {
+            await refreshPluginState(on: channel)
+            return "DSH 已进入恢复模式，第三方插件未加载。"
+        }
+        do {
+            try await syncLiveRuntimeConfig(on: channel)
+        } catch {
+            await refreshPluginState(on: channel)
+            return "插件已重启，但运行时设置同步失败：\(error.localizedDescription)"
+        }
         await refreshPluginState(on: channel)
-        if result["safeMode"] as? Bool == true { return "DSH 已进入恢复模式，第三方插件未加载。" }
         if result["rolledBack"] as? Bool == true { return "插件未能启动，已恢复上次可用配置。" }
         return applied
     }
@@ -1008,6 +1454,10 @@ public final class LocalAgentHost: ObservableObject {
             _ = try await channel.request("session.clear", params: ["sessionId": sessionId], timeoutSeconds: 60)
             messagesBySession[sessionId] = []
             legacyMessagesBySession[sessionId] = []
+            discardSessionHistoryCache(sessionId)
+            persistedSessionIDs.remove(sessionId)
+            persistedSessionActivityByID.removeValue(forKey: sessionId)
+            persistedSessionPreviewByID.removeValue(forKey: sessionId)
             lastStreamError = nil
             persistWorkspace()
         } catch {
@@ -1020,35 +1470,276 @@ public final class LocalAgentHost: ObservableObject {
         _ = try? await channel.request("session.clear", params: ["sessionId": sessionId], timeoutSeconds: 60)
     }
 
+    private func schedulePrivateSessionAccessSync() {
+        guard state == .ready, let rpc = channel else { return }
+        Task { [weak self] in _ = await self?.syncPrivateSessionAccess(on: rpc) }
+    }
+
+    private func syncPrivateSessionAccess() async {
+        guard let channel else { return }
+        _ = await syncPrivateSessionAccess(on: channel)
+    }
+
+    @discardableResult
+    private func syncPrivateSessionAccess(on rpc: IPCChannel) async -> Bool {
+        let tombstones = UserDefaults.standard.stringArray(forKey: "dsbot.privateSessionTombstones") ?? []
+        let ids = Self.privateSessionIDs(bots: bots, tombstones: tombstones)
+        do {
+            _ = try await rpc.request("session.private.update", params: ["botIds": ids], timeoutSeconds: 15)
+            return true
+        } catch {
+            workspaceError = "私密会话 Web API 隔离同步失败：\(error.localizedDescription)"
+            return false
+        }
+    }
+
+    private static func privateSessionIDs(bots: [BotProfile], tombstones: [String]) -> [String] {
+        Array(Set(bots.filter(\.isPrivate).map(\.id) + tombstones))
+            .filter { $0.range(of: "^[A-Za-z0-9_-]{1,80}$", options: .regularExpression) != nil }
+            .sorted()
+    }
+
     private func loadDSHSessions(on rpc: IPCChannel) async {
+        guard !refreshingSessionSummaries else { return }
+        refreshingSessionSummaries = true
+        defer { refreshingSessionSummaries = false }
+        let generation = runtimeGeneration
         do {
             let listing = try await rpc.request("session.list", timeoutSeconds: 30)
+            try Task.checkCancellation()
+            guard generation == runtimeGeneration else { return }
             let sessions = listing["sessions"] as? [[String: Any]] ?? []
-            messagesBySession = legacyMessagesBySession
-            for session in sessions {
-                guard let id = session["sessionId"] as? String,
-                      bots.contains(where: { $0.id == id }) else { continue }
-                let response = try await rpc.request("session.history", params: ["sessionId": id], timeoutSeconds: 30)
-                let records = response["messages"] as? [[String: Any]] ?? []
-                let persisted = records.compactMap { record -> ChatMessageItem? in
-                    guard let role = record["role"] as? String,
-                          let content = record["content"] as? String else { return nil }
-                    var message = ChatMessageItem(
-                        id: record["id"] as? String ?? UUID().uuidString,
-                        sessionId: id,
-                        role: role,
-                        content: content,
-                        reasoning: record["reasoning"] as? String ?? "",
-                        timestamp: Self.sessionDate(record["timestamp"])
-                    )
-                    message.incomplete = false
-                    return message
+            persistedSessionIDs = Set(sessions.compactMap { record in
+                guard (record["eventCount"] as? Int ?? 0) > 0 else { return nil }
+                return record["sessionId"] as? String
+            })
+            var activityByID: [String: Date] = [:]
+            var previewByID: [String: String] = [:]
+            for record in sessions {
+                guard let id = record["sessionId"] as? String else { continue }
+                if let milliseconds = record["lastActivityAt"] as? NSNumber {
+                    activityByID[id] = Date(timeIntervalSince1970: milliseconds.doubleValue / 1_000)
                 }
-                messagesBySession[id, default: []].append(contentsOf: persisted)
+                if let preview = record["lastMessagePreview"] as? String, !preview.isEmpty {
+                    previewByID[id] = preview
+                }
             }
-            persistWorkspace()
+            persistedSessionActivityByID = activityByID
+            persistedSessionPreviewByID = previewByID
+        } catch is CancellationError {
+            return
         } catch {
-            workspaceError = "读取 DSH 会话失败：\(error.localizedDescription)"
+            workspaceError = "读取 DSH 会话列表失败：\(error.localizedDescription)"
+        }
+    }
+
+    public func refreshSessionSummaries() async {
+        guard let rpc = rpc() else { return }
+        await loadDSHSessions(on: rpc)
+    }
+
+    public func hasSessionHistory(_ id: String) -> Bool {
+        persistedSessionIDs.contains(id) || messagesBySession[id]?.isEmpty == false
+    }
+
+    public func hasOlderHistory(_ id: String) -> Bool { historyCursors[id] != nil }
+
+    public func discardSessionHistoryCache(_ id: String) {
+        historyEpochs[id] = UUID()
+        loadedHistoryIDs.remove(id)
+        historyCursors[id] = nil
+        loadingHistoryIDs.remove(id)
+        messagesBySession[id] = nil
+        dshToolActivities.removeAll { $0.sessionId == id }
+        dshApprovalAudits.removeAll { $0.sessionId == id }
+    }
+
+    public func loadSessionHistory(_ id: String, older: Bool = false) async throws {
+        guard let rpc = rpc(), !loadingHistoryIDs.contains(id),
+              older ? historyCursors[id] != nil : !loadedHistoryIDs.contains(id) else { return }
+        let epoch = UUID()
+        let generation = runtimeGeneration
+        historyEpochs[id] = epoch
+        loadingHistoryIDs.insert(id)
+        defer {
+            if historyEpochs[id] == epoch { loadingHistoryIDs.remove(id) }
+        }
+        var request: [String: Any] = ["sessionId": id]
+        if older { request["beforeSeq"] = historyCursors[id] }
+        let response = try await rpc.request("session.history.page", params: request, timeoutSeconds: 15)
+        try Task.checkCancellation()
+        guard historyEpochs[id] == epoch, runtimeGeneration == generation else { return }
+        let persisted = Self.decodeHistoryMessages(response, sessionId: id)
+        let activities = (response["toolActivities"] as? [[String: Any]] ?? []).compactMap { record -> DSHToolActivity? in
+            guard let activityId = record["id"] as? String,
+                  let callId = record["callId"] as? String,
+                  let toolName = record["toolName"] as? String else { return nil }
+            return DSHToolActivity(
+                id: activityId,
+                callId: callId,
+                sessionId: id,
+                turnId: record["turnId"] as? String ?? "history",
+                toolName: toolName,
+                phase: record["phase"] as? String ?? "unknown",
+                arguments: record["arguments"] as? String ?? "",
+                result: record["result"] as? String ?? "",
+                fileSummary: record["fileSummary"] as? String,
+                timestamp: Self.sessionDate(record["timestamp"]),
+                sequence: record["sequence"] as? Int,
+                callSequence: record["callSequence"] as? Int
+            )
+        }
+        let approvals = (response["approvals"] as? [[String: Any]] ?? []).compactMap { record -> DSHApprovalAudit? in
+            guard let auditId = record["id"] as? String,
+                  let toolName = record["toolName"] as? String,
+                  let outcome = record["outcome"] as? String else { return nil }
+            return DSHApprovalAudit(
+                id: auditId,
+                sessionId: id,
+                toolName: toolName,
+                outcome: outcome,
+                timestamp: Self.sessionDate(record["timestamp"]),
+                sequence: record["sequence"] as? Int
+            )
+        }
+        let current = messagesBySession[id] ?? legacyMessagesBySession[id] ?? []
+        var known = Set(current.map(\.id))
+        var merged = current
+        for message in persisted where known.insert(message.id).inserted {
+            merged.append(message)
+        }
+        messagesBySession[id] = Self.sortSessionMessages(merged)
+        for activity in activities {
+            if let existingIndex = dshToolActivities.firstIndex(where: {
+                $0.sessionId == id && $0.callId == activity.callId
+            }) {
+                // Keep the richer live payload while adding the durable sequence
+                // needed to reopen its full history record after reconnect.
+                dshToolActivities[existingIndex].callSequence = activity.callSequence
+                if dshToolActivities[existingIndex].sequence == nil {
+                    dshToolActivities[existingIndex].sequence = activity.sequence
+                }
+            } else {
+                dshToolActivities.append(activity)
+            }
+        }
+        for audit in approvals {
+            if let existingIndex = dshApprovalAudits.firstIndex(where: {
+                $0.sessionId == id && $0.id == audit.id
+            }) {
+                dshApprovalAudits[existingIndex] = audit
+            } else {
+                dshApprovalAudits.append(audit)
+            }
+        }
+        historyCursors[id] = response["hasMore"] as? Bool == true ? response["nextBeforeSeq"] as? Int : nil
+        loadedHistoryIDs.insert(id)
+    }
+
+    func searchSessionContext(botId: String, sequence: Int) async throws -> [ChatMessageItem] {
+        guard bots.contains(where: { $0.id == botId && !$0.isPrivate }), let rpc = rpc() else {
+            throw IPCFrameError.channelClosed
+        }
+        let generation = runtimeGeneration
+        let response = try await rpc.request("session.search.context", params: ["sessionId": botId, "sequence": sequence])
+        try Task.checkCancellation()
+        guard generation == runtimeGeneration, bots.contains(where: { $0.id == botId && !$0.isPrivate }) else {
+            throw IPCFrameError.invalidJSON
+        }
+        return Self.decodeHistoryMessages(response, sessionId: botId)
+    }
+
+    func loadHistoryToolActivityPage(_ activity: DSHToolActivity, argumentsFrom: Int = 0,
+                                     resultFrom: Int = 0) async throws -> DSHToolActivityHistoryPage {
+        guard let sequence = activity.callSequence, let rpc = rpc() else { throw IPCFrameError.channelClosed }
+        let generation = runtimeGeneration
+        let response = try await rpc.request("session.history.tool", params: [
+            "sessionId": activity.sessionId, "sequence": sequence,
+            "argumentsFrom": argumentsFrom, "resultFrom": resultFrom, "pageBytes": 64 * 1024,
+        ], timeoutSeconds: 30)
+        try Task.checkCancellation()
+        guard generation == runtimeGeneration,
+              response["callId"] as? String == activity.callId,
+              let arguments = response["arguments"] as? String,
+              let argumentsNext = response["argumentsNext"] as? Int,
+              let argumentsTotalBytes = response["argumentsTotalBytes"] as? Int,
+              let result = response["result"] as? String,
+              let resultNext = response["resultNext"] as? Int,
+              let resultTotalBytes = response["resultTotalBytes"] as? Int,
+              let phase = response["phase"] as? String else {
+            throw IPCFrameError.invalidJSON
+        }
+        return DSHToolActivityHistoryPage(
+            arguments: arguments, argumentsNext: argumentsNext, argumentsTotalBytes: argumentsTotalBytes,
+            result: result, resultNext: resultNext, resultTotalBytes: resultTotalBytes, phase: phase
+        )
+    }
+
+    private static func decodeHistoryMessages(_ response: [String: Any], sessionId id: String) -> [ChatMessageItem] {
+        let records = response["messages"] as? [[String: Any]] ?? []
+        return records.compactMap { record -> ChatMessageItem? in
+            guard let role = record["role"] as? String,
+                  let content = record["content"] as? String else { return nil }
+            var message = ChatMessageItem(
+                id: record["id"] as? String ?? UUID().uuidString,
+                sessionId: id,
+                role: role,
+                content: content,
+                reasoning: record["reasoning"] as? String ?? "",
+                timestamp: Self.sessionDate(record["timestamp"]),
+                sequence: record["sequence"] as? Int
+            )
+            message.historyPreview = record["truncated"] as? Bool
+            message.incomplete = false
+            return message
+        }
+    }
+
+    private static func sortSessionMessages(_ messages: [ChatMessageItem]) -> [ChatMessageItem] {
+        messages.enumerated().sorted { left, right in
+            if left.element.timestamp != right.element.timestamp {
+                return left.element.timestamp < right.element.timestamp
+            }
+            if let leftSequence = left.element.sequence, let rightSequence = right.element.sequence,
+               leftSequence != rightSequence {
+                return leftSequence < rightSequence
+            }
+            if left.element.sequence != nil && right.element.sequence == nil { return false }
+            if left.element.sequence == nil && right.element.sequence != nil { return true }
+            return left.offset < right.offset
+        }.map(\.element)
+    }
+
+    private func loadDSHAgentPresets(on rpc: IPCChannel) async {
+        do {
+            let response = try await rpc.request("agent.presets.list", timeoutSeconds: 15)
+            let presets = (response["presets"] as? [[String: Any]] ?? []).compactMap { item -> DSHAgentPresetOption? in
+                guard let id = item["id"] as? String, !id.isEmpty else { return nil }
+                return DSHAgentPresetOption(
+                    id: id,
+                    name: item["name"] as? String ?? id,
+                    description: item["description"] as? String ?? "",
+                    broken: item["broken"] as? String
+                )
+            }
+            guard !presets.isEmpty else { return }
+            dshAgentPresets = presets
+            let requestedDefault = response["defaultId"] as? String ?? "standard"
+            defaultAgentPreset = presets.contains(where: { $0.id == requestedDefault && $0.isAvailable })
+                ? requestedDefault
+                : (presets.first(where: { $0.isAvailable })?.id ?? "standard")
+        } catch {
+            pluginStatus = "读取 DSH Agent 模式失败：\(error.localizedDescription)"
+        }
+    }
+
+    public func agentPresetName(_ id: String) -> String {
+        if let preset = dshAgentPresets.first(where: { $0.id == id }) { return preset.name }
+        switch id {
+        case "cordis": return "创造模式"
+        case "ptc-python": return "PTC 开发模式"
+        case "minimal": return "轻量模式"
+        default: return id == "standard" ? "标准模式" : id
         }
     }
 
@@ -1128,9 +1819,30 @@ public final class LocalAgentHost: ObservableObject {
                   plugins.contains("dsh-agent"),
                   plugins.contains("dsh-agent-loop"),
                   plugins.contains("dsh-session"),
-                  plugins.contains("dsbot-ios-sqlite-session-persistence") else { throw IPCFrameError.invalidJSON }
+                  (plugins.contains("@dsbot/dsh-ios-host/session-persistence")
+                   || plugins.contains("ios-session-persistence")
+                   || plugins.contains("dsbot-ios-sqlite-session-persistence")) else { throw IPCFrameError.invalidJSON }
+            let safeMode = params["safeMode"] as? Bool == true
+            let shouldResyncSettings = await MainActor.run {
+                self?.state == .ready && self?.runtimeRestartInProgress == false
+            }
+            if safeMode || shouldResyncSettings {
+                await MainActor.run { self?.effectiveWebSearchSendOriginalQuestion = false }
+            }
             await self?.updatePluginRecovery(params["safeMode"] as? Bool == true)
+            await MainActor.run { self?.runtimeGeneration = UUID() }
             await self?.resolveRuntimeReadiness()
+            if shouldResyncSettings && !safeMode {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    do {
+                        try await self.syncLiveRuntimeConfig(on: rpc)
+                    } catch {
+                        self.effectiveWebSearchSendOriginalQuestion = false
+                        self.workspaceError = "DSH 运行时已恢复，但设置同步失败：\(error.localizedDescription)"
+                    }
+                }
+            }
             return ["accepted": true]
         }
         await rpc.registerHandler(method: "credential.resolve") { [weak self] params in
@@ -1161,29 +1873,56 @@ public final class LocalAgentHost: ObservableObject {
         }
         await rpc.registerHandler(method: "native.tool.execute") { [weak self] params in
             guard let self, let name = params["name"] as? String else { throw IPCFrameError.invalidJSON }
+            var arguments = params["args"] as? [String: Any] ?? [:]
             if name == "web_search" {
                 guard self.webSearchEnabled, self.usesOfficialModels, !self.sentCancellation,
                       let turnId = params["turnId"] as? String, turnId == self.activeTurnId,
                       let botId = params["botId"] as? String, botId == self.streamingSessionId else {
                     throw IPCFrameError.remoteError(code: -32000, message: "当前会话不能发起网页搜索。")
                 }
+                arguments.removeValue(forKey: "originalQuestion")
+                if self.effectiveWebSearchSendOriginalQuestion {
+                    guard let originalQuestion = self.webSearchOriginalQuestionContext(sessionId: botId) else {
+                        throw IPCFrameError.remoteError(code: -32000, message: "无法展示将发送的原始问题上下文，已阻止网页搜索。")
+                    }
+                    arguments["originalQuestion"] = originalQuestion
+                }
             }
             return try await self.workspaceCapabilities.executeNativeTool(
                 name: name,
-                arguments: params["args"] as? [String: Any] ?? [:],
+                arguments: arguments,
                 botId: params["botId"] as? String ?? "main",
                 turnId: params["turnId"] as? String ?? "",
-                isGroup: params["isGroup"] as? Bool ?? false
+                isGroup: params["isGroup"] as? Bool ?? false,
+                pythonRunner: { code, botId, turnId in
+                    let result = try await rpc.request("python.execute", params: [
+                        "botId": botId, "turnId": turnId, "code": code,
+                    ], timeoutSeconds: 60)
+                    return result["output"] as? String ?? ""
+                }
             )
         }
         await rpc.registerHandler(method: "native.tool.cancel") { [weak self] params in
             guard let self else { throw IPCFrameError.channelClosed }
             await self.workspaceCapabilities.cancelNativeTool(
                 botId: params["botId"] as? String ?? "main",
-                turnId: params["turnId"] as? String ?? ""
+                turnId: params["turnId"] as? String ?? "",
+                pythonCanceller: { botId, turnId in
+                    _ = try? await rpc.request("python.cancel", params: ["botId": botId, "turnId": turnId], timeoutSeconds: 5)
+                }
             )
             return ["cancelled": true]
         }
+    }
+
+    private func webSearchOriginalQuestionContext(sessionId: String) -> String? {
+        guard let original = messagesBySession[sessionId]?.last(where: { $0.role == "user" })?.content else { return nil }
+        let normalized = original
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let scalars = Array(normalized.unicodeScalars.prefix(128))
+        let context = String(String.UnicodeScalarView(scalars))
+        return context.isEmpty ? nil : context
     }
 
     private func loadPersistedWorkspace() throws {
@@ -1244,6 +1983,16 @@ public final class LocalAgentHost: ObservableObject {
 
     private func finishTurn(_ params: [String: Any] = [:]) {
         flushPendingStreamBuffers()
+        if let sessionId = streamingSessionId, let turnId = activeTurnId {
+            for index in dshToolActivities.indices where dshToolActivities[index].sessionId == sessionId
+                && dshToolActivities[index].turnId == turnId && dshToolActivities[index].phase == "started" {
+                let wasAborted = params["status"] as? String == "aborted"
+                dshToolActivities[index].phase = wasAborted ? "cancelled" : "failed"
+                if dshToolActivities[index].result.isEmpty {
+                    dshToolActivities[index].result = wasAborted ? "会话已取消，工具执行已中止。" : "工具未返回完成结果。"
+                }
+            }
+        }
         if let sessionId = streamingSessionId, !streamingContent.isEmpty || !streamingReasoning.isEmpty {
             var item = ChatMessageItem(sessionId: sessionId, role: "assistant", content: streamingContent, reasoning: streamingReasoning)
             item.incomplete = params["status"] as? String != "completed"
@@ -1259,6 +2008,7 @@ public final class LocalAgentHost: ObservableObject {
         streamingContent = ""
         streamingSessionId = nil
         pendingApprovals.removeAll()
+        pendingDSHQuestions.removeAll()
         isStreaming = false
         activeTurnId = nil
     }
@@ -1276,7 +2026,24 @@ public final class LocalAgentHost: ObservableObject {
                 if method == "runtime.failed" {
                     let message = params["message"] as? String ?? "内嵌 DSH 运行时启动失败。"
                     self.resolveRuntimeReadiness(.remoteError(code: -32000, message: message))
+                    self.effectiveWebSearchSendOriginalQuestion = false
                     self.state = .failed(message)
+                    continue
+                }
+                if method.hasPrefix("approval.") {
+                    self.handleNativeApprovalNotification(method: method, params: params)
+                    continue
+                }
+                if method.hasPrefix("user-question.") {
+                    self.handleDSHQuestionNotification(method: method, params: params)
+                    continue
+                }
+                if method == "dsh.tool.event" {
+                    self.handleDSHToolNotification(params)
+                    continue
+                }
+                if method == "dsh.approval.event" {
+                    self.handleDSHApprovalAuditNotification(params)
                     continue
                 }
                 guard let turnId = params["turnId"] as? String, self.activeTurnId == turnId,
@@ -1315,10 +2082,10 @@ public final class LocalAgentHost: ObservableObject {
 
         let botMode = bots.first(where: { $0.id == sessionId })?.permissionMode ?? "ask"
         let lowerTool = tool.lowercased()
-        let isWriteOrMutate = lowerTool.contains("write") || lowerTool.contains("edit") || lowerTool.contains("delete") || lowerTool.contains("memory")
-        let isLowRiskReadOnly = lowerTool.contains("workspace_list") || lowerTool.contains("workspace_read") || lowerTool.contains("workspace_search") || lowerTool.contains("device_status") || lowerTool.contains("device.status") || lowerTool.contains("remote_mcp_list")
+        let isWriteOrMutate = lowerTool.contains("write") || lowerTool.contains("edit") || lowerTool.contains("patch") || lowerTool.contains("delete") || lowerTool.contains("memory")
+        let isLowRiskReadOnly = lowerTool.contains("workspace_list") || lowerTool.contains("workspace_read") || lowerTool.contains("workspace_search") || lowerTool == "read" || lowerTool == "grep" || lowerTool == "glob" || lowerTool.contains("device_status") || lowerTool.contains("device.status") || lowerTool.contains("remote_mcp_list")
 
-        let approval = PendingApproval(id: id, sessionId: sessionId, turnId: turnId, tool: tool, summary: summary)
+        let approval = PendingApproval(id: id, sessionId: sessionId, turnId: turnId, tool: tool, summary: summary, isDSH: params["source"] as? String == "dsh")
         pendingApprovals.append(approval)
 
         if botMode == "readOnly" && isWriteOrMutate {
@@ -1333,6 +2100,108 @@ public final class LocalAgentHost: ObservableObject {
             if autoReviewLog.count > 40 { autoReviewLog = Array(autoReviewLog.prefix(40)) }
             Task { await respondToApproval(id: id, approved: true) }
             return
+        }
+    }
+
+    private func handleDSHQuestionNotification(method: String, params: [String: Any]) {
+        if method == "user-question.closed" {
+            pendingDSHQuestions.removeAll { $0.id == params["questionId"] as? String }
+            return
+        }
+        guard method == "user-question.request",
+              !sentCancellation,
+              let turnId = params["turnId"] as? String, activeTurnId == turnId,
+              let sessionId = params["sessionId"] as? String, sessionId == streamingSessionId,
+              let questionId = params["questionId"] as? String,
+              let rawQuestions = params["questions"] as? [[String: Any]] else { return }
+        let questions = rawQuestions.compactMap { raw -> DSHQuestionItem? in
+            guard let id = raw["id"] as? String, let question = raw["question"] as? String else { return nil }
+            let options = (raw["options"] as? [[String: Any]] ?? []).compactMap { item -> DSHQuestionOption? in
+                guard let label = item["label"] as? String else { return nil }
+                return DSHQuestionOption(label: label, description: item["description"] as? String ?? "")
+            }
+            return DSHQuestionItem(
+                id: id,
+                question: question,
+                detail: raw["detail"] as? String ?? "",
+                header: raw["header"] as? String ?? "",
+                multiSelect: raw["multiSelect"] as? Bool ?? false,
+                options: options
+            )
+        }
+        guard !questions.isEmpty else { return }
+        pendingDSHQuestions.removeAll { $0.id == questionId }
+        pendingDSHQuestions.append(PendingDSHQuestion(id: questionId, sessionId: sessionId, turnId: turnId, questions: questions))
+    }
+
+    private func handleDSHToolNotification(_ params: [String: Any]) {
+        guard !sentCancellation,
+              let sessionId = params["sessionId"] as? String,
+              let turnId = params["turnId"] as? String,
+              activeTurnId == turnId, streamingSessionId == sessionId,
+              let callId = params["callId"] as? String, !callId.isEmpty else { return }
+        let phase = params["phase"] as? String ?? "started"
+        let toolName = params["toolName"] as? String ?? "DSH tool"
+        if let index = dshToolActivities.firstIndex(where: {
+            $0.sessionId == sessionId && $0.callId == callId
+        }) {
+            dshToolActivities[index].phase = phase
+            if let arguments = params["arguments"] as? String { dshToolActivities[index].arguments = arguments }
+            if let result = params["result"] as? String { dshToolActivities[index].result = result }
+            if let fileSummary = params["fileSummary"] as? String { dshToolActivities[index].fileSummary = fileSummary }
+            if let timestamp = params["timestamp"] { dshToolActivities[index].timestamp = Self.sessionDate(timestamp) }
+            if let sequence = params["sequence"] as? Int { dshToolActivities[index].sequence = sequence }
+            if let callSequence = params["callSequence"] as? Int { dshToolActivities[index].callSequence = callSequence }
+            if phase == "started", let sequence = params["sequence"] as? Int {
+                dshToolActivities[index].callSequence = sequence
+            }
+        } else {
+            dshToolActivities.append(DSHToolActivity(
+                id: callId,
+                callId: callId,
+                sessionId: sessionId,
+                turnId: turnId,
+                toolName: toolName,
+                phase: phase,
+                arguments: params["arguments"] as? String ?? "",
+                result: params["result"] as? String ?? "",
+                fileSummary: params["fileSummary"] as? String,
+                timestamp: Self.sessionDate(params["timestamp"]),
+                sequence: params["sequence"] as? Int,
+                callSequence: params["callSequence"] as? Int ?? (phase == "started" ? params["sequence"] as? Int : nil)
+            ))
+        }
+        let sessionActivities = dshToolActivities.filter { $0.sessionId == sessionId }
+        if sessionActivities.count > 40 {
+            let removals = Set(sessionActivities.prefix(sessionActivities.count - 40).map(\.id))
+            dshToolActivities.removeAll { $0.sessionId == sessionId && removals.contains($0.id) }
+        }
+    }
+
+    private func handleDSHApprovalAuditNotification(_ params: [String: Any]) {
+        guard let sessionId = params["sessionId"] as? String,
+              sessionId == streamingSessionId,
+              let turnId = params["turnId"] as? String, turnId == activeTurnId,
+              let auditId = params["id"] as? String, !auditId.isEmpty,
+              let outcome = params["outcome"] as? String else { return }
+        let toolName = params["toolName"] as? String ?? "DSH 工具"
+        let timestamp = Self.sessionDate(params["timestamp"])
+        let sequence = params["sequence"] as? Int
+        if let index = dshApprovalAudits.firstIndex(where: { $0.sessionId == sessionId && $0.id == auditId }) {
+            dshApprovalAudits[index].toolName = toolName
+            dshApprovalAudits[index].outcome = outcome
+            dshApprovalAudits[index].timestamp = timestamp
+            dshApprovalAudits[index].sequence = sequence
+        } else {
+            dshApprovalAudits.append(DSHApprovalAudit(
+                id: auditId, sessionId: sessionId, toolName: toolName,
+                outcome: outcome, timestamp: timestamp, sequence: sequence
+            ))
+        }
+        let sessionAudits = dshApprovalAudits.filter { $0.sessionId == sessionId }
+        if sessionAudits.count > 100 {
+            let removals = Set(sessionAudits.prefix(sessionAudits.count - 100).map(\.id))
+            dshApprovalAudits.removeAll { $0.sessionId == sessionId && removals.contains($0.id) }
         }
     }
 }

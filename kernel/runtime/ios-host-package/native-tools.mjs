@@ -76,6 +76,7 @@ function apply(context) {
         const { runtime } = iosHost()
         const turn = runtime.activeTurns.get(exec.agent.session.id)
         if (!turn?.webSearchEnabled || turn.done) throw new Error('Web search is disabled for this turn')
+        if (!runtime.webSearchConfigSynced) throw new Error('Web search settings are not synchronized with the iOS host')
         const query = args.query.trim()
         if (!query || [...query].length > 300 || /[\x00-\x1f\x7f]/.test(query)) {
           throw new Error('Use a single search query of at most 300 characters')
@@ -85,7 +86,7 @@ function apply(context) {
         const approval = await bridge('web_search', { query }, exec)
         if (approval.output !== 'approved') throw new Error(approval.output || 'Web search was not approved')
         exec.signal?.throwIfAborted()
-        const result = await context.web.search({ query, llmProvider, maxResults: 5 }, exec.signal)
+        const result = await context.web.search({ query, llmProvider, maxResults: runtime.liveConfig?.webSearchCount ?? 5 }, exec.signal)
         const sources = result.sources.map((source) => ({
           url: source.url.slice(0, 2048),
           title: source.title?.slice(0, 250),

@@ -3,6 +3,7 @@
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,10 +22,19 @@ UPSTREAM_COMMIT = "9c2670d3bce5275e0d1610272958121af87787bb"
 IOS_PROFILE_BUNDLE = "@dsbot/dsh-ios-profile"
 PROFILE_BOOT_ENTRY = "vendor/dsh-profile-boot/lib/profile-boot.js"
 PROFILE_BOOT_IMPLEMENTATION = "vendor/dsh-profile-boot/lib/profile-boot-QhDEDXsF.js"
+PROFILE_PATCH = SOURCE / "ios-profile-package" / "cordis.patch.yml"
 
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def enabled_profile_plugins():
+    source = PROFILE_PATCH.read_text(encoding="utf-8")
+    names = re.findall(r"^\s+name:\s+['\"]?@deepseek-ai/(dsh-[A-Za-z0-9._-]+)['\"]?\s*$", source, re.MULTILINE)
+    if "dsh-web-app" not in names:
+        raise SystemExit("The iOS DSH profile must explicitly mount dsh-web-app")
+    return list(dict.fromkeys(names))
 
 
 def add_ios_platform_to_official_profile_loader(path):
@@ -66,7 +76,7 @@ def main():
     shutil.copytree(
         node_modules,
         DESTINATION / "node_modules",
-        ignore=shutil.ignore_patterns("*.map", ".DS_Store", "*.node", "*.dylib", "*.so", "*.dll", "*.exe", "*.wasm"),
+        ignore=shutil.ignore_patterns("*.map", ".DS_Store", "*.node", "*.dylib", "*.so", "*.dll", "*.exe", "*.wasm", "pyodide"),
     )
     vendor_source = SOURCE / "vendor" / "dsh-profile-boot"
     vendor_destination = DESTINATION / "vendor" / "dsh-profile-boot"
@@ -111,20 +121,46 @@ def main():
         "packageLockSha256": digest(lockfile),
         "packageManager": package.get("packageManager", f"npm (lockfile v{lock.get('lockfileVersion')})"),
         "topLevelPackages": package["dependencies"],
-        "enabledUpstreamPlugins": [
-            "dsh-session", "dsh-session-projection",
-            "dsh-llm", "dsh-llm-deepseek-api-key", "dsh-system-prompt", "dsh-tools",
-            "dsh-tool-executor-native", "dsh-agent", "dsh-agent-loop",
-            "dsh-web", "dsh-web-deepseek-api", "dsh-fs-local", "dsh-working-directory", "dsh-subagent",
-            "dsh-subagent-spawn-in-process", "dsh-tool-subagent",
-        ],
+        "enabledUpstreamPlugins": enabled_profile_plugins(),
+        "webUI": {
+            "server": "@deepseek-ai/dsh-host-webserver",
+            "application": "@deepseek-ai/dsh-web-app",
+            "frontend": "@deepseek-ai/dsh-web-frontend",
+            "embedding": "WKWebView over authenticated 127.0.0.1 ephemeral port",
+            "communityPluginPrefix": "dsh-client-ui-",
+        },
         "iosHostAdapters": [
             "official DSH profile-boot runProfile lifecycle",
             "DSH SQLite SessionPersistence backed by node:sqlite",
             "iOS Keychain credentials provider",
             "DSH native tools bridged to iOS capabilities",
             "iOS profile bundle source discovery, install, enable, disable, and remove",
+            "offline Pyodide Python and NumPy in a bounded, cancellable Worker",
+            "DSH PTC Python provider with full-source approval and bounded nested-tool bridge",
+            "DSH process-local Jobs registry with session-owned offline Python producer and native output controls",
         ],
+        "pythonRuntime": None,
+        "backgroundJobs": {
+            "registry": "@deepseek-ai/dsh-jobs-local@0.2.2-rc.5",
+            "controls": "@deepseek-ai/dsh-tool-jobs@0.2.2-rc.5",
+            "producer": "python_job_start",
+            "ownerScope": "one native non-private Bot session",
+            "maxConcurrentPerSession": 1,
+            "maxConcurrentPythonWorkers": 1,
+            "maxExecutionSeconds": 120,
+            "outputLimitBytes": 131072,
+            "retentionBytes": 262144,
+            "settledOutputRetentionBytes": 16384,
+            "completionDelivery": "wakeup",
+            "nativeCompletionDelivery": "defer-tool-jobs-to-next-user-turn",
+            "backgroundBehavior": "defer-native-followups-as-inbox-injections-while-suspended",
+            "processLocal": True,
+            "survivesHostRestart": False,
+            "runsWhileIOSAppSuspended": False,
+            "directHostFileAccess": False,
+            "networkAccess": False,
+            "processAccess": False,
+        },
         "nativePersistence": "node:sqlite DatabaseSync, WAL, synchronous=FULL",
         "pluginSources": {
             "indexFormat": 1,
@@ -134,12 +170,12 @@ def main():
             ],
             "installer": "exact NPM version, SHA-512 verified tarball, no lifecycle scripts",
             "dependencyPolicy": "all runtime and peer dependencies must already be available in the embedded iOS DSH graph",
-            "nativeAddonPolicy": "reject .node, .dylib, .so, .wasm, symlinks, and special files",
+            "nativeAddonPolicy": "reject .node, .dylib, .so, unpinned .wasm, symlinks, and special files; embed only the pinned Pyodide Python core WebAssembly asset",
         },
         "excludedCapabilities": [
-            "@deepseek-ai/dsh desktop umbrella package", "dsh-base", "dsh-web-app",
-            "dsh-web-frontend", "dsh-shell", "dsh-terminal", "dsh-cordis-client-runner",
-            "dsh-cordis-host-runner", "shell", "desktop", "browser automation",
+            "@deepseek-ai/dsh desktop umbrella package", "dsh-base",
+            "dsh-shell", "dsh-terminal", "dsh-experimental-terminal-bundle", "dsh-cua-bundle",
+            "shell", "desktop automation",
             "npm lifecycle scripts", "unbundled dependency installation",
         ],
         "releaseEligible": False,
@@ -167,6 +203,13 @@ def main():
         if isinstance(license_name, dict):
             license_name = license_name.get("type", "SEE PACKAGE LICENSE")
         notice_lines.append(f"- {package_name}@{metadata.get('version', version)} — {license_name}")
+    notice_lines.extend([
+        "",
+        "Embedded offline Python runtime assets under DSHRuntime/python-runtime:",
+        "- Pyodide 0.29.5 — MPL-2.0; https://github.com/pyodide/pyodide",
+        "- NumPy 2.2.5 WebAssembly wheel — BSD-3-Clause; https://numpy.org/",
+        "The full license texts and pinned runtime artifact digests are included in DSHRuntime/python-runtime.",
+    ])
     (DESTINATION / "THIRD-PARTY-NOTICES.txt").write_text("\n".join(notice_lines) + "\n", encoding="utf-8")
     print(f"Staged DSH {manifest['dshVersion']} with {len(package['dependencies'])} direct pinned packages ({DESTINATION})")
 

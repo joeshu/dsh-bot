@@ -13,11 +13,11 @@
 - boot.mjs 通过 runCli() 启动 dsh web 并附加 ios.patch.yml。该 overlay 禁用部分桌面进程/沙箱实现，插入 iOS subprocess、sandbox、host、native 插件；相关替代实现把 shell 命令转交 just-bash，把部分 Node 子进程转为 worker。
 - IPA 的最低系统版本为 iOS 17.0。
 
-## Fish Pocket 的采用与取舍
+## 对当前 iOS 宿主的采用与取舍
 
 这份样本证明了 NodeMobile、iOS 原生宿主和 DSH 插件组合可以落地，也给出了有价值的边界适配方式：原生桥接插件、插件版本 pin、变更后的重启提示，以及在 iOS 上替换桌面专属服务。
 
-Fish Pocket 的目标是 SwiftUI 原生客户端，不需要启动 DSH Web Server 或把桌面终端搬到手机。因此当前实现使用 DSH 0.2.2-rc.5 的官方 profile-boot 生命周期和独立 dsbot-ios profile，逐项挂载 session、agent、LLM、tools 与原生适配器。它不把 @deepseek-ai/dsh 总包、dsh-base、dsh-web-app、pnpm、Python、FFmpeg 或终端 bundle 当作运行基础。
+当前 iOS 宿主保留 SwiftUI 原生主界面，同时内嵌官方 DSH Web 工作台，以覆盖 DSH Web 和社区 `dsh-client-ui-*` 插件能力。工作台只在 loopback 上使用认证的临时端口，并由 WKWebView 打开。运行时使用 DSH 0.2.2-rc.5 的官方 profile-boot 生命周期和独立 dsbot-ios profile，显式挂载 session、agent、LLM、tools、Web UI 与原生适配器。它不把 @deepseek-ai/dsh 总包、dsh-base、pnpm、Python、FFmpeg 或桌面终端 bundle 当作运行基础。
 
 插件安装保留市场目录发现能力，但采用适合 iOS 的精确版本、SHA-512 tarball 校验和、不运行安装脚本、依赖必须已随 App 内嵌、拒绝本机二进制/链接的策略。内嵌的 DSH profile 插件受保护，不会显示成可卸载的第三方插件。profile 变更前先结束当前 Agent 轮次并释放空闲 Agent；如果官方重组流程报告需要重启，原生界面会明确提示用户重新打开 App。需要重启的卸载会暂存待清理记录，等下次启动后再删除包文件，避免当前 Node 进程继续引用时丢失文件。
 

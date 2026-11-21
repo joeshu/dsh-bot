@@ -191,7 +191,7 @@ public struct PluginManagerView: View {
 
     @ViewBuilder
     private var installedSection: some View {
-        Section("dsh-purge-safe · 红队演练模式") {
+        Section("dsh-purge-safe · iOS 适配与授权") {
             if host.redteamStatus.installed {
                 Toggle(isOn: Binding(
                     get: { host.redteamModeEnabled },
@@ -199,18 +199,36 @@ public struct PluginManagerView: View {
                 )) {
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 6) {
-                            Text("红队演练模式（原生 Bot + Web 共用）").font(.subheadline.weight(.semibold))
+                            Text("启用插件工具宿主（Bot + Web 控制台）").font(.subheadline.weight(.semibold))
                             DSStatusBadge(
                                 host.redteamModeEnabled ? "已开启" : "已关闭",
                                 color: host.redteamModeEnabled ? .red : .secondary
                             )
                         }
-                        Text("开启后自动挂载 dsh-purge-safe/redteam/tools 工具集，并与 DSH Web 演练台共享 SQLite 事实库。")
+                        Text("这是全局宿主开关；每个 Bot 仍须单独获准使用工具、写入演练台或读取敏感资料。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                 }
                 .tint(.red)
+
+                Toggle("允许 Web 演练台读取普通演练数据", isOn: Binding(
+                    get: { host.redteamWebReadEnabled },
+                    set: { value in Task { await host.setRedteamWebPermissions(readEnabled: value) } }
+                ))
+                Toggle("允许 Web 演练台写入演练记录", isOn: Binding(
+                    get: { host.redteamWebWriteEnabled },
+                    set: { value in Task { await host.setRedteamWebPermissions(writeEnabled: value) } }
+                ))
+                .disabled(!host.redteamWebReadEnabled)
+                Toggle("允许 Web 查看敏感资料与主动探测", isOn: Binding(
+                    get: { host.redteamWebSensitiveEnabled },
+                    set: { value in Task { await host.setRedteamWebPermissions(sensitiveEnabled: value) } }
+                ))
+                .disabled(!host.redteamWebReadEnabled)
+                Text("Web 权限独立于 Bot：普通读取、演练记录写入、凭据等敏感资料和主动探测分别控制。Web 控制台由用户直接操作；Bot 工具仍按会话授权并走 DSH/iOS 审批。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
                 HStack(spacing: 8) {
                     DSStatusBadge(
@@ -218,9 +236,22 @@ public struct PluginManagerView: View {
                         color: host.redteamStatus.storeReady ? DSTheme.success : .secondary
                     )
                     DSStatusBadge("已挂载 \(host.redteamStatus.toolCount) 工具", color: DSTheme.brand)
+                    DSStatusBadge("iOS 补丁旁路已关闭", color: DSTheme.success)
                     if host.redteamStatus.skillCount > 0 {
                         DSStatusBadge("\(host.redteamStatus.skillCount) 演练技能", color: .indigo)
                     }
+                }
+
+                Text("iOS 保留 RedTeam SQLite、工具、技能和 Web 演练台；关闭 dsh-purge-safe 根层的应用包修改、自动放行和子代理审批接管。文件修改仍走 DSH 原生审批。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if !host.redteamStatus.webWorkbenchSupported {
+                    Text(host.redteamStatus.compatibilityWarning.isEmpty
+                         ? "当前插件版本未通过 iOS Web API 隔离适配；Web 演练台已禁用。"
+                         : "Web 演练台已禁用：\(host.redteamStatus.compatibilityWarning)")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                 }
 
                 if !host.redteamStatus.tools.isEmpty {
@@ -233,24 +264,36 @@ public struct PluginManagerView: View {
                     }
                 }
 
-                NavigationLink {
-                    DSHWebUIView(host: host)
-                } label: {
-                    Label("打开 Web 演练台（含 RedTeam Dock 与预设）", systemImage: "shield.lefthalf.filled")
-                        .font(.subheadline)
+                if host.redteamStatus.webWorkbenchSupported {
+                    if !host.redteamModeEnabled {
+                        Text("请先打开上方全局宿主开关，再进入 Web 演练台。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else if !host.redteamWebReadEnabled {
+                        Text("请授予 Web 演练台读取权限后再打开。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    NavigationLink {
+                        DSHWebUIView(host: host)
+                    } label: {
+                        Label("打开 Web 演练台（含 RedTeam Dock 与预设）", systemImage: "shield.lefthalf.filled")
+                            .font(.subheadline)
+                    }
+                    .disabled(!host.redteamModeEnabled || !host.redteamWebReadEnabled)
                 }
             } else {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("未安装 CallMeGuLab/dsh-purge-safe 插件")
+                    Text("未安装 joeshu/dsh-purge-safe 插件")
                         .font(.subheadline.weight(.semibold))
-                    Text("安装后即可在原生 Bot 与 DSH Web 工作台同时开启红队演练模式、红队工具集、SQLite 事实库与预设。")
+                    Text("安装后可启用 RedTeam 工具、SQLite 事实库、技能与 Web 演练台；每个 Bot 的权限分别配置。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Button {
-                    pendingInstall = .github("https://github.com/CallMeGuLab/dsh-purge-safe")
+                    pendingInstall = .github("https://github.com/joeshu/dsh-purge-safe")
                 } label: {
-                    Label("一键安装 CallMeGuLab/dsh-purge-safe", systemImage: "arrow.down.circle.fill")
+                    Label("安装 joeshu/dsh-purge-safe", systemImage: "arrow.down.circle.fill")
                 }
                 .disabled(host.state != .ready)
             }

@@ -63,13 +63,30 @@ REQUIRED_DSH_PACKAGES = {
     "@deepseek-ai/dsh-session-projection": "0.2.2-rc.5",
     "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.5",
     "@deepseek-ai/dsh-tools": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-ptc-runtime": "0.2.2-rc.5",
     "@deepseek-ai/dsh-tool-executor-native": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-tool-executor-ptc": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-jobs": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-jobs-local": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-tool-jobs": "0.2.2-rc.5",
     "@deepseek-ai/dsh-app-boot": "0.2.2-rc.5",
     "@deepseek-ai/dsh-official-bundles": "0.2.2-rc.5",
     "@deepseek-ai/dsh-http-proxy": "0.2.2-rc.5",
     "@deepseek-ai/dsh-cmdline": "0.2.2-rc.5",
 }
 MINIMUM_RELEASE_NODE_VERSION = (24, 22, 3)
+PYODIDE_NPM_INTEGRITY = "sha512-TkYrUv9m8QmfImADKRmpwZulL48E0uUaBSO+dvRQKyAJc0qh9gu7jn8btyHPh3NZm1r2IH2YrJhIr7Q2B9urAw=="
+PYTHON_RUNTIME_ARTIFACT_SHA256 = {
+    "pyodide.mjs": "510ca14305230018f50c40fb81be673afd68080e70ce7733fcce6600dd6a1714",
+    "pyodide.asm.js": "356c42f69e1695397e9d8670bd3c2e678248cde76e18bdae1731e848537b47d7",
+    "pyodide.asm.wasm": "54309a5a2cfd757b1f0fdbc9093c92503f7b341500110329d932487183912718",
+    "python_stdlib.zip": "831fd1e535084b972f87c6a35275de3d236efd5166f5e77ce89497710635e73c",
+    "pyodide-lock.json": "14d2c2dba101277999e17135e653d8f15389ad1437f53eae213bf0c3cdff723d",
+    "full/numpy-2.2.5-cp313-cp313-pyemscripten_2025_0_wasm32.whl":
+        "800c98edc0c864dfa49f07005680c699b4b42b84eae1f8cb19d35b3634e7f05c",
+    "LICENSE-PYODIDE-MPL-2.0.txt": "1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5",
+    "LICENSE-NUMPY-BSD-3-CLAUSE.txt": "01fb016849aa427edb1bbbbd55f91c26ca6cadb32a5b20e7f000655dd05b0760",
+}
 
 
 def verify_runtime(archive, prefix, names):
@@ -90,7 +107,10 @@ def verify_runtime(archive, prefix, names):
     ios_profile_patch = prefix + "DSHRuntime/node_modules/@dsbot/dsh-ios-profile/cordis.patch.yml"
     ios_host_package = prefix + "DSHRuntime/node_modules/@dsbot/dsh-ios-host/package.json"
     ios_host_files = [prefix + "DSHRuntime/node_modules/@dsbot/dsh-ios-host/" + name
-                      for name in ["index.mjs", "credentials.mjs", "session-persistence.mjs", "native-tools.mjs"]]
+                      for name in ["index.mjs", "credentials.mjs", "session-persistence.mjs", "native-tools.mjs",
+                                   "approval.mjs", "ios-python-tool.mjs", "python-execution.mjs", "python-worker.mjs",
+                                   "python-worker-gate.mjs", "ios-python-jobs.mjs", "ios-ptc-runtime.mjs", "ios-ptc-python-worker.mjs",
+                                   "ios-ptc-executor.mjs"]]
     framework_root = prefix + "Frameworks/NodeMobile.framework/"
     framework_binary_path = framework_root + "NodeMobile"
     for required in [runtime_path, package_path, lock_path, notices_path, supervisor_path, entry_path, plugin_manager_path,
@@ -135,19 +155,106 @@ def verify_runtime(archive, prefix, names):
     profile_patch = archive.read(ios_profile_patch)
     for name in [b"@deepseek-ai/dsh-agent", b"@deepseek-ai/dsh-agent-loop", b"@deepseek-ai/dsh-session",
                  b"@deepseek-ai/dsh-session-projection", b"@deepseek-ai/dsh-llm-deepseek-api-key",
-                 b"@dsbot/dsh-ios-host/native-tools", b"@dsbot/dsh-ios-host/session-persistence"]:
+                 b"@dsbot/dsh-ios-host/native-tools", b"@dsbot/dsh-ios-host/session-persistence",
+                 b"@dsbot/dsh-ios-host/ios-ptc-runtime", b"@dsbot/dsh-ios-host/ios-ptc-executor",
+                 b"@deepseek-ai/dsh-jobs-local", b"@deepseek-ai/dsh-tool-jobs",
+                 b"ptc-python", b"tool/ptc-dispatch"]:
         require(name in profile_patch, f"Dedicated iOS DSH profile is missing {name.decode()}")
+    entry_bytes = archive.read(entry_path)
+    require(b"mountIOSPythonJobTool" in entry_bytes and b"@dsbot/dsh-ios-host/ios-python-jobs" in entry_bytes,
+            "The native runtime entry does not mount the approved iOS Python Jobs producer")
+    require(b"@deepseek-ai/dsh-web-app" in profile_patch,
+            "The dedicated iOS DSH profile is missing the embedded Web workbench")
     host_manifest = json.loads(archive.read(ios_host_package))
     require(host_manifest.get("name") == "@dsbot/dsh-ios-host", "Missing the app-owned iOS adapter plugin package")
+    host_dependencies = host_manifest.get("dependencies", {})
+    require(host_dependencies.get("@deepseek-ai/dsh-ptc-runtime") == "0.2.2-rc.5"
+            and host_dependencies.get("@deepseek-ai/dsh-tool-executor-ptc") == "0.2.2-rc.5",
+            "The iOS PTC adapter must use the exact pinned DSH PTC runtime and executor")
+    jobs = manifest.get("backgroundJobs", {})
+    require(jobs == {
+        "registry": "@deepseek-ai/dsh-jobs-local@0.2.2-rc.5",
+        "controls": "@deepseek-ai/dsh-tool-jobs@0.2.2-rc.5",
+        "producer": "python_job_start",
+        "ownerScope": "one native non-private Bot session",
+        "maxConcurrentPerSession": 1,
+        "maxConcurrentPythonWorkers": 1,
+        "maxExecutionSeconds": 120,
+        "outputLimitBytes": 131072,
+        "retentionBytes": 262144,
+        "settledOutputRetentionBytes": 16384,
+        "completionDelivery": "wakeup",
+        "nativeCompletionDelivery": "defer-tool-jobs-to-next-user-turn",
+        "backgroundBehavior": "defer-native-followups-as-inbox-injections-while-suspended",
+        "processLocal": True,
+        "survivesHostRestart": False,
+        "runsWhileIOSAppSuspended": False,
+        "directHostFileAccess": False,
+        "networkAccess": False,
+        "processAccess": False,
+    }, "The iOS background Jobs boundary or lifecycle contract changed")
     require(re.fullmatch(r"[a-f0-9]{64}", manifest.get("packageLockSha256", "")) is not None, "Missing DSH package lock digest")
     lock_bytes = archive.read(lock_path)
     require(hashlib.sha256(lock_bytes).hexdigest() == manifest["packageLockSha256"], "DSH package lock digest mismatch")
+    python_runtime = manifest.get("pythonRuntime")
+    require(isinstance(python_runtime, dict)
+            and python_runtime.get("engine") == "Pyodide"
+            and python_runtime.get("version") == "0.29.5"
+            and python_runtime.get("license") == "MPL-2.0"
+            and python_runtime.get("pythonVersion") == "3.13.2"
+            and python_runtime.get("numpyVersion") == "2.2.5"
+            and python_runtime.get("numpyLicense") == "BSD-3-Clause"
+            and python_runtime.get("offline") is True
+            and python_runtime.get("freshInterpreterPerExecution") is True
+            and python_runtime.get("pythonMemoryLimitBytes") == 268435456
+            and python_runtime.get("maxExecutionSeconds") == 45
+            and python_runtime.get("maxCodeCharacters") == 16000
+            and python_runtime.get("maxOutputCharacters") == 32000,
+            "The runtime manifest does not describe the bounded offline Python/NumPy runtime")
+    ptc = python_runtime.get("ptc", {})
+    require(ptc == {
+        "preset": "ptc-python",
+        "executor": "@deepseek-ai/dsh-tool-executor-ptc@0.2.2-rc.5",
+        "language": "python",
+        "programFormat": "function-body",
+        "approval": "full-source-per-run",
+        "retainsState": False,
+        "maxExecutionSeconds": 120,
+        "maxNestedCalls": 60,
+        "maxParallelNestedCalls": 2,
+        "maxBindingBytes": 262144,
+        "maxBindingValueBytes": 96000,
+        "javascriptGlobals": "frozen-null-prototype-host-call-only",
+        "bindingPromise": "prototype-free-awaitable",
+        "directAppFileAccess": False,
+        "networkBindings": False,
+        "processBindings": False,
+        "sandboxEscalation": False,
+    }, "The PTC Python provider contract or resource limits changed")
+    require(python_runtime.get("artifacts") == PYTHON_RUNTIME_ARTIFACT_SHA256,
+            "The Python runtime artifact pins do not match the approved Pyodide/NumPy versions")
+    python_runtime_root = prefix + "DSHRuntime/python-runtime/"
+    python_runtime_files = {name[len(python_runtime_root):] for name in names
+                            if name.startswith(python_runtime_root) and not name.endswith("/")}
+    require(python_runtime_files == set(PYTHON_RUNTIME_ARTIFACT_SHA256),
+            "The embedded Python runtime contains missing or unapproved assets")
+    for relative_path, expected_digest in PYTHON_RUNTIME_ARTIFACT_SHA256.items():
+        path = python_runtime_root + relative_path
+        require(path in names and hashlib.sha256(archive.read(path)).hexdigest() == expected_digest,
+                f"Pinned Python runtime asset digest mismatch: {relative_path}")
     top_level = manifest.get("topLevelPackages", {})
     package_manifest = json.loads(archive.read(package_path))
     lock = json.loads(lock_bytes)
     require(package_manifest.get("dependencies") == top_level
             and lock.get("packages", {}).get("", {}).get("dependencies") == top_level,
             "Embedded DSH manifest, package.json, and lockfile dependencies do not match")
+    pyodide_package = lock.get("packages", {}).get("node_modules/pyodide", {})
+    require(top_level.get("pyodide") == "0.29.5"
+            and pyodide_package.get("version") == "0.29.5"
+            and pyodide_package.get("resolved") == "https://registry.npmjs.org/pyodide/-/pyodide-0.29.5.tgz"
+            and pyodide_package.get("license") == "MPL-2.0"
+            and pyodide_package.get("integrity") == PYODIDE_NPM_INTEGRITY,
+            "Pyodide must be pinned to the reviewed 0.29.5 npm package")
     require(top_level.get("@dsbot/dsh-ios-profile") == "file:./ios-profile-package"
             and top_level.get("@dsbot/dsh-ios-host") == "file:./ios-host-package",
             "The application-owned iOS profile and adapters are not pinned into the runtime graph")
@@ -189,10 +296,22 @@ def verify_runtime(archive, prefix, names):
              "dsh-session-projection", "dsh-llm", "dsh-llm-deepseek-api-key",
              "dsh-system-prompt", "dsh-tools", "dsh-tool-executor-native"}.issubset(enabled),
             "The runtime manifest does not declare the required upstream DSH core plugins")
+    require({"dsh-jobs-local", "dsh-tool-jobs"}.issubset(enabled),
+            "The runtime manifest does not declare the mounted DSH Jobs registry and tool controls")
+    require("dsh-web-app" in enabled,
+            "The runtime manifest does not declare the mounted DSH Web application")
+    web_ui = manifest.get("webUI", {})
+    require(web_ui.get("application") == "@deepseek-ai/dsh-web-app"
+            and web_ui.get("frontend") == "@deepseek-ai/dsh-web-frontend"
+            and web_ui.get("communityPluginPrefix") == "dsh-client-ui-",
+            "The runtime manifest does not describe the embedded DSH Web UI components")
     host_adapters = set(manifest.get("iosHostAdapters", []))
     require({"DSH SQLite SessionPersistence backed by node:sqlite",
              "iOS Keychain credentials provider",
              "DSH native tools bridged to iOS capabilities",
+             "offline Pyodide Python and NumPy in a bounded, cancellable Worker",
+             "DSH PTC Python provider with full-source approval and bounded nested-tool bridge",
+             "DSH process-local Jobs registry with session-owned offline Python producer and native output controls",
              "official DSH profile-boot runProfile lifecycle",
              "iOS profile bundle source discovery, install, enable, disable, and remove"}.issubset(host_adapters),
             "The runtime manifest does not declare the iOS host adapters")
@@ -202,9 +321,11 @@ def verify_runtime(archive, prefix, names):
             and "SHA-512" in plugin_sources.get("installer", "")
             and "no lifecycle scripts" in plugin_sources.get("installer", ""),
             "The iOS profile does not declare its constrained DSH index and package installer")
-    require({"dsh-base", "dsh-web-app", "dsh-shell", "dsh-terminal"}.issubset(
+    require({"dsh-base", "dsh-shell", "dsh-terminal"}.issubset(
                 set(manifest.get("excludedCapabilities", []))),
             "The iOS profile must explicitly exclude the desktop bundles")
+    require(not {"dsh-web-app", "dsh-web-frontend"}.intersection(manifest.get("excludedCapabilities", [])),
+            "The embedded DSH Web UI must not be declared as excluded")
 
     node = manifest.get("node")
     require(isinstance(node, dict) and re.fullmatch(r"\d+\.\d+\.\d+", node.get("version", "")) is not None,
@@ -237,9 +358,14 @@ def verify_runtime(archive, prefix, names):
     framework_entries = {name for name in names if "/Frameworks/" in name and name != prefix + "Frameworks/"}
     require(framework_entries and all("/Frameworks/NodeMobile.framework/" in name for name in framework_entries),
             "Only the NodeMobile.framework may be embedded")
+    pinned_python_wasm = prefix + "DSHRuntime/python-runtime/pyodide.asm.wasm"
     for name in names:
         if name.endswith((".node", ".dylib", ".so", ".wasm")):
-            require(name.startswith(framework_root), f"Unexpected native or WebAssembly runtime component: {name}")
+            require(name.startswith(framework_root) or name == pinned_python_wasm,
+                    f"Unexpected native or WebAssembly runtime component: {name}")
+    notices = archive.read(notices_path).decode("utf-8", errors="strict")
+    require("Pyodide 0.29.5 — MPL-2.0" in notices and "NumPy 2.2.5 WebAssembly wheel — BSD-3-Clause" in notices,
+            "The embedded Python runtime license notices are missing")
     return manifest
 
 

@@ -29,9 +29,31 @@ function snapshot(row) {
     header,
     revision: SessionPersistenceRevision(`sqlite:${row.id}:${row.revision}:${row.next_seq}`),
     eventCount: row.next_seq,
+    lastActivityAt: Number.isSafeInteger(row.last_activity_at) ? row.last_activity_at : undefined,
+    lastMessagePreview: typeof row.last_message_preview === 'string' ? row.last_message_preview : undefined,
     sizeBytes: undefined,
     location: { kind: 'sqlite', path: databasePath },
   }
+}
+
+function lastMessagePreview(event) {
+  let blocks
+  if (event?.type === 'user/message') {
+    if (event.data?.source && event.data.source.kind !== 'user') return undefined
+    blocks = event.data?.content
+  } else if (event?.type === 'assistant/message') {
+    blocks = event.data?.message?.content
+  } else {
+    return undefined
+  }
+  const text = typeof blocks === 'string'
+    ? blocks
+    : Array.isArray(blocks)
+      ? blocks.filter((block) => block?.type === 'text' && typeof block.text === 'string')
+        .map((block) => block.text).join('')
+      : ''
+  const preview = Array.from(text).slice(0, 180).join('').trim()
+  return preview || undefined
 }
 
 class SQLiteSessionHandle {
@@ -86,6 +108,15 @@ class SQLiteSessionHandle {
       for (const event of batch) insert.run(this.id, event.seq, JSON.stringify(event))
       this.owner.db.prepare('UPDATE sessions SET next_seq = ?, revision = revision + 1 WHERE id = ?')
         .run(current.next_seq + batch.length, this.id)
+      const lastActivityAt = batch.at(-1)?.time
+      let preview
+      for (let index = batch.length - 1; index >= 0 && preview === undefined; index -= 1) {
+        preview = lastMessagePreview(batch[index])
+      }
+      this.owner.db.prepare(`UPDATE sessions
+        SET last_activity_at = COALESCE(?, last_activity_at),
+            last_message_preview = COALESCE(?, last_message_preview)
+        WHERE id = ?`).run(Number.isSafeInteger(lastActivityAt) ? lastActivityAt : null, preview ?? null, this.id)
       this.owner.db.exec('COMMIT')
     } catch (error) {
       try { this.owner.db.exec('ROLLBACK') } catch {}
@@ -161,7 +192,9 @@ export class SQLiteSessionPersistence extends SessionPersistence {
         inherited_event_count INTEGER NOT NULL,
         next_seq INTEGER NOT NULL DEFAULT 0,
         revision INTEGER NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        last_activity_at INTEGER,
+        last_message_preview TEXT
       );
       CREATE TABLE IF NOT EXISTS session_events (
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -170,6 +203,10 @@ export class SQLiteSessionPersistence extends SessionPersistence {
         PRIMARY KEY (session_id, seq)
       );
     `)
+    const sessionColumns = new Set(this.db.prepare('PRAGMA table_info(sessions)').all().map((row) => row.name))
+    if (!sessionColumns.has('last_activity_at')) this.db.exec('ALTER TABLE sessions ADD COLUMN last_activity_at INTEGER')
+    if (!sessionColumns.has('last_message_preview')) this.db.exec('ALTER TABLE sessions ADD COLUMN last_message_preview TEXT')
+    this.backfillSessionSummaries()
     this.handles = new Set()
     this.writeOwners = new Map()
     const persistence = this
@@ -194,6 +231,32 @@ export class SQLiteSessionPersistence extends SessionPersistence {
   }
 
   handlesFor(id) { return [...this.handles].filter((handle) => handle.id === id) }
+
+  backfillSessionSummaries() {
+    const pending = this.db.prepare(`SELECT id FROM sessions
+      WHERE (last_activity_at IS NULL OR last_message_preview IS NULL)
+        AND next_seq > 0`).all()
+    const lastEvent = this.db.prepare(`SELECT json_extract(event_json, '$.time') AS time
+      FROM session_events WHERE session_id = ? ORDER BY seq DESC LIMIT 1`)
+    const lastMessage = this.db.prepare(`SELECT event_json FROM session_events
+      WHERE session_id = ?
+        AND (json_extract(event_json, '$.type') = 'assistant/message'
+          OR (json_extract(event_json, '$.type') = 'user/message'
+            AND (json_type(event_json, '$.data.source') IS NULL
+              OR json_extract(event_json, '$.data.source.kind') = 'user')))
+      ORDER BY seq DESC LIMIT 1`)
+    const update = this.db.prepare(`UPDATE sessions
+      SET last_activity_at = COALESCE(last_activity_at, ?),
+          last_message_preview = COALESCE(last_message_preview, ?)
+      WHERE id = ?`)
+    for (const { id } of pending) {
+      const activity = lastEvent.get(id)
+      const message = lastMessage.get(id)
+      const preview = message ? lastMessagePreview(JSON.parse(message.event_json)) ?? '' : ''
+      update.run(Number.isSafeInteger(activity?.time) ? activity.time : null, preview, id)
+    }
+  }
+
   async flushHandleLive(handle) {
     if (handle.access === 'write') return handle.drainLive()
     await this.writeOwners.get(handle.id)?.drainLive()
@@ -241,12 +304,14 @@ export class SQLiteSessionPersistence extends SessionPersistence {
 
   async stat(id, options = {}) {
     abortIfRequested(options.signal)
-    return snapshot(this.db.prepare('SELECT id, header_json, next_seq, revision FROM sessions WHERE id = ?').get(id))
+    return snapshot(this.db.prepare(`SELECT id, header_json, next_seq, revision,
+      last_activity_at, last_message_preview FROM sessions WHERE id = ?`).get(id))
   }
 
   async list(options = {}) {
     abortIfRequested(options.signal)
-    return this.db.prepare('SELECT id, header_json, next_seq, revision FROM sessions ORDER BY created_at DESC, id').all()
+    return this.db.prepare(`SELECT id, header_json, next_seq, revision,
+      last_activity_at, last_message_preview FROM sessions ORDER BY created_at DESC, id`).all()
       .map((row) => snapshot(row))
   }
 

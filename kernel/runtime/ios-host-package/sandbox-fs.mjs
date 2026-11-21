@@ -1,26 +1,7 @@
 import { realpathSync } from 'node:fs'
-import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { FsError } from '@deepseek-ai/dsh-fs'
 import LocalFileSystem from '@deepseek-ai/dsh-fs-local'
-
-const BLOCKED_ROOT_ENTRIES = new Set([
-  'dsh-sessions.sqlite',
-  'dsh-sessions.sqlite-wal',
-  'dsh-sessions.sqlite-shm',
-  'dsh-sessions.sqlite-journal',
-  'dsh-storage.sqlite',
-  'dsh-storage.sqlite-wal',
-  'dsh-storage.sqlite-shm',
-  'dsh-storage.sqlite-journal',
-  'chats.json',
-  'bots.json',
-  'memory.json',
-  'connectors.json',
-  'usage.json',
-  'groups.json',
-  'profiles',
-  'plugin-imports',
-])
 
 function canonicalize(targetPath) {
   const abs = resolve(targetPath)
@@ -39,8 +20,11 @@ function canonicalize(targetPath) {
 
 export default class IosSandboxedFileSystem extends LocalFileSystem {
   constructor(ctx, config) {
-    super(ctx, config)
-    this.sandboxRoot = canonicalize(process.env.DSH_HOME || this.config.cwd)
+    const home = resolve(process.env.DSH_HOME || config?.cwd || process.cwd())
+    const sandboxRoot = join(home, 'files')
+    super(ctx, { ...config, cwd: sandboxRoot })
+    this.runtimeRoot = home
+    this.sandboxRoot = canonicalize(sandboxRoot)
   }
 
   assertAllowed(candidatePath) {
@@ -49,17 +33,16 @@ export default class IosSandboxedFileSystem extends LocalFileSystem {
     if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
       throw new FsError('Path escapes the iOS DSH workspace', 'FS_SANDBOX_DENIED')
     }
-    if (rel) {
-      const top = rel.split(sep)[0]
-      if (BLOCKED_ROOT_ENTRIES.has(top)) {
-        throw new FsError('Access to internal DS Bot storage is denied', 'FS_SANDBOX_DENIED')
-      }
-    }
     return canonical
   }
 
+  cwdForSession(cwd) {
+    if (typeof cwd !== 'string' || !cwd || resolve(cwd) === this.runtimeRoot) return this.sandboxRoot
+    return cwd
+  }
+
   async resolve(path, opts) {
-    const result = await super.resolve(path, opts)
+    const result = await super.resolve(path, { ...opts, cwd: this.cwdForSession(opts?.cwd) })
     this.assertAllowed(String(result.targetKey))
     return result
   }
@@ -78,9 +61,9 @@ export default class IosSandboxedFileSystem extends LocalFileSystem {
 
   async lstat(path, opts, signal) {
     if (typeof path === 'string' && path.trim().length > 0) {
-      const base = opts?.cwd ?? this.config.cwd
+      const base = this.cwdForSession(opts?.cwd ?? this.config.cwd)
       this.assertAllowed(resolve(base, path))
     }
-    return super.lstat(path, opts, signal)
+    return super.lstat(path, { ...opts, cwd: this.cwdForSession(opts?.cwd) }, signal)
   }
 }

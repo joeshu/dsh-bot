@@ -16,6 +16,69 @@ const MAX_UNPACKED_BYTES = 128 * 1024 * 1024
 const MAX_PACKAGE_FILES = 20_000
 const PROFILE_BUNDLE = '@dsbot/dsh-ios-profile'
 const PENDING_REMOVALS_FILE = 'ios-plugin-pending-removals.json'
+const IOS_PRIVATE_API_MARKER = 'DSBOT_IOS_PRIVATE_API_GUARD_V1'
+const IOS_WEB_SCOPE_MARKER = 'DSBOT_IOS_WEB_SCOPE_GUARD_V1'
+const IOS_REDTEAM_WEB_OPERATION_TIER = `function iosRedteamWebOperationTier(op) {
+  if (['updateApply', 'proxyPoolConnect', 'proxyProfileConnect'].includes(op)) return 'unsupported'
+  const tiers = {
+    read: new Set(['bootstrap', 'teamBoard', 'agentsStatus', 'orchestratorSettings', 'platformConfigGet', 'platformEnvAdaptStatus', 'skillCatalog', 'skillRead', 'version', 'updateCheck', 'sessionBinding', 'sessionBindings', 'snapshot', 'assets', 'asset', 'graph', 'attackGraph', 'stats', 'vulns', 'vulnStats', 'domains', 'web', 'httpEvidence', 'chain', 'report', 'reportTargets', 'scoreChain', 'scoreReport', 'scores', 'testStats', 'consoleDigest', 'discoveryTimeline', 'prompts', 'stages', 'activeTests', 'attention', 'intelStatus', 'shots']),
+    sensitiveRead: new Set(['credentials', 'access', 'sessions', 'webshells', 'tunnels', 'dataProofs', 'cleanup', 'attackFiles', 'readAttackFile', 'shotData', 'pocSearch', 'pocList', 'pocGet', 'pocStats', 'templateSearch', 'templateStats', 'cveSearch', 'cveLookup', 'templateCatalogStatus', 'proxyPoolGet']),
+    write: new Set(['openEngagement', 'activateEngagement', 'bindSessionEngagement', 'savePrompt', 'resetPrompts', 'updateVuln', 'saveScorePoint', 'deleteScorePoint', 'addScoreHit', 'setAgentsMax', 'setOrchestratorSettings', 'platformConfigSave', 'platformAssignToolkit', 'platformEnvAdaptSkip', 'addVuln', 'shotAdd', 'shotDelete', 'addHttpEvidence', 'addChainStep', 'assetTest', 'assessAsset', 'saveStage', 'attentionAck', 'import', 'updateCleanup']),
+    sensitiveWrite: new Set(['probeSessions', 'intelRefresh', 'intelSync', 'addCredential', 'addAccess', 'addWebshell', 'updateWebshell', 'addTunnel', 'updateTunnel', 'addDataProof', 'addCleanup', 'addAttackFile', 'pocSave', 'pocUpdate', 'pocDelete', 'pocUse', 'proxyConfigImport', 'proxyPoolImport', 'proxyPoolSave', 'proxyPoolDisconnect', 'proxyProfileSave', 'proxyProfileDelete', 'proxyProfilesDelete', 'proxyProfileTest', 'proxyPoolTest']),
+  }
+  if (tiers.sensitiveWrite.has(op)) return 'sensitiveWrite'
+  if (tiers.write.has(op)) return 'write'
+  if (tiers.sensitiveRead.has(op)) return 'sensitiveRead'
+  if (tiers.read.has(op)) return 'read'
+  return undefined
+}`
+const IOS_PRIVATE_API_HELPERS = `/* ${IOS_PRIVATE_API_MARKER} */
+function iosPrivateSessionRoots() {
+  if (process.env.DS_BOT_IOS_HOST !== '1') return null
+  try {
+    const values = JSON.parse(process.env.DS_BOT_IOS_PRIVATE_BOT_IDS || '[]')
+    if (!Array.isArray(values) || values.some((id) => typeof id !== 'string')) return new Set(['*'])
+    return new Set(values.map((id) => id.startsWith('ios:') ? id : 'ios:' + id))
+  } catch { return new Set(['*']) }
+}
+function iosPrivateSessionClosure(rows) {
+  const roots = iosPrivateSessionRoots()
+  if (roots === null) return new Set()
+  if (roots.has('*')) return new Set(rows.map((row) => String(row?.id ?? row?.header?.id ?? '')).filter(Boolean))
+  const byId = new Map(rows.map((row) => [String(row?.id ?? row?.header?.id ?? ''), row]))
+  const hidden = new Set()
+  for (const row of rows) {
+    const id = String(row?.id ?? row?.header?.id ?? '')
+    let cursor = id
+    const seen = new Set()
+    for (let depth = 0; cursor && depth < 64 && !seen.has(cursor); depth += 1) {
+      if (roots.has(cursor)) { hidden.add(id); break }
+      seen.add(cursor)
+      cursor = String(byId.get(cursor)?.header?.parentSession ?? '')
+    }
+  }
+  return hidden
+}
+function visibleIOSSessions(sessions) {
+  const rows = sessions.list()
+  const hidden = iosPrivateSessionClosure(rows)
+  return rows.filter((row) => !hidden.has(String(row?.id ?? row?.header?.id ?? '')))
+}
+function isPrivateIOSSessionReference(ctx, sessionId) {
+  if (process.env.DS_BOT_IOS_HOST !== '1' || typeof sessionId !== 'string' || !sessionId) return false
+  let sessions
+  try { sessions = ctx.get('sessions') } catch { return true }
+  if (!sessions || typeof sessions.list !== 'function') return true
+  const roots = iosPrivateSessionRoots()
+  if (roots?.has('*')) return true
+  const aliases = new Set([sessionId, sessionId.startsWith('ios:') ? sessionId.slice(4) : 'ios:' + sessionId])
+  if ([...aliases].some((id) => roots?.has(id))) return true
+  const rows = sessions.list()
+  const hidden = iosPrivateSessionClosure(rows)
+  return [...hidden].some((id) => aliases.has(id))
+}
+${IOS_REDTEAM_WEB_OPERATION_TIER}
+`
 const DESKTOP_ONLY_BUNDLES = new Set([
   '@deepseek-ai/dsh',
   '@deepseek-ai/dsh-base',
@@ -62,6 +125,93 @@ function assertInside(root, path) {
     if (rel === '') return
     throw new Error('插件包包含越界路径')
   }
+}
+
+function replaceCompatibilityAnchor(source, before, after, label) {
+  const first = source.indexOf(before)
+  if (first < 0 || source.indexOf(before, first + before.length) >= 0) {
+    throw new Error(`dsh-purge-safe 的 iOS 适配点不匹配：${label}；为避免 Web API 泄露私密会话，已拒绝安装此版本`)
+  }
+  return `${source.slice(0, first)}${after}${source.slice(first + before.length)}`
+}
+
+/** Apply host-only routing/privacy changes without altering the upstream plugin on disk. */
+export async function ensurePurgeSafeIOSCompatibility(pluginRoot) {
+  const uiPath = resolve(pluginRoot, 'lib', 'redteam', 'ui.js')
+  let source
+  try { source = await readFile(uiPath, 'utf8') } catch (error) {
+    if (error.code === 'ENOENT') return { webWorkbenchAvailable: false, reason: '插件包未包含 lib/redteam/ui.js' }
+    throw error
+  }
+  if (!source.includes(IOS_PRIVATE_API_MARKER)) {
+    const rowAnchor = 'function sessionRowsOf(sessions) {\n  return sessions.list().map((s) => {'
+    source = replaceCompatibilityAnchor(
+      source,
+      rowAnchor,
+      `${IOS_PRIVATE_API_HELPERS}\nfunction sessionRowsOf(sessions) {\n  return visibleIOSSessions(sessions).map((s) => {`,
+      'teamBoard 会话列表',
+    )
+    source = replaceCompatibilityAnchor(
+      source,
+      'const roots = sessions.list().filter((s) => {',
+      'const roots = visibleIOSSessions(sessions).filter((s) => {',
+      'agentsStatus 会话列表',
+    )
+    source = replaceCompatibilityAnchor(
+      source,
+      "if (k && k.kind === 'child') children.push({ id: String(k.id), parent: String(root.id), label: k.label || String(k.id), activity: k.activity, mode: k.mode })",
+      "if (k && k.kind === 'child' && !isPrivateIOSSessionReference(ctx, String(k.id))) children.push({ id: String(k.id), parent: String(root.id), label: k.label || String(k.id), activity: k.activity, mode: k.mode })",
+      'agentsStatus 子会话列表',
+    )
+    source = replaceCompatibilityAnchor(
+      source,
+      '      /* 来源校验：本机回环一律放行（官方桌面端 Origin 常是 app:// / file://，',
+      `      if (process.env.DS_BOT_IOS_HOST === '1' && process.env.DS_BOT_IOS_REDTEAM_ENABLED !== '1') {\n        sendJson(res, 503, { ok: false, error: 'iOS 插件工具宿主尚未启用' })\n        return\n      }\n      /* 来源校验：本机回环一律放行（官方桌面端 Origin 常是 app:// / file://，`,
+      'Web 演练台宿主开关',
+    )
+    source = replaceCompatibilityAnchor(
+      source,
+      '        const request = raw.trim() ? JSON.parse(raw) : {}',
+      `        const request = raw.trim() ? JSON.parse(raw) : {}\n        if (isPrivateIOSSessionReference(ctx, request?.session) || isPrivateIOSSessionReference(ctx, request?.session_id)) {\n          sendJson(res, 404, { ok: false, error: 'not found' })\n          return\n        }`,
+      'Web API 私密会话引用检查',
+    )
+  } else {
+    const legacyPrivateCheck = `  const hidden = iosPrivateSessionClosure(rows)\n  const aliases = new Set([sessionId, sessionId.startsWith('ios:') ? sessionId.slice(4) : 'ios:' + sessionId])\n  return [...hidden].some((id) => aliases.has(id))`
+    if (source.includes(legacyPrivateCheck)) {
+      source = source.replace(legacyPrivateCheck, `  const roots = iosPrivateSessionRoots()\n  if (roots?.has('*')) return true\n  const aliases = new Set([sessionId, sessionId.startsWith('ios:') ? sessionId.slice(4) : 'ios:' + sessionId])\n  if ([...aliases].some((id) => roots?.has(id))) return true\n  const hidden = iosPrivateSessionClosure(rows)\n  return [...hidden].some((id) => aliases.has(id))`)
+    }
+    source = source.replace(
+      'if (isPrivateIOSSessionReference(ctx, request?.session)) {',
+      'if (isPrivateIOSSessionReference(ctx, request?.session) || isPrivateIOSSessionReference(ctx, request?.session_id)) {',
+    )
+  }
+
+  if (!source.includes('function iosRedteamWebOperationTier(op) {')) {
+    source = replaceCompatibilityAnchor(
+      source,
+      'function sessionRowsOf(sessions) {',
+      `${IOS_REDTEAM_WEB_OPERATION_TIER}\nfunction sessionRowsOf(sessions) {`,
+      'Web 演练台授权分类表',
+    )
+  }
+
+  if (!source.includes(IOS_WEB_SCOPE_MARKER)) {
+    const requestAnchor = `        const request = raw.trim() ? JSON.parse(raw) : {}\n        if (isPrivateIOSSessionReference(ctx, request?.session) || isPrivateIOSSessionReference(ctx, request?.session_id)) {\n          sendJson(res, 404, { ok: false, error: 'not found' })\n          return\n        }`
+    source = replaceCompatibilityAnchor(
+      source,
+      requestAnchor,
+      `${requestAnchor}\n        /* ${IOS_WEB_SCOPE_MARKER} */\n        const tier = iosRedteamWebOperationTier(request?.op)\n        const scopes = { read: process.env.DS_BOT_IOS_REDTEAM_WEB_READ === '1', write: process.env.DS_BOT_IOS_REDTEAM_WEB_WRITE === '1', sensitive: process.env.DS_BOT_IOS_REDTEAM_WEB_SENSITIVE === '1' }\n        const permitted = tier === 'read' ? scopes.read\n          : tier === 'sensitiveRead' ? scopes.read && scopes.sensitive\n          : tier === 'write' ? scopes.read && scopes.write\n          : tier === 'sensitiveWrite' ? scopes.read && scopes.write && scopes.sensitive\n          : false\n        if (!permitted) {\n          sendJson(res, 403, { ok: false, error: tier ? 'iOS Web 演练台未获此操作权限' : 'iOS 未审核此 Web API 操作，默认拒绝' })\n          return\n        }`,
+      'Web 演练台逐类授权',
+    )
+    source = replaceCompatibilityAnchor(
+      source,
+      '        sendJson(res, 200, skillResult === undefined ? await dispatchAsync(store, withRoot) : skillResult)',
+      `        const response = skillResult === undefined ? await dispatchAsync(store, withRoot) : skillResult\n        if (request.op === 'sessionBindings' && response?.agents && typeof response.agents === 'object') {\n          response.agents = Object.fromEntries(Object.entries(response.agents).filter(([id]) => !isPrivateIOSSessionReference(ctx, id)))\n        }\n        sendJson(res, 200, response)`,
+      'Web API 私密绑定结果过滤',
+    )
+  }
+  await writeFile(uiPath, source, 'utf8')
+  return { webWorkbenchAvailable: true }
 }
 
 function parsePax(data) {
@@ -724,6 +874,7 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
         }
       }
       const { manifest } = await inspectPackage(staged, expectedName, expectedVersion)
+      if (manifest.name === 'dsh-purge-safe') await ensurePurgeSafeIOSCompatibility(staged)
       if (DESKTOP_ONLY_BUNDLES.has(manifest.name)) throw new Error('这个完整桌面 bundle 不允许安装到 iOS profile')
       const available = await assertDependenciesAvailable(manifest, staged)
       if (available.has(manifest.name)) throw new Error('插件名称与已经内嵌的 DSH runtime 包冲突')

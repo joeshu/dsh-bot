@@ -8,11 +8,22 @@
     "./credentials": "./credentials.mjs",
     "./session-persistence": "./session-persistence.mjs",
     "./native-tools": "./native-tools.mjs",
-    "./sandbox-fs": "./sandbox-fs.mjs"
+    "./sandbox-fs": "./sandbox-fs.mjs",
+    "./approval": "./approval.mjs",
+    "./fs-search": "./fs-search.mjs",
+    "./questions": "./questions.mjs",
+    "./private-session-access": "./private-session-access.mjs",
+    "./ios-python-tool": "./ios-python-tool.mjs",
+    "./ios-python-jobs": "./ios-python-jobs.mjs",
+    "./ios-schedule-tools": "./ios-schedule-tools.mjs",
+    "./ios-ptc-runtime": "./ios-ptc-runtime.mjs",
+    "./ios-ptc-executor": "./ios-ptc-executor.mjs"
   },
   "dependencies": {
     "@deepseek-ai/dsh-credentials": "0.2.2-rc.5",
     "@deepseek-ai/dsh-session-persistence": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-ptc-runtime": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-tool-executor-ptc": "0.2.2-rc.5",
     "@deepseek-ai/dsh-tools": "0.2.2-rc.5"
   }
 }

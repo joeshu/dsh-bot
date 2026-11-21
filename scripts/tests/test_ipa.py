@@ -30,14 +30,31 @@ PACKAGES = {
     "@deepseek-ai/dsh-session-projection": "0.2.2-rc.5",
     "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.5",
     "@deepseek-ai/dsh-tools": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-ptc-runtime": "0.2.2-rc.5",
     "@deepseek-ai/dsh-tool-executor-native": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-tool-executor-ptc": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-jobs": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-jobs-local": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-tool-jobs": "0.2.2-rc.5",
 }
 TOP_LEVEL = {
     **PACKAGES,
+    "pyodide": "0.29.5",
     "semver": "7.8.5",
     "@dsbot/dsh-ios-profile": "file:./ios-profile-package",
     "@dsbot/dsh-ios-host": "file:./ios-host-package",
 }
+PYTHON_ARTIFACTS = {
+    "pyodide.mjs": b"pyodide loader fixture",
+    "pyodide.asm.js": b"pyodide wasm loader fixture",
+    "pyodide.asm.wasm": b"pinned wasm fixture",
+    "python_stdlib.zip": b"python standard library fixture",
+    "pyodide-lock.json": b"pyodide package lock fixture",
+    "full/numpy-2.2.5-cp313-cp313-pyemscripten_2025_0_wasm32.whl": b"numpy wheel fixture",
+    "LICENSE-PYODIDE-MPL-2.0.txt": b"Pyodide license fixture",
+    "LICENSE-NUMPY-BSD-3-CLAUSE.txt": b"NumPy license fixture",
+}
+PYTHON_ARTIFACT_HASHES = {name: hashlib.sha256(data).hexdigest() for name, data in PYTHON_ARTIFACTS.items()}
 
 
 def dylib_command(command, name):
@@ -59,6 +76,9 @@ class IPARegressionTests(unittest.TestCase):
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / "DS-Bot-iOS-Standalone-v1.9.0-unsigned.ipa"
+        original_artifacts = ipa.PYTHON_RUNTIME_ARTIFACT_SHA256
+        ipa.PYTHON_RUNTIME_ARTIFACT_SHA256 = PYTHON_ARTIFACT_HASHES
+        self.addCleanup(setattr, ipa, "PYTHON_RUNTIME_ARTIFACT_SHA256", original_artifacts)
 
     def make_ipa(self, *, platform=2, signature=False, executable=True, extra=None, sharing=False):
         node_load = dylib_command(0xC, "@rpath/NodeMobile.framework/NodeMobile")
@@ -72,7 +92,14 @@ class IPARegressionTests(unittest.TestCase):
         app_boot_bytes = b'DS_BOT_IOS_HOST platforms.includes("ios")'
         lock = json.dumps({
             "name": "@dsbot/dsh-ios-runtime", "lockfileVersion": 3,
-            "packages": {"": {"dependencies": TOP_LEVEL}},
+            "packages": {
+                "": {"dependencies": TOP_LEVEL},
+                "node_modules/pyodide": {
+                    "version": "0.29.5", "license": "MPL-2.0",
+                    "resolved": "https://registry.npmjs.org/pyodide/-/pyodide-0.29.5.tgz",
+                    "integrity": "sha512-TkYrUv9m8QmfImADKRmpwZulL48E0uUaBSO+dvRQKyAJc0qh9gu7jn8btyHPh3NZm1r2IH2YrJhIr7Q2B9urAw==",
+                },
+            },
         }, sort_keys=True).encode()
         runtime = {
             "dshVersion": "0.2.2-rc.5",
@@ -94,21 +121,66 @@ class IPARegressionTests(unittest.TestCase):
             },
             "iosProfile": {"name": "dsbot-ios", "bundle": "@dsbot/dsh-ios-profile"},
             "packageLockSha256": hashlib.sha256(lock).hexdigest(),
+            "backgroundJobs": {
+                "registry": "@deepseek-ai/dsh-jobs-local@0.2.2-rc.5",
+                "controls": "@deepseek-ai/dsh-tool-jobs@0.2.2-rc.5",
+                "producer": "python_job_start",
+                "ownerScope": "one native non-private Bot session",
+                "maxConcurrentPerSession": 1,
+                "maxConcurrentPythonWorkers": 1,
+                "maxExecutionSeconds": 120,
+                "outputLimitBytes": 131072,
+                "retentionBytes": 262144,
+                "settledOutputRetentionBytes": 16384,
+                "completionDelivery": "wakeup",
+                "nativeCompletionDelivery": "defer-tool-jobs-to-next-user-turn",
+                "backgroundBehavior": "defer-native-followups-as-inbox-injections-while-suspended",
+                "processLocal": True,
+                "survivesHostRestart": False,
+                "runsWhileIOSAppSuspended": False,
+                "directHostFileAccess": False,
+                "networkAccess": False,
+                "processAccess": False,
+            },
             "topLevelPackages": TOP_LEVEL,
-            "enabledUpstreamPlugins": ["dsh-agent", "dsh-agent-loop", "dsh-session",
+            "enabledUpstreamPlugins": ["dsh-agent", "dsh-agent-loop", "dsh-session", "dsh-web-app",
                                        "dsh-session-projection", "dsh-llm", "dsh-llm-deepseek-api-key",
-                                       "dsh-system-prompt", "dsh-tools", "dsh-tool-executor-native"],
+                                       "dsh-system-prompt", "dsh-tools", "dsh-tool-executor-native",
+                                       "dsh-jobs-local", "dsh-tool-jobs"],
+            "webUI": {"application": "@deepseek-ai/dsh-web-app", "frontend": "@deepseek-ai/dsh-web-frontend",
+                      "communityPluginPrefix": "dsh-client-ui-"},
             "iosHostAdapters": ["DSH SQLite SessionPersistence backed by node:sqlite",
                                 "iOS Keychain credentials provider",
                                 "DSH native tools bridged to iOS capabilities",
+                                "offline Pyodide Python and NumPy in a bounded, cancellable Worker",
+                                "DSH PTC Python provider with full-source approval and bounded nested-tool bridge",
+                                "DSH process-local Jobs registry with session-owned offline Python producer and native output controls",
                                 "official DSH profile-boot runProfile lifecycle",
                                 "iOS profile bundle source discovery, install, enable, disable, and remove"],
+            "pythonRuntime": {
+                "engine": "Pyodide", "version": "0.29.5", "license": "MPL-2.0",
+                "pythonVersion": "3.13.2", "numpyVersion": "2.2.5", "numpyLicense": "BSD-3-Clause",
+                "offline": True, "freshInterpreterPerExecution": True,
+                "pythonMemoryLimitBytes": 268435456, "maxExecutionSeconds": 45,
+                "maxCodeCharacters": 16000, "maxOutputCharacters": 32000,
+                "ptc": {
+                    "preset": "ptc-python", "executor": "@deepseek-ai/dsh-tool-executor-ptc@0.2.2-rc.5",
+                    "language": "python", "programFormat": "function-body", "approval": "full-source-per-run",
+                    "retainsState": False, "maxExecutionSeconds": 120, "maxNestedCalls": 60,
+                    "maxParallelNestedCalls": 2, "maxBindingBytes": 262144, "maxBindingValueBytes": 96000,
+                    "javascriptGlobals": "frozen-null-prototype-host-call-only",
+                    "bindingPromise": "prototype-free-awaitable",
+                    "directAppFileAccess": False, "networkBindings": False, "processBindings": False,
+                    "sandboxEscalation": False,
+                },
+                "artifacts": PYTHON_ARTIFACT_HASHES,
+            },
             "pluginSources": {
                 "indexFormat": 1,
                 "defaultSources": ["https://example.invalid/dsh-market.json", "https://example.invalid/dshfind.json"],
                 "installer": "exact NPM version, SHA-512 verified tarball, no lifecycle scripts",
             },
-            "excludedCapabilities": ["dsh-base", "dsh-web-app", "dsh-shell", "dsh-terminal"],
+            "excludedCapabilities": ["dsh-base", "dsh-shell", "dsh-terminal"],
             "node": {"version": "24.22.1", "minimumReleaseVersion": "24.22.3", "releaseEligible": False, "devicePlatform": "iPhoneOS",
                      "deviceArchitecture": "arm64", "deviceBinarySha256": hashlib.sha256(node_binary).hexdigest(),
                      "releaseBlocker": "NodeMobile needs an updated release build."},
@@ -135,9 +207,11 @@ class IPARegressionTests(unittest.TestCase):
             archive.writestr(base + "DSHRuntime/runtime-manifest.json", json.dumps(runtime).encode())
             archive.writestr(base + "DSHRuntime/package.json", json.dumps({"dependencies": TOP_LEVEL}).encode())
             archive.writestr(base + "DSHRuntime/package-lock.json", lock)
-            archive.writestr(base + "DSHRuntime/THIRD-PARTY-NOTICES.txt", b"NOTICE")
+            archive.writestr(base + "DSHRuntime/THIRD-PARTY-NOTICES.txt",
+                             "Pyodide 0.29.5 — MPL-2.0\nNumPy 2.2.5 WebAssembly wheel — BSD-3-Clause\n")
             archive.writestr(base + "DSHRuntime/ios-supervisor.mjs", b"// supervisor")
-            archive.writestr(base + "DSHRuntime/dsh-ios-entry.mjs", b"// runtime entry")
+            archive.writestr(base + "DSHRuntime/dsh-ios-entry.mjs",
+                             b"import { mountIOSPythonJobTool } from '@dsbot/dsh-ios-host/ios-python-jobs'; mountIOSPythonJobTool(ctx)")
             archive.writestr(base + "DSHRuntime/ios-plugin-manager.mjs", b"// plugin manager")
             archive.writestr(base + "DSHRuntime/sqlite-session-persistence.mjs", b"// persistence")
             archive.writestr(base + "DSHRuntime/ipc-protocol.mjs", b"// protocol")
@@ -149,13 +223,20 @@ class IPARegressionTests(unittest.TestCase):
                 "name": "@dsbot/dsh-ios-profile", "dsh": {"bundle": {"patch": "./cordis.patch.yml"}},
             }).encode())
             archive.writestr(base + "DSHRuntime/node_modules/@dsbot/dsh-ios-profile/cordis.patch.yml",
-                             b"@deepseek-ai/dsh-agent @deepseek-ai/dsh-agent-loop @deepseek-ai/dsh-session @deepseek-ai/dsh-session-projection @deepseek-ai/dsh-llm-deepseek-api-key @dsbot/dsh-ios-host/native-tools @dsbot/dsh-ios-host/session-persistence")
+                             b"@deepseek-ai/dsh-agent @deepseek-ai/dsh-agent-loop @deepseek-ai/dsh-session @deepseek-ai/dsh-session-projection @deepseek-ai/dsh-llm-deepseek-api-key @deepseek-ai/dsh-web-app @deepseek-ai/dsh-jobs-local @deepseek-ai/dsh-tool-jobs @dsbot/dsh-ios-host/native-tools @dsbot/dsh-ios-host/session-persistence @dsbot/dsh-ios-host/ios-ptc-runtime @dsbot/dsh-ios-host/ios-ptc-executor ptc-python tool/ptc-dispatch")
             archive.writestr(base + "DSHRuntime/node_modules/@dsbot/dsh-ios-host/package.json",
-                             json.dumps({"name": "@dsbot/dsh-ios-host"}).encode())
-            for name in ["index.mjs", "credentials.mjs", "session-persistence.mjs", "native-tools.mjs"]:
+                             json.dumps({"name": "@dsbot/dsh-ios-host", "dependencies": {
+                                 "@deepseek-ai/dsh-ptc-runtime": "0.2.2-rc.5",
+                                 "@deepseek-ai/dsh-tool-executor-ptc": "0.2.2-rc.5",
+                             }}).encode())
+            for name in ["index.mjs", "credentials.mjs", "session-persistence.mjs", "native-tools.mjs",
+                         "approval.mjs", "ios-python-tool.mjs", "python-execution.mjs", "python-worker.mjs",
+                         "python-worker-gate.mjs", "ios-python-jobs.mjs", "ios-ptc-runtime.mjs", "ios-ptc-python-worker.mjs", "ios-ptc-executor.mjs"]:
                 archive.writestr(base + "DSHRuntime/node_modules/@dsbot/dsh-ios-host/" + name, b"// adapter")
             for package, version in PACKAGES.items():
                 archive.writestr(base + "DSHRuntime/node_modules/" + package + "/package.json", json.dumps({"version": version}).encode())
+            for name, data in PYTHON_ARTIFACTS.items():
+                archive.writestr(base + "DSHRuntime/python-runtime/" + name, data)
             archive.writestr(base + "Frameworks/", b"")
             archive.writestr(framework + "NodeMobile", node_binary)
             archive.writestr(framework + "Info.plist", plistlib.dumps({

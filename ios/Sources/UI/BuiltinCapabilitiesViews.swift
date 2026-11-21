@@ -101,7 +101,7 @@ public struct WebSearchSettingsView: View {
             } header: {
                 Text("搜索参数与隐私")
             } footer: {
-                Text("默认关闭「发送原始问题上下文」，仅将经你审批的精简关键词发送到搜索接口。")
+                Text("默认关闭「发送原始问题上下文」。开启后，原始问题会压缩空白并截取前 128 个字符；审批卡片会展示实际发送的上下文。")
             }
 
             if !status.isEmpty {

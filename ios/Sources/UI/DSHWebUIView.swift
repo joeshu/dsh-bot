@@ -20,7 +20,10 @@ public struct DSHWebUIView: View {
     public var body: some View {
         Group {
             if let url = launchURL, allowedPort > 0 {
-                LoopbackWebView(url: url, allowedPort: allowedPort, reloadToken: reloadToken)
+                LoopbackWebView(url: url, allowedPort: allowedPort, reloadToken: reloadToken) {
+                    launchURL = nil
+                    errorMessage = "本机 Web 连接已断开，请重新连接。"
+                }
                     .ignoresSafeArea(edges: .bottom)
             } else if let errorMessage {
                 VStack(spacing: 12) {
@@ -65,30 +68,37 @@ public struct DSHWebUIView: View {
                 }
             }
         }
-        .task {
+        .task(id: host.runtimeGeneration) {
             await loadWebUIInfo()
         }
     }
 
     private func loadWebUIInfo() async {
+        let generation = host.runtimeGeneration
         errorMessage = nil
         guard let rpc = host.rpc() else {
+            launchURL = nil
             errorMessage = "DSH 运行时尚未就绪，请稍候重试。"
             return
         }
         do {
             let info = try await rpc.request("web.ui.info", timeoutSeconds: 15)
+            guard !Task.isCancelled, generation == host.runtimeGeneration else { return }
             guard info["ready"] as? Bool == true,
                   let raw = info["url"] as? String,
                   let parsed = URL(string: raw),
                   let port = info["port"] as? Int, port > 0,
+                  parsed.scheme == "http", parsed.port == port,
                   parsed.host == "127.0.0.1" else {
+                launchURL = nil
                 errorMessage = "DSH Web 工作台未启动（当前可能处于恢复模式）。"
                 return
             }
             allowedPort = port
             launchURL = parsed
         } catch {
+            guard !Task.isCancelled, generation == host.runtimeGeneration else { return }
+            launchURL = nil
             errorMessage = "无法获取 Web 工作台地址：\(error.localizedDescription)"
         }
     }
@@ -98,9 +108,10 @@ private struct LoopbackWebView: UIViewRepresentable {
     let url: URL
     let allowedPort: Int
     let reloadToken: UUID
+    let onDisconnect: () -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(allowedPort: allowedPort)
+        Coordinator(allowedPort: allowedPort, onDisconnect: onDisconnect)
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -110,6 +121,7 @@ private struct LoopbackWebView: UIViewRepresentable {
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = true
+        context.coordinator.lastLoadedURL = url
         context.coordinator.lastLoadedToken = reloadToken
         webView.load(URLRequest(url: url))
         return webView
@@ -117,7 +129,9 @@ private struct LoopbackWebView: UIViewRepresentable {
 
     func updateUIView(_ webView: WKWebView, context: Context) {
         context.coordinator.allowedPort = allowedPort
-        if context.coordinator.lastLoadedToken != reloadToken {
+        context.coordinator.onDisconnect = onDisconnect
+        if context.coordinator.lastLoadedToken != reloadToken || context.coordinator.lastLoadedURL != url {
+            context.coordinator.lastLoadedURL = url
             context.coordinator.lastLoadedToken = reloadToken
             webView.load(URLRequest(url: url))
         }
@@ -126,9 +140,21 @@ private struct LoopbackWebView: UIViewRepresentable {
     final class Coordinator: NSObject, WKNavigationDelegate {
         var allowedPort: Int
         var lastLoadedToken: UUID?
+        var lastLoadedURL: URL?
+        var onDisconnect: () -> Void
 
-        init(allowedPort: Int) {
+        init(allowedPort: Int, onDisconnect: @escaping () -> Void) {
             self.allowedPort = allowedPort
+            self.onDisconnect = onDisconnect
+        }
+
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            onDisconnect()
+        }
+
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            guard (error as NSError).code != NSURLErrorCancelled else { return }
+            onDisconnect()
         }
 
         func webView(

@@ -44,6 +44,24 @@
     - id: ios-native-tools
       name: '@dsbot/dsh-ios-host/native-tools'
 
+    - id: ios-approval
+      name: '@dsbot/dsh-ios-host/approval'
+
+    - id: ios-fs-search
+      name: '@dsbot/dsh-ios-host/fs-search'
+
+    - id: ios-questions
+      name: '@dsbot/dsh-ios-host/questions'
+
+    # DSH's job registry is process-local by design. The scoped standard and
+    # creator presets attach the controller and offline Python producer.
+    - id: ios-jobs-local
+      name: '@deepseek-ai/dsh-jobs-local'
+      config:
+        maxConcurrentJobsPerOwner: 1
+        retainBytes: 262144
+        settledRetainBytes: 16384
+
     - id: ios-web
       name: '@deepseek-ai/dsh-web'
       config:
@@ -65,7 +83,7 @@
     - id: ios-working-directory
       name: '@deepseek-ai/dsh-working-directory'
       config:
-        defaultDirectory: !!js process.env.DSH_HOME
+        defaultDirectory: !!js process.env.DSH_HOME + '/files'
 
     - id: ios-subagent
       name: '@deepseek-ai/dsh-subagent'
@@ -97,15 +115,18 @@
 
     - id: time-context
       name: '@deepseek-ai/dsh-time-context'
+      disabled: true
 
     - id: skill
       name: '@deepseek-ai/dsh-skill'
 
     - id: skill-filesystem
       name: '@deepseek-ai/dsh-skill-filesystem'
+      disabled: true
 
     - id: tool-skill
       name: '@deepseek-ai/dsh-tool-skill'
+      disabled: true
 
     # ── DSH Web UI surface (127.0.0.1 ephemeral loopback) + community dsh-client-ui-* support ──
     - id: storage
@@ -125,8 +146,8 @@
     - id: session-query-sqlite
       name: '@deepseek-ai/dsh-session-query-sqlite'
       config:
-        path: ':memory:'
-        openAt: never
+        path: !!js process.env.DSH_HOME + '/session-query.sqlite'
+        openAt: first-search
 
     - id: sandbox-policy
       name: '@deepseek-ai/dsh-sandbox-policy'
@@ -143,16 +164,261 @@
     - id: agent-preset-registry
       name: '@deepseek-ai/dsh-agent-preset-registry'
       config:
-        default: default
+        default: standard
 
-    - id: agent-preset-default
+    - id: user-approval
+      name: '@deepseek-ai/dsh-user-approval'
+      config:
+        policy: ask
+
+    # Python PTC is opt-in through its own iOS Agent preset. It uses the same
+    # offline Pyodide runtime as python_exec but exposes DSH tools only through
+    # the approved, bounded PTC binding bridge.
+    - id: ios-python-ptc-runtime
+      name: '@dsbot/dsh-ios-host/ios-ptc-runtime'
+
+    # Original DSH Web session actions: slash feedback, per-message ratings,
+    # and browser-side Markdown/ZIP export backed by the canonical session log.
+    - id: command-feedback
+      name: '@deepseek-ai/dsh-command-feedback'
+
+    - id: message-feedback
+      name: '@deepseek-ai/dsh-message-feedback'
+      config:
+        maxNoteBytes: 8192
+
+    - id: session-log-export
+      name: '@deepseek-ai/dsh-session-log-export'
+      config:
+        compressionLevel: 6
+
+    # Read-only runtime API discovery used by the Creator preset. The browser
+    # half is supplied by ui-cordis; these providers never invoke business APIs.
+    - id: cordis-host-runner
+      name: '@deepseek-ai/dsh-cordis-host-runner'
+
+    - id: cordis-inspect-providers
+      name: '@deepseek-ai/dsh-tool-cordis/host'
+
+    - id: agent-preset-standard
       name: '@deepseek-ai/dsh-agent-preset'
       config:
-        id: default
-        name: 默认模式
-        description: DS Bot iOS 默认智能体模式
-        order: 0
-        plugins: []
+        id: standard
+        name: 标准模式
+        description: DSH 标准编码模式；包含沙盒工作区文件读取、搜索、写入、编辑与补丁工具。
+        order: 1
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a coding agent powered by the {{model}} model.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              readImage: false
+              applyPatch: true
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+            config:
+              customSkillDirs:
+                - !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deepseek-ai/dsh-agent-preset/package.json')), 'skills')
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
+            config:
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                    You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Requests to implement changes mean plan the implementation, not execute it.
+
+                    Explore the workspace using read-only tools first. Do not edit or write files, change settings, or execute mutation tools while plan mode is active. Give the user a decision-complete plan, then submit it through exit_plan_mode for review.
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+
+    - id: agent-preset-creator
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: cordis
+        name: 创造模式
+        description: DSH 创造者模式；在标准开发工具上添加 DSH 自定义与扩展指导。
+        order: 2
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: >-
+                You are a coding agent powered by the {{model}} model.
+                You help the user customize DeepSeek Harness itself.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              readImage: false
+              applyPatch: true
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+            config:
+              customSkillDirs:
+                - !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deepseek-ai/dsh-agent-preset/package.json')), 'skills')
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
+            config:
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                    You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Requests to implement changes mean plan the implementation, not execute it.
+
+                    Explore the workspace using read-only tools first. Do not edit or write files, change settings, or execute mutation tools while plan mode is active. Give the user a decision-complete plan, then submit it through exit_plan_mode for review.
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: tool-cordis
+            name: '@deepseek-ai/dsh-tool-cordis'
+
+    - id: agent-preset-ptc-python
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: ptc-python
+        name: PTC 开发模式
+        description: 使用受限的本机 Python/NumPy 程序编排 DSH 工具；每次运行先审批，嵌套工具按自身策略审批。
+        order: 3
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a coding agent powered by the {{model}} model.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              readImage: false
+              applyPatch: true
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+            config:
+              customSkillDirs:
+                - !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@deepseek-ai/dsh-agent-preset/package.json')), 'skills')
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
+            config:
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                    You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Requests to implement changes mean plan the implementation, not execute it.
+
+                    Explore the workspace using read-only tools first. Do not edit or write files, change settings, or execute mutation tools while plan mode is active. Give the user a decision-complete plan, then submit it through exit_plan_mode for review.
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          - id: tool-cordis
+            name: '@deepseek-ai/dsh-tool-cordis'
+          - id: ptc-executor
+            name: '@dsbot/dsh-ios-host/ios-ptc-executor'
+            config:
+              maxSubCallsPerMinute: 30
+              maxParallelSubCalls: 2
+
+    - id: agent-preset-minimal
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: minimal
+        name: 轻量模式
+        description: 面向移动端的轻量助手；只读访问工作区文件，不包含写入、终端或后台作业工具。
+        order: 4
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a helpful assistant. Use the available read-only workspace tools only when they help answer the user's request.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              read: true
+              readImage: false
+              write: false
+              edit: false
+              applyPatch: false
+          - id: plan-mode
+            name: '@deepseek-ai/dsh-plan-mode'
+            config:
+              section: |
+                You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode.
+
+                Explore the workspace using read-only tools first. Do not edit or write files, change settings, or execute mutation tools while plan mode is active. Give the user a decision-complete plan, then submit it through exit_plan_mode for review.
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
 
     - id: typert
       name: '@deepseek-ai/dsh-typert-registry'
@@ -200,6 +466,11 @@
     - id: session-controller
       name: '@deepseek-ai/dsh-api-session-controller'
 
+    # Durable task records use the already configured SQLite storage-domain.
+    # Delivery is driven by the foreground DSH host; iOS background timing is not guaranteed.
+    - id: ios-schedule
+      name: '@deepseek-ai/dsh-schedule'
+
     - id: workspace-files
       name: '@deepseek-ai/dsh-api-workspace-files'
 
@@ -228,6 +499,9 @@
 
     - id: remote-access
       name: '@deepseek-ai/dsh-api-remote-access'
+
+    - id: ios-private-session-access
+      name: '@dsbot/dsh-ios-host/private-session-access'
 
     - id: cordis-client-runner
       name: '@deepseek-ai/dsh-cordis-client-runner'
@@ -283,8 +557,20 @@
     - id: ui-chat
       name: '@deepseek-ai/dsh-client-ui-chat'
 
+    - id: ui-attachment
+      name: '@deepseek-ai/dsh-client-ui-attachment'
+
+    - id: ui-cordis
+      name: '@deepseek-ai/dsh-client-ui-cordis'
+
+    - id: ui-secret-mask
+      name: '@deepseek-ai/dsh-client-ui-secret-mask'
+
     - id: ui-tool
       name: '@deepseek-ai/dsh-client-ui-tool'
+
+    - id: ui-message-feedback
+      name: '@deepseek-ai/dsh-client-ui-message-feedback'
 
     - id: ui-input-trigger
       name: '@deepseek-ai/dsh-client-ui-input-trigger'
@@ -298,11 +584,29 @@
     - id: ui-subagent
       name: '@deepseek-ai/dsh-client-ui-subagent'
 
+    - id: ui-agent-team
+      name: '@deepseek-ai/dsh-client-ui-agent-team'
+
+    - id: ui-trajectory
+      name: '@deepseek-ai/dsh-client-ui-trajectory'
+
     - id: ui-model-selection
       name: '@deepseek-ai/dsh-client-ui-model-selection'
 
     - id: ui-agent-preset
       name: '@deepseek-ai/dsh-client-ui-agent-preset'
+
+    - id: ui-reference
+      name: '@deepseek-ai/dsh-client-ui-reference'
+
+    - id: user-questions
+      name: '@deepseek-ai/dsh-user-questions'
+
+    - id: ui-user-questions
+      name: '@deepseek-ai/dsh-client-ui-user-questions'
+
+    - id: ui-plan
+      name: '@deepseek-ai/dsh-client-ui-plan'
 
     - id: ui-workspace
       name: '@deepseek-ai/dsh-client-ui-workspace'
@@ -310,11 +614,17 @@
     - id: ui-brand-official
       name: '@deepseek-ai/dsh-client-ui-brand-official'
 
+    - id: ui-sidebar-documentpreview
+      name: '@deepseek-ai/dsh-client-ui-sidebar-documentpreview'
+
+    - id: ui-deliverables
+      name: '@deepseek-ai/dsh-client-ui-deliverables'
+
+    - id: deliverable-file-references
+      name: '@deepseek-ai/dsh-deliverable-file-references'
+
     - id: ui-settings
       name: '@deepseek-ai/dsh-client-ui-settings'
-
-    - id: ui-settings-shell
-      name: '@deepseek-ai/dsh-client-ui-settings-shell'
 
     - id: ui-settings-general
       name: '@deepseek-ai/dsh-client-ui-settings-general'
@@ -333,6 +643,3 @@
 
     - id: ui-settings-web-search
       name: '@deepseek-ai/dsh-client-ui-settings-web-search'
-
-    - id: ui-plugin-manager
-      name: '@deepseek-ai/dsh-client-ui-plugin-manager'

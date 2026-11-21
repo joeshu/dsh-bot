@@ -35,25 +35,27 @@ public struct SessionsTabView: View {
     @State private var searchText = ""
     @State private var showCreateSheet = false
 
-    private var filteredBots: [BotProfile] {
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return host.bots }
-        return host.bots.filter { bot in
-            bot.name.localizedCaseInsensitiveContains(query)
-            || bot.roleLabel.localizedCaseInsensitiveContains(query)
-            || matchingMessage(for: bot, query: query) != nil
-        }
+    private var searchQuery: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func matchingMessage(for bot: BotProfile, query: String? = nil) -> ChatMessageItem? {
-        let searchQuery = (query ?? searchText).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !bot.isPrivate, !searchQuery.isEmpty else { return nil }
-        return host.messages(for: bot.id).last {
-            $0.content.localizedCaseInsensitiveContains(searchQuery)
+    private var botSearchSnapshot: (bots: [BotProfile], messages: [String: ChatMessageItem]) {
+        let query = searchQuery
+        guard !query.isEmpty else { return (host.recentlyActiveBots, [:]) }
+        var matches: [String: ChatMessageItem] = [:]
+        let matchingBots = host.bots.filter { bot in
+            let matchesIdentity = bot.name.localizedCaseInsensitiveContains(query)
+                || bot.roleLabel.localizedCaseInsensitiveContains(query)
+            if !bot.isPrivate, let message = host.matchingImportedMessage(botId: bot.id, query: query) {
+                matches[bot.id] = message
+            }
+            return matchesIdentity || matches[bot.id] != nil
         }
+        return (host.sortBySessionActivity(matchingBots), matches)
     }
 
     public var body: some View {
+        let searchSnapshot = botSearchSnapshot
         NavigationStack {
             List {
                 Section {
@@ -62,9 +64,20 @@ public struct SessionsTabView: View {
                 .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
                 .listRowBackground(Color.clear)
 
-                Section("最近会话") {
-                    ForEach(filteredBots) { bot in
-                        let matchedMessage = matchingMessage(for: bot)
+                NavigationLink {
+                    SessionInboxView(host: host)
+                } label: {
+                    Label("待处理", systemImage: "tray")
+                }
+
+                if !searchQuery.isEmpty {
+                    SessionSearchResults(host: host, query: searchQuery)
+                        .id(searchQuery)
+                }
+
+                Section(searchQuery.isEmpty ? "最近会话" : "匹配的会话") {
+                    ForEach(searchSnapshot.bots) { bot in
+                        let matchedMessage = searchSnapshot.messages[bot.id]
                         NavigationLink {
                             ChatView(bot: bot, host: host, targetMessageID: matchedMessage?.id)
                         } label: {
@@ -92,7 +105,7 @@ public struct SessionsTabView: View {
                                 }
                                 Spacer()
                                 VStack(alignment: .trailing, spacing: 3) {
-                                    if !bot.isPrivate, let timestamp = (matchedMessage ?? host.messages(for: bot.id).last)?.timestamp {
+                                    if !bot.isPrivate, let timestamp = host.sessionActivityDate(for: bot.id) {
                                         Text(timestamp.formatted(date: .omitted, time: .shortened))
                                             .font(.caption2)
                                             .foregroundColor(.secondary)
@@ -105,6 +118,7 @@ public struct SessionsTabView: View {
                 }
             }
             .listStyle(.insetGrouped)
+            .refreshable { await host.refreshSessionSummaries() }
             .navigationTitle("会话")
             .searchable(text: $searchText, prompt: "搜索会话和消息")
             .toolbar {
@@ -129,6 +143,9 @@ public struct SessionsTabView: View {
         }
         if let last = host.messages(for: bot.id).last {
             return last.content
+        }
+        if let persistedPreview = host.sessionPreview(for: bot.id) {
+            return persistedPreview
         }
         return bot.roleLabel
     }
@@ -316,6 +333,18 @@ public struct ToolsHubTabView: View {
                     }
 
                     NavigationLink {
+                        ScheduleBotPickerView(host: host)
+                    } label: {
+                        toolRow(icon: "calendar.badge.clock", color: .orange, title: "定时任务", subtitle: "按 Bot 查看、编辑、暂停和查看投递记录")
+                    }
+
+                    NavigationLink {
+                        JobsBotPickerView(host: host)
+                    } label: {
+                        toolRow(icon: "hourglass", color: .purple, title: "后台任务", subtitle: "按 Bot 查看离线 Python 任务、读取输出和取消")
+                    }
+
+                    NavigationLink {
                         JSSandboxPlaygroundView(host: host)
                     } label: {
                         toolRow(icon: "chevron.left.forwardslash.chevron.right", color: DSTheme.success, title: "端侧 JS 沙盒与设备探针", subtitle: "离线执行脚本并查看本机电量和温控")
@@ -340,6 +369,16 @@ public struct ToolsHubTabView: View {
                     }
                 }
 
+                Section("DSH 开发工具使用") {
+                    Label("新建 / 编辑 Bot，或在空会话菜单中选择标准、创造或轻量模式。", systemImage: "slider.horizontal.3")
+                        .font(.subheadline)
+                    Text("标准模式提供文件读写、补丁、搜索、Skill、计划、提问和待办；创造模式额外提供只读 Cordis API 检查。对话中会显示工具名称、运行状态及截断后的输入和结果。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("文件修改需要审批；选择只读权限会拒绝写入。自定义模型需在设置中打开「服务支持工具调用」。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
 
             }
             .listStyle(.insetGrouped)
@@ -366,6 +405,253 @@ public struct ToolsHubTabView: View {
 
 // MARK: - Enhanced ChatView (Reading Pill + / Slash Commands + Model Switcher + Streaming Commit + Approvals)
 
+private struct DSHUserQuestionCard: View {
+    let request: PendingDSHQuestion
+    let onSubmit: ([[String: Any]]) -> Void
+    @State private var selected: [String: Set<String>] = [:]
+    @State private var customText: [String: String] = [:]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("DSH 需要你的回答", systemImage: "questionmark.circle.fill")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(DSTheme.brand)
+
+            ForEach(request.questions) { item in
+                VStack(alignment: .leading, spacing: 8) {
+                    if !item.header.isEmpty {
+                        Text(item.header.uppercased())
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(item.question).font(.subheadline.weight(.medium))
+                    if !item.detail.isEmpty {
+                        Text(item.detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    ForEach(item.options) { option in
+                        let isSelected = selected[item.id, default: []].contains(option.label)
+                        Button {
+                            var values = selected[item.id, default: []]
+                            if item.multiSelect {
+                                if isSelected { values.remove(option.label) } else { values.insert(option.label) }
+                            } else {
+                                values = [option.label]
+                            }
+                            selected[item.id] = values
+                        } label: {
+                            HStack(alignment: .top, spacing: 8) {
+                                Image(systemName: isSelected
+                                      ? (item.multiSelect ? "checkmark.square.fill" : "largecircle.fill.circle")
+                                      : (item.multiSelect ? "square" : "circle"))
+                                    .foregroundStyle(isSelected ? DSTheme.brand : Color.secondary)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(option.label).font(.callout.weight(.medium))
+                                    if !option.description.isEmpty {
+                                        Text(option.description).font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    TextField("补充说明（可选）", text: Binding(
+                        get: { customText[item.id, default: ""] },
+                        set: { customText[item.id] = $0 }
+                    ), axis: .vertical)
+                    .lineLimit(1...4)
+                    .textFieldStyle(.roundedBorder)
+                }
+            }
+
+            Button("提交回答") {
+                let answers: [[String: Any]] = request.questions.map { item in
+                    var answer: [String: Any] = [
+                        "id": item.id,
+                        "selected": item.options.filter { selected[item.id, default: []].contains($0.label) }.map(\.label),
+                    ]
+                    let custom = customText[item.id]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    if !custom.isEmpty { answer["custom"] = custom }
+                    return answer
+                }
+                onSubmit(answers)
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .padding(12)
+        .background(DSTheme.brand.opacity(0.1))
+        .clipShape(RoundedRectangle(cornerRadius: DSTheme.cornerCard, style: .continuous))
+    }
+}
+
+private struct DSHToolActivityCard: View {
+    let activity: DSHToolActivity
+    let onViewFull: () -> Void
+
+    private var workspacePathSummary: String? {
+        if let fileSummary = activity.fileSummary { return fileSummary }
+        guard ["write", "edit", "apply_patch", "patch", "delete"].contains(activity.toolName),
+              let data = activity.arguments.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let arguments = object as? [String: Any] else { return nil }
+        let directPath = arguments["file_path"] as? String ?? arguments["path"] as? String
+        if let directPath, !directPath.isEmpty { return directPath }
+        let patchText = arguments["patch"] as? String ?? arguments["patch_text"] as? String ?? ""
+        let paths = patchText.split(separator: "\n").compactMap { line -> String? in
+            let value = String(line)
+            for prefix in ["*** Add File: ", "*** Update File: ", "*** Delete File: "] where value.hasPrefix(prefix) {
+                return String(value.dropFirst(prefix.count))
+            }
+            return nil
+        }
+        if !paths.isEmpty { return paths.prefix(3).joined(separator: ", ") + (paths.count > 3 ? " …" : "") }
+        return activity.toolName == "apply_patch" || activity.toolName == "patch" ? "多文件 patch" : nil
+    }
+
+    private var statusIcon: String {
+        switch activity.phase {
+        case "started": return "gearshape.2.fill"
+        case "completed": return "checkmark.circle.fill"
+        case "failed": return "exclamationmark.triangle.fill"
+        case "cancelled": return "xmark.circle.fill"
+        default: return "wrench.and.screwdriver.fill"
+        }
+    }
+
+    private var statusTint: Color {
+        switch activity.phase {
+        case "started": return DSTheme.brand
+        case "failed": return DSTheme.danger
+        case "cancelled": return DSTheme.warning
+        default: return .secondary
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: statusIcon).foregroundStyle(statusTint)
+                Text(activity.toolName).font(.subheadline.weight(.semibold))
+                Spacer()
+                Text(activity.phaseLabel).font(.caption).foregroundStyle(statusTint)
+            }
+            if let workspacePathSummary {
+                Label {
+                    Text("工作区 · \(workspacePathSummary)").lineLimit(2)
+                } icon: {
+                    Image(systemName: "doc.badge.gearshape")
+                }
+                .font(.caption2)
+                .foregroundStyle(activity.phase == "completed" ? DSTheme.brand : .secondary)
+            }
+            DisclosureGroup("查看工具输入与结果") {
+                if !activity.arguments.isEmpty {
+                    Text("输入").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Text(activity.arguments)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(8)
+                        .background(.secondary.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+                if !activity.result.isEmpty {
+                    Text("结果").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Text(activity.result)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(8)
+                        .background(.secondary.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+            }
+            .font(.caption)
+            if activity.callSequence != nil {
+                Button("查看完整工具记录") { onViewFull() }
+                    .font(.caption)
+            }
+        }
+        .padding(12)
+        .background(Color.secondary.opacity(0.07))
+        .clipShape(RoundedRectangle(cornerRadius: DSTheme.cornerCard, style: .continuous))
+    }
+}
+
+private struct DSHApprovalAuditCard: View {
+    let audit: DSHApprovalAudit
+
+    private var tint: Color {
+        switch audit.outcome {
+        case "allowed-once": return DSTheme.brand
+        case "rejected", "unavailable": return DSTheme.danger
+        case "cancelled": return DSTheme.warning
+        default: return .secondary
+        }
+    }
+
+    private var icon: String {
+        switch audit.outcome {
+        case "allowed-once": return "checkmark.shield.fill"
+        case "rejected", "unavailable": return "xmark.shield.fill"
+        case "cancelled": return "nosign"
+        default: return "questionmark.shield"
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon).foregroundStyle(tint)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("审批 · \(audit.toolName)").font(.caption.weight(.semibold))
+                Text(audit.outcomeLabel).font(.caption).foregroundStyle(tint)
+            }
+            Spacer(minLength: 0)
+            Text(audit.timestamp.formatted(date: .omitted, time: .shortened))
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(tint.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: DSTheme.cornerCard, style: .continuous))
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private enum ChatTranscriptRow: Identifiable {
+    case message(ChatMessageItem)
+    case tool(DSHToolActivity)
+    case approval(DSHApprovalAudit)
+
+    var id: String {
+        switch self {
+        case .message(let message): return "message-\(message.id)"
+        case .tool(let activity): return "tool-\(activity.id)"
+        case .approval(let audit): return "approval-\(audit.id)"
+        }
+    }
+
+    var timestamp: Date {
+        switch self {
+        case .message(let message): return message.timestamp
+        case .tool(let activity): return activity.timestamp
+        case .approval(let audit): return audit.timestamp
+        }
+    }
+
+    var sequence: Int? {
+        switch self {
+        case .message(let message): return message.sequence
+        case .tool(let activity): return activity.sequence
+        case .approval(let audit): return audit.sequence
+        }
+    }
+}
+
 public struct ChatView: View {
     let bot: BotProfile
     @ObservedObject var host: LocalAgentHost
@@ -376,11 +662,17 @@ public struct ChatView: View {
     @State private var showGroupWorkspace = false
     @State private var activeSectionTitle = ""
     @State private var isPrivateUnlocked = false
+    @State private var historyError: String?
+    @State private var historyPresentation: SessionHistoryPresentation?
+    @State private var restoringOlderHistory = false
+    @State private var followsLiveOutput = true
     @State private var showClearConfirm = false
     @State private var showEditBot = false
     @State private var showMemory = false
     @State private var showFileImporter = false
     @State private var showDiagnostics = false
+    @State private var showScheduleManager = false
+    @State private var showJobsManager = false
     @State private var showReferenceChatPicker = false
     @State private var referencedBot: BotProfile?
     @State private var attachedFile: LocalAgentHost.AttachedWorkspaceFile?
@@ -405,10 +697,33 @@ public struct ChatView: View {
         host.bots.first(where: { $0.id == bot.id }) ?? bot
     }
 
+    private func redteamPresetAllowed(for profile: BotProfile) -> Bool {
+        !profile.isPrivate && host.redteamModeEnabled && profile.redteamToolsEnabled
+            && profile.redteamWriteEnabled && profile.redteamSensitiveDataEnabled
+            && profile.permissionMode != "readOnly"
+    }
+
     private var isLocked: Bool { liveBot.isPrivate && !isPrivateUnlocked }
 
     private var sessionMessages: [ChatMessageItem] {
         isLocked ? [] : host.messages(for: liveBot.id)
+    }
+
+    private var transcriptRows: [ChatTranscriptRow] {
+        let messages = sessionMessages.map(ChatTranscriptRow.message)
+        let activities = (isLocked ? [] : host.dshToolActivities.filter { $0.sessionId == liveBot.id })
+            .map(ChatTranscriptRow.tool)
+        let approvalAudits = (isLocked ? [] : host.dshApprovalAudits.filter { $0.sessionId == liveBot.id })
+            .map(ChatTranscriptRow.approval)
+        return (messages + activities + approvalAudits).sorted { left, right in
+            if left.timestamp != right.timestamp { return left.timestamp < right.timestamp }
+            if let leftSequence = left.sequence, let rightSequence = right.sequence, leftSequence != rightSequence {
+                return leftSequence < rightSequence
+            }
+            if left.sequence != nil && right.sequence == nil { return true }
+            if left.sequence == nil && right.sequence != nil { return false }
+            return left.id < right.id
+        }
     }
 
     private var latestHeadings: [MarkdownHeading] {
@@ -424,6 +739,9 @@ public struct ChatView: View {
             } else {
                 conversation
             }
+        }
+        .task(id: isLocked) {
+            if !isLocked { await loadHistory() }
         }
         .navigationTitle(liveBot.name)
         .onChange(of: liveBot.model) { selectedModel = host.modelSelection($0) }
@@ -445,26 +763,72 @@ public struct ChatView: View {
                         .help("会话数据诊断")
                     }
                     Menu {
+                        Section("DSH Agent 模式") {
+                            Picker(host.agentPresetName(liveBot.agentPreset), selection: Binding(
+                                get: { liveBot.agentPreset },
+                                set: { host.setAgentPreset(sessionId: liveBot.id, presetId: $0) }
+                            )) {
+                                ForEach(host.dshAgentPresets) { preset in
+                                    let allowed = preset.isAvailable && (preset.id != "redteam" || redteamPresetAllowed(for: liveBot))
+                                    Text(allowed ? preset.name : "\(preset.name)（不可用/未授权）")
+                                        .tag(preset.id)
+                                        .disabled(!allowed)
+                                }
+                                if !host.dshAgentPresets.contains(where: { $0.id == liveBot.agentPreset }) {
+                                    Text(host.agentPresetName(liveBot.agentPreset)).tag(liveBot.agentPreset)
+                                }
+                            }
+                            .disabled(host.hasSessionHistory(bot.id) || host.isStreaming)
+                        }
                         if host.usesOfficialModels || !host.models.isEmpty {
                             ModelSelectionView(host: host, model: $selectedModel, allowsTyping: false)
                         }
                         Button("侧边对话 (/side)") { showSideChat = true }
+                        Button("定时任务") { showScheduleManager = true }
+                        if liveBot.agentPreset == "standard" || liveBot.agentPreset == "cordis" {
+                            Button("后台任务") { showJobsManager = true }
+                        }
                         if liveBot.isGroup { Button("群目标与待办") { showGroupWorkspace = true } }
                         if liveBot.isPrivate { Button("锁定私密会话") { lockPrivateConversation() } }
                         if host.redteamStatus.installed {
-                            Button {
-                                Task { await host.setRedteamMode(!host.redteamModeEnabled) }
-                            } label: {
-                                Label(
-                                    host.redteamModeEnabled ? "关闭红队演练模式" : "开启红队演练模式",
-                                    systemImage: host.redteamModeEnabled ? "shield.slash" : "shield.lefthalf.filled"
-                                )
+                            Section("dsh-purge-safe 会话授权") {
+                                Toggle("允许本 Bot 调用红队工具", isOn: Binding(
+                                    get: { liveBot.redteamToolsEnabled },
+                                    set: { host.setRedteamPermissions(sessionId: liveBot.id, toolsEnabled: $0) }
+                                ))
+                                Toggle("允许写入红队演练台", isOn: Binding(
+                                    get: { liveBot.redteamWriteEnabled },
+                                    set: { host.setRedteamPermissions(sessionId: liveBot.id, writeEnabled: $0) }
+                                ))
+                                .disabled(!liveBot.redteamToolsEnabled)
+                                Toggle("允许敏感工具（凭据 / 入口 / WebShell / 隧道 / PoC / 探测 / 清理）", isOn: Binding(
+                                    get: { liveBot.redteamSensitiveDataEnabled },
+                                    set: { host.setRedteamPermissions(sessionId: liveBot.id, sensitiveDataEnabled: $0) }
+                                ))
+                                .disabled(!liveBot.redteamToolsEnabled)
+                                if liveBot.isPrivate {
+                                    Text("私密会话始终禁止调用红队工具。")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                } else if !host.redteamModeEnabled {
+                                    Text("请先在“探索与插件”启用全局插件工具宿主。")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                } else {
+                                    Text("审批策略：\(liveBot.permissionModeLabel)。每次询问会逐次确认写入和敏感操作；自动审查仍会确认敏感操作；只读模式禁止写入。")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
                             }
+                            .disabled(liveBot.isPrivate || !host.redteamModeEnabled || host.isStreaming)
                         }
                         Button("会话数据诊断") { showDiagnostics = true }
-                        ShareLink(item: host.exportSessionMarkdown(sessionId: liveBot.id, botName: liveBot.name)) {
+                        Button {
+                            historyPresentation = .export
+                        } label: {
                             Label("导出会话为 Markdown", systemImage: "square.and.arrow.up")
                         }
+                        .disabled(host.streamingSessionId == bot.id)
                         Button("记忆") { showMemory = true }
                         Button("编辑 Bot 设置") { showEditBot = true }
                         Button("清空当前会话", role: .destructive) { showClearConfirm = true }
@@ -473,6 +837,11 @@ public struct ChatView: View {
                         Image(systemName: "ellipsis.circle")
                     }
                 }
+            }
+        }
+        .sheet(item: $historyPresentation) { presentation in
+            if !isLocked {
+                SessionHistoryDetailView(host: host, bot: liveBot, presentation: presentation)
             }
         }
         .sheet(isPresented: $showSideChat) {
@@ -492,6 +861,16 @@ public struct ChatView: View {
         }
         .sheet(isPresented: $showDiagnostics) {
             if !isLocked { SessionDiagnosticsSheet(host: host, bot: liveBot) }
+        }
+        .sheet(isPresented: $showScheduleManager) {
+            if !isLocked {
+                NavigationStack { ScheduleManagerView(host: host, botId: liveBot.id) }
+            }
+        }
+        .sheet(isPresented: $showJobsManager) {
+            if !isLocked {
+                NavigationStack { JobsManagerView(host: host, botId: liveBot.id) }
+            }
         }
         .sheet(isPresented: $showReferenceChatPicker) {
             NavigationStack {
@@ -535,7 +914,7 @@ public struct ChatView: View {
             Button("取消", role: .cancel) {}
         }
         .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.item]) { result in
-            guard !isLocked else { return }
+            guard !liveBot.isPrivate else { return }
             switch result {
             case .success(let url):
                 do {
@@ -552,10 +931,30 @@ public struct ChatView: View {
         }
     }
 
+    private func loadHistory(older: Bool = false) async {
+        guard !isLocked else { return }
+        historyError = nil
+        restoringOlderHistory = older
+        let previousCount = sessionMessages.count
+        defer { if previousCount == sessionMessages.count { restoringOlderHistory = false } }
+        do {
+            try await host.loadSessionHistory(bot.id, older: older)
+        } catch is CancellationError {
+            return
+        } catch {
+            if !isLocked { historyError = "无法读取会话记录。请重试。" }
+        }
+    }
+
     private func lockPrivateConversation() {
         isPrivateUnlocked = false
+        host.discardSessionHistoryCache(bot.id)
+        historyError = nil
+        historyPresentation = nil
         showSideChat = false
         showGroupWorkspace = false
+        showScheduleManager = false
+        showJobsManager = false
         showEditBot = false
         showMemory = false
         showFileImporter = false
@@ -583,12 +982,36 @@ public struct ChatView: View {
                                 )
                             }
 
-                            if sessionMessages.isEmpty && !host.isStreaming {
+                            if host.loadingHistoryIDs.contains(bot.id) {
+                                ProgressView("正在读取记录")
+                            } else if let historyError {
+                                Text(historyError).font(.caption).foregroundStyle(.secondary)
+                                Button("重试读取记录") {
+                                    Task { await loadHistory(older: host.hasOlderHistory(bot.id)) }
+                                }
+                            } else if host.hasOlderHistory(bot.id) {
+                                Button("加载更早记录") {
+                                    Task { await loadHistory(older: true) }
+                                }
+                            }
+
+                            if sessionMessages.isEmpty && !host.hasSessionHistory(bot.id)
+                                && !host.loadingHistoryIDs.contains(bot.id) && !host.isStreaming {
                                 emptyWelcomeView
                             }
 
-                            ForEach(sessionMessages) { msg in
-                                messageRow(msg).id(msg.id)
+                            ForEach(transcriptRows) { row in
+                                switch row {
+                                case .message(let msg):
+                                    messageRow(msg).id(msg.id)
+                                case .tool(let activity):
+                                    DSHToolActivityCard(activity: activity) {
+                                        historyPresentation = .tool(activity)
+                                    }
+                                    .id(activity.id)
+                                case .approval(let audit):
+                                    DSHApprovalAuditCard(audit: audit).id(audit.id)
+                                }
                             }
 
                             if host.isStreaming && host.streamingSessionId == bot.id {
@@ -599,6 +1022,12 @@ public struct ChatView: View {
                                 approvalCard(approval)
                             }
 
+                            ForEach(host.pendingDSHQuestions.filter { $0.sessionId == bot.id }) { request in
+                                DSHUserQuestionCard(request: request) { answers in
+                                    Task { await host.respondToDSHQuestion(id: request.id, answers: answers) }
+                                }
+                            }
+
                             if host.smartActionCardsEnabled,
                                !host.isStreaming,
                                let lastAssistant = sessionMessages.last(where: { $0.role == "assistant" }),
@@ -607,6 +1036,8 @@ public struct ChatView: View {
                             }
 
                             Color.clear.frame(height: 1).id("chat_bottom")
+                                .onAppear { followsLiveOutput = true }
+                                .onDisappear { followsLiveOutput = false }
                         }
                         .padding()
                     }
@@ -615,11 +1046,16 @@ public struct ChatView: View {
                         scrollToSearchResult(using: proxy)
                     }
                     .onChange(of: sessionMessages.count) { _ in
+                        if restoringOlderHistory {
+                            restoringOlderHistory = false
+                            return
+                        }
                         if !scrollToSearchResult(using: proxy) {
                             withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
                         }
                     }
                     .onChange(of: host.streamingContent.count) { _ in
+                        guard followsLiveOutput, host.streamingSessionId == bot.id else { return }
                         let now = Date()
                         if now.timeIntervalSince(lastScrollAt) >= 0.12 {
                             lastScrollAt = now
@@ -627,6 +1063,7 @@ public struct ChatView: View {
                         }
                     }
                     .onChange(of: host.streamingReasoning.count) { _ in
+                        guard followsLiveOutput, host.streamingSessionId == bot.id else { return }
                         let now = Date()
                         if now.timeIntervalSince(lastScrollAt) >= 0.12 {
                             lastScrollAt = now
@@ -634,6 +1071,15 @@ public struct ChatView: View {
                         }
                     }
                     .onChange(of: host.pendingApprovals.count) { _ in
+                        withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
+                    }
+                    .onChange(of: host.pendingDSHQuestions.count) { _ in
+                        withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
+                    }
+                    .onChange(of: host.dshToolActivities.count) { _ in
+                        withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
+                    }
+                    .onChange(of: host.dshApprovalAudits.count) { _ in
                         withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
                     }
                     .onDisappear {
@@ -762,6 +1208,11 @@ public struct ChatView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
 
+            if msg.historyPreview == true {
+                Button("查看完整消息") { historyPresentation = .message(msg) }
+                    .font(.caption)
+            }
+
             DSMarkdownText(msg.content)
                 .contextMenu {
                     Button {
@@ -770,7 +1221,7 @@ public struct ChatView: View {
                         #endif
                         DSHaptics.impact(.light)
                     } label: {
-                        Label("复制全文", systemImage: "doc.on.doc")
+                        Label(msg.historyPreview == true ? "复制预览" : "复制全文", systemImage: "doc.on.doc")
                     }
                     Button {
                         Task {
@@ -894,7 +1345,7 @@ public struct ChatView: View {
                     .buttonStyle(.bordered)
                 }
 
-                if lastAssistant.content.contains("```") {
+                if !liveBot.isPrivate && lastAssistant.content.contains("```") {
                     Button {
                         saveAssistantContentToWorkspace(lastAssistant.content)
                     } label: {
@@ -929,6 +1380,7 @@ public struct ChatView: View {
     }
 
     private func saveAssistantContentToWorkspace(_ content: String) {
+        guard !liveBot.isPrivate else { return }
         let dir = LocalAgentTransport.defaultWorkspace.appendingPathComponent("files", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let fileName = "snippet-\(Int(Date().timeIntervalSince1970)).md"
@@ -945,7 +1397,25 @@ public struct ChatView: View {
                 Image(systemName: "hand.raised.fill").foregroundColor(DSTheme.warning)
                 Text("需要审批：\(approval.tool)").font(.subheadline.weight(.semibold))
             }
-            Text(approval.summary).font(.caption).foregroundColor(.secondary).textSelection(.enabled)
+            if approval.tool == "run_code" || approval.tool == "python_job_start" {
+                Text(approval.tool == "run_code"
+                     ? "本次运行将在本机隔离 Python Worker 中执行；嵌套文件修改、联网等工具仍会按各自规则审批。"
+                     : "本次运行将在本机隔离 Python Worker 中执行，作为后台任务最多运行 120 秒，不会访问应用文件、网络、进程、MCP 或 DSH 工具。App 切到后台后是否继续运行由 iOS 决定。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                DisclosureGroup(approval.tool == "run_code" ? "查看完整 Python 程序" : "查看完整后台任务程序") {
+                    ScrollView(.vertical) {
+                        Text(approval.summary)
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 320)
+                }
+                .font(.caption)
+            } else {
+                Text(approval.summary).font(.caption).foregroundColor(.secondary).textSelection(.enabled)
+            }
             Text("工具结果会返回当前模型服务。").font(.caption2).foregroundStyle(.secondary)
             HStack(spacing: 10) {
                 Button("批准") {
@@ -1046,7 +1516,9 @@ public struct ChatView: View {
             }
             HStack(spacing: 8) {
                 Menu {
-                    Button { showFileImporter = true } label: { Label("附加文件到工作区", systemImage: "paperclip") }
+                    if !liveBot.isPrivate {
+                        Button { showFileImporter = true } label: { Label("附加文件到工作区", systemImage: "paperclip") }
+                    }
                     Button { showReferenceChatPicker = true } label: { Label("引用历史对话作为上下文", systemImage: "quote.bubble") }
                     Button { showSideChat = true } label: { Label("/side 侧边对话", systemImage: "bubble.left.and.exclamationmark.bubble.right") }
                     if liveBot.isGroup { Button { showGroupWorkspace = true } label: { Label("/goal 群目标与待办", systemImage: "target") } }
@@ -1169,6 +1641,10 @@ private struct CreateBotSheet: View {
     @State private var isPrivate = false
     @State private var isGroup = false
     @State private var permissionMode = "ask"
+    @State private var agentPreset = "standard"
+    @State private var redteamToolsEnabled = false
+    @State private var redteamWriteEnabled = false
+    @State private var redteamSensitiveDataEnabled = false
 
     private static let presets: [(title: String, role: String, model: String, prompt: String)] = [
         ("代码架构师", "架构设计与代码审查", ModelProvider.thinkingModel, "你是资深软件架构师，先给出清晰结论，再提供可验证的代码与边界风险分析。"),
@@ -1177,6 +1653,11 @@ private struct CreateBotSheet: View {
         ("红队评测", "提示词安全与边界评测", ModelProvider.thinkingModel, "你负责评估系统提示词与安全策略的鲁棒性，输出客观复现步骤与修复建议。"),
         ("日常翻译", "中英日精准互译", ModelProvider.defaultModel, "请准确自然地翻译用户输入，保留专业术语与排版格式。")
     ]
+
+    private func redteamPresetAllowed(_ preset: DSHAgentPresetOption) -> Bool {
+        preset.isAvailable && !isPrivate && host.redteamModeEnabled && redteamToolsEnabled
+            && redteamWriteEnabled && redteamSensitiveDataEnabled && permissionMode != "readOnly"
+    }
 
     var body: some View {
         NavigationStack {
@@ -1203,6 +1684,21 @@ private struct CreateBotSheet: View {
                     TextField("名称（如 研报助手）", text: $name)
                     TextField("职责描述", text: $roleLabel)
                     ModelSelectionView(host: host, model: $model)
+                    Picker("DSH Agent 模式", selection: $agentPreset) {
+                        ForEach(host.dshAgentPresets) { preset in
+                            let allowed = preset.id == "redteam" ? redteamPresetAllowed(preset) : preset.isAvailable
+                            Text(allowed ? preset.name : "\(preset.name)（不可用/未授权）")
+                                .tag(preset.id)
+                                .disabled(!allowed)
+                        }
+                    }
+                    .onAppear {
+                        if let defaultPreset = host.dshAgentPresets.first(where: { $0.id == host.defaultAgentPreset }),
+                           defaultPreset.isAvailable,
+                           (defaultPreset.id != "redteam" || redteamPresetAllowed(defaultPreset)) {
+                            agentPreset = host.defaultAgentPreset
+                        }
+                    }
                 }
                 Section("系统提示词（可选）") {
                     TextEditor(text: $systemPrompt)
@@ -1217,7 +1713,33 @@ private struct CreateBotSheet: View {
                     Toggle("创建群会话与待办", isOn: $isGroup)
                         .onChange(of: isGroup) { v in if v { isPrivate = false } }
                     Toggle("锁定私密会话（独立隔离，禁止入群）", isOn: $isPrivate)
-                        .onChange(of: isPrivate) { v in if v { isGroup = false } }
+                        .onChange(of: isPrivate) { v in
+                            if v {
+                                isGroup = false
+                                redteamToolsEnabled = false
+                                redteamWriteEnabled = false
+                                redteamSensitiveDataEnabled = false
+                            }
+                        }
+                }
+                if host.redteamStatus.installed {
+                    Section("dsh-purge-safe 工具授权") {
+                        Toggle("允许本 Bot 调用红队工具", isOn: $redteamToolsEnabled)
+                            .onChange(of: redteamToolsEnabled) { enabled in
+                                if !enabled {
+                                    redteamWriteEnabled = false
+                                    redteamSensitiveDataEnabled = false
+                                }
+                            }
+                        Toggle("允许写入红队演练台", isOn: $redteamWriteEnabled)
+                            .disabled(!redteamToolsEnabled)
+                        Toggle("允许敏感工具（凭据 / 入口 / WebShell / 隧道 / PoC / 探测 / 清理）", isOn: $redteamSensitiveDataEnabled)
+                            .disabled(!redteamToolsEnabled)
+                        Text("敏感工具仍按上方审批策略确认；只读模式禁止写入。私密会话不能授权红队工具。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .disabled(isPrivate || !host.redteamModeEnabled)
                 }
             }
             .navigationTitle("新建 Bot / 群聊")
@@ -1233,7 +1755,11 @@ private struct CreateBotSheet: View {
                             systemPrompt: systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines),
                             isPrivate: isPrivate,
                             isGroup: isGroup,
-                            permissionMode: permissionMode
+                            permissionMode: permissionMode,
+                            agentPreset: agentPreset,
+                            redteamToolsEnabled: redteamToolsEnabled,
+                            redteamWriteEnabled: redteamWriteEnabled,
+                            redteamSensitiveDataEnabled: redteamSensitiveDataEnabled
                         )
                         DSHaptics.notify(.success)
                         dismiss()
@@ -1414,6 +1940,10 @@ private struct EditBotSheet: View {
     @State private var model: String
     @State private var systemPrompt: String
     @State private var permissionMode: String
+    @State private var agentPreset: String
+    @State private var redteamToolsEnabled: Bool
+    @State private var redteamWriteEnabled: Bool
+    @State private var redteamSensitiveDataEnabled: Bool
 
     @MainActor
     init(bot: BotProfile, host: LocalAgentHost) {
@@ -1424,6 +1954,15 @@ private struct EditBotSheet: View {
         _model = State(initialValue: host.modelSelection(bot.model))
         _systemPrompt = State(initialValue: bot.systemPrompt)
         _permissionMode = State(initialValue: bot.permissionMode)
+        _agentPreset = State(initialValue: bot.agentPreset)
+        _redteamToolsEnabled = State(initialValue: bot.redteamToolsEnabled)
+        _redteamWriteEnabled = State(initialValue: bot.redteamWriteEnabled)
+        _redteamSensitiveDataEnabled = State(initialValue: bot.redteamSensitiveDataEnabled)
+    }
+
+    private var redteamPresetAllowed: Bool {
+        !bot.isPrivate && host.redteamModeEnabled && redteamToolsEnabled
+            && redteamWriteEnabled && redteamSensitiveDataEnabled && permissionMode != "readOnly"
     }
 
     var body: some View {
@@ -1433,6 +1972,23 @@ private struct EditBotSheet: View {
                     TextField("名称", text: $name)
                     TextField("职责描述", text: $roleLabel)
                     ModelSelectionView(host: host, model: $model)
+                    Picker("DSH Agent 模式", selection: $agentPreset) {
+                        ForEach(host.dshAgentPresets) { preset in
+                            let allowed = preset.isAvailable && (preset.id != "redteam" || redteamPresetAllowed)
+                            Text(allowed ? preset.name : "\(preset.name)（不可用/未授权）")
+                                .tag(preset.id)
+                                .disabled(!allowed)
+                        }
+                        if !host.dshAgentPresets.contains(where: { $0.id == agentPreset }) {
+                            Text(host.agentPresetName(agentPreset)).tag(agentPreset)
+                        }
+                    }
+                    .disabled(host.hasSessionHistory(bot.id) || host.isStreaming)
+                    if host.hasSessionHistory(bot.id) {
+                        Text("会话开始后模式固定；切换模式请新建 Bot。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 Section("权限预设") {
                     Picker("工具审批策略", selection: $permissionMode) {
@@ -1443,6 +1999,25 @@ private struct EditBotSheet: View {
                     Text("自动审查会放行只读查询工具；只读模式会拦截写入/修改类工具。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                }
+                if host.redteamStatus.installed {
+                    Section("dsh-purge-safe 工具授权") {
+                        Toggle("允许本 Bot 调用红队工具", isOn: $redteamToolsEnabled)
+                            .onChange(of: redteamToolsEnabled) { enabled in
+                                if !enabled {
+                                    redteamWriteEnabled = false
+                                    redteamSensitiveDataEnabled = false
+                                }
+                            }
+                        Toggle("允许写入红队演练台", isOn: $redteamWriteEnabled)
+                            .disabled(!redteamToolsEnabled)
+                        Toggle("允许敏感工具（凭据 / 入口 / WebShell / 隧道 / PoC / 探测 / 清理）", isOn: $redteamSensitiveDataEnabled)
+                            .disabled(!redteamToolsEnabled)
+                        Text("敏感工具要求独立授权；每次询问策略会逐次审批写入和敏感操作，自动审查策略会逐次审批敏感操作。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .disabled(bot.isPrivate || !host.redteamModeEnabled || host.streamingSessionId == bot.id)
                 }
                 Section("系统提示词（人设与指令）") {
                     TextEditor(text: $systemPrompt)
@@ -1461,7 +2036,11 @@ private struct EditBotSheet: View {
                             roleLabel: roleLabel.trimmingCharacters(in: .whitespacesAndNewlines),
                             model: model,
                             systemPrompt: systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines),
-                            permissionMode: permissionMode
+                            permissionMode: permissionMode,
+                            agentPreset: agentPreset,
+                            redteamToolsEnabled: redteamToolsEnabled,
+                            redteamWriteEnabled: redteamWriteEnabled,
+                            redteamSensitiveDataEnabled: redteamSensitiveDataEnabled
                         )
                         dismiss()
                     }

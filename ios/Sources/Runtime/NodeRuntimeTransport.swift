@@ -17,11 +17,11 @@ public final class NodeRuntimeTransport: IPCByteTransport, @unchecked Sendable {
     private var closed = false
     private var launched = false
 
-    public static func prepare(apiBaseURL: String, workspace: URL = defaultWorkspace) throws -> NodeRuntimeTransport {
-        try NodeRuntimeTransport(apiBaseURL: apiBaseURL, workspace: workspace)
+    public static func prepare(apiBaseURL: String, workspace: URL = defaultWorkspace, privateSessionIDs: [String] = []) throws -> NodeRuntimeTransport {
+        try NodeRuntimeTransport(apiBaseURL: apiBaseURL, workspace: workspace, privateSessionIDs: privateSessionIDs)
     }
 
-    private init(apiBaseURL: String, workspace: URL) throws {
+    private init(apiBaseURL: String, workspace: URL, privateSessionIDs: [String]) throws {
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         guard let runtimeDirectory = Bundle.main.resourceURL?.appendingPathComponent("DSHRuntime", isDirectory: true) else {
             throw IPCFrameError.remoteError(code: -32000, message: "Embedded DSH runtime resources are missing.")
@@ -46,12 +46,18 @@ public final class NodeRuntimeTransport: IPCByteTransport, @unchecked Sendable {
         _ = setsockopt(hostFD, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
         _ = setsockopt(nodeFD, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
 
+        let idsData = try JSONSerialization.data(withJSONObject: privateSessionIDs)
+        let privateIdsToken = idsData.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
         arguments = [
             "node", "--no-warnings", "--expose-internals", entry.path,
             "--ipc-fd=\(nodeFD)",
             "--workspace=\(workspace.path)",
             "--database=\(database.path)",
             "--api-base=\(apiBaseURL)",
+            "--private-session-ids=\(privateIdsToken)",
         ]
     }
 

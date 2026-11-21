@@ -356,6 +356,7 @@ private struct ConnectorSetupSheet: View {
     @State private var token = ""
     @State private var status = ""
     @State private var isWorking = false
+    @State private var savedConnectorId: String?
 
     init(host: LocalAgentHost, item: ConnectorCatalogItem?, onSaved: @escaping (String) -> Void) {
         self.host = host
@@ -398,6 +399,14 @@ private struct ConnectorSetupSheet: View {
                     SecureField(item?.auth == .none ? "Token（此服务免认证，可留空）" : "Bearer Token / API Key（存入 Keychain）", text: $token)
                 }
 
+                if item == nil {
+                    Section("会话开发工具") {
+                        Text("Bot 已内置离线 Python 3.13 与 NumPy，python_exec 在本机隔离 Worker 中运行，不需要配置连接器。若要调用外部 Python 或其他开发服务，请通过 remote_mcp_list / remote_mcp_call 使用此处配置的 MCP；调用前会显示目标并请求批准。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 Section {
                     Text("凭据仅保存在本机 iOS Keychain 中，远程 MCP 工具调用前仍遵循审批安全策略。")
                         .font(.caption)
@@ -434,13 +443,28 @@ private struct ConnectorSetupSheet: View {
         let cleanToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
             guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
-            _ = try await rpc.request("connectors.upsert", params: [
+            var params: [String: Any] = [
                 "name": cleanName,
                 "endpoint": cleanEndpoint,
                 "token": cleanToken
-            ])
-            onSaved("已保存连接器：\(cleanName)")
-            dismiss()
+            ]
+            if let savedConnectorId { params["id"] = savedConnectorId }
+            let result = try await rpc.request("connectors.upsert", params: params)
+            guard let connector = result["connector"] as? [String: Any],
+                  let connectorId = connector["id"] as? String else {
+                throw IPCFrameError.invalidJSON
+            }
+            savedConnectorId = connectorId
+            do {
+                let probe = try await rpc.request("mcp.listTools", params: ["connectorId": connectorId], timeoutSeconds: 180)
+                let count = (probe["tools"] as? [[String: Any]])?.count ?? 0
+                onSaved("\(cleanName)：已连通，发现 \(count) 个远程工具。")
+                dismiss()
+            } catch {
+                let message = "已保存连接器「\(cleanName)」，但连接探测失败：\(error.localizedDescription)"
+                status = message
+                onSaved(message)
+            }
         } catch {
             status = error.localizedDescription
         }

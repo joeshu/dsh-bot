@@ -17,6 +17,7 @@ if [[ "$(node --version)" != "v24.22.3" || "$(npm --version)" != "11.9.0" ]]; th
 fi
 npm --prefix "$ROOT/kernel/runtime" ci --ignore-scripts --omit=optional --no-audit --no-fund
 python3 "$ROOT/scripts/prepare-dsh-runtime.py"
+python3 "$ROOT/scripts/prepare-python-runtime.py"
 python3 "$ROOT/scripts/prepare-node-mobile-ios.py"
 python3 "$ROOT/scripts/prepare-quickjs.py"
 cd "$ROOT/ios"

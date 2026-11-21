@@ -1,5 +1,8 @@
 import Foundation
 
+typealias LocalPythonRunHandler = @Sendable (String, String, String) async throws -> String
+typealias LocalPythonCancelHandler = @Sendable (String, String) async -> Void
+
 /// Disk-persisted native tool state.
 actor LocalAgentStore {
     struct PersistedState: Codable {
@@ -305,8 +308,9 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
         return try await handle(method: method, params: params)
     }
 
-    func executeNativeTool(name: String, arguments: [String: Any], botId: String, turnId: String, isGroup: Bool) async throws -> [String: Any] {
-        guard ["js_eval", "device_status", "memory_save", "group_todo_add", "web_fetch", "web_search", "remote_mcp_call",
+    func executeNativeTool(name: String, arguments: [String: Any], botId: String, turnId: String, isGroup: Bool,
+                           pythonRunner: LocalPythonRunHandler? = nil) async throws -> [String: Any] {
+        guard ["js_eval", "python_exec", "device_status", "memory_save", "group_todo_add", "web_fetch", "web_search", "remote_mcp_list", "remote_mcp_call",
                "workspace_list", "workspace_read", "workspace_write", "workspace_search", "workspace_edit"].contains(name) else {
             throw IPCFrameError.remoteError(code: -32601, message: "Unsupported DSH native tool: \(name)")
         }
@@ -318,12 +322,14 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
         call.id = "dsh_\(UUID().uuidString)"
         call.function.name = name
         call.function.arguments = encoded
-        let output = try await execute(call, sessionId: botId, turnId: turnId, isGroup: isGroup, structuredWeb: name == "web_fetch")
+        let output = try await execute(call, sessionId: botId, turnId: turnId, isGroup: isGroup,
+                                       structuredWeb: name == "web_fetch", pythonRunner: pythonRunner)
         return ["output": output]
     }
 
-    func cancelNativeTool(botId: String, turnId: String) async {
+    func cancelNativeTool(botId: String, turnId: String, pythonCanceller: LocalPythonCancelHandler? = nil) async {
         await approvals.cancel(sessionId: botId, turnId: turnId)
+        await pythonCanceller?(botId, turnId)
     }
 
     public func write(_ data: Data) {
@@ -443,14 +449,20 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
             let endpoint = try RemoteMCPClient.endpointURL(params["endpoint"] as? String ?? "").absoluteString
             let name = (params["name"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !name.isEmpty else { throw IPCFrameError.remoteError(code: -32602, message: "请输入连接器名称。") }
-            let id = "conn_" + UUID().uuidString
+            let requestedID = params["id"] as? String
+            var existing: LocalAgentStore.ConnectorItem?
+            if let requestedID { existing = await store.connector(id: requestedID) }
+            let id: String
+            if let existing, existing.type == "remote-mcp" { id = existing.id }
+            else { id = "conn_" + UUID().uuidString }
+            let isExistingConnector = existing?.type == "remote-mcp"
             let account = "connector:\(id)"
             let token = params["token"] as? String ?? ""
             if !token.isEmpty { _ = try keychain.setSecret(account: account, value: token) }
             do {
                 return ["connector": try await store.upsertConnector(id: id, type: "remote-mcp", name: name, endpoint: endpoint)]
             } catch {
-                if !token.isEmpty { _ = try? keychain.deleteSecret(account: account) }
+                if !isExistingConnector, !token.isEmpty { _ = try? keychain.deleteSecret(account: account) }
                 throw error
             }
         case "connectors.delete":
@@ -487,6 +499,7 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
 
     private static let tools: [[String: Any]] = [
         tool("js_eval", "Evaluate JavaScript locally for calculations and data transforms.", ["script": "string"], ["script"]),
+        tool("python_exec", "Run offline Python 3.13 with NumPy in a fresh, resource-limited local WebAssembly worker. State resets after each call; print results or leave a final expression. No app files, network, process, or MCP bindings are exposed; use workspace tools for files. Each call shows the full code and requires approval.", ["code": "string"], ["code"]),
         tool("memory_save", "Save memory for the current bot.", ["title": "string", "content": "string", "layer": "string"], ["title", "content"]),
         tool("group_todo_add", "Add a todo to the current group.", ["text": "string"], ["text"]),
         tool("device_status", "Read iOS device power and thermal status.", [:], []),
@@ -641,7 +654,8 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
         throw ModelProviderError.interrupted
     }
 
-    private func execute(_ call: ProviderMessage.ToolCall, sessionId: String, turnId: String, isGroup: Bool, structuredWeb: Bool = false) async throws -> String {
+    private func execute(_ call: ProviderMessage.ToolCall, sessionId: String, turnId: String, isGroup: Bool,
+                         structuredWeb: Bool = false, pythonRunner: LocalPythonRunHandler? = nil) async throws -> String {
         let name = call.function.name
         guard let args = try JSONSerialization.jsonObject(with: Data(call.function.arguments.utf8)) as? [String: Any] else {
             return "Invalid tool arguments."
@@ -657,6 +671,14 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
         case "js_eval":
             let result = await js.evaluate(text("script"))
             return result.error ?? (result.value.isEmpty ? result.logs.joined(separator: "\n") : result.value)
+        case "python_exec":
+            guard pythonRunner != nil else { return "本机 Python 运行时尚未连接。请重启 DSH 运行时后重试。" }
+            let code = args["code"] as? String ?? ""
+            guard !code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  code.count <= 16_000, !code.unicodeScalars.contains(where: { $0.value == 0 }) else {
+                return "Python 代码不能为空、不能包含 NUL，且最多 16,000 个字符。"
+            }
+            summary = "本机离线 Python 3.13 + NumPy（需批准；代码留在本机）\n每次在全新 WebAssembly Worker 中运行，45 秒上限、256 MiB Python 内存上限、32,000 字符输出上限。无宿主文件、网络、进程或 MCP 绑定。\n完整代码（\(code.count) 字符）：\n\(code)"
         case "memory_save":
             guard !text("title").isEmpty, !text("content").isEmpty else { return "Memory title and content are required." }
         case "group_todo_add":
@@ -687,6 +709,14 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
                 return "搜索关键词须为单行，且不能超过 300 个字符。"
             }
             summary = "发送到 api.deepseek.com 的搜索关键词：\n" + query
+            let originalQuestion = args["originalQuestion"] as? String ?? ""
+            if !originalQuestion.isEmpty {
+                guard originalQuestion.unicodeScalars.count <= 128,
+                      !originalQuestion.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }) else {
+                    return "原始问题上下文格式无效，已阻止网页搜索。"
+                }
+                summary += "\n\n发送的原始问题上下文（空白已压缩，最多 128 个 Unicode 字符）：\n「" + originalQuestion + "」"
+            }
         case "web_fetch":
             address = try? ModelProvider.httpsComponents(text("url")).url
             guard let address else { return "A valid HTTPS URL is required." }
@@ -751,6 +781,9 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
                 guard let connector, await store.connector(id: connector.id)?.endpoint == connector.endpoint else { return "Connector changed." }
                 return try await mcp.callTool(endpoint: connector.endpoint, name: text("toolName"),
                     arguments: args["arguments"] as? [String: Any] ?? [:], keychainAccount: "connector:\(connector.id)")
+            case "python_exec":
+                guard let pythonRunner else { return "本机 Python 运行时尚未连接。请重启 DSH 运行时后重试。" }
+                return try await pythonRunner(args["code"] as? String ?? "", sessionId, turnId)
             case "web_search": return "approved"
             case "web_fetch":
                 guard let address else { return "Invalid URL." }
