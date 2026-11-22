@@ -100,8 +100,9 @@ public final class LocalAgentHost: ObservableObject {
     private var legacyMessagesBySession: [String: [ChatMessageItem]] = [:]
     @Published public private(set) var streamingSessionId: String?
     @Published public var visibleChatSessionId: String?
-    @Published public private(set) var streamingReasoning: String = ""
-    @Published public private(set) var streamingContent: String = ""
+    public let liveStream = StreamingTurnState()
+    public var streamingReasoning: String { liveStream.reasoning }
+    public var streamingContent: String { liveStream.content }
     @Published public private(set) var isStreaming: Bool = false
     @Published public private(set) var streamFirstTokenMs: Int?
     @Published public private(set) var lastStreamError: String?
@@ -246,6 +247,11 @@ public final class LocalAgentHost: ObservableObject {
     private var pendingContentBuffer = ""
     private var flushScheduled = false
     private var streamStartedAt: Date?
+    private var lastStreamActivityAt: Date?
+    private var lastDraftSavedAt: Date = .distantPast
+    private var lastDraftSavedLength: Int = 0
+    private var pendingSteerNote: String?
+    private var streamStallWatchdogTask: Task<Void, Never>?
     private var sentCancellation = false
 
     public init() {
@@ -372,6 +378,8 @@ public final class LocalAgentHost: ObservableObject {
     public func steerActiveTurn(sessionId: String, text: String, model: String) async {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        pendingSteerNote = trimmed
+        liveStream.recentSteerNote = trimmed
         if isStreaming {
             await abortActiveTurn()
             for _ in 0..<25 {
@@ -380,6 +388,17 @@ public final class LocalAgentHost: ObservableObject {
             }
         }
         await sendMessage(sessionId: sessionId, text: "[插话引导] \(trimmed)", model: model)
+    }
+
+    /// Refreshes session summaries and reloads visible non-private history after closing the DSH Web Workbench.
+    public func syncFromWebWorkbench() async {
+        guard state == .ready, !isStreaming else { return }
+        await refreshSessionSummaries()
+        if let visibleId = visibleChatSessionId,
+           bots.first(where: { $0.id == visibleId })?.isPrivate != true {
+            loadedHistoryIDs.remove(visibleId)
+            try? await loadSessionHistory(visibleId)
+        }
     }
 
     public func importConversation(from url: URL) throws -> BotProfile {
@@ -471,13 +490,34 @@ public final class LocalAgentHost: ObservableObject {
         activeTurnId = turnId
         streamingSessionId = sessionId
         sentCancellation = false
-        streamingReasoning = ""
-        streamingContent = ""
+        let steerNote = pendingSteerNote
+        pendingSteerNote = nil
+        liveStream.begin(sessionId: sessionId, steerNote: steerNote)
+        lastDraftSavedAt = .distantPast
+        lastDraftSavedLength = 0
         streamStartedAt = Date()
+        lastStreamActivityAt = Date()
         streamFirstTokenMs = nil
         lastStreamError = nil
         isStreaming = true
         DSHaptics.impact(.light)
+
+        streamStallWatchdogTask?.cancel()
+        streamStallWatchdogTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                guard let self, self.activeTurnId == turnId, self.isStreaming else { return }
+                guard self.pendingApprovals.isEmpty, self.pendingDSHQuestions.isEmpty else {
+                    self.lastStreamActivityAt = Date()
+                    continue
+                }
+                if let last = self.lastStreamActivityAt, Date().timeIntervalSince(last) >= 120 {
+                    self.lastStreamError = "流式响应超过 120 秒无新数据（网络可能已断开），已安全停止，可点击重试。"
+                    await self.abortActiveTurn()
+                    return
+                }
+            }
+        }
 
         let bot = bots.first(where: { $0.id == sessionId })
         let legacyHistory = (legacyMessagesBySession[sessionId] ?? []).suffix(12).map { message in
@@ -739,7 +779,8 @@ public final class LocalAgentHost: ObservableObject {
         return (content, response["reasoning"] as? String ?? "")
     }
 
-    public struct AttachedWorkspaceFile: Equatable, Sendable {
+    public struct AttachedWorkspaceFile: Identifiable, Equatable, Sendable {
+        public var id: String { relativePath }
         public let relativePath: String
         public let fileName: String
         public let byteCount: Int
@@ -749,75 +790,172 @@ public final class LocalAgentHost: ObservableObject {
             if let inlineText, !inlineText.isEmpty {
                 return "[附件文件：files/\(relativePath)（\(byteCount) 字节）]\n```\n\(inlineText)\n```\n\n"
             }
-            return "[附件文件：files/\(relativePath)（\(byteCount) 字节，已存入工作区，可使用 workspace_read 查看）]\n\n"
+            return "[附件文件：files/\(relativePath)（\(byteCount) 字节，已存入工作区，可使用 workspace_read 或 python_exec 查看）]\n\n"
         }
+    }
+
+    private static let imageExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "heic", "heif", "webp", "bmp", "tif", "tiff", "gif"
+    ]
+
+    private static let textExtensions: Set<String> = [
+        "txt", "md", "markdown", "json", "jsonl", "yaml", "yml", "xml", "csv", "tsv", "log",
+        "swift", "py", "js", "mjs", "cjs", "ts", "tsx", "jsx", "html", "htm", "css", "scss",
+        "sql", "sh", "bash", "zsh", "toml", "ini", "cfg", "conf", "env", "c", "h", "cpp", "hpp",
+        "m", "mm", "go", "rs", "java", "kt", "rb", "php", "pl", "r", "lua", "dart", "vue", "svelte",
+        "dockerfile", "makefile", "gitignore", "properties", "gradle", "plist", "svg", "tex"
+    ]
+
+    private static func sanitizeAttachmentFilename(_ rawName: String, fallbackExt: String = "bin") -> String {
+        let trimmed = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let filtered = trimmed.unicodeScalars.map { scalar -> Character in
+            if scalar == "/" || scalar == "\\" || scalar == "\0" || scalar.value < 0x20 || scalar.value == 0x7F {
+                return "_"
+            }
+            if scalar == ":" || scalar == "*" || scalar == "?" || scalar == "\"" || scalar == "<" || scalar == ">" || scalar == "|" {
+                return "_"
+            }
+            return Character(scalar)
+        }
+        var cleaned = String(filtered).trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+        while cleaned.contains("..") {
+            cleaned = cleaned.replacingOccurrences(of: "..", with: ".")
+        }
+        if cleaned.count > 120 {
+            let ext = (cleaned as NSString).pathExtension
+            let stem = (cleaned as NSString).deletingPathExtension
+            let maxStem = max(16, 115 - ext.count)
+            cleaned = ext.isEmpty ? String(stem.prefix(120)) : "\(String(stem.prefix(maxStem))).\(ext)"
+        }
+        if cleaned.isEmpty {
+            return "attachment_\(UUID().uuidString.prefix(6)).\(fallbackExt)"
+        }
+        return cleaned
+    }
+
+    private static func uniqueDestination(in filesDir: URL, preferredName: String) -> (name: String, url: URL) {
+        var targetName = preferredName
+        var dest = filesDir.appendingPathComponent(targetName, isDirectory: false)
+        if FileManager.default.fileExists(atPath: dest.path) {
+            let stem = (preferredName as NSString).deletingPathExtension
+            let ext = (preferredName as NSString).pathExtension
+            let suffix = String(UUID().uuidString.prefix(6)).lowercased()
+            targetName = ext.isEmpty ? "\(stem)_\(suffix)" : "\(stem)_\(suffix).\(ext)"
+            dest = filesDir.appendingPathComponent(targetName, isDirectory: false)
+        }
+        return (targetName, dest)
+    }
+
+    private static func extractInlinePreview(at dest: URL, byteCount: Int) -> String? {
+        let inlineLimit = 24_576
+        let ext = dest.pathExtension.lowercased()
+        if ext == "pdf" {
+            return extractPDFText(at: dest, maxChars: inlineLimit)
+        }
+        if imageExtensions.contains(ext) {
+            if let data = try? Data(contentsOf: dest, options: .mappedIfSafe) {
+                return extractImageOCRText(from: data, maxChars: inlineLimit)
+            }
+            return nil
+        }
+        // Read up to inlineLimit bytes for text/code files (or small UTF-8 files of any extension)
+        if textExtensions.contains(ext) || byteCount <= inlineLimit {
+            guard let handle = try? FileHandle(forReadingFrom: dest) else { return nil }
+            defer { try? handle.close() }
+            let slice = (try? handle.read(upToCount: inlineLimit)) ?? Data()
+            guard !slice.isEmpty, !slice.contains(0) else { return nil }
+            if let decoded = String(data: slice, encoding: .utf8) {
+                if byteCount > slice.count {
+                    return decoded + "\n...[已截断，完整内容请使用 workspace_read 或 python_exec 查看]"
+                }
+                return decoded
+            }
+        }
+        return nil
     }
 
     public func importFileToWorkspace(from sourceURL: URL) throws -> AttachedWorkspaceFile {
         let accessed = sourceURL.startAccessingSecurityScopedResource()
         defer { if accessed { sourceURL.stopAccessingSecurityScopedResource() } }
-        let values = try sourceURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
-        guard values.isRegularFile == true else {
-            throw IPCFrameError.remoteError(code: -32602, message: "只能附加普通文件。")
-        }
-        let maxImportBytes = 2 * 1024 * 1024
-        let maxRawImageBytes = 25 * 1024 * 1024
-        let sourceExt = sourceURL.pathExtension.lowercased()
-        let isImage = ["png", "jpg", "jpeg", "heic", "heif", "webp", "bmp", "tif", "tiff"].contains(sourceExt)
-        let data: Data
-        if isImage, let size = values.fileSize, size > maxImportBytes {
-            guard size <= maxRawImageBytes else {
-                throw IPCFrameError.remoteError(code: -32602, message: "单张图片不能超过 25 MB。")
-            }
-            guard let downsampled = MemoryGovernor.downsampleImage(at: sourceURL, maxPixelSize: 1568, compressionQuality: 0.82),
-                  downsampled.count <= maxImportBytes else {
-                throw IPCFrameError.remoteError(code: -32602, message: "图片压缩后仍超过 2 MB，请裁剪后重试。")
-            }
-            data = downsampled
-        } else {
-            if let size = values.fileSize, size > maxImportBytes {
-                throw IPCFrameError.remoteError(code: -32602, message: "单个附件不能超过 2 MB。")
-            }
-            let rawData = try Data(contentsOf: sourceURL)
-            guard rawData.count <= maxImportBytes else {
-                throw IPCFrameError.remoteError(code: -32602, message: "单个附件不能超过 2 MB。")
-            }
-            data = rawData
-        }
-        let rawName = sourceURL.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
-        let safeChars = rawName.map { ch -> Character in
-            (ch.isASCII && (ch.isLetter || ch.isNumber || ch == "." || ch == "-" || ch == "_")) ? ch : "_"
-        }
-        let baseName = String(safeChars).trimmingCharacters(in: CharacterSet(charactersIn: "."))
-        let fileName = baseName.isEmpty ? "attachment_\(UUID().uuidString.prefix(6)).txt" : baseName
+
+        let maxImportBytes = 25 * 1024 * 1024
+        let maxImageDirectBytes = 4 * 1024 * 1024
         let filesDir = LocalAgentTransport.defaultWorkspace.appendingPathComponent("files", isDirectory: true)
         try FileManager.default.createDirectory(at: filesDir, withIntermediateDirectories: true)
-        var targetName = fileName
-        var dest = filesDir.appendingPathComponent(targetName, isDirectory: false)
-        if FileManager.default.fileExists(atPath: dest.path) {
-            let stem = (fileName as NSString).deletingPathExtension
-            let ext = (fileName as NSString).pathExtension
-            let suffix = String(UUID().uuidString.prefix(6)).lowercased()
-            targetName = ext.isEmpty ? "\(stem)_\(suffix)" : "\(stem)_\(suffix).\(ext)"
-            dest = filesDir.appendingPathComponent(targetName, isDirectory: false)
-        }
-        try data.write(to: dest, options: .atomic)
-        let inlineLimit = 24_576
-        var inlineText: String? = data.count <= inlineLimit ? String(data: data, encoding: .utf8) : nil
-        if inlineText == nil {
-            let ext = dest.pathExtension.lowercased()
-            if ext == "pdf" {
-                inlineText = Self.extractPDFText(from: data, maxChars: inlineLimit)
-            } else if ["png", "jpg", "jpeg", "heic", "heif", "webp", "bmp", "tif", "tiff"].contains(ext) {
-                inlineText = Self.extractImageOCRText(from: data, maxChars: inlineLimit)
+
+        var coordinatorError: NSError?
+        var importError: Error?
+        var importedFile: AttachedWorkspaceFile?
+
+        let coordinator = NSFileCoordinator()
+        coordinator.coordinate(readingItemAt: sourceURL, options: .withoutChanges, error: &coordinatorError) { coordinatedURL in
+            do {
+                let values = try coordinatedURL.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey, .fileSizeKey])
+                if values.isDirectory == true && values.isPackage != true {
+                    throw IPCFrameError.remoteError(code: -32602, message: "暂不支持直接附加文件夹，请选择文件或压缩包。")
+                }
+                let rawSize = values.fileSize ?? 0
+                if rawSize > maxImportBytes {
+                    throw IPCFrameError.remoteError(code: -32602, message: "单个附件不能超过 25 MB。")
+                }
+
+                let sourceExt = coordinatedURL.pathExtension.lowercased()
+                let isImage = Self.imageExtensions.contains(sourceExt)
+                var preferredName = Self.sanitizeAttachmentFilename(coordinatedURL.lastPathComponent)
+
+                if isImage && rawSize > maxImageDirectBytes {
+                    if let downsampled = MemoryGovernor.downsampleImage(at: coordinatedURL, maxPixelSize: 1568, compressionQuality: 0.82),
+                       downsampled.count <= maxImportBytes {
+                        let stem = (preferredName as NSString).deletingPathExtension
+                        preferredName = "\(stem).jpg"
+                        let (targetName, dest) = Self.uniqueDestination(in: filesDir, preferredName: preferredName)
+                        try downsampled.write(to: dest, options: .atomic)
+                        let inlineText = Self.extractInlinePreview(at: dest, byteCount: downsampled.count)
+                        importedFile = AttachedWorkspaceFile(relativePath: targetName, fileName: targetName, byteCount: downsampled.count, inlineText: inlineText)
+                        return
+                    }
+                }
+
+                let (targetName, dest) = Self.uniqueDestination(in: filesDir, preferredName: preferredName)
+                try FileManager.default.copyItem(at: coordinatedURL, to: dest)
+                let copiedAttrs = try? FileManager.default.attributesOfItem(atPath: dest.path)
+                let finalSize = (copiedAttrs?[.size] as? Int) ?? rawSize
+                if finalSize > maxImportBytes {
+                    try? FileManager.default.removeItem(at: dest)
+                    throw IPCFrameError.remoteError(code: -32602, message: "单个附件不能超过 25 MB。")
+                }
+                let inlineText = Self.extractInlinePreview(at: dest, byteCount: finalSize)
+                importedFile = AttachedWorkspaceFile(relativePath: targetName, fileName: targetName, byteCount: finalSize, inlineText: inlineText)
+            } catch {
+                importError = error
             }
         }
+
+        if let coordinatorError { throw coordinatorError }
+        if let importError { throw importError }
+        guard let importedFile else {
+            throw IPCFrameError.remoteError(code: -32603, message: "无法读取所选文件，请重试。")
+        }
+        return importedFile
+    }
+
+    public func importRawDataToWorkspace(_ data: Data, suggestedName: String) throws -> AttachedWorkspaceFile {
+        let maxImportBytes = 25 * 1024 * 1024
+        guard data.count <= maxImportBytes else {
+            throw IPCFrameError.remoteError(code: -32602, message: "单个附件不能超过 25 MB。")
+        }
+        let filesDir = LocalAgentTransport.defaultWorkspace.appendingPathComponent("files", isDirectory: true)
+        try FileManager.default.createDirectory(at: filesDir, withIntermediateDirectories: true)
+        let preferredName = Self.sanitizeAttachmentFilename(suggestedName, fallbackExt: "jpg")
+        let (targetName, dest) = Self.uniqueDestination(in: filesDir, preferredName: preferredName)
+        try data.write(to: dest, options: .atomic)
+        let inlineText = Self.extractInlinePreview(at: dest, byteCount: data.count)
         return AttachedWorkspaceFile(relativePath: targetName, fileName: targetName, byteCount: data.count, inlineText: inlineText)
     }
 
-    private static func extractPDFText(from data: Data, maxChars: Int) -> String? {
+    private static func extractPDFText(at url: URL, maxChars: Int) -> String? {
         #if canImport(PDFKit)
-        guard let doc = PDFDocument(data: data) else { return nil }
+        guard let doc = PDFDocument(url: url) else { return nil }
         var buffer = ""
         let pageCap = min(doc.pageCount, 30)
         for index in 0..<pageCap {
@@ -973,27 +1111,47 @@ public final class LocalAgentHost: ObservableObject {
 
     public func suspendForBackground() async {
         guard let channel else { return }
-        if activeTurnId != nil {
+        let suspendedTurnId = activeTurnId
+        let suspendedSessionId = streamingSessionId
+        if suspendedTurnId != nil {
             sentCancellation = true
             pendingApprovals.removeAll()
             pendingDSHQuestions.removeAll()
         }
-        _ = try? await channel.request("agent.suspend")
+        _ = try? await channel.request("agent.suspend", timeoutSeconds: 3)
+        if let suspendedTurnId, activeTurnId == suspendedTurnId {
+            if let suspendedSessionId {
+                lastCancelledSessionId = suspendedSessionId
+            }
+            finishTurn(["status": "aborted"])
+        }
     }
 
     public func resumeFromBackground() async {
         MemoryGovernor.shared.refreshSnapshot()
         guard let channel else { return }
-        _ = try? await channel.request("agent.resume")
+        _ = try? await channel.request("agent.resume", timeoutSeconds: 5)
         do {
             let health = try await channel.request("runtime.health", timeoutSeconds: 4)
             let isHealthy = health["ok"] as? Bool == true
             let webPort = health["webPort"] as? Int ?? 0
             let webAlive = webPort == 0 || (health["webServerAlive"] as? Bool ?? true)
+            let activeTurns = health["activeTurns"] as? Int ?? 0
+            if isStreaming && (sentCancellation || activeTurns == 0) {
+                let stuckSessionId = streamingSessionId
+                finishTurn(["status": "aborted"])
+                if let stuckSessionId {
+                    loadedHistoryIDs.remove(stuckSessionId)
+                    try? await loadSessionHistory(stuckSessionId)
+                }
+            }
             if (!isHealthy || !webAlive), state == .ready, !isStreaming {
                 _ = await restartRuntime()
             }
         } catch {
+            if isStreaming {
+                finishTurn(["status": "aborted"])
+            }
             if state == .ready, !isStreaming {
                 _ = await restartRuntime()
             }
@@ -1001,17 +1159,24 @@ public final class LocalAgentHost: ObservableObject {
     }
 
     public func abortActiveTurn() async {
-        guard let turnId = activeTurnId, !sentCancellation else { return }
+        guard let turnId = activeTurnId else { return }
+        if sentCancellation {
+            // Second tap on Stop or already-cancelled turn: force-unblock UI and preserve partial text.
+            if let sessionId = streamingSessionId { lastCancelledSessionId = sessionId }
+            finishTurn(["status": "aborted"])
+            return
+        }
         sentCancellation = true
+        liveStream.phase = .cancelling
         pendingApprovals.removeAll { $0.turnId == turnId }
         pendingDSHQuestions.removeAll { $0.turnId == turnId }
         do {
-            let response = try await channel?.request("chat.abort", params: ["turnId": turnId])
-            if response?["aborted"] as? Bool != true, activeTurnId == turnId { finishTurn() }
+            let response = try await channel?.request("chat.abort", params: ["turnId": turnId], timeoutSeconds: 5)
+            if response?["aborted"] as? Bool != true, activeTurnId == turnId { finishTurn(["status": "aborted"]) }
         } catch {
             if activeTurnId == turnId {
                 lastStreamError = error.localizedDescription
-                finishTurn()
+                finishTurn(["status": "aborted"])
             }
         }
     }
@@ -1392,7 +1557,18 @@ public final class LocalAgentHost: ObservableObject {
         var known = Set(current.map(\.id))
         var merged = current
         for message in persisted where known.insert(message.id).inserted {
-            merged.append(message)
+            let trimmedNew = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let dupIndex = merged.firstIndex(where: { existing in
+                existing.sequence == nil
+                    && existing.role == message.role
+                    && existing.content.trimmingCharacters(in: .whitespacesAndNewlines) == trimmedNew
+                    && abs(existing.timestamp.timeIntervalSince(message.timestamp)) <= 45
+            }) {
+                // Replace optimistic client-side placeholder with durable sequenced record
+                merged[dupIndex] = message
+            } else {
+                merged.append(message)
+            }
         }
         messagesBySession[id] = Self.sortSessionMessages(merged)
         for activity in activities {
@@ -1735,6 +1911,7 @@ public final class LocalAgentHost: ObservableObject {
             bots = try load("bots.json", fallback: Self.defaultBots)
             if bots.isEmpty { bots = Self.defaultBots }
             messagesBySession = try load("chats.json", fallback: [:])
+            restoreInterruptedStreamingDraftIfNeeded()
             legacyMessagesBySession = messagesBySession
             workspaceReadable = true
         } catch {
@@ -1759,15 +1936,87 @@ public final class LocalAgentHost: ObservableObject {
         }
     }
 
+    private func streamingDraftURL() -> URL {
+        workspace.appendingPathComponent("streaming-draft.json")
+    }
+
+    private func restoreInterruptedStreamingDraftIfNeeded() {
+        let url = streamingDraftURL()
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        defer { try? FileManager.default.removeItem(at: url) }
+        guard let data = try? Data(contentsOf: url),
+              let draft = try? JSONDecoder().decode(StreamingDraftRecord.self, from: data),
+              (!draft.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+               || !draft.reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) else {
+            return
+        }
+        var recovered = ChatMessageItem(
+            sessionId: draft.sessionId,
+            role: "assistant",
+            content: draft.content,
+            reasoning: draft.reasoning,
+            timestamp: draft.updatedAt
+        )
+        recovered.incomplete = true
+        messagesBySession[draft.sessionId, default: []].append(recovered)
+        persistWorkspace()
+    }
+
+    private func checkpointStreamingDraftIfNeeded() {
+        guard let sessionId = streamingSessionId else { return }
+        let totalLen = liveStream.content.count + liveStream.reasoning.count
+        guard totalLen > 0 else { return }
+        let now = Date()
+        let deltaChars = totalLen - lastDraftSavedLength
+        guard deltaChars >= 512 || (deltaChars > 0 && now.timeIntervalSince(lastDraftSavedAt) >= 4.0) else { return }
+        lastDraftSavedAt = now
+        lastDraftSavedLength = totalLen
+        let draft = StreamingDraftRecord(
+            sessionId: sessionId,
+            content: liveStream.content,
+            reasoning: liveStream.reasoning,
+            updatedAt: now
+        )
+        let url = streamingDraftURL()
+        persistQueue.async {
+            if let encoded = try? JSONEncoder().encode(draft) {
+                try? encoded.write(to: url, options: .atomic)
+            }
+        }
+    }
+
+    private func clearStreamingDraft() {
+        let url = streamingDraftURL()
+        persistQueue.async {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
     private func flushPendingStreamBuffers() {
         flushScheduled = false
+        var grew = false
         if !pendingReasoningBuffer.isEmpty {
-            streamingReasoning += pendingReasoningBuffer
+            liveStream.reasoning += pendingReasoningBuffer
             pendingReasoningBuffer = ""
+            if liveStream.content.isEmpty && !sentCancellation {
+                liveStream.phase = .thinking
+            }
+            grew = true
         }
         if !pendingContentBuffer.isEmpty {
-            streamingContent += pendingContentBuffer
+            liveStream.content += pendingContentBuffer
             pendingContentBuffer = ""
+            if !sentCancellation {
+                liveStream.phase = .generating
+            }
+            grew = true
+        }
+        if grew, let start = streamStartedAt {
+            let elapsed = max(0.25, Date().timeIntervalSince(start))
+            liveStream.elapsedSeconds = Int(elapsed)
+            let totalChars = liveStream.content.count + liveStream.reasoning.count
+            liveStream.charsPerSecond = max(1, Int(Double(totalChars) / elapsed))
+            checkpointStreamingDraftIfNeeded()
         }
     }
 
@@ -1782,6 +2031,7 @@ public final class LocalAgentHost: ObservableObject {
 
     private func finishTurn(_ params: [String: Any] = [:]) {
         flushPendingStreamBuffers()
+        clearStreamingDraft()
         if let sessionId = streamingSessionId, let turnId = activeTurnId {
             for index in dshToolActivities.indices where dshToolActivities[index].sessionId == sessionId
                 && dshToolActivities[index].turnId == turnId && dshToolActivities[index].phase == "started" {
@@ -1792,16 +2042,32 @@ public final class LocalAgentHost: ObservableObject {
                 }
             }
         }
-        if let sessionId = streamingSessionId, !streamingContent.isEmpty || !streamingReasoning.isEmpty {
-            var item = ChatMessageItem(sessionId: sessionId, role: "assistant", content: streamingContent, reasoning: streamingReasoning)
-            item.incomplete = params["status"] as? String != "completed"
-            if let transcript = params["transcript"],
-               let bytes = try? JSONSerialization.data(withJSONObject: transcript) {
-                item.transcript = try? JSONDecoder().decode([ProviderMessage].self, from: bytes)
-                item.providerProfile = params["profile"] as? String
+        if let sessionId = streamingSessionId {
+            let authoritativeContent = (params["finalContent"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let authoritativeReasoning = (params["finalReasoning"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let finalText: String
+            if !authoritativeContent.isEmpty && (liveStream.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || authoritativeContent.count > liveStream.content.count) {
+                finalText = authoritativeContent
+            } else {
+                finalText = liveStream.content
             }
-            messagesBySession[sessionId, default: []].append(item)
-            persistWorkspace()
+            let finalThink: String
+            if !authoritativeReasoning.isEmpty && (liveStream.reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || authoritativeReasoning.count > liveStream.reasoning.count) {
+                finalThink = authoritativeReasoning
+            } else {
+                finalThink = liveStream.reasoning
+            }
+            if !finalText.isEmpty || !finalThink.isEmpty {
+                var item = ChatMessageItem(sessionId: sessionId, role: "assistant", content: finalText, reasoning: finalThink)
+                item.incomplete = params["status"] as? String != "completed"
+                if let transcript = params["transcript"],
+                   let bytes = try? JSONSerialization.data(withJSONObject: transcript) {
+                    item.transcript = try? JSONDecoder().decode([ProviderMessage].self, from: bytes)
+                    item.providerProfile = params["profile"] as? String
+                }
+                messagesBySession[sessionId, default: []].append(item)
+                persistWorkspace()
+            }
         }
         if let usage = params["usage"] as? [String: Any] {
             let model = usage["model"] as? String ?? ModelProvider.defaultModel
@@ -1817,8 +2083,13 @@ public final class LocalAgentHost: ObservableObject {
         }
         groupLeaseWatchdogTask?.cancel()
         groupLeaseWatchdogTask = nil
-        streamingReasoning = ""
-        streamingContent = ""
+        streamStallWatchdogTask?.cancel()
+        streamStallWatchdogTask = nil
+        lastStreamActivityAt = nil
+        lastDraftSavedAt = .distantPast
+        lastDraftSavedLength = 0
+        sentCancellation = false
+        liveStream.reset()
         streamingSessionId = nil
         pendingApprovals.removeAll()
         pendingDSHQuestions.removeAll()
@@ -1844,18 +2115,22 @@ public final class LocalAgentHost: ObservableObject {
                     continue
                 }
                 if method.hasPrefix("approval.") {
+                    self.lastStreamActivityAt = Date()
                     self.handleNativeApprovalNotification(method: method, params: params)
                     continue
                 }
                 if method.hasPrefix("user-question.") {
+                    self.lastStreamActivityAt = Date()
                     self.handleDSHQuestionNotification(method: method, params: params)
                     continue
                 }
                 if method == "dsh.tool.event" {
+                    self.lastStreamActivityAt = Date()
                     self.handleDSHToolNotification(params)
                     continue
                 }
                 if method == "dsh.approval.event" {
+                    self.lastStreamActivityAt = Date()
                     self.handleDSHApprovalAuditNotification(params)
                     continue
                 }
@@ -1864,8 +2139,11 @@ public final class LocalAgentHost: ObservableObject {
                 switch method {
                 case "chat.delta":
                     guard !self.sentCancellation else { continue }
+                    self.lastStreamActivityAt = Date()
                     if self.streamFirstTokenMs == nil, let start = self.streamStartedAt {
-                        self.streamFirstTokenMs = max(1, Int(Date().timeIntervalSince(start) * 1_000))
+                        let ttft = max(1, Int(Date().timeIntervalSince(start) * 1_000))
+                        self.streamFirstTokenMs = ttft
+                        self.liveStream.firstTokenMs = ttft
                     }
                     self.pendingReasoningBuffer += params["reasoning"] as? String ?? ""
                     self.pendingContentBuffer += params["content"] as? String ?? ""
@@ -1902,6 +2180,7 @@ public final class LocalAgentHost: ObservableObject {
 
         let approval = PendingApproval(id: id, sessionId: sessionId, turnId: turnId, tool: tool, summary: summary, isDSH: params["source"] as? String == "dsh")
         pendingApprovals.append(approval)
+        liveStream.phase = .awaitingApproval(tool)
 
         if botMode == "readOnly" && isWriteOrMutate {
             autoReviewLog.insert("[\(Date().formatted(date: .omitted, time: .shortened))] 只读保护拦截：\(tool)", at: 0)
@@ -1966,6 +2245,9 @@ public final class LocalAgentHost: ObservableObject {
               let callId = params["callId"] as? String, !callId.isEmpty else { return }
         let phase = params["phase"] as? String ?? "started"
         let toolName = params["toolName"] as? String ?? "DSH tool"
+        if phase == "started" {
+            liveStream.phase = .toolRunning(toolName)
+        }
         let redactedArgs = (params["arguments"] as? String).map { SecretRedactor.redactCommonTokens($0) }
         let redactedResult = (params["result"] as? String).map { SecretRedactor.redactCommonTokens($0) }
         if let index = dshToolActivities.firstIndex(where: {

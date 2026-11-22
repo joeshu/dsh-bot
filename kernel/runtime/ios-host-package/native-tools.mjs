@@ -101,7 +101,14 @@ async function safePublicHttpsFetch(rawUrl, { maxBytes = 131_072, maxRedirects =
   let current = await assertSafePublicHttpsUrl(rawUrl)
   let resp
   for (let hop = 0; ; hop++) {
-    resp = await globalThis.fetch(current.toString(), { signal: combinedSignal, redirect: 'manual' })
+    resp = await globalThis.fetch(current.toString(), {
+      signal: combinedSignal,
+      redirect: 'manual',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
+        'Accept': 'text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.8',
+      },
+    })
     if (![301, 302, 303, 307, 308].includes(resp.status)) break
     const location = resp.headers.get('location')
     await resp.body?.cancel().catch(() => {})

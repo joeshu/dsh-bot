@@ -223,6 +223,7 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
     private let keychain: KeychainBridge
     private let modelKey: (ModelProvider) async throws -> String
     private let session: URLSession
+    private let webFetchSession: URLSession
     private let store: LocalAgentStore
     private let js = LocalJavaScript()
     private let device = DeviceCapabilitiesBridge()
@@ -249,6 +250,7 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
             try await keychain.modelKey(provider: provider, migrateOfficialKey: migrateOfficialKey)
         }
         self.session = session ?? isolatedHTTPSession(timeout: 45)
+        self.webFetchSession = session ?? isolatedWebFetchSession(timeout: 30)
         self.store = LocalAgentStore(root: root)
         self.mcp = mcp ?? RemoteMCPClient(keychain: keychain)
     }
@@ -737,7 +739,18 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
                 summary += "\n\n发送的原始问题上下文（空白已压缩，最多 128 个 Unicode 字符）：\n「" + originalQuestion + "」"
             }
         case "web_fetch":
-            address = try? ModelProvider.httpsComponents(text("url")).url
+            var rawURL = text("url").trimmingCharacters(in: .whitespacesAndNewlines)
+            if let hashIdx = rawURL.firstIndex(of: "#") {
+                rawURL = String(rawURL[..<hashIdx])
+            }
+            if rawURL.lowercased().hasPrefix("http://") {
+                rawURL = "https://" + rawURL.dropFirst("http://".count)
+            }
+            let parts = try? ModelProvider.httpsComponents(rawURL)
+            if let host = parts?.host, SafeHTTPSRedirects.isPrivateOrLoopbackHost(host) {
+                return "Private or loopback addresses are blocked for web_fetch."
+            }
+            address = parts?.url
             guard let address else { return "A valid HTTPS URL is required." }
             summary = address.absoluteString
         case "workspace_list":
@@ -806,20 +819,47 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
             case "web_search": return "approved"
             case "web_fetch":
                 guard let address else { return "Invalid URL." }
-                let (bytes, response) = try await session.bytes(from: address)
+                var request = URLRequest(url: address)
+                request.httpMethod = "GET"
+                request.setValue(
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+                    forHTTPHeaderField: "User-Agent"
+                )
+                request.setValue(
+                    "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.8",
+                    forHTTPHeaderField: "Accept"
+                )
+                let (bytes, response) = try await webFetchSession.bytes(for: request)
                 defer { bytes.task.cancel() }
                 guard let http = response as? HTTPURLResponse else { throw ModelProviderError.invalidResponse }
                 if !structuredWeb { try checkHTTP(http) }
-                guard ["text/plain", "text/html"].contains(response.mimeType ?? "") else { return "Unsupported web content type." }
+                let mime = (response.mimeType ?? "").lowercased()
+                let isSupportedMime = mime.isEmpty
+                    || mime.hasPrefix("text/")
+                    || mime == "application/json"
+                    || mime == "application/xml"
+                    || mime == "application/xhtml+xml"
+                    || mime == "application/javascript"
+                    || mime.hasSuffix("+json")
+                    || mime.hasSuffix("+xml")
+                guard isSupportedMime else { return "Unsupported web content type: \(mime)." }
                 var data = Data()
                 for try await byte in bytes {
                     try Task.checkCancellation()
                     guard data.count < 1_500_000 else { throw ModelProviderError.responseTooLarge }
                     data.append(byte)
                 }
-                let plain = String(decoding: data, as: UTF8.self)
-                    .replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
-                    .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+                let rawText = String(decoding: data, as: UTF8.self)
+                let plain: String
+                if mime.contains("html") {
+                    plain = rawText
+                        .replacingOccurrences(of: "(?is)<(script|style|noscript)[^>]*>.*?</\\1>", with: " ", options: .regularExpression)
+                        .replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
+                        .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                } else {
+                    plain = rawText
+                }
                 let content = String(plain.prefix(12_000))
                 if !structuredWeb { return content }
                 let result: [String: Any] = [

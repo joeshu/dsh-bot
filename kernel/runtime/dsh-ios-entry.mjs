@@ -1043,6 +1043,18 @@ async function boot() {
   }
   if (!safeMode) await settlePluginRevision(PROFILE_DIR, false)
   await cleanupPendingPluginRemovals(PROFILE_DIR)
+  try {
+    const wsRegistry = ctx?.get?.('workspaceRegistry')
+    if (wsRegistry && typeof wsRegistry.list === 'function' && wsRegistry.list().length === 0) {
+      if (typeof wsRegistry.initializeDefault === 'function') {
+        await wsRegistry.initializeDefault(async () => WORKSPACE_FILES)
+      } else if (typeof wsRegistry.create === 'function') {
+        await wsRegistry.create(WORKSPACE_FILES)
+      }
+    }
+  } catch (error) {
+    ctx?.logger?.warn?.(`Default iOS workspace initialization skipped: ${String(error)}`)
+  }
   createIOSPluginManager({ rpc, runtime, workspace: WORKSPACE, profileDir: PROFILE_DIR, installAnchor: INSTALL_ANCHOR, safeMode, drainAgents: () => ctx.subagents.drainDescendants([...runtime.activeAgents.values()].map(({ agent }) => agent)) })
   await rpc.request('runtime.ready', runtimeInfo(), 30_000)
 }
@@ -1266,11 +1278,30 @@ async function startTurn(params, preparation) {
     let status = 'completed'
     let error
     let turnUsage
+    let finalContent = ''
+    let finalReasoning = ''
     try {
       await active.agent.whenIdle()
       await ctx.sessions.flush(active.agent.session)
       const events = active.agent.session.snapshotEvents()
       const turnEvents = events.filter((event) => event.seq >= startSeq)
+      const assistantParts = []
+      const reasoningParts = []
+      for (const event of turnEvents) {
+        if (event.type !== 'assistant/message') continue
+        const blocks = event.data?.message?.content
+        const textPart = messageText(blocks)
+        if (textPart) assistantParts.push(textPart)
+        if (Array.isArray(blocks)) {
+          const thinkPart = blocks
+            .filter((b) => b?.type === 'thinking' && typeof b.thinking === 'string')
+            .map((b) => b.thinking)
+            .join('')
+          if (thinkPart) reasoningParts.push(thinkPart)
+        }
+      }
+      finalContent = assistantParts.join('\n\n')
+      finalReasoning = reasoningParts.join('\n\n')
       const end = [...turnEvents].reverse().find((event) => event.type === 'turn/end')
       const reason = end?.data.reason
       if (reason?.kind !== 'completed') {
@@ -1315,6 +1346,8 @@ async function startTurn(params, preparation) {
         sessionId: botId,
         turnId,
         status,
+        ...(finalContent ? { finalContent } : {}),
+        ...(finalReasoning ? { finalReasoning } : {}),
         ...(error ? { error } : {}),
         ...(turnUsage ? { usage: turnUsage } : {}),
       })

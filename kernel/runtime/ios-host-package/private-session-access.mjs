@@ -124,12 +124,20 @@ async function apply(ctx) {
 
   const globalRole = { name: 'iOS Web public global APIs', resource: 'global', actions: [] }
   const sessionRole = { name: 'iOS Web public session APIs', resource: 'session', actions: [] }
+  const workspaceRole = { name: 'iOS Web public workspace APIs', resource: 'workspace', actions: [] }
   const remoteAccess = ctx.remoteAccess
 
   function actionRoster() {
-    return ctx.typert.remotes.list()
-      .map(({ namespace, method }) => `${namespace}/${method}`)
-      .filter((action) => !isBlockedWebAction(action))
+    const descriptors = [
+      ...(typeof ctx.typert?.local?.list === 'function' ? ctx.typert.local.list() : []),
+      ...(typeof ctx.typert?.remotes?.list === 'function' ? ctx.typert.remotes.list() : []),
+    ]
+    return [...new Set(
+      descriptors
+        .filter((item) => item && typeof item.namespace === 'string' && typeof item.method === 'string')
+        .map(({ namespace, method }) => `${namespace}/${method}`)
+        .filter((action) => !isBlockedWebAction(action))
+    )]
   }
 
   function bindings() {
@@ -137,8 +145,30 @@ async function apply(ctx) {
     globalRole.actions = actions
     // list/search/control are global operations that also filter each row with allows().
     sessionRole.actions = [...new Set([...actions, ...FORWARDED_SESSION_EVENTS])]
+    workspaceRole.actions = actions
     const result = [{ role: globalRole, resource: { kind: 'global' } }]
-    for (const sessionId of knownHeaders.keys()) {
+    const workspaceRegistry = ctx.get?.('workspaceRegistry')
+    const workspaces = typeof workspaceRegistry?.list === 'function' ? workspaceRegistry.list() : []
+    for (const workspace of workspaces) {
+      const workspaceId = typeof workspace?.id === 'string' ? workspace.id : (typeof workspace?.workspaceId === 'string' ? workspace.workspaceId : null)
+      if (!workspaceId) continue
+      result.push({
+        role: workspaceRole,
+        resource: { kind: 'workspace', id: workspaceId },
+      })
+    }
+    const sessionIds = new Set(knownHeaders.keys())
+    const liveSessions = ctx.get?.('sessions')?.list?.() ?? []
+    for (const session of liveSessions) {
+      if (typeof session?.id === 'string') {
+        if (session.header?.id === session.id && !knownHeaders.has(session.id)) {
+          knownHeaders.set(session.id, session.header)
+          refreshPrivateClosure()
+        }
+        sessionIds.add(session.id)
+      }
+    }
+    for (const sessionId of sessionIds) {
       if (isPrivateSession(sessionId)) continue
       result.push({
         role: sessionRole,
@@ -190,6 +220,14 @@ async function apply(ctx) {
     // These upstream exact Fetch handlers are owner-only and bypass Remote
     // access policy. Keep them working for public Sessions, but hide private
     // Session existence before export or raw upload reaches the handler.
+    if (typeof sessionId === 'string' && !knownHeaders.has(sessionId)) {
+      const live = ctx.get?.('sessions')?.get?.(sessionId)
+      if (live?.header?.id === sessionId) {
+        knownHeaders.set(sessionId, live.header)
+        sessionIndexReady = true
+        refreshPrivateClosure()
+      }
+    }
     if (!sessionIndexReady || typeof sessionId !== 'string' || !knownHeaders.has(sessionId) || isPrivateSession(sessionId)) {
       response.writeHead(404)
       response.end('not found')
@@ -198,13 +236,17 @@ async function apply(ctx) {
     return requestPrincipal.run({ allowOwnerExactFetch: true }, next)
   })
 
-  ctx.on('session/created', (session) => {
+  function trackSessionHeader(session) {
     if (typeof session?.id !== 'string' || session.header?.id !== session.id) return
     knownHeaders.set(session.id, session.header)
     sessionIndexReady = true
     refreshPrivateClosure()
     remoteAccess.invalidate(WEB_PRINCIPAL)
-  })
+  }
+
+  ctx.on('session/created', trackSessionHeader)
+  ctx.on('session/opened', trackSessionHeader)
+  ctx.on('session/loaded', trackSessionHeader)
 
   ctx.on('session/event', (session, event) => {
     if (typeof session?.id !== 'string') return
@@ -228,7 +270,16 @@ async function apply(ctx) {
     remoteAccess.invalidate(WEB_PRINCIPAL)
   })
 
-  ctx.typert.remotes.subscribe(() => remoteAccess.invalidate(WEB_PRINCIPAL))
+  ctx.on('domain/changed', (change) => {
+    if (change?.domain === 'workspace') remoteAccess.invalidate(WEB_PRINCIPAL)
+  })
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['workspaceRegistry'], () => {
+      remoteAccess.invalidate(WEB_PRINCIPAL)
+    })
+  }
+  ctx.typert?.local?.subscribe?.(() => remoteAccess.invalidate(WEB_PRINCIPAL))
+  ctx.typert?.remotes?.subscribe?.(() => remoteAccess.invalidate(WEB_PRINCIPAL))
   ctx.effect(() => () => {
     unregisterPolicy()
     if (originalPrincipalDescriptor) Object.defineProperty(browserPeer, 'principal', originalPrincipalDescriptor)

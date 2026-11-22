@@ -11,9 +11,9 @@ private enum DSHWebViewportMode: String, CaseIterable, Identifiable {
     var viewportContent: String {
         switch self {
         case .responsive:
-            return "width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes"
+            return "width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes, viewport-fit=cover"
         case .desktop1280:
-            return "width=1280, initial-scale=0.32, minimum-scale=0.25, maximum-scale=5.0, user-scalable=yes"
+            return "width=1280, initial-scale=0.32, minimum-scale=0.25, maximum-scale=5.0, user-scalable=yes, viewport-fit=cover"
         }
     }
 }
@@ -89,9 +89,12 @@ public struct DSHWebUIView: View {
             await loadWebUIInfo()
         }
         .onChange(of: scenePhase) { newPhase in
-            if newPhase == .active, launchURL == nil, host.state == .ready {
-                Task { await loadWebUIInfo() }
+            if newPhase == .active, host.state == .ready {
+                Task { await loadWebUIInfo(preserveIfSamePort: true) }
             }
+        }
+        .onDisappear {
+            Task { await host.syncFromWebWorkbench() }
         }
     }
 
@@ -133,9 +136,11 @@ public struct DSHWebUIView: View {
         }
     }
 
-    private func loadWebUIInfo() async {
+    private func loadWebUIInfo(preserveIfSamePort: Bool = false) async {
         let generation = host.runtimeGeneration
-        errorMessage = nil
+        if !preserveIfSamePort {
+            errorMessage = nil
+        }
         guard let rpc = host.rpc() else {
             launchURL = nil
             errorMessage = "DSH 运行时尚未就绪，请稍候重试。"
@@ -154,6 +159,10 @@ public struct DSHWebUIView: View {
                 errorMessage = "DSH Web 工作台未启动（当前可能处于恢复模式）。"
                 return
             }
+            if preserveIfSamePort && allowedPort == port && launchURL != nil {
+                return
+            }
+            errorMessage = nil
             allowedPort = port
             launchURL = parsed
         } catch {
@@ -189,6 +198,7 @@ private struct LoopbackWebView: UIViewRepresentable {
       style.id = 'dsh-mobile-inject';
       style.textContent = [
         ':where(body) { --dsw-alias-bg-layer-4: color-mix(in srgb, var(--dsw-alias-bg-layer-3, #f3f4f6) 94%, var(--dsw-alias-label-primary, #111827) 6%); }',
+        'html, body, #root, #app { height: 100dvh; max-height: 100dvh; }',
         'input, textarea, select { font-size: 16px !important; }',
         'table { display: block; max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }',
         'pre { max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }',
@@ -218,7 +228,7 @@ private struct LoopbackWebView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
-        config.websiteDataStore = .nonPersistent()
+        config.websiteDataStore = .default()
         config.allowsInlineMediaPlayback = true
         config.userContentController.addUserScript(WKUserScript(
             source: Self.mobileStyleInjectScript,

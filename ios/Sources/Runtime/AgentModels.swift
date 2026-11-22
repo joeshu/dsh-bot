@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 public enum LocalAgentState: Equatable {
     case idle
@@ -325,4 +326,80 @@ public struct BotProfile: Identifiable, Codable, Equatable {
         default: return agentPreset
         }
     }
+}
+
+public enum StreamTurnPhase: Equatable, Sendable {
+    case connecting
+    case thinking
+    case toolRunning(String)
+    case awaitingApproval(String)
+    case generating
+    case cancelling
+
+    public var label: String {
+        switch self {
+        case .connecting: return "正在连接模型…"
+        case .thinking: return "深度思考中…"
+        case .toolRunning(let name): return "正在调用工具 \(name)…"
+        case .awaitingApproval(let tool): return "等待审批 \(tool)"
+        case .generating: return "正在生成"
+        case .cancelling: return "正在安全停止…"
+        }
+    }
+
+    public var icon: String {
+        switch self {
+        case .connecting: return "antenna.radiowaves.left.and.right"
+        case .thinking: return "brain"
+        case .toolRunning: return "gearshape.2.fill"
+        case .awaitingApproval: return "checkmark.shield"
+        case .generating: return "sparkles"
+        case .cancelling: return "stop.circle"
+        }
+    }
+}
+
+/// Isolated high-frequency observable for the active streaming turn so 30fps token
+/// flushes only re-render `StreamingTurnRow` and never invalidate the entire chat history.
+@MainActor
+public final class StreamingTurnState: ObservableObject {
+    @Published public var sessionId: String?
+    @Published public var content: String = ""
+    @Published public var reasoning: String = ""
+    @Published public var phase: StreamTurnPhase = .connecting
+    @Published public var firstTokenMs: Int?
+    @Published public var charsPerSecond: Int = 0
+    @Published public var elapsedSeconds: Int = 0
+    @Published public var recentSteerNote: String?
+
+    public init() {}
+
+    public func begin(sessionId: String, steerNote: String? = nil) {
+        self.sessionId = sessionId
+        self.content = ""
+        self.reasoning = ""
+        self.phase = .connecting
+        self.firstTokenMs = nil
+        self.charsPerSecond = 0
+        self.elapsedSeconds = 0
+        self.recentSteerNote = steerNote
+    }
+
+    public func reset() {
+        sessionId = nil
+        content = ""
+        reasoning = ""
+        phase = .connecting
+        firstTokenMs = nil
+        charsPerSecond = 0
+        elapsedSeconds = 0
+        recentSteerNote = nil
+    }
+}
+
+struct StreamingDraftRecord: Codable, Sendable {
+    let sessionId: String
+    let content: String
+    let reasoning: String
+    let updatedAt: Date
 }

@@ -223,6 +223,276 @@ public struct DSHToolActivityCard: View {
     }
 }
 
+// MARK: - 2b. Collapsed Consecutive Tool Burst Card
+
+public struct DSHToolBurstCard: View {
+    let activities: [DSHToolActivity]
+    let onViewFull: (DSHToolActivity) -> Void
+    @State private var isExpanded = false
+
+    public init(activities: [DSHToolActivity], onViewFull: @escaping (DSHToolActivity) -> Void) {
+        self.activities = activities
+        self.onViewFull = onViewFull
+    }
+
+    private var runningActivity: DSHToolActivity? {
+        activities.last(where: { $0.phase == "started" })
+    }
+
+    private var completedCount: Int {
+        activities.filter { $0.phase == "completed" }.count
+    }
+
+    private var failedCount: Int {
+        activities.filter { $0.phase == "failed" || $0.phase == "cancelled" }.count
+    }
+
+    private var toolSummaryPills: [(name: String, count: Int)] {
+        var counts: [String: Int] = [:]
+        var order: [String] = []
+        for item in activities {
+            if counts[item.toolName] == nil { order.append(item.toolName) }
+            counts[item.toolName, default: 0] += 1
+        }
+        return order.map { ($0, counts[$0] ?? 1) }
+    }
+
+    private var statusTint: Color {
+        if runningActivity != nil { return DSTheme.brand }
+        if failedCount > 0 && completedCount == 0 { return DSTheme.danger }
+        if failedCount > 0 { return DSTheme.warning }
+        return DSTheme.success
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        if runningActivity != nil {
+                            ProgressView()
+                                .scaleEffect(0.75)
+                        } else {
+                            Image(systemName: failedCount > 0 ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                                .foregroundStyle(statusTint)
+                        }
+                        if let running = runningActivity {
+                            Text("正在执行 \(running.toolName)（第 \(activities.count) 步）…")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                        } else {
+                            let detail = failedCount > 0
+                                ? "\(completedCount) 成功 · \(failedCount) 失败"
+                                : "全部成功"
+                            Text("执行了 \(activities.count) 项工具调用 · \(detail)")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                        }
+                        Spacer()
+                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(toolSummaryPills, id: \.name) { pill in
+                                Text(pill.count > 1 ? "\(pill.name) ×\(pill.count)" : pill.name)
+                                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 3)
+                                    .background(DSTheme.surfacePrimary.opacity(0.85))
+                                    .clipShape(Capsule())
+                            }
+                        }
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(activities) { activity in
+                        DSHToolActivityCard(activity: activity) {
+                            onViewFull(activity)
+                        }
+                    }
+                }
+                .padding(.top, 2)
+            }
+        }
+        .padding(11)
+        .background(Color.secondary.opacity(0.07))
+        .overlay(
+            RoundedRectangle(cornerRadius: DSTheme.cornerCard, style: .continuous)
+                .stroke(statusTint.opacity(0.22), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: DSTheme.cornerCard, style: .continuous))
+    }
+}
+
+// MARK: - 2c. Isolated High-Frequency Streaming Turn Row
+
+public struct StreamingTurnRow: View {
+    let botName: String
+    @ObservedObject var liveStream: StreamingTurnState
+    let collapseThinkingByDefault: Bool
+    let onStreamGrowth: () -> Void
+
+    @State private var expandReasoning: Bool
+    @State private var userToggledReasoning = false
+
+    public init(
+        botName: String,
+        liveStream: StreamingTurnState,
+        collapseThinkingByDefault: Bool,
+        onStreamGrowth: @escaping () -> Void
+    ) {
+        self.botName = botName
+        self.liveStream = liveStream
+        self.collapseThinkingByDefault = collapseThinkingByDefault
+        self.onStreamGrowth = onStreamGrowth
+        _expandReasoning = State(initialValue: !collapseThinkingByDefault)
+    }
+
+    private var splitContent: (stable: String, tail: String) {
+        Self.splitMarkdownForStreaming(liveStream.content)
+    }
+
+    private var telemetryLine: String {
+        var parts: [String] = ["\(botName) · \(liveStream.phase.label)"]
+        if let ttft = liveStream.firstTokenMs {
+            parts.append("首字 \(ttft)ms")
+        }
+        if liveStream.charsPerSecond > 0, !liveStream.content.isEmpty {
+            parts.append("\(liveStream.charsPerSecond) 字/秒")
+        }
+        if !liveStream.content.isEmpty {
+            parts.append("\(liveStream.content.count) 字")
+        } else if !liveStream.reasoning.isEmpty {
+            parts.append("思考 \(liveStream.reasoning.count) 字")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let steer = liveStream.recentSteerNote, !steer.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.triangle.turn.up.right.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    Text("已插话引导：\(steer)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color.orange.opacity(0.10))
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+
+            HStack(spacing: 6) {
+                ProgressView()
+                    .scaleEffect(0.72)
+                Image(systemName: liveStream.phase.icon)
+                    .font(.caption2)
+                    .foregroundStyle(DSTheme.brand)
+                Text(telemetryLine)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+
+            if !liveStream.reasoning.isEmpty {
+                let title = liveStream.content.isEmpty
+                    ? "深度思考中…（\(liveStream.reasoning.count) 字）"
+                    : "已完成思考（\(liveStream.reasoning.count) 字）"
+                DisclosureGroup(
+                    title,
+                    isExpanded: Binding(
+                        get: { expandReasoning },
+                        set: { next in
+                            userToggledReasoning = true
+                            expandReasoning = next
+                        }
+                    )
+                ) {
+                    Text(liveStream.reasoning)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 4)
+                }
+                .font(.caption.weight(.medium))
+                .padding(10)
+                .background(DSTheme.surfaceSecondary)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+
+            if !liveStream.content.isEmpty {
+                let parts = splitContent
+                VStack(alignment: .leading, spacing: 6) {
+                    if !parts.stable.isEmpty {
+                        DSMarkdownText(parts.stable)
+                    }
+                    if !parts.tail.isEmpty {
+                        Text(parts.tail + " ▍")
+                            .font(.body)
+                            .foregroundStyle(.primary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .padding(12)
+                .background(DSTheme.surfaceSecondary)
+                .clipShape(RoundedRectangle(cornerRadius: DSTheme.cornerBubble, style: .continuous))
+            }
+        }
+        .onChange(of: liveStream.content.isEmpty) { isEmpty in
+            if !isEmpty && !userToggledReasoning && expandReasoning {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    expandReasoning = false
+                }
+            }
+        }
+        .onChange(of: liveStream.content.count) { _ in
+            onStreamGrowth()
+        }
+        .onChange(of: liveStream.reasoning.count) { _ in
+            onStreamGrowth()
+        }
+    }
+
+    /// Splits streaming Markdown into stable completed paragraphs (safe for full Markdown rendering)
+    /// and a live trailing paragraph (rendered as lightweight plain text) without splitting open code fences.
+    static func splitMarkdownForStreaming(_ text: String) -> (stable: String, tail: String) {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        guard lines.count > 2 else { return ("", text) }
+        var inFence = false
+        var lastSafeSplitLine = -1
+        for (idx, line) in lines.enumerated() {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("```") {
+                inFence.toggle()
+            } else if !inFence && trimmed.isEmpty && idx < lines.count - 1 {
+                lastSafeSplitLine = idx
+            }
+        }
+        guard lastSafeSplitLine > 0 else { return ("", text) }
+        let stable = lines[0..<lastSafeSplitLine].joined(separator: "\n")
+        let tail = lines[(lastSafeSplitLine + 1)...].joined(separator: "\n")
+        return (stable, tail)
+    }
+}
+
 // MARK: - 3. Inline Approval Audit History Card
 
 public struct DSHApprovalAuditCard: View {

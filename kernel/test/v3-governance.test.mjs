@@ -243,5 +243,95 @@ test('v3 redteam: future-proof heuristic classifier, subagent/Web policy inherit
   assert.match(pm, /if \(name === 'dsh-purge-safe'\)/)
 })
 
+test('v3 web-access: private-session-access exposes typert.local RPCs (directoryPicker/workspace) and workspace bindings while blocking admin APIs and private sessions', async () => {
+  const mod = await import(join(runtimeDir, 'ios-host-package', 'private-session-access.mjs'))
+  const listeners = new Map()
+  let registeredPolicy = null
+  let invalidateCount = 0
+  const browserPeer = { principal: { kind: 'owner' } }
+  const localDescriptors = [
+    { namespace: 'directoryPicker', method: 'list' },
+    { namespace: 'directoryPicker', method: 'createDirectory' },
+    { namespace: 'workspace', method: 'follow' },
+    { namespace: 'workspace', method: 'create' },
+    { namespace: 'session', method: 'list' },
+    { namespace: 'pluginManager', method: 'install' },
+    { namespace: 'plugins', method: 'enable' },
+    { namespace: 'schedule', method: 'create' },
+  ]
+  const workspaces = [{ id: 'ws-default', path: '/workspace' }]
+  const mockCtx = {
+    logger: { error() {}, warn() {} },
+    connection: { browserPeer },
+    remoteAccess: {
+      registerPolicy(kind, policy) {
+        assert.equal(kind, 'ios-web')
+        registeredPolicy = policy
+        return () => {}
+      },
+      invalidate() { invalidateCount += 1 },
+    },
+    typert: {
+      local: { list: () => localDescriptors, subscribe: () => () => {} },
+      remotes: { list: () => [], subscribe: () => () => {} },
+    },
+    get(name) {
+      if (name === 'sessionPersistence') {
+        return {
+          async list() {
+            return [
+              { header: { id: 'ios:public-bot' } },
+              { header: { id: 'ios:secret-bot' } },
+            ]
+          },
+          async open() { return { async read() { return { events: [] } }, async close() {} } },
+        }
+      }
+      if (name === 'workspaceRegistry') return { list: () => workspaces }
+      return undefined
+    },
+    on(event, fn) {
+      if (!listeners.has(event)) listeners.set(event, [])
+      listeners.get(event).push(fn)
+    },
+    inject(_deps, fn) { fn(mockCtx) },
+    effect() {},
+  }
+
+  const prevEnv = process.env.DS_BOT_IOS_PRIVATE_BOT_IDS
+  process.env.DS_BOT_IOS_PRIVATE_BOT_IDS = JSON.stringify(['secret-bot'])
+  try {
+    await mod.default.apply(mockCtx)
+  } finally {
+    if (prevEnv === undefined) delete process.env.DS_BOT_IOS_PRIVATE_BOT_IDS
+    else process.env.DS_BOT_IOS_PRIVATE_BOT_IDS = prevEnv
+  }
+
+  assert.equal(browserPeer.principal.kind, 'ios-web')
+  assert.ok(registeredPolicy, 'ios-web policy must be registered')
+  const bindings = registeredPolicy.bindings({ kind: 'ios-web' })
+
+  const globalBinding = bindings.find((b) => b.resource.kind === 'global')
+  assert.ok(globalBinding, 'global binding must exist')
+  assert.ok(globalBinding.role.actions.includes('directoryPicker/list'))
+  assert.ok(globalBinding.role.actions.includes('directoryPicker/createDirectory'))
+  assert.ok(globalBinding.role.actions.includes('workspace/follow'))
+  assert.ok(globalBinding.role.actions.includes('workspace/create'))
+  assert.ok(!globalBinding.role.actions.includes('pluginManager/install'))
+  assert.ok(!globalBinding.role.actions.includes('plugins/enable'))
+  assert.ok(!globalBinding.role.actions.includes('schedule/create'))
+
+  const wsBinding = bindings.find((b) => b.resource.kind === 'workspace' && b.resource.id === 'ws-default')
+  assert.ok(wsBinding, 'workspace resource binding must be emitted for ws-default')
+  assert.ok(wsBinding.role.actions.includes('workspace/follow'))
+
+  assert.ok(bindings.some((b) => b.resource.kind === 'session' && b.resource.id === 'ios:public-bot'))
+  assert.ok(!bindings.some((b) => b.resource.kind === 'session' && b.resource.id === 'ios:secret-bot'))
+
+  const before = invalidateCount
+  for (const fn of listeners.get('domain/changed') ?? []) fn({ domain: 'workspace' })
+  assert.ok(invalidateCount > before, 'workspace domain change must invalidate WEB_PRINCIPAL')
+})
+
 
 

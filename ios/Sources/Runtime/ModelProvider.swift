@@ -218,6 +218,59 @@ final class NoRedirects: NSObject, URLSessionTaskDelegate {
     }
 }
 
+final class SafeHTTPSRedirects: NSObject, URLSessionTaskDelegate {
+    private let maxHops = 5
+    private var hopCounts: [Int: Int] = [:]
+    private let lock = NSLock()
+
+    static func isPrivateOrLoopbackHost(_ rawHost: String) -> Bool {
+        let host = rawHost.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        if host.isEmpty || host == "localhost" || host.hasSuffix(".local") || host.hasSuffix(".internal") {
+            return true
+        }
+        if host == "::1" || host == "::" || host.hasPrefix("fe80:") || host.hasPrefix("fc") || host.hasPrefix("fd") {
+            return true
+        }
+        let parts = host.split(separator: ".").compactMap { Int($0) }
+        if parts.count == 4 && parts.allSatisfy({ (0...255).contains($0) }) {
+            let (a, b) = (parts[0], parts[1])
+            if a == 10 || a == 127 || a == 0 { return true }
+            if a == 169 && b == 254 { return true }
+            if a == 172 && (16...31).contains(b) { return true }
+            if a == 192 && b == 168 { return true }
+            if a == 100 && (64...127).contains(b) { return true }
+        }
+        return false
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        lock.lock()
+        let nextHop = (hopCounts[task.taskIdentifier] ?? 0) + 1
+        hopCounts[task.taskIdentifier] = nextHop
+        lock.unlock()
+        guard nextHop <= maxHops,
+              let url = request.url,
+              url.scheme?.lowercased() == "https",
+              url.user == nil, url.password == nil,
+              let host = url.host,
+              !Self.isPrivateOrLoopbackHost(host) else {
+            completionHandler(nil)
+            return
+        }
+        var sanitized = request
+        sanitized.setValue(nil, forHTTPHeaderField: "Authorization")
+        sanitized.setValue(nil, forHTTPHeaderField: "Cookie")
+        completionHandler(sanitized)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        lock.lock()
+        hopCounts.removeValue(forKey: task.taskIdentifier)
+        lock.unlock()
+    }
+}
+
 func isolatedHTTPSession(timeout: TimeInterval) -> URLSession {
     let configuration = URLSessionConfiguration.ephemeral
     configuration.httpShouldSetCookies = false
@@ -225,5 +278,14 @@ func isolatedHTTPSession(timeout: TimeInterval) -> URLSession {
     configuration.timeoutIntervalForRequest = timeout
     configuration.timeoutIntervalForResource = timeout * 2
     return URLSession(configuration: configuration, delegate: NoRedirects(), delegateQueue: nil)
+}
+
+func isolatedWebFetchSession(timeout: TimeInterval) -> URLSession {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.httpShouldSetCookies = false
+    configuration.urlCredentialStorage = nil
+    configuration.timeoutIntervalForRequest = timeout
+    configuration.timeoutIntervalForResource = timeout * 2
+    return URLSession(configuration: configuration, delegate: SafeHTTPSRedirects(), delegateQueue: nil)
 }
 #endif

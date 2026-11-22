@@ -1,5 +1,8 @@
 import SwiftUI
 import UniformTypeIdentifiers
+#if canImport(PhotosUI)
+import PhotosUI
+#endif
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -7,12 +10,14 @@ import UIKit
 private enum ChatTranscriptRow: Identifiable {
     case message(ChatMessageItem)
     case tool(DSHToolActivity)
+    case toolBurst([DSHToolActivity])
     case approval(DSHApprovalAudit)
 
     var id: String {
         switch self {
         case .message(let message): return "message-\(message.id)"
         case .tool(let activity): return "tool-\(activity.id)"
+        case .toolBurst(let items): return "toolburst-\(items.first?.id ?? UUID().uuidString)"
         case .approval(let audit): return "approval-\(audit.id)"
         }
     }
@@ -21,6 +26,7 @@ private enum ChatTranscriptRow: Identifiable {
         switch self {
         case .message(let message): return message.timestamp
         case .tool(let activity): return activity.timestamp
+        case .toolBurst(let items): return items.first?.timestamp ?? .distantPast
         case .approval(let audit): return audit.timestamp
         }
     }
@@ -29,6 +35,7 @@ private enum ChatTranscriptRow: Identifiable {
         switch self {
         case .message(let message): return message.sequence
         case .tool(let activity): return activity.sequence
+        case .toolBurst(let items): return items.first?.sequence
         case .approval(let audit): return audit.sequence
         }
     }
@@ -79,7 +86,10 @@ public struct ChatView: View {
     @State private var showFileImporter = false
     @State private var activeSheet: ChatActiveSheet?
     @State private var referencedBot: BotProfile?
-    @State private var attachedFile: LocalAgentHost.AttachedWorkspaceFile?
+    @State private var attachedFiles: [LocalAgentHost.AttachedWorkspaceFile] = []
+    #if canImport(PhotosUI)
+    @State private var selectedPhotoItems: [PhotosPickerItem] = []
+    #endif
     @StateObject private var speechInput = SpeechInputController()
     @State private var actionStatus = ""
     @State private var lastScrollAt = Date.distantPast
@@ -102,7 +112,13 @@ public struct ChatView: View {
     }
 
     private func redteamPresetAllowed(for profile: BotProfile) -> Bool {
-        !profile.isPrivate && host.redteamModeEnabled && profile.redteamToolsEnabled
+        !profile.isPrivate && host.redteamStatus.installed
+    }
+
+    private func redteamDisabledHint(for profile: BotProfile) -> String {
+        if profile.isPrivate { return "私密会话不可用" }
+        if !host.redteamStatus.installed { return "未安装 dsh-purge-safe" }
+        return "不可用"
     }
 
     private var isLocked: Bool { liveBot.isPrivate && !isPrivateUnlocked }
@@ -117,7 +133,7 @@ public struct ChatView: View {
             .map(ChatTranscriptRow.tool)
         let approvalAudits = (isLocked ? [] : host.dshApprovalAudits.filter { $0.sessionId == liveBot.id })
             .map(ChatTranscriptRow.approval)
-        return (messages + activities + approvalAudits).sorted { left, right in
+        let sorted = (messages + activities + approvalAudits).sorted { left, right in
             if left.timestamp != right.timestamp { return left.timestamp < right.timestamp }
             if let leftSequence = left.sequence, let rightSequence = right.sequence, leftSequence != rightSequence {
                 return leftSequence < rightSequence
@@ -126,6 +142,30 @@ public struct ChatView: View {
             if left.sequence == nil && right.sequence != nil { return false }
             return left.id < right.id
         }
+        var grouped: [ChatTranscriptRow] = []
+        var pendingTools: [DSHToolActivity] = []
+        func flushPendingTools() {
+            guard !pendingTools.isEmpty else { return }
+            if pendingTools.count == 1 {
+                grouped.append(.tool(pendingTools[0]))
+            } else {
+                grouped.append(.toolBurst(pendingTools))
+            }
+            pendingTools.removeAll(keepingCapacity: true)
+        }
+        for row in sorted {
+            if case .tool(let activity) = row {
+                if let prev = pendingTools.last, prev.turnId != activity.turnId {
+                    flushPendingTools()
+                }
+                pendingTools.append(activity)
+            } else {
+                flushPendingTools()
+                grouped.append(row)
+            }
+        }
+        flushPendingTools()
+        return grouped
     }
 
     private var latestHeadings: [MarkdownHeading] {
@@ -198,11 +238,29 @@ public struct ChatView: View {
                         Section("实时模式与审批（热切换）") {
                             Picker(host.agentPresetName(liveBot.agentPreset), selection: Binding(
                                 get: { liveBot.agentPreset },
-                                set: { host.setAgentPreset(sessionId: liveBot.id, presetId: $0) }
+                                set: { nextPreset in
+                                    if nextPreset == "redteam" && redteamPresetAllowed(for: liveBot) {
+                                        if !host.redteamModeEnabled {
+                                            host.setRedteamMode(true)
+                                        }
+                                        if !liveBot.redteamToolsEnabled {
+                                            host.setRedteamPermissions(sessionId: liveBot.id, toolsEnabled: true)
+                                        }
+                                        host.setAgentPreset(sessionId: liveBot.id, presetId: nextPreset)
+                                        actionStatus = "已开启红队宿主并切换至红队模式"
+                                    } else {
+                                        host.setAgentPreset(sessionId: liveBot.id, presetId: nextPreset)
+                                    }
+                                }
                             )) {
                                 ForEach(host.dshAgentPresets) { preset in
                                     let allowed = preset.isAvailable && (preset.id != "redteam" || redteamPresetAllowed(for: liveBot))
-                                    Text(allowed ? preset.name : "\(preset.name)（不可用/未授权）")
+                                    let label: String = {
+                                        if allowed { return preset.name }
+                                        if preset.id == "redteam" { return "\(preset.name)（\(redteamDisabledHint(for: liveBot))）" }
+                                        return "\(preset.name)（不可用）"
+                                    }()
+                                    Text(label)
                                         .tag(preset.id)
                                         .disabled(!allowed)
                                 }
@@ -348,22 +406,78 @@ public struct ChatView: View {
             }
             Button("取消", role: .cancel) {}
         }
-        .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.item]) { result in
+        .fileImporter(
+            isPresented: $showFileImporter,
+            allowedContentTypes: [.item, .data, .content],
+            allowsMultipleSelection: true
+        ) { result in
             guard !liveBot.isPrivate else { return }
             switch result {
-            case .success(let url):
-                do {
-                    attachedFile = try host.importFileToWorkspace(from: url)
-                    actionStatus = "已附加：files/\(attachedFile?.relativePath ?? "")"
+            case .success(let urls):
+                var addedCount = 0
+                var lastError: String?
+                for url in urls.prefix(10) {
+                    do {
+                        let imported = try host.importFileToWorkspace(from: url)
+                        if !attachedFiles.contains(where: { $0.relativePath == imported.relativePath }) {
+                            attachedFiles.append(imported)
+                        }
+                        addedCount += 1
+                    } catch {
+                        lastError = error.localizedDescription
+                    }
+                }
+                if addedCount > 0 {
+                    actionStatus = addedCount == 1
+                        ? "已附加：files/\(attachedFiles.last?.relativePath ?? "")"
+                        : "已附加 \(addedCount) 个文件到工作区"
                     DSHaptics.notify(.success)
-                } catch {
-                    actionStatus = "附加失败：\(error.localizedDescription)"
+                } else if let lastError {
+                    actionStatus = "附加失败：\(lastError)"
                     DSHaptics.notify(.error)
                 }
             case .failure(let error):
                 actionStatus = "附加失败：\(error.localizedDescription)"
+                DSHaptics.notify(.error)
             }
         }
+        #if canImport(PhotosUI)
+        .onChange(of: selectedPhotoItems) { items in
+            guard !items.isEmpty, !liveBot.isPrivate else { return }
+            let picked = items
+            selectedPhotoItems = []
+            Task {
+                var added = 0
+                var lastError: String?
+                for (idx, item) in picked.prefix(5).enumerated() {
+                    do {
+                        if let rawData = try await item.loadTransferable(type: Data.self) {
+                            let stamp = Int(Date().timeIntervalSince1970)
+                            let name = "photo_\(stamp)_\(idx + 1).jpg"
+                            let imported = try host.importRawDataToWorkspace(rawData, suggestedName: name)
+                            await MainActor.run {
+                                attachedFiles.append(imported)
+                            }
+                            added += 1
+                        }
+                    } catch {
+                        lastError = error.localizedDescription
+                    }
+                }
+                await MainActor.run {
+                    if added > 0 {
+                        actionStatus = added == 1
+                            ? "已附加图片：files/\(attachedFiles.last?.relativePath ?? "")"
+                            : "已附加 \(added) 张图片到工作区"
+                        DSHaptics.notify(.success)
+                    } else if let lastError {
+                        actionStatus = "图片附加失败：\(lastError)"
+                        DSHaptics.notify(.error)
+                    }
+                }
+            }
+        }
+        #endif
     }
 
     @ViewBuilder
@@ -464,7 +578,7 @@ public struct ChatView: View {
         historyError = nil
         activeSheet = nil
         showFileImporter = false
-        attachedFile = nil
+        attachedFiles.removeAll()
         speechInput.stop()
         showClearConfirm = false
         actionStatus = ""
@@ -476,7 +590,54 @@ public struct ChatView: View {
         ScrollViewReader { proxy in
             ZStack(alignment: .top) {
                 VStack(spacing: 0) {
-                    conversationScrollView(proxy: proxy)
+                    if host.isStreaming,
+                       let activeId = host.streamingSessionId,
+                       activeId != liveBot.id,
+                       let activeBot = host.bots.first(where: { $0.id == activeId }) {
+                        HStack(spacing: 8) {
+                            ProgressView().scaleEffect(0.7)
+                            Text("「\(activeBot.name)」正在后台流式生成中")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 6)
+                        .background(DSTheme.brand.opacity(0.08))
+                    }
+                    ZStack(alignment: .bottomTrailing) {
+                        conversationScrollView(proxy: proxy)
+                        if !followsLiveOutput && (!sessionMessages.isEmpty || (host.isStreaming && host.streamingSessionId == bot.id)) {
+                            Button {
+                                followsLiveOutput = true
+                                withAnimation(.easeOut(duration: 0.2)) {
+                                    proxy.scrollTo("chat_bottom", anchor: .bottom)
+                                }
+                            } label: {
+                                HStack(spacing: 6) {
+                                    if host.isStreaming && host.streamingSessionId == bot.id {
+                                        Circle()
+                                            .fill(DSTheme.brand)
+                                            .frame(width: 7, height: 7)
+                                    }
+                                    Image(systemName: "arrow.down")
+                                        .font(.caption.weight(.bold))
+                                    Text(host.isStreaming && host.streamingSessionId == bot.id ? "回到最新输出" : "回到底部")
+                                        .font(.caption.weight(.semibold))
+                                }
+                                .foregroundStyle(.primary)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .background(.ultraThinMaterial)
+                                .clipShape(Capsule())
+                                .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+                            }
+                            .padding(.trailing, 14)
+                            .padding(.bottom, 12)
+                            .transition(.opacity.combined(with: .move(edge: .bottom)))
+                        }
+                    }
                     conversationFooterNotices
                     composerBar
                 }
@@ -490,7 +651,7 @@ public struct ChatView: View {
             LazyVStack(alignment: .leading, spacing: 14) {
                 Color.clear.frame(height: 1).id("chat_top")
                 conversationHeaderSection
-                conversationTranscriptSection
+                conversationTranscriptSection(proxy: proxy)
                 conversationPendingSection
                 Color.clear.frame(height: 1).id("chat_bottom")
                     .onAppear { followsLiveOutput = true }
@@ -511,12 +672,6 @@ public struct ChatView: View {
                 withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
             }
         }
-        .onChange(of: host.streamingContent.count) { _ in
-            scrollToBottomIfFollowing(proxy: proxy)
-        }
-        .onChange(of: host.streamingReasoning.count) { _ in
-            scrollToBottomIfFollowing(proxy: proxy)
-        }
         .onChange(of: host.pendingApprovals.count) { _ in
             withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
         }
@@ -524,9 +679,11 @@ public struct ChatView: View {
             withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
         }
         .onChange(of: host.dshToolActivities.count) { _ in
+            guard followsLiveOutput else { return }
             withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
         }
         .onChange(of: host.dshApprovalAudits.count) { _ in
+            guard followsLiveOutput else { return }
             withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
         }
         .onDisappear {
@@ -591,7 +748,7 @@ public struct ChatView: View {
     }
 
     @ViewBuilder
-    private var conversationTranscriptSection: some View {
+    private func conversationTranscriptSection(proxy: ScrollViewProxy) -> some View {
         ForEach(transcriptRows) { row in
             switch row {
             case .message(let msg):
@@ -601,13 +758,24 @@ public struct ChatView: View {
                     activeSheet = .history(.tool(activity))
                 }
                 .id(activity.id)
+            case .toolBurst(let burst):
+                DSHToolBurstCard(activities: burst) { activity in
+                    activeSheet = .history(.tool(activity))
+                }
+                .id(row.id)
             case .approval(let audit):
                 DSHApprovalAuditCard(audit: audit).id(audit.id)
             }
         }
 
         if host.isStreaming && host.streamingSessionId == bot.id {
-            streamingRow
+            StreamingTurnRow(
+                botName: liveBot.name,
+                liveStream: host.liveStream,
+                collapseThinkingByDefault: host.collapseThinkingByDefault
+            ) {
+                scrollToBottomIfFollowing(proxy: proxy)
+            }
         }
     }
 
@@ -667,16 +835,42 @@ public struct ChatView: View {
         }
 
         if !host.isStreaming, host.lastCancelledSessionId == bot.id {
-            Text("已停止生成")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.bottom, 4)
+            HStack(spacing: 6) {
+                Image(systemName: "stop.circle")
+                    .font(.caption2)
+                Text("已停止生成")
+                    .font(.caption)
+            }
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .background(DSTheme.surfaceSecondary.opacity(0.9))
+            .clipShape(Capsule())
+            .padding(.top, 6)
+            .padding(.bottom, 6)
         }
         if !actionStatus.isEmpty {
-            Text(actionStatus)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.bottom, 4)
+            HStack(spacing: 6) {
+                Text(actionStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                Button {
+                    actionStatus = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .background(DSTheme.surfaceSecondary.opacity(0.9))
+            .clipShape(Capsule())
+            .padding(.horizontal, 12)
+            .padding(.top, 4)
+            .padding(.bottom, 6)
         }
     }
 
@@ -789,7 +983,25 @@ public struct ChatView: View {
             }
 
             if msg.incomplete == true {
-                DSStatusBadge("回复未完成", color: DSTheme.warning, icon: "exclamationmark.circle")
+                HStack(spacing: 8) {
+                    DSStatusBadge("回复未完成", color: DSTheme.warning, icon: "exclamationmark.circle")
+                    if !isUser && !host.isStreaming && msg.id == sessionMessages.last(where: { $0.role == "assistant" })?.id {
+                        Button {
+                            Task {
+                                await host.sendMessage(
+                                    sessionId: bot.id,
+                                    text: "请从刚才中断的位置继续完成上面的回答，不要重复已输出的内容。",
+                                    model: selectedModel
+                                )
+                            }
+                        } label: {
+                            Label("继续生成", systemImage: "play.circle.fill")
+                                .font(.caption.weight(.semibold))
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                    }
+                }
             }
 
             if !msg.reasoning.isEmpty {
@@ -876,42 +1088,6 @@ public struct ChatView: View {
             if searchResultMessageID == msg.id {
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
                     .stroke(DSTheme.brand.opacity(0.45), lineWidth: 1)
-            }
-        }
-    }
-
-    private var streamingRow: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                ProgressView().scaleEffect(0.75)
-                if let ttfb = host.streamFirstTokenMs {
-                    Text("\(liveBot.name) 正在生成 · 首字 \(ttfb)ms · \(host.streamingContent.count) 字")
-                        .font(.caption2.monospacedDigit())
-                        .foregroundColor(.secondary)
-                } else {
-                    Text("\(liveBot.name) 正在连接与思考…")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                }
-            }
-            if !host.streamingReasoning.isEmpty {
-                DisclosureGroup("深度思考中…", isExpanded: $expandStreamingReasoning) {
-                    Text(host.streamingReasoning)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.top, 4)
-                }
-                .font(.caption.weight(.medium))
-                .padding(10)
-                .background(DSTheme.surfaceSecondary)
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            }
-            if !host.streamingContent.isEmpty {
-                Text(host.streamingContent)
-                    .padding(12)
-                    .background(DSTheme.surfaceSecondary)
-                    .clipShape(RoundedRectangle(cornerRadius: DSTheme.cornerBubble, style: .continuous))
             }
         }
     }
@@ -1032,27 +1208,46 @@ public struct ChatView: View {
                 }
                 .background(DSTheme.surfaceSecondary.opacity(0.6))
             }
-            if let file = attachedFile {
-                HStack(spacing: 8) {
-                    Image(systemName: "paperclip")
-                        .font(.caption)
-                        .foregroundColor(DSTheme.brand)
-                    Text("files/\(file.relativePath) (\(ByteCountFormatter.string(fromByteCount: Int64(file.byteCount), countStyle: .file)))")
-                        .font(.caption)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Spacer()
-                    Button {
-                        attachedFile = nil
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundColor(.secondary)
+            if !attachedFiles.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(attachedFiles) { file in
+                            HStack(spacing: 6) {
+                                Image(systemName: Self.attachmentIcon(for: file.fileName))
+                                    .font(.caption)
+                                    .foregroundColor(DSTheme.brand)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(file.fileName)
+                                        .font(.caption.weight(.medium))
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    Text(ByteCountFormatter.string(fromByteCount: Int64(file.byteCount), countStyle: .file))
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.secondary)
+                                }
+                                Button {
+                                    attachedFiles.removeAll { $0.id == file.id }
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(DSTheme.surfacePrimary)
+                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .stroke(DSTheme.brand.opacity(0.22), lineWidth: 1)
+                            )
+                        }
                     }
-                    .buttonStyle(.plain)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 6)
-                .background(DSTheme.surfaceSecondary.opacity(0.7))
+                .background(DSTheme.surfaceSecondary.opacity(0.75))
             }
             if let ref = referencedBot {
                 HStack(spacing: 8) {
@@ -1078,7 +1273,14 @@ public struct ChatView: View {
             HStack(spacing: 8) {
                 Menu {
                     if !liveBot.isPrivate {
-                        Button { showFileImporter = true } label: { Label("附加文件到工作区", systemImage: "paperclip") }
+                        Button {
+                            Task { @MainActor in
+                                try? await Task.sleep(nanoseconds: 200_000_000)
+                                showFileImporter = true
+                            }
+                        } label: {
+                            Label("选择任意文件（PDF/文档/代码/压缩包）", systemImage: "paperclip")
+                        }
                         Button { activeSheet = .workspaceFiles } label: { Label("/files 浏览与编辑工作区", systemImage: "folder.fill") }
                     }
                     Button { activeSheet = .referenceChatPicker } label: { Label("引用历史对话作为上下文", systemImage: "quote.bubble") }
@@ -1098,7 +1300,29 @@ public struct ChatView: View {
                         .foregroundColor(.secondary)
                 }
 
-                TextField(host.isStreaming && host.streamingSessionId == bot.id ? "输入插话引导内容（Steer）…" : "给 \(liveBot.name) 发消息（/side /files /clear）…", text: $input, axis: .vertical)
+                if !liveBot.isPrivate {
+                    Button {
+                        showFileImporter = true
+                    } label: {
+                        Image(systemName: "paperclip")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundColor(attachedFiles.isEmpty ? .secondary : DSTheme.brand)
+                    }
+                    .disabled(host.isStreaming)
+                    .help("附加任意文件")
+
+                    #if canImport(PhotosUI)
+                    PhotosPicker(selection: $selectedPhotoItems, maxSelectionCount: 5, matching: .images) {
+                        Image(systemName: "photo")
+                            .font(.system(size: 17, weight: .medium))
+                            .foregroundColor(.secondary)
+                    }
+                    .disabled(host.isStreaming)
+                    .help("从相册选择图片")
+                    #endif
+                }
+
+                TextField(host.isStreaming && host.streamingSessionId == bot.id ? "输入插话引导内容（Steer）…" : "给 \(liveBot.name) 发消息…", text: $input, axis: .vertical)
                     .lineLimit(1...4)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
@@ -1144,7 +1368,7 @@ public struct ChatView: View {
                     Button {
                         speechInput.stop()
                         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !text.isEmpty || attachedFile != nil else { return }
+                        guard !text.isEmpty || !attachedFiles.isEmpty else { return }
                         if text == "/side" {
                             input = ""
                             activeSheet = .sideChat
@@ -1179,24 +1403,43 @@ public struct ChatView: View {
                                 refPrefix = "[引用历史会话「\(ref.name)」]\n\(snippet)\n\n"
                             }
                         }
-                        let prefix = refPrefix + (attachedFile?.promptPrefix() ?? "")
+                        let attachmentPrefix = attachedFiles.map { $0.promptPrefix() }.joined()
+                        let prefix = refPrefix + attachmentPrefix
                         let body = text.isEmpty ? "请查看我刚附加的工作区文件。" : text
                         let payload = prefix + body
                         input = ""
-                        attachedFile = nil
+                        attachedFiles.removeAll()
                         referencedBot = nil
                         Task { await host.sendMessage(sessionId: bot.id, text: payload, model: selectedModel) }
                     } label: {
                         Image(systemName: "arrow.up.circle.fill")
                             .font(.title2)
-                            .foregroundColor((input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachedFile == nil) ? .secondary : DSTheme.brand)
+                            .foregroundColor((input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachedFiles.isEmpty) ? .secondary : DSTheme.brand)
                     }
-                    .disabled(host.state != .ready || host.isStreaming || (input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachedFile == nil))
+                    .disabled(host.state != .ready || host.isStreaming || (input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachedFiles.isEmpty))
                 }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .background(DSTheme.surfacePrimary)
+        }
+    }
+
+    private static func attachmentIcon(for fileName: String) -> String {
+        let ext = (fileName as NSString).pathExtension.lowercased()
+        switch ext {
+        case "png", "jpg", "jpeg", "heic", "heif", "webp", "gif", "bmp", "tif", "tiff":
+            return "photo"
+        case "pdf":
+            return "doc.richtext"
+        case "zip", "tar", "gz", "7z", "rar":
+            return "doc.zipper"
+        case "swift", "py", "js", "ts", "mjs", "json", "yaml", "yml", "xml", "html", "css", "sh", "sql", "c", "cpp", "go", "rs":
+            return "chevron.left.forwardslash.chevron.right"
+        case "doc", "docx", "pages", "rtf", "txt", "md", "csv", "xlsx", "pptx":
+            return "doc.text"
+        default:
+            return "paperclip"
         }
     }
 }
