@@ -3,7 +3,7 @@ import Foundation
 import ImageIO
 import MetricKit
 import UIKit
-import os.proc
+import os
 
 /// Memory pressure tier derived from iOS Jetsam headroom (`os_proc_available_memory`),
 /// Mach `task_vm_info.phys_footprint`, and `DispatchSourceMemoryPressure`.
