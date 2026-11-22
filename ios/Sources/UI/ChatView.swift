@@ -240,14 +240,18 @@ public struct ChatView: View {
                                 get: { liveBot.agentPreset },
                                 set: { nextPreset in
                                     if nextPreset == "redteam" && redteamPresetAllowed(for: liveBot) {
-                                        if !host.redteamModeEnabled {
-                                            host.setRedteamMode(true)
+                                        let targetId = liveBot.id
+                                        let needsTools = !liveBot.redteamToolsEnabled
+                                        Task { @MainActor in
+                                            if !host.redteamModeEnabled {
+                                                await host.setRedteamMode(true)
+                                            }
+                                            if needsTools {
+                                                host.setRedteamPermissions(sessionId: targetId, toolsEnabled: true)
+                                            }
+                                            host.setAgentPreset(sessionId: targetId, presetId: nextPreset)
+                                            actionStatus = "已开启红队宿主并切换至红队模式"
                                         }
-                                        if !liveBot.redteamToolsEnabled {
-                                            host.setRedteamPermissions(sessionId: liveBot.id, toolsEnabled: true)
-                                        }
-                                        host.setAgentPreset(sessionId: liveBot.id, presetId: nextPreset)
-                                        actionStatus = "已开启红队宿主并切换至红队模式"
                                     } else {
                                         host.setAgentPreset(sessionId: liveBot.id, presetId: nextPreset)
                                     }
