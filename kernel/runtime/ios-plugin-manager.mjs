@@ -1102,13 +1102,17 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
     }
     const tarball = httpsURL(packageInfo.dist.tarball)
     if (tarball.origin !== 'https://registry.npmjs.org') throw new Error('包下载地址不属于已配置的 npm 仓库')
+    rpc.notify?.('plugins.progress', { stage: 'download', detail: `正在从 npm 下载 ${name}@${version}…` })
     const bytes = await fetchBuffer(tarball.href, MAX_ARCHIVE_BYTES)
     await verifyIntegrity(bytes, packageInfo.dist.integrity)
     const staging = join(profileDir, `.ios-plugin-download-${randomUUID()}`)
     await mkdir(staging)
     try {
+      rpc.notify?.('plugins.progress', { stage: 'unpack', detail: `正在解包并校验 ${name}…` })
       await unpackNpmTarball(bytes, staging)
+      rpc.notify?.('plugins.progress', { stage: 'deps', detail: `正在解析纯 JS 依赖树…` })
       await resolvePureJsDependencies(staging)
+      rpc.notify?.('plugins.progress', { stage: 'stage', detail: `正在写入 DSH Profile…` })
       return await installDirectory(staging, name, version)
     } finally {
       await rm(staging, { recursive: true, force: true })
@@ -1250,12 +1254,16 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
       }
     }
     const tarballUrl = `https://codeload.github.com/${owner}/${repo}/tar.gz/${encodeURIComponent(targetRef || 'HEAD')}`
+    rpc.notify?.('plugins.progress', { stage: 'download', detail: `正在下载 GitHub 源码包 ${owner}/${repo}…` })
     const bytes = await fetchBuffer(tarballUrl, MAX_ARCHIVE_BYTES, 45_000)
     const staging = join(profileDir, `.ios-plugin-github-${randomUUID()}`)
     await mkdir(staging)
     try {
+      rpc.notify?.('plugins.progress', { stage: 'unpack', detail: `正在解包 ${owner}/${repo}…` })
       await unpackNpmTarball(bytes, staging, { stripSingleRoot: true })
+      rpc.notify?.('plugins.progress', { stage: 'deps', detail: `正在解析纯 JS 依赖树…` })
       await resolvePureJsDependencies(staging)
+      rpc.notify?.('plugins.progress', { stage: 'stage', detail: `正在校验并写入 DSH Profile…` })
       return await installDirectory(staging)
     } finally {
       await rm(staging, { recursive: true, force: true })
@@ -1367,8 +1375,78 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
     }
   }
 
+  const pluginConfigPath = join(profileDir, 'ios-plugin-configs.json')
+
+  async function readPluginConfigs() {
+    try {
+      const parsed = JSON.parse(await readFile(pluginConfigPath, 'utf8'))
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+    } catch {
+      return {}
+    }
+  }
+
+  async function writePluginConfigs(configs) {
+    await writeFile(pluginConfigPath, `${JSON.stringify(configs, null, 2)}\n`, { mode: 0o600 })
+  }
+
+  async function installLocalPath(resolved) {
+    const info = await lstat(resolved)
+    if (info.isFile()) {
+      const lower = resolved.toLowerCase()
+      if (!lower.endsWith('.tgz') && !lower.endsWith('.tar.gz')) {
+        throw new Error('本地离线包仅支持文件夹或 .tgz / .tar.gz 压缩包')
+      }
+      rpc.notify?.('plugins.progress', { stage: 'unpack', detail: '正在解包本地 .tgz 插件包…' })
+      const bytes = await readFile(resolved)
+      if (bytes.byteLength > MAX_ARCHIVE_BYTES) throw new Error('本地插件压缩包超过 48 MB 限制')
+      const staging = join(profileDir, `.ios-plugin-local-${randomUUID()}`)
+      await mkdir(staging)
+      try {
+        await unpackNpmTarball(bytes, staging, { stripSingleRoot: true })
+        rpc.notify?.('plugins.progress', { stage: 'deps', detail: '正在解析纯 JS 依赖树…' })
+        await resolvePureJsDependencies(staging)
+        rpc.notify?.('plugins.progress', { stage: 'stage', detail: '正在写入 DSH Profile…' })
+        return await installDirectory(staging)
+      } finally {
+        await rm(staging, { recursive: true, force: true })
+      }
+    }
+    rpc.notify?.('plugins.progress', { stage: 'stage', detail: '正在校验并导入本地插件目录…' })
+    return await installDirectory(resolved)
+  }
+
   rpc.handle('plugins.installed.list', async () => ({ plugins: await installedPlugins() }))
   rpc.handle('plugins.audit', async ({ name }) => auditInstalledPlugin(String(name ?? '')))
+  rpc.handle('plugins.config.get', async ({ name }) => {
+    const pkgName = String(name ?? '')
+    validatePackageName(pkgName)
+    const configs = await readPluginConfigs()
+    const config = configs[pkgName] && typeof configs[pkgName] === 'object' ? configs[pkgName] : {}
+    return { name: pkgName, config }
+  })
+  rpc.handle('plugins.config.set', async ({ name, config }) => {
+    const pkgName = String(name ?? '')
+    validatePackageName(pkgName)
+    if (!config || typeof config !== 'object' || Array.isArray(config)) {
+      throw new Error('插件配置必须是 JSON 对象（例如 {}）')
+    }
+    const serialized = JSON.stringify(config)
+    if (serialized.length > 32 * 1024) throw new Error('插件配置不能超过 32 KB')
+    const configs = await readPluginConfigs()
+    configs[pkgName] = config
+    await writePluginConfigs(configs)
+    return { name: pkgName, saved: true, restartRequired: true }
+  })
+  rpc.handle('plugins.disableAll', async () => mutateProfile(async () => {
+    const before = readProfileManifest('dsh', profileDir)
+    const embedded = await embeddedPackages()
+    const existing = before.dsh?.profile?.bundles ?? [PROFILE_BUNDLE]
+    const nextBundles = existing.filter((item) => item === PROFILE_BUNDLE || embedded.has(item))
+    const disabledCount = existing.length - nextBundles.length
+    const composition = await stageProfile(before, before, nextBundles)
+    return { disabledCount, restartRequired: Boolean(composition?.restartReason || disabledCount > 0) }
+  }))
   rpc.handle('plugins.install.npm', async (params) => mutateProfile(() =>
     installFromNpm(String(params.name ?? ''), String(params.version ?? ''), String(params.sourceId ?? ''))))
   rpc.handle('plugins.install.github', async ({ url }) => mutateProfile(() =>
@@ -1376,13 +1454,13 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
   rpc.handle('plugins.install.local', async ({ path }) => {
     const allowedRoot = await realpath(importRoot).catch(() => resolve(importRoot))
     const resolved = await realpath(resolve(String(path ?? ''))).catch(() => {
-      throw new Error('本地插件目录不存在或无法解析')
+      throw new Error('本地插件目录或压缩包不存在或无法解析')
     })
     const rel = relative(allowedRoot, resolved)
     if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
       throw new Error('本地插件只能从应用内的导入暂存目录读取')
     }
-    return mutateProfile(() => installDirectory(resolved))
+    return mutateProfile(() => installLocalPath(resolved))
   })
   rpc.handle('plugins.enable', async ({ name, enabled }) =>
     mutateProfile(() => setPluginEnabled(String(name ?? ''), enabled === true)))

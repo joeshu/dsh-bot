@@ -111,7 +111,11 @@ private final class DSMarkdownBlockCache: @unchecked Sendable {
 
 /// Renders Markdown natively with styled fenced code blocks (with one-tap copy confirmation),
 /// Markdown headings, and cached inline `AttributedString(markdown:)` formatting.
-public struct DSMarkdownText: View {
+public struct DSMarkdownText: View, Equatable {
+    public static func == (lhs: DSMarkdownText, rhs: DSMarkdownText) -> Bool {
+        lhs.raw == rhs.raw
+    }
+
     public static func clearRenderCache() {
         DSMarkdownBlockCache.shared.removeAll()
     }
@@ -161,6 +165,10 @@ public struct DSMarkdownText: View {
                                 #endif
                                 DSHaptics.impact(.light)
                                 copiedBlockId = id
+                                Task { @MainActor in
+                                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                                    if copiedBlockId == id { copiedBlockId = nil }
+                                }
                             } label: {
                                 Label(
                                     copiedBlockId == id ? "已复制" : "复制代码",

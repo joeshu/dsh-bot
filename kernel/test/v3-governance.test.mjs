@@ -333,5 +333,39 @@ test('v3 web-access: private-session-access exposes typert.local RPCs (directory
   assert.ok(invalidateCount > before, 'workspace domain change must invalidate WEB_PRINCIPAL')
 })
 
+test('v3 browser: registers all 12 browser_* tools, enforces private-bot & readOnly gates, and wires iOS WKWebView controller', async () => {
+  const nativeToolsSrc = readFileSync(join(runtimeDir, 'ios-host-package/native-tools.mjs'), 'utf8')
+  const entrySrc = readFileSync(join(runtimeDir, 'dsh-ios-entry.mjs'), 'utf8')
+  const swiftControllerSrc = readFileSync(join(__dirname, '..', '..', 'ios/Sources/Bridge/AgentBrowserController.swift'), 'utf8')
+
+  const expectedTools = [
+    'browser_open', 'browser_snapshot', 'browser_click', 'browser_type',
+    'browser_select', 'browser_press_key', 'browser_scroll', 'browser_screenshot',
+    'browser_back', 'browser_wait', 'browser_eval', 'browser_handoff',
+  ]
+  for (const toolName of expectedTools) {
+    assert.ok(nativeToolsSrc.includes(`name: '${toolName}'`), `native-tools.mjs must register ${toolName}`)
+    assert.ok(entrySrc.includes(`'${toolName}'`), `dsh-ios-entry.mjs allowlist must include ${toolName}`)
+  }
+  assert.match(swiftControllerSrc, /WKUIDelegate/, 'AgentBrowserController must implement WKUIDelegate')
+  assert.match(swiftControllerSrc, /WKDownloadDelegate/, 'AgentBrowserController must implement WKDownloadDelegate')
+  assert.match(swiftControllerSrc, /isHumanControlling/, 'AgentBrowserController must support human takeover lock')
+  assert.match(swiftControllerSrc, /__dsbotCollectRoots/, 'AgentBrowserController must pierce open Shadow DOM')
+  assert.match(swiftControllerSrc, /acquireActionSlot/, 'AgentBrowserController must serialize concurrent browser actions')
+  assert.match(swiftControllerSrc, /captchaDetected/, 'AgentBrowserController must detect verification gates for handoff')
+})
+
+test('v3 web-ui: DSHWebUIView provides immersive floating capsule, sidebar return bridge, theme sync, and visualViewport keyboard handling', async () => {
+  const webUISrc = readFileSync(join(__dirname, '..', '..', 'ios/Sources/UI/DSHWebUIView.swift'), 'utf8')
+  assert.match(webUISrc, /\.toolbar\(\.hidden,\s*for:\s*\.navigationBar\)/, 'DSHWebUIView must hide redundant native navigation bar')
+  assert.match(webUISrc, /floatingCapsule/, 'DSHWebUIView must render floating top-right capsule')
+  assert.match(webUISrc, /dsbotNative/, 'DSHWebUIView must wire dsbotNative WKScriptMessageHandler')
+  assert.match(webUISrc, /dsbot-return-pill/, 'DSHWebUIView must inject sidebar return-to-DS-Bot pill')
+  assert.match(webUISrc, /visualViewport/, 'DSHWebUIView must sync visualViewport height for iOS keyboard')
+  assert.match(webUISrc, /themeChanged/, 'DSHWebUIView must sync Web UI theme color to native top bar')
+})
+
+
+
 
 

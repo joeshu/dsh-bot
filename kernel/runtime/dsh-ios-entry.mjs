@@ -567,6 +567,8 @@ const NATIVE_TOOL_NAMES = [
   'terminal_exec', 'git_workspace',
   'schedule_create', 'schedule_list', 'schedule_view', 'schedule_history', 'schedule_edit',
   'job_output', 'job_list', 'job_kill',
+  'browser_open', 'browser_snapshot', 'browser_click', 'browser_type', 'browser_select', 'browser_press_key', 'browser_scroll', 'browser_screenshot',
+  'browser_back', 'browser_wait', 'browser_eval', 'browser_handoff',
 ]
 const DEVELOPER_TOOL_NAMES = [
   'read', 'read_image', 'write', 'edit', 'apply_patch', 'glob', 'grep',
@@ -723,11 +725,85 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
     }
     await ctx.agentPresets.mount(agentCtx, agentPreset)
     let personaDisposer
+    let rulesDisposer
+    let reasoningDisposer
     let redteamPromptDisposer
     let toolRestriction
     let toolGuard
     let redteamPreExecuteDisposer
     let lastToolsPolicyKey = ''
+    let lastRulesHash = ''
+    let lastReasoningEffort = ''
+
+    const refreshWorkspaceRules = () => {
+      const isPrivate = runtime.privateBotIds?.has(botId) === true
+      if (isPrivate) {
+        rulesDisposer?.()
+        rulesDisposer = undefined
+        lastRulesHash = ''
+        return
+      }
+      const chunks = []
+      for (const candidate of [join(WORKSPACE, 'files', 'AGENTS.md'), join(WORKSPACE, 'files', 'CLAUDE.md')]) {
+        try {
+          if (existsSync(candidate)) {
+            const raw = readFileSync(candidate, 'utf8').trim()
+            if (raw) {
+              chunks.push(`工作区规则（${candidate.endsWith('CLAUDE.md') ? 'files/CLAUDE.md' : 'files/AGENTS.md'}）：\n${raw.slice(0, 4096)}`)
+              break
+            }
+          }
+        } catch {}
+      }
+      try {
+        const skillsDir = join(WORKSPACE, 'skills')
+        if (existsSync(skillsDir)) {
+          const entries = readdirSync(skillsDir, { withFileTypes: true }).slice(0, 20)
+          const names = []
+          for (const entry of entries) {
+            if (entry.name.startsWith('.')) continue
+            if (entry.isDirectory() && existsSync(join(skillsDir, entry.name, 'SKILL.md'))) {
+              names.push(entry.name)
+            } else if (entry.isFile() && entry.name.endsWith('.md')) {
+              names.push(entry.name.replace(/\.md$/i, ''))
+            }
+          }
+          if (names.length > 0) {
+            chunks.push(`工作区可用用户 Skills（位于 skills/）：${names.join(', ')}。当用户提及相关技能时可读取对应 SKILL.md 遵循其流程。`)
+          }
+        }
+      } catch {}
+      const combined = chunks.join('\n\n')
+      if (combined === lastRulesHash) return
+      lastRulesHash = combined
+      rulesDisposer?.()
+      rulesDisposer = undefined
+      if (combined) {
+        rulesDisposer = agentCtx.systemPrompt.section({ name: 'dsbot-ios-workspace-rules', order: 860, text: combined })
+      }
+    }
+
+    const setReasoningEffort = (effort) => {
+      const normalized = ['low', 'medium', 'high'].includes(effort) ? effort : 'medium'
+      if (normalized === lastReasoningEffort) return
+      lastReasoningEffort = normalized
+      reasoningDisposer?.()
+      reasoningDisposer = undefined
+      if (normalized === 'low') {
+        reasoningDisposer = agentCtx.systemPrompt.section({
+          name: 'dsbot-ios-reasoning-effort',
+          order: 870,
+          text: '推理等级：低（快速模式）。请保持思考精炼，直接给出清晰结论与可执行步骤。',
+        })
+      } else if (normalized === 'high') {
+        reasoningDisposer = agentCtx.systemPrompt.section({
+          name: 'dsbot-ios-reasoning-effort',
+          order: 870,
+          text: '推理等级：高（深度模式）。请在回答与工具调用前充分推演边界条件、依赖与潜在风险，确保方案严谨完整。',
+        })
+      }
+    }
+
     setPersona = (value) => {
       personaDisposer?.()
       personaDisposer = undefined
@@ -736,8 +812,11 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
       }
     }
     setPersona(systemPrompt)
+    refreshWorkspaceRules()
     setToolsEnabled = (enabled, allowSubagent, allowWebSearch, allowRedteam = false,
-      allowRedteamWrites = false, allowRedteamSensitive = false, redteamPermissionMode = 'ask') => {
+      allowRedteamWrites = false, allowRedteamSensitive = false, redteamPermissionMode = 'ask', reasoningEffort = 'medium') => {
+      refreshWorkspaceRules()
+      setReasoningEffort(reasoningEffort)
       const normalizedPermissionMode = ['ask', 'autoReview', 'readOnly'].includes(redteamPermissionMode) ? redteamPermissionMode : 'ask'
       const rtTools = registeredRedteamToolNames()
       const policyKey = JSON.stringify({
@@ -771,7 +850,16 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
         sensitive: allowRedteamSensitive,
         permissionMode: normalizedPermissionMode,
       }
-      const globalToolNames = new Set(ctx.tools.definitions().map((tool) => tool.name))
+      const globalToolDefs = ctx.tools.definitions()
+      const globalToolNames = new Set(globalToolDefs.map((tool) => tool.name))
+      const thirdPartyTools = enabled
+        ? globalToolDefs
+            .filter((tool) => tool?.name && !DISABLED_TOOL_NAMES.has(tool.name) && tool.name !== 'subagent' && !tool.name.startsWith('redteam_'))
+            .map((tool) => ({
+              name: String(tool.name),
+              description: String(tool.description ?? '').replace(/\s+/g, ' ').trim().slice(0, 120),
+            }))
+        : []
       const deny = enabled ? [] : [...DISABLED_TOOL_NAMES].filter((name) => globalToolNames.has(name))
       if (!allowSubagent || !enabled) deny.push('subagent')
       if (enabled && !allowWebSearch) deny.push('web_search')
@@ -783,11 +871,22 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
         }
       }
       const allowedRedteamTools = rtTools.filter((name) => !redteamToolDenial(redteamPolicy, name))
+      const promptParts = []
+      if (enabled && !runtime.privateBotIds?.has(botId)) {
+        promptParts.push('App 内置浏览器可用：需要交互浏览网页、点击、填表、下拉选择、等待动态渲染或截图识图时，可直接调用 browser_open / browser_snapshot / browser_click / browser_type / browser_select / browser_press_key / browser_wait / browser_eval / browser_screenshot；遇到登录、2FA 或人机验证时必须立即调用 browser_handoff 请用户在内置浏览器中手动接管。')
+      }
+      if (thirdPartyTools.length > 0) {
+        const listed = thirdPartyTools.slice(0, 24).map((t) => t.description ? `- ${t.name}: ${t.description}` : `- ${t.name}`).join('\n')
+        promptParts.push(`当前已加载 ${thirdPartyTools.length} 个第三方插件工具，可在相关任务中直接调用：\n${listed}`)
+      }
       if (allowedRedteamTools.length > 0) {
+        promptParts.push(`dsh-purge-safe 红队演练工具已获本 Bot 授权。只允许在用户明确授权的演练范围内查询与记录；不得自行扩大范围。当前可用工具（${allowedRedteamTools.length} 项）：${allowedRedteamTools.join(', ')}。`)
+      }
+      if (promptParts.length > 0) {
         redteamPromptDisposer = agentCtx.systemPrompt.section({
-          name: 'dsbot-ios-redteam-mode',
+          name: 'dsbot-ios-plugin-tools',
           order: 850,
-          text: `dsh-purge-safe 红队演练工具已获本 Bot 授权。只允许在用户明确授权的演练范围内查询与记录；不得自行扩大范围。当前可用工具（${allowedRedteamTools.length} 项）：${allowedRedteamTools.join(', ')}。`,
+          text: promptParts.join('\n\n'),
         })
       }
       if (deny.length) toolRestriction = agentCtx.tools.restrict({ deny })
@@ -804,6 +903,13 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
         if (String(execution.name ?? '').startsWith('redteam_')) {
           const denial = redteamToolDenial(redteamPolicy, execution.name)
           if (denial) return { reason: denial }
+        }
+        if (normalizedPermissionMode === 'readOnly'
+          && !DISABLED_TOOL_NAMES.has(execution.name)
+          && execution.name !== 'subagent'
+          && !String(execution.name ?? '').startsWith('redteam_')
+          && /(?:write|edit|delete|remove|create|update|set|exec|run|patch|send|post|push)/i.test(String(execution.name ?? ''))) {
+          return { reason: `当前处于只读保护模式，已拦截写入/执行类第三方插件工具 ${execution.name}。` }
         }
         if (!enabled && DISABLED_TOOL_NAMES.has(execution.name)) {
           return { reason: 'This tool is disabled for the selected provider.' }
@@ -837,23 +943,57 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
     if (importedContext) {
       agentCtx.systemPrompt.section({ name: 'dsbot-ios-imported-history', order: 800, text: importedContext })
     }
+    let pendingContent = ''
+    let pendingReasoning = ''
+    let pendingTurnId = ''
+    let deltaFlushTimer = null
+    function flushPendingDeltas() {
+      if (deltaFlushTimer) {
+        clearTimeout(deltaFlushTimer)
+        deltaFlushTimer = null
+      }
+      if (!pendingContent && !pendingReasoning) return
+      const active = runtime.activeTurns.get(id)
+      const content = pendingContent
+      const reasoning = pendingReasoning
+      const turnIdForFlush = pendingTurnId || active?.turnId || ''
+      pendingContent = ''
+      pendingReasoning = ''
+      pendingTurnId = ''
+      if (!turnIdForFlush || !active || active.done) return
+      rpc.notify('chat.delta', { sessionId: botId, turnId: turnIdForFlush, content, reasoning })
+    }
     agentCtx.on('agent/assistant-stream', ({ frame }) => {
       if (frame?.type !== 'chunk') return
       const active = runtime.activeTurns.get(id)
       if (!active || active.done) return
+      active.flushDelta = flushPendingDeltas
       const chunk = frame.chunk
-      if (chunk.type === 'text-delta') {
-        rpc.notify('chat.delta', { sessionId: botId, turnId: active.turnId, content: chunk.text, reasoning: '' })
-      } else if (chunk.type === 'reasoning-delta') {
-        rpc.notify('chat.delta', { sessionId: botId, turnId: active.turnId, content: '', reasoning: chunk.text })
+      if (chunk.type === 'text-delta' && chunk.text) {
+        pendingTurnId = active.turnId
+        pendingContent += chunk.text
+      } else if (chunk.type === 'reasoning-delta' && chunk.text) {
+        pendingTurnId = active.turnId
+        pendingReasoning += chunk.text
+      } else {
+        return
+      }
+      if (pendingContent.length + pendingReasoning.length >= 512) {
+        flushPendingDeltas()
+      } else if (!deltaFlushTimer) {
+        deltaFlushTimer = setTimeout(flushPendingDeltas, 24)
       }
     })
     const toolNamesByCall = new Map()
+    const toolStartedAtByCall = new Map()
     const approvalToolsById = new Map()
     agentCtx.on('session/event', (session, event) => {
       if (session?.id !== id) return
       const active = runtime.activeTurns.get(id)
       if (!active || active.done) return
+      if (event?.type === 'tool/call' || event?.type === 'approval/asked' || event?.type === 'turn/end') {
+        flushPendingDeltas()
+      }
       if (event?.type === 'approval/asked') {
         const id = String(event.data?.id ?? '')
         if (id) approvalToolsById.set(id, String(event.data?.toolName ?? 'DSH 工具'))
@@ -898,6 +1038,7 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
         const toolName = String(event.data?.name ?? 'DSH tool')
         if (!callId) return
         toolNamesByCall.set(callId, toolName)
+        toolStartedAtByCall.set(callId, Number.isSafeInteger(event.time) ? event.time : Date.now())
         rpc.notify('dsh.tool.event', {
           sessionId: botId, turnId: active.turnId, callId, toolName,
           phase: 'started', arguments: excerpt(event.data?.arguments),
@@ -910,12 +1051,17 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
       const callId = String(message?.source?.callId ?? '')
       if (!callId) return
       const toolName = toolNamesByCall.get(callId) ?? String(message?.source?.toolName ?? 'DSH tool')
+      const startedAt = toolStartedAtByCall.get(callId)
+      const finishedAt = Number.isSafeInteger(event.time) ? event.time : Date.now()
+      const durationMs = typeof startedAt === 'number' ? Math.max(0, finishedAt - startedAt) : undefined
       toolNamesByCall.delete(callId)
+      toolStartedAtByCall.delete(callId)
       rpc.notify('dsh.tool.event', {
         sessionId: botId, turnId: active.turnId, callId, toolName,
         phase: event.data?.error || message?.isError ? 'failed' : 'completed',
         result: toolResultText(message, event.data?.error),
         timestamp: event.time, sequence: event.seq,
+        ...(durationMs !== undefined ? { durationMs } : {}),
       })
     })
     agentCtx.effect(() => () => {
@@ -927,9 +1073,9 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
     setup,
     setPersona: (value) => setPersona(value),
     setToolsEnabled: (enabled, allowSubagent, allowWebSearch, allowRedteam = false,
-      allowRedteamWrites = false, allowRedteamSensitive = false, redteamPermissionMode = 'ask') =>
+      allowRedteamWrites = false, allowRedteamSensitive = false, redteamPermissionMode = 'ask', reasoningEffort = 'medium') =>
       setToolsEnabled(enabled, allowSubagent, allowWebSearch, allowRedteam,
-        allowRedteamWrites, allowRedteamSensitive, redteamPermissionMode),
+        allowRedteamWrites, allowRedteamSensitive, redteamPermissionMode, reasoningEffort),
     id,
   }
 }
@@ -941,6 +1087,7 @@ async function boot() {
   if (workerData?.safeMode || workerData?.recoveringRevision) await settlePluginRevision(PROFILE_DIR, true)
   const safeMode = workerData?.safeMode === true
   const compatibilityPatch = await preparePurgeSafeIOSOverlay(!safeMode)
+  const userConfigPatch = prepareUserPluginConfigsOverlay(!safeMode)
   const manifest = readProfileManifest('dsh', PROFILE_DIR)
   const currentBundles = manifest.dsh?.profile?.bundles ?? []
   const bundles = [PROFILE_BUNDLE, ...currentBundles.filter((name) => name !== PROFILE_BUNDLE)]
@@ -957,7 +1104,7 @@ async function boot() {
     environment: loadLayeredEnv('dsh', WORKSPACE),
     profile: PROFILE,
     resolvedProfile: { profile, installAnchor: INSTALL_ANCHOR },
-    patchFiles: [compatibilityPatch],
+    patchFiles: [compatibilityPatch, userConfigPatch],
     args: [],
   })
   ctx = application.ctx
@@ -1249,7 +1396,8 @@ async function startTurn(params, preparation) {
       active.setPersona(active.frozenSystemPrompt)
     }
     active.setToolsEnabled(toolsEnabled, params.subagentEnabled === true, webSearchEnabled,
-      redteamMode, redteamWriteEnabled, redteamSensitiveDataEnabled, permissionMode)
+      redteamMode, redteamWriteEnabled, redteamSensitiveDataEnabled, permissionMode,
+      typeof params.reasoningEffort === 'string' ? params.reasoningEffort : 'medium')
   }
 
   if (preparation.cancelled || runtime.suspended) {
@@ -1257,7 +1405,7 @@ async function startTurn(params, preparation) {
     return { turnId, status: 'accepted', engine: 'node+dsh' }
   }
   const userMessage = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })
-  const turn = { turnId, botId, isGroup: params.isGroup === true, webSearchEnabled, toolsEnabled, permissionMode, done: false }
+  const turn = { turnId, botId, isGroup: params.isGroup === true, webSearchEnabled, toolsEnabled, permissionMode, done: false, startedAt: Date.now() }
   runtime.activeTurns.set(id, turn)
   runtime.redteamTurnPolicies.set(id, {
     botId,
@@ -1325,11 +1473,11 @@ async function startTurn(params, preparation) {
       let cacheReadTokens = 0
       let outputTokens = 0
       for (const event of turnEvents) {
-        const u = event.data?.message?.usage ?? event.data?.usage
+        const u = event.data?.message?.usage ?? event.data?.usage ?? usageFromStream(event.data?.stream)
         if (u && typeof u === 'object') {
-          inputTokens += Number(u.input_tokens ?? u.inputTokens ?? 0) || 0
-          cacheReadTokens += Number(u.cache_read_input_tokens ?? u.cacheReadTokens ?? 0) || 0
-          outputTokens += Number(u.output_tokens ?? u.outputTokens ?? 0) || 0
+          inputTokens += Number(u.input_tokens ?? u.inputTokens ?? u.prompt_tokens ?? u.promptTokens ?? 0) || 0
+          cacheReadTokens += Number(u.cache_read_input_tokens ?? u.cacheReadTokens ?? u.prompt_cache_hit_tokens ?? 0) || 0
+          outputTokens += Number(u.output_tokens ?? u.outputTokens ?? u.completion_tokens ?? u.completionTokens ?? 0) || 0
         }
       }
       if (inputTokens > 0 || cacheReadTokens > 0 || outputTokens > 0) {
@@ -1339,13 +1487,16 @@ async function startTurn(params, preparation) {
       status = 'error'
       error = reason instanceof Error ? reason.message : String(reason)
     } finally {
+      turn.flushDelta?.()
       turn.done = true
       runtime.activeTurns.delete(id)
       clearRedteamApprovalGrants(id)
+      const durationMs = Math.max(1, Date.now() - (turn.startedAt ?? Date.now()))
       rpc.notify('chat.done', {
         sessionId: botId,
         turnId,
         status,
+        durationMs,
         ...(finalContent ? { finalContent } : {}),
         ...(finalReasoning ? { finalReasoning } : {}),
         ...(error ? { error } : {}),
@@ -1434,6 +1585,55 @@ async function preparePurgeSafeIOSOverlay(enabled) {
   writeFileSync(path, `${rows.length ? rows.join('\n') : '[]'}\n`, { mode: 0o600 })
   return path
 }
+
+function prepareUserPluginConfigsOverlay(enabled) {
+  const path = join(WORKSPACE, '.dsbot-ios-user-plugin-configs.patch.yml')
+  const entries = []
+  if (enabled) {
+    const configPath = join(PROFILE_DIR, 'ios-plugin-configs.json')
+    if (existsSync(configPath)) {
+      try {
+        const parsed = JSON.parse(readFileSync(configPath, 'utf8'))
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          for (const [pluginId, cfg] of Object.entries(parsed)) {
+            if (!pluginId || !cfg || typeof cfg !== 'object' || Array.isArray(cfg) || Object.keys(cfg).length === 0) continue
+            const safeConfig = { ...cfg }
+            if (pluginId === 'dsh-purge-safe') {
+              // Never let user JSON override iOS security boundary keys for dsh-purge-safe
+              delete safeConfig.toolGateBypass
+              delete safeConfig.subagentControl
+              delete safeConfig.autoApplyOnStart
+              delete safeConfig.autoUpdateOnStart
+            }
+            if (Object.keys(safeConfig).length > 0) {
+              entries.push({ id: pluginId, config: safeConfig })
+            }
+          }
+        }
+      } catch {
+        // Ignore malformed user config file and boot cleanly
+      }
+    }
+  }
+  writeFileSync(path, `${JSON.stringify(entries, null, 2)}\n`, { mode: 0o600 })
+  return path
+}
+
+rpc.handle('plugins.runtime.capabilities', async () => {
+  const defs = typeof ctx?.tools?.definitions === 'function' ? ctx.tools.definitions() : []
+  const thirdPartyTools = defs
+    .filter((tool) => tool?.name && !DISABLED_TOOL_NAMES.has(tool.name) && tool.name !== 'subagent' && !String(tool.name).startsWith('redteam_'))
+    .map((tool) => ({
+      name: String(tool.name),
+      description: String(tool.description ?? '').replace(/\s+/g, ' ').trim().slice(0, 200),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name))
+  return {
+    thirdPartyTools,
+    activePlugins: runtime.activePlugins ?? [],
+    webReady: webUiInfo().ready === true,
+  }
+})
 
 rpc.handle('chat.abort', async ({ turnId }) => {
   const item = [...runtime.activeTurns.entries()].find(([, active]) => active.turnId === turnId)

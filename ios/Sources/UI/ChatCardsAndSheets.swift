@@ -117,6 +117,7 @@ public struct DSHUserQuestionCard: View {
 public struct DSHToolActivityCard: View {
     let activity: DSHToolActivity
     let onViewFull: () -> Void
+    @State private var copiedResult = false
 
     public init(activity: DSHToolActivity, onViewFull: @escaping () -> Void) {
         self.activity = activity
@@ -166,11 +167,26 @@ public struct DSHToolActivityCard: View {
     public var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Image(systemName: statusIcon)
-                    .foregroundStyle(statusTint)
-                Text(activity.toolName)
-                    .font(.subheadline.weight(.semibold).monospaced())
+                if activity.phase == "started" {
+                    ProgressView().scaleEffect(0.72)
+                } else {
+                    Image(systemName: statusIcon)
+                        .foregroundStyle(statusTint)
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(activity.toolName)
+                        .font(.subheadline.weight(.semibold).monospaced())
+                        .lineLimit(1)
+                    Text(activity.displayLabel)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
+                if let duration = activity.formattedDuration {
+                    Text(duration)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
                 DSStatusBadge(activity.phaseLabel, color: statusTint)
             }
             if let workspacePathSummary {
@@ -181,6 +197,17 @@ public struct DSHToolActivityCard: View {
                 }
                 .font(.caption2)
                 .foregroundStyle(activity.phase == "completed" ? DSTheme.brand : .secondary)
+            }
+            if activity.phase == "failed", !activity.result.isEmpty {
+                Text(activity.result)
+                    .font(.caption2)
+                    .foregroundStyle(DSTheme.danger)
+                    .lineLimit(2)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(DSTheme.danger.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
             DisclosureGroup("查看工具输入与结果预览") {
                 VStack(alignment: .leading, spacing: 8) {
@@ -195,7 +222,26 @@ public struct DSHToolActivityCard: View {
                             .clipShape(RoundedRectangle(cornerRadius: 8))
                     }
                     if !activity.result.isEmpty {
-                        Text("结果").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                        HStack {
+                            Text("结果").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                            Spacer()
+                            Button {
+                                #if canImport(UIKit)
+                                UIPasteboard.general.string = activity.result
+                                #endif
+                                DSHaptics.impact(.light)
+                                copiedResult = true
+                                Task { @MainActor in
+                                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                                    copiedResult = false
+                                }
+                            } label: {
+                                Label(copiedResult ? "已复制" : "复制结果", systemImage: copiedResult ? "checkmark" : "doc.on.doc")
+                                    .font(.caption2.weight(.medium))
+                                    .foregroundStyle(copiedResult ? DSTheme.success : DSTheme.brand)
+                            }
+                            .buttonStyle(.plain)
+                        }
                         Text(activity.result)
                             .font(.caption.monospaced())
                             .textSelection(.enabled)
@@ -257,6 +303,13 @@ public struct DSHToolBurstCard: View {
         return order.map { ($0, counts[$0] ?? 1) }
     }
 
+    private var totalDurationLabel: String? {
+        let total = activities.compactMap(\.durationMs).reduce(0, +)
+        guard total > 0 else { return nil }
+        if total < 1_000 { return "\(total)ms" }
+        return String(format: "%.1fs", Double(total) / 1_000.0)
+    }
+
     private var statusTint: Color {
         if runningActivity != nil { return DSTheme.brand }
         if failedCount > 0 && completedCount == 0 { return DSTheme.danger }
@@ -289,7 +342,8 @@ public struct DSHToolBurstCard: View {
                             let detail = failedCount > 0
                                 ? "\(completedCount) 成功 · \(failedCount) 失败"
                                 : "全部成功"
-                            Text("执行了 \(activities.count) 项工具调用 · \(detail)")
+                            let suffix = totalDurationLabel.map { " · \($0)" } ?? ""
+                            Text("执行了 \(activities.count) 项工具调用 · \(detail)\(suffix)")
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.primary)
                                 .lineLimit(1)
@@ -348,6 +402,7 @@ public struct StreamingTurnRow: View {
 
     @State private var expandReasoning: Bool
     @State private var userToggledReasoning = false
+    @State private var liveElapsedSeconds: Int = 0
 
     public init(
         botName: String,
@@ -362,10 +417,6 @@ public struct StreamingTurnRow: View {
         _expandReasoning = State(initialValue: !collapseThinkingByDefault)
     }
 
-    private var splitContent: (stable: String, tail: String) {
-        Self.splitMarkdownForStreaming(liveStream.content)
-    }
-
     private var telemetryLine: String {
         var parts: [String] = ["\(botName) · \(liveStream.phase.label)"]
         if let ttft = liveStream.firstTokenMs {
@@ -378,6 +429,9 @@ public struct StreamingTurnRow: View {
             parts.append("\(liveStream.content.count) 字")
         } else if !liveStream.reasoning.isEmpty {
             parts.append("思考 \(liveStream.reasoning.count) 字")
+        }
+        if liveElapsedSeconds >= 2 {
+            parts.append("\(liveElapsedSeconds)s")
         }
         return parts.joined(separator: " · ")
     }
@@ -439,13 +493,12 @@ public struct StreamingTurnRow: View {
             }
 
             if !liveStream.content.isEmpty {
-                let parts = splitContent
-                VStack(alignment: .leading, spacing: 6) {
-                    if !parts.stable.isEmpty {
-                        DSMarkdownText(parts.stable)
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(Array(liveStream.stableBlocks.enumerated()), id: \.offset) { _, block in
+                        DSMarkdownText(block).equatable()
                     }
-                    if !parts.tail.isEmpty {
-                        Text(parts.tail + " ▍")
+                    if !liveStream.liveTail.isEmpty {
+                        Text(liveStream.liveTail + " ▍")
                             .font(.body)
                             .foregroundStyle(.primary)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -454,6 +507,16 @@ public struct StreamingTurnRow: View {
                 .padding(12)
                 .background(DSTheme.surfaceSecondary)
                 .clipShape(RoundedRectangle(cornerRadius: DSTheme.cornerBubble, style: .continuous))
+            }
+        }
+        .task(id: liveStream.startedAt) {
+            guard let start = liveStream.startedAt else {
+                liveElapsedSeconds = 0
+                return
+            }
+            while !Task.isCancelled {
+                liveElapsedSeconds = max(0, Int(Date().timeIntervalSince(start)))
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
         }
         .onChange(of: liveStream.content.isEmpty) { isEmpty in
@@ -469,27 +532,6 @@ public struct StreamingTurnRow: View {
         .onChange(of: liveStream.reasoning.count) { _ in
             onStreamGrowth()
         }
-    }
-
-    /// Splits streaming Markdown into stable completed paragraphs (safe for full Markdown rendering)
-    /// and a live trailing paragraph (rendered as lightweight plain text) without splitting open code fences.
-    static func splitMarkdownForStreaming(_ text: String) -> (stable: String, tail: String) {
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-        guard lines.count > 2 else { return ("", text) }
-        var inFence = false
-        var lastSafeSplitLine = -1
-        for (idx, line) in lines.enumerated() {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("```") {
-                inFence.toggle()
-            } else if !inFence && trimmed.isEmpty && idx < lines.count - 1 {
-                lastSafeSplitLine = idx
-            }
-        }
-        guard lastSafeSplitLine > 0 else { return ("", text) }
-        let stable = lines[0..<lastSafeSplitLine].joined(separator: "\n")
-        let tail = lines[(lastSafeSplitLine + 1)...].joined(separator: "\n")
-        return (stable, tail)
     }
 }
 
@@ -560,22 +602,36 @@ public struct DSHPendingApprovalCard: View {
     }
 
     private var canUpgradeToSandboxAuto: Bool {
+        true
+    }
+
+    private var riskBadge: (label: String, color: Color) {
         let lower = approval.tool.lowercased()
-        return lower == "write" || lower == "edit" || lower == "apply_patch" || lower == "patch"
-            || lower == "workspace_write" || lower == "workspace_edit"
-            || lower == "terminal_exec" || lower == "web_search" || lower == "memory_save"
-            || lower.hasPrefix("redteam_")
+        if lower.hasPrefix("redteam_") {
+            return ("红队演练", .red)
+        }
+        if lower == "python_exec" || lower == "run_code" || lower == "python_job_start" || lower == "terminal_exec" {
+            return ("代码/命令执行", .orange)
+        }
+        if lower == "web_search" || lower == "web_fetch" || lower.hasPrefix("remote_mcp") {
+            return ("联网/外部调用", DSTheme.brand)
+        }
+        if lower.contains("write") || lower.contains("edit") || lower.contains("patch") || lower.contains("delete") {
+            return ("工作区写入", DSTheme.warning)
+        }
+        return (approval.isDSH ? "DSH 插件/工具" : "iOS 沙盒", DSTheme.warning)
     }
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Image(systemName: "hand.raised.fill")
-                    .foregroundColor(DSTheme.warning)
+                    .foregroundColor(riskBadge.color)
                 Text("需要审批：\(approval.tool)")
                     .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
                 Spacer()
-                DSStatusBadge(approval.isDSH ? "DSH Guard" : "iOS 沙盒", color: DSTheme.warning)
+                DSStatusBadge(riskBadge.label, color: riskBadge.color)
             }
             if approval.tool == "run_code" || approval.tool == "python_job_start" {
                 Text(approval.tool == "run_code"
@@ -841,6 +897,7 @@ public struct EditBotSheet: View {
     @State private var systemPrompt: String
     @State private var permissionMode: String
     @State private var agentPreset: String
+    @State private var reasoningEffort: String
     @State private var redteamToolsEnabled: Bool
     @State private var redteamWriteEnabled: Bool
     @State private var redteamSensitiveDataEnabled: Bool
@@ -855,6 +912,7 @@ public struct EditBotSheet: View {
         _systemPrompt = State(initialValue: bot.systemPrompt)
         _permissionMode = State(initialValue: bot.permissionMode)
         _agentPreset = State(initialValue: bot.agentPreset)
+        _reasoningEffort = State(initialValue: bot.reasoningEffort)
         _redteamToolsEnabled = State(initialValue: bot.redteamToolsEnabled)
         _redteamWriteEnabled = State(initialValue: bot.redteamWriteEnabled)
         _redteamSensitiveDataEnabled = State(initialValue: bot.redteamSensitiveDataEnabled)
@@ -871,6 +929,11 @@ public struct EditBotSheet: View {
                     TextField("名称", text: $name)
                     TextField("职责描述", text: $roleLabel)
                     ModelSelectionView(host: host, model: $model)
+                    Picker("推理等级", selection: $reasoningEffort) {
+                        Text("低（快速）").tag("low")
+                        Text("中（均衡）").tag("medium")
+                        Text("高（深度）").tag("high")
+                    }
                     Picker("DSH Agent 模式", selection: $agentPreset) {
                         ForEach(host.dshAgentPresets) { preset in
                             let allowed = preset.isAvailable && (preset.id != "redteam" || redteamPresetAllowed)
@@ -935,6 +998,7 @@ public struct EditBotSheet: View {
                             systemPrompt: systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines),
                             permissionMode: permissionMode,
                             agentPreset: agentPreset,
+                            reasoningEffort: reasoningEffort,
                             redteamToolsEnabled: redteamToolsEnabled,
                             redteamWriteEnabled: redteamWriteEnabled,
                             redteamSensitiveDataEnabled: redteamSensitiveDataEnabled

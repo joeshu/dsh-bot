@@ -44,14 +44,39 @@ public struct PluginManagerView: View {
         )
     }
 
+    private var localPluginContentTypes: [UTType] {
+        var types: [UTType] = [.folder, .gzip]
+        if let tgz = UTType(filenameExtension: "tgz") {
+            types.append(tgz)
+        }
+        return types
+    }
+
     public var body: some View {
         Form {
-            if hasPendingRestart {
+            if host.isDSHRecoveryMode {
+                Section {
+                    DSBannerCard(
+                        icon: "exclamationmark.shield.fill",
+                        tint: DSTheme.danger,
+                        message: "DSH 当前处于安全恢复模式，所有第三方插件已暂停加载。你可以停用全部第三方插件后恢复正常启动。",
+                        actionTitle: "停用全部并重启"
+                    ) {
+                        Task {
+                            await host.disableAllThirdPartyPlugins()
+                            await host.refreshPluginState()
+                            await host.refreshRedteamStatus()
+                        }
+                    }
+                }
+                .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
+                .listRowBackground(Color.clear)
+            } else if hasPendingRestart {
                 Section {
                     DSBannerCard(
                         icon: "arrow.triangle.2.circlepath.circle.fill",
                         tint: DSTheme.warning,
-                        message: "检测到插件安装/更新或开关变更，重启 DSH 引擎后即可生效。",
+                        message: "检测到插件安装/更新、配置或开关变更，重启 DSH 引擎后即可生效。",
                         actionTitle: "立即重启"
                     ) {
                         Task {
@@ -86,11 +111,11 @@ public struct PluginManagerView: View {
                 sourcesSection
             }
 
-            if isInstalling {
+            if isInstalling || !host.pluginInstallStage.isEmpty {
                 Section {
                     HStack(spacing: 10) {
                         ProgressView()
-                        Text("正在下载、校验依赖并写入 DSH Profile…")
+                        Text(host.pluginInstallStage.isEmpty ? "正在下载、校验依赖并写入 DSH Profile…" : host.pluginInstallStage)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -136,7 +161,7 @@ public struct PluginManagerView: View {
         }
         .fileImporter(
             isPresented: $showFolderPicker,
-            allowedContentTypes: [.folder],
+            allowedContentTypes: localPluginContentTypes,
             allowsMultipleSelection: false
         ) { result in
             switch result {
@@ -374,7 +399,7 @@ public struct PluginManagerView: View {
             Button {
                 showFolderPicker = true
             } label: {
-                Label("从本地文件夹导入 DSH Bundle", systemImage: "folder")
+                Label("从本地文件夹或 .tgz 离线包导入", systemImage: "folder")
             }
             .disabled(isInstalling || host.state != .ready)
         }
@@ -443,16 +468,30 @@ public struct PluginManagerView: View {
                                 .lineLimit(4)
                         }
                         HStack {
+                            let installedMatch = host.installedPlugins.first(where: { $0.name == item.name })
                             Text(item.installable ? "待验证 · \(item.installSource)" : "仅浏览")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                             Spacer()
-                            Button(item.installable ? "安装" : "仅浏览") {
-                                guard item.installable else { return }
-                                pendingInstall = .catalog(item)
+                            if let installed = installedMatch {
+                                if !item.version.isEmpty && installed.version != item.version && item.installable {
+                                    Button("更新至 v\(item.version)") {
+                                        pendingInstall = .catalog(item)
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .tint(.orange)
+                                    .disabled(isInstalling)
+                                } else {
+                                    DSStatusBadge("已安装 v\(installed.version)", color: DSTheme.success, icon: "checkmark.circle.fill")
+                                }
+                            } else {
+                                Button(item.installable ? "安装" : "仅浏览") {
+                                    guard item.installable else { return }
+                                    pendingInstall = .catalog(item)
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(!item.installable || isInstalling)
                             }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(!item.installable || host.installedPlugins.contains(where: { $0.name == item.name }))
                         }
                     }
                     .padding(.vertical, 4)
@@ -542,6 +581,11 @@ public struct PluginDetailView: View {
     @State private var auditDshCompatible: Bool = true
     @State private var auditFindings: [String] = []
     @State private var auditError: String = ""
+    @State private var configText: String = "{}"
+    @State private var configLoaded = false
+    @State private var configSaving = false
+    @State private var configStatus: String = ""
+    @State private var configRestartNeeded = false
 
     public init(host: LocalAgentHost, pluginId: String) {
         self.host = host
@@ -564,6 +608,27 @@ public struct PluginDetailView: View {
     public var body: some View {
         Form {
             if let plugin {
+                if !host.isDSHRecoveryMode && (plugin.desiredEnabled != plugin.enabled || configRestartNeeded) {
+                    Section {
+                        DSBannerCard(
+                            icon: "arrow.triangle.2.circlepath.circle.fill",
+                            tint: DSTheme.warning,
+                            message: "当前插件状态或配置已变更，重启 DSH 引擎后立即生效。",
+                            actionTitle: "立即重启"
+                        ) {
+                            Task {
+                                let res = await host.restartRuntime()
+                                host.setPluginStatus(res)
+                                configRestartNeeded = false
+                                await host.refreshPluginState()
+                                await host.refreshRedteamStatus()
+                            }
+                        }
+                    }
+                    .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
+                    .listRowBackground(Color.clear)
+                }
+
                 Section {
                     HStack(spacing: 12) {
                         ZStack {
@@ -607,6 +672,74 @@ public struct PluginDetailView: View {
                         Text(plugin.description)
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
+                    }
+                }
+
+                Section("实时运行能力与快捷使用") {
+                    if plugin.enabled {
+                        NavigationLink {
+                            DSHWebUIView(host: host)
+                        } label: {
+                            Label("在 DSH Web 工作台打开并使用", systemImage: "globe")
+                        }
+                    } else {
+                        Text("启用插件并重启引擎后，即可在所有非私密 Bot 会话和 DSH Web 工作台中使用。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if !host.thirdPartyPluginTools.isEmpty {
+                        DisclosureGroup("当前已挂载的第三方插件工具 (\(host.thirdPartyPluginTools.count))") {
+                            ForEach(host.thirdPartyPluginTools) { tool in
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(tool.name)
+                                        .font(.caption.monospaced().weight(.semibold))
+                                    if !tool.description.isEmpty {
+                                        Text(tool.description)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(2)
+                                    }
+                                }
+                                .padding(.vertical, 2)
+                            }
+                        }
+                        .font(.caption)
+                    }
+                }
+
+                Section("插件配置 (JSON)") {
+                    TextEditor(text: $configText)
+                        .font(.caption.monospaced())
+                        .frame(minHeight: 88, maxHeight: 180)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    HStack {
+                        Button {
+                            configSaving = true
+                            configStatus = ""
+                            Task {
+                                defer { configSaving = false }
+                                do {
+                                    let msg = try await host.savePluginConfig(name: plugin.name, jsonText: configText)
+                                    configStatus = msg
+                                    configRestartNeeded = true
+                                    DSHaptics.notify(.success)
+                                } catch {
+                                    configStatus = error.localizedDescription
+                                    DSHaptics.notify(.error)
+                                }
+                            }
+                        } label: {
+                            Label(configSaving ? "正在保存…" : "保存配置", systemImage: "square.and.arrow.down")
+                        }
+                        .disabled(configSaving)
+                        Spacer()
+                        if !configStatus.isEmpty {
+                            Text(configStatus)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
                     }
                 }
 
@@ -696,6 +829,12 @@ public struct PluginDetailView: View {
         .task(id: plugin?.name) {
             if let name = plugin?.name {
                 await runAudit(name: name)
+                if !configLoaded {
+                    configLoaded = true
+                    if let loaded = try? await host.loadPluginConfig(name: name) {
+                        configText = loaded
+                    }
+                }
             }
         }
         .confirmationDialog("确定卸载插件「\(plugin?.name ?? "")」？", isPresented: $confirmUninstall, titleVisibility: .visible) {

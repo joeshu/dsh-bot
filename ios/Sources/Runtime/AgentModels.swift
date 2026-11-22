@@ -61,6 +61,48 @@ public struct DSHToolActivity: Identifiable, Equatable {
     public var timestamp: Date
     public var sequence: Int?
     public var callSequence: Int?
+    public var durationMs: Int? = nil
+
+    public var formattedDuration: String? {
+        guard let ms = durationMs, ms >= 0 else { return nil }
+        if ms < 1_000 { return "\(ms)ms" }
+        let seconds = Double(ms) / 1_000.0
+        return String(format: "%.1fs", seconds)
+    }
+
+    public var displayLabel: String {
+        switch toolName {
+        case "web_search": return "联网搜索"
+        case "web_fetch": return "网页抓取"
+        case "terminal_exec": return "终端命令"
+        case "python_exec", "run_code": return "Python 执行"
+        case "python_job_start": return "Python 后台任务"
+        case "js_eval": return "JS 沙盒"
+        case "read", "workspace_read": return "读取文件"
+        case "write", "workspace_write": return "写入文件"
+        case "edit", "workspace_edit", "apply_patch", "patch": return "编辑文件"
+        case "glob", "grep", "workspace_list", "workspace_search": return "搜索工作区"
+        case "memory_save": return "保存记忆"
+        case "remote_mcp_list", "remote_mcp_call": return "远程 MCP"
+        case "subagent": return "子智能体"
+        case "git_workspace": return "工作区 Git"
+        case "browser_open": return "内置浏览器 · 打开网页"
+        case "browser_snapshot": return "内置浏览器 · 读取页面"
+        case "browser_click": return "内置浏览器 · 点击元素"
+        case "browser_type": return "内置浏览器 · 填写表单"
+        case "browser_select": return "内置浏览器 · 选择下拉项"
+        case "browser_press_key": return "内置浏览器 · 发送按键"
+        case "browser_scroll": return "内置浏览器 · 滚动页面"
+        case "browser_screenshot": return "内置浏览器 · 页面截图与 OCR"
+        case "browser_back": return "内置浏览器 · 返回上页"
+        case "browser_wait": return "内置浏览器 · 等待加载"
+        case "browser_eval": return "内置浏览器 · 提取数据"
+        case "browser_handoff": return "内置浏览器 · 请求人工接管"
+        default:
+            if toolName.hasPrefix("redteam_") { return "红队工具" }
+            return "插件/扩展工具"
+        }
+    }
 
     public var phaseLabel: String {
         switch phase {
@@ -100,6 +142,30 @@ public struct DSHApprovalAudit: Identifiable, Equatable {
         case "unavailable": return "审批不可用，已拒绝"
         default: return "结果未知"
         }
+    }
+}
+
+public struct SessionLiveTelemetry: Equatable, Sendable {
+    public var inputTokens: Int = 0
+    public var cacheReadTokens: Int = 0
+    public var outputTokens: Int = 0
+    public var modelDurationMs: Int = 0
+    public var ttftSumMs: Int = 0
+    public var ttftSamples: Int = 0
+
+    public var totalTokens: Int { inputTokens + outputTokens }
+    public var uncachedInputTokens: Int { max(0, inputTokens - cacheReadTokens) }
+    public var cacheHitPercent: Int {
+        guard inputTokens > 0 else { return 0 }
+        return min(100, Int((Double(cacheReadTokens) / Double(inputTokens) * 100.0).rounded()))
+    }
+    public var averageTtftMs: Int? {
+        guard ttftSamples > 0 else { return nil }
+        return ttftSumMs / ttftSamples
+    }
+    public var tokensPerSecond: Double? {
+        guard outputTokens > 0, modelDurationMs >= 200 else { return nil }
+        return Double(outputTokens) / (Double(modelDurationMs) / 1000.0)
     }
 }
 
@@ -261,16 +327,17 @@ public struct BotProfile: Identifiable, Codable, Equatable {
     public var section: String
     public var permissionMode: String // "ask" | "autoReview" | "readOnly"
     public var agentPreset: String // "standard" | "cordis" | "ptc-python" | "minimal" | "redteam"
+    public var reasoningEffort: String // "low" | "medium" | "high"
     public var redteamToolsEnabled: Bool
     public var redteamWriteEnabled: Bool
     public var redteamSensitiveDataEnabled: Bool
 
     enum CodingKeys: String, CodingKey {
-        case id, name, roleLabel, model, systemPrompt, isMain, isPrivate, isGroup, section, permissionMode, agentPreset
+        case id, name, roleLabel, model, systemPrompt, isMain, isPrivate, isGroup, section, permissionMode, agentPreset, reasoningEffort
         case redteamToolsEnabled, redteamWriteEnabled, redteamSensitiveDataEnabled
     }
 
-    public init(id: String, name: String, roleLabel: String, model: String = "deepseek-flash", systemPrompt: String = "", isMain: Bool = false, isPrivate: Bool = false, isGroup: Bool = false, section: String = "默认团队", permissionMode: String = "ask", agentPreset: String = "standard", redteamToolsEnabled: Bool = false, redteamWriteEnabled: Bool = false, redteamSensitiveDataEnabled: Bool = false) {
+    public init(id: String, name: String, roleLabel: String, model: String = "deepseek-flash", systemPrompt: String = "", isMain: Bool = false, isPrivate: Bool = false, isGroup: Bool = false, section: String = "默认团队", permissionMode: String = "ask", agentPreset: String = "standard", reasoningEffort: String = "medium", redteamToolsEnabled: Bool = false, redteamWriteEnabled: Bool = false, redteamSensitiveDataEnabled: Bool = false) {
         self.id = id
         self.name = name
         self.roleLabel = roleLabel
@@ -282,6 +349,7 @@ public struct BotProfile: Identifiable, Codable, Equatable {
         self.section = section
         self.permissionMode = permissionMode
         self.agentPreset = agentPreset
+        self.reasoningEffort = ["low", "medium", "high"].contains(reasoningEffort) ? reasoningEffort : "medium"
         self.redteamToolsEnabled = !isPrivate && redteamToolsEnabled
         self.redteamWriteEnabled = !isPrivate && redteamToolsEnabled && redteamWriteEnabled
         self.redteamSensitiveDataEnabled = !isPrivate && redteamToolsEnabled && redteamSensitiveDataEnabled
@@ -300,12 +368,22 @@ public struct BotProfile: Identifiable, Codable, Equatable {
         section = try c.decodeIfPresent(String.self, forKey: .section) ?? "默认团队"
         permissionMode = try c.decodeIfPresent(String.self, forKey: .permissionMode) ?? "ask"
         agentPreset = try c.decodeIfPresent(String.self, forKey: .agentPreset) ?? "standard"
+        let storedEffort = try c.decodeIfPresent(String.self, forKey: .reasoningEffort) ?? "medium"
+        reasoningEffort = ["low", "medium", "high"].contains(storedEffort) ? storedEffort : "medium"
         let storedRedteamToolsEnabled = try c.decodeIfPresent(Bool.self, forKey: .redteamToolsEnabled) ?? false
         let storedRedteamWriteEnabled = try c.decodeIfPresent(Bool.self, forKey: .redteamWriteEnabled) ?? false
         let storedRedteamSensitiveDataEnabled = try c.decodeIfPresent(Bool.self, forKey: .redteamSensitiveDataEnabled) ?? false
         redteamToolsEnabled = !isPrivate && storedRedteamToolsEnabled
         redteamWriteEnabled = !isPrivate && redteamToolsEnabled && storedRedteamWriteEnabled
         redteamSensitiveDataEnabled = !isPrivate && redteamToolsEnabled && storedRedteamSensitiveDataEnabled
+    }
+
+    public var reasoningEffortLabel: String {
+        switch reasoningEffort {
+        case "low": return "低（快速）"
+        case "high": return "高（深度）"
+        default: return "中（均衡）"
+        }
     }
 
     public var permissionModeLabel: String {
@@ -365,35 +443,100 @@ public enum StreamTurnPhase: Equatable, Sendable {
 public final class StreamingTurnState: ObservableObject {
     @Published public var sessionId: String?
     @Published public var content: String = ""
+    @Published public var stableBlocks: [String] = []
+    @Published public var liveTail: String = ""
     @Published public var reasoning: String = ""
     @Published public var phase: StreamTurnPhase = .connecting
     @Published public var firstTokenMs: Int?
     @Published public var charsPerSecond: Int = 0
     @Published public var elapsedSeconds: Int = 0
+    @Published public var startedAt: Date?
     @Published public var recentSteerNote: String?
+
+    private var inCodeFence = false
+    private var tailBuffer = ""
 
     public init() {}
 
     public func begin(sessionId: String, steerNote: String? = nil) {
         self.sessionId = sessionId
         self.content = ""
+        self.stableBlocks = []
+        self.liveTail = ""
         self.reasoning = ""
         self.phase = .connecting
         self.firstTokenMs = nil
         self.charsPerSecond = 0
         self.elapsedSeconds = 0
+        self.startedAt = Date()
         self.recentSteerNote = steerNote
+        self.inCodeFence = false
+        self.tailBuffer = ""
+    }
+
+    /// Incrementally appends streaming content in O(delta) time, sealing completed paragraphs
+    /// outside open fenced code blocks into `stableBlocks` so completed Markdown blocks are never re-parsed.
+    public func appendContent(_ delta: String) {
+        guard !delta.isEmpty else { return }
+        content += delta
+        tailBuffer += delta
+
+        // Fast path: only scan for paragraph boundaries when a newline was added
+        guard delta.contains("\n") else {
+            liveTail = tailBuffer
+            return
+        }
+
+        // Process complete lines in tailBuffer while keeping the trailing partial line
+        var lines = tailBuffer.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let trailingPartial = lines.popLast() ?? ""
+        var currentBlockLines: [String] = []
+        var sealedAny = false
+        var localInFence = inCodeFence
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("```") {
+                localInFence.toggle()
+                currentBlockLines.append(line)
+            } else if !localInFence && trimmed.isEmpty {
+                let candidate = currentBlockLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !candidate.isEmpty {
+                    stableBlocks.append(candidate)
+                    sealedAny = true
+                }
+                currentBlockLines.removeAll(keepingCapacity: true)
+            } else {
+                currentBlockLines.append(line)
+            }
+        }
+
+        if sealedAny {
+            inCodeFence = localInFence
+            if !trailingPartial.isEmpty || !currentBlockLines.isEmpty {
+                currentBlockLines.append(trailingPartial)
+                tailBuffer = currentBlockLines.joined(separator: "\n")
+            } else {
+                tailBuffer = ""
+            }
+        }
+        liveTail = tailBuffer
     }
 
     public func reset() {
         sessionId = nil
         content = ""
+        stableBlocks = []
+        liveTail = ""
         reasoning = ""
         phase = .connecting
         firstTokenMs = nil
         charsPerSecond = 0
         elapsedSeconds = 0
+        startedAt = nil
         recentSteerNote = nil
+        inCodeFence = false
+        tailBuffer = ""
     }
 }
 
@@ -402,4 +545,10 @@ struct StreamingDraftRecord: Codable, Sendable {
     let content: String
     let reasoning: String
     let updatedAt: Date
+}
+
+public struct RuntimePluginTool: Identifiable, Codable, Equatable, Sendable {
+    public var id: String { name }
+    public let name: String
+    public let description: String
 }

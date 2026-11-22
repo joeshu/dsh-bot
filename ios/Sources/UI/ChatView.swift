@@ -52,6 +52,12 @@ private enum ChatActiveSheet: Identifiable {
     case scheduleManager
     case jobsManager
     case referenceChatPicker
+    case agentBrowser
+    case pluginManager
+    case webWorkbench
+    case sessionConfig
+    case rulesEditor
+    case skillsManager
     case history(SessionHistoryPresentation)
 
     var id: String {
@@ -66,6 +72,12 @@ private enum ChatActiveSheet: Identifiable {
         case .scheduleManager: return "scheduleManager"
         case .jobsManager: return "jobsManager"
         case .referenceChatPicker: return "referenceChatPicker"
+        case .agentBrowser: return "agentBrowser"
+        case .pluginManager: return "pluginManager"
+        case .webWorkbench: return "webWorkbench"
+        case .sessionConfig: return "sessionConfig"
+        case .rulesEditor: return "rulesEditor"
+        case .skillsManager: return "skillsManager"
         case .history(let presentation): return "history-\(presentation.id)"
         }
     }
@@ -74,9 +86,13 @@ private enum ChatActiveSheet: Identifiable {
 public struct ChatView: View {
     let bot: BotProfile
     @ObservedObject var host: LocalAgentHost
+    @ObservedObject private var browserController = AgentBrowserController.shared
     private let searchResultMessageID: String?
     @State private var input = ""
     @State private var selectedModel: String
+    @State private var sessionViewMode: ChatSessionViewMode = .dialogue
+    @State private var showCommandPalette = false
+    @State private var isPlanMode = false
     @State private var activeSectionTitle = ""
     @State private var isPrivateUnlocked = false
     @State private var historyError: String?
@@ -104,6 +120,7 @@ public struct ChatView: View {
         self.searchResultMessageID = targetMessageID
         _pendingSearchMessageID = State(initialValue: targetMessageID)
         _selectedModel = State(initialValue: host.modelSelection(bot.model))
+        _input = State(initialValue: bot.isPrivate ? "" : host.draftInput(for: bot.id))
         _expandStreamingReasoning = State(initialValue: !host.collapseThinkingByDefault)
     }
 
@@ -189,6 +206,11 @@ public struct ChatView: View {
         .onChange(of: liveBot.model) { selectedModel = host.modelSelection($0) }
         .onChange(of: selectedModel) { nextModel in
             host.setBotModel(sessionId: liveBot.id, model: nextModel)
+        }
+        .onChange(of: input) { nextText in
+            if !isLocked {
+                host.setDraftInput(nextText, for: liveBot.id, isPrivate: liveBot.isPrivate)
+            }
         }
         .onChange(of: host.apiBaseURL) { _ in selectedModel = host.modelSelection(liveBot.model) }
         .onAppear {
@@ -348,6 +370,13 @@ public struct ChatView: View {
                                 activeSheet = .workspaceFiles
                             } label: {
                                 Label("工作区文件 (files/)", systemImage: "folder.fill")
+                            }
+                            if !liveBot.isPrivate {
+                                Button {
+                                    activeSheet = .agentBrowser
+                                } label: {
+                                    Label("内置浏览器（Bot 可控）", systemImage: "safari")
+                                }
                             }
                             if liveBot.isGroup {
                                 Button {
@@ -515,6 +544,34 @@ public struct ChatView: View {
             NavigationStack { ScheduleManagerView(host: host, botId: liveBot.id) }
         case .jobsManager:
             NavigationStack { JobsManagerView(host: host, botId: liveBot.id) }
+        case .agentBrowser:
+            AgentBrowserSheet(workspace: host.workspace) { prompt in
+                guard !host.isStreaming else {
+                    input = prompt
+                    return
+                }
+                Task { await host.sendMessage(sessionId: bot.id, text: prompt, model: selectedModel) }
+            }
+        case .pluginManager:
+            NavigationStack {
+                PluginManagerView(host: host)
+                    .toolbar {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button("完成") { activeSheet = nil }
+                        }
+                    }
+            }
+        case .webWorkbench:
+            DSHWebUIView(host: host)
+        case .sessionConfig:
+            ChatSessionConfigSheet(host: host, bot: liveBot, selectedModel: $selectedModel)
+        case .rulesEditor:
+            SessionRulesEditorSheet(workspace: host.workspace)
+        case .skillsManager:
+            SessionSkillsSheet(workspace: host.workspace) { skillName, skillBody in
+                let clipped = String(skillBody.prefix(2_500))
+                input = "[使用用户 Skill：\(skillName)]\n\(clipped)\n\n请基于以上 Skill 规范帮我："
+            }
         case .referenceChatPicker:
             NavigationStack {
                 List {
@@ -594,6 +651,23 @@ public struct ChatView: View {
         ScrollViewReader { proxy in
             ZStack(alignment: .top) {
                 VStack(spacing: 0) {
+                    let sessionActivities = host.dshToolActivities.filter { $0.sessionId == bot.id }
+                    let sessionAudits = host.dshApprovalAudits.filter { $0.sessionId == bot.id }
+                    let turnCount = sessionMessages.filter { $0.role == "user" }.count
+                    ChatSessionSubTabBar(
+                        mode: $sessionViewMode,
+                        stepCount: sessionActivities.count,
+                        isPrivate: liveBot.isPrivate,
+                        enabledPlugins: host.installedPlugins.filter(\.enabled),
+                        thirdPartyTools: host.thirdPartyPluginTools,
+                        onOpenPlugins: { activeSheet = .pluginManager },
+                        onOpenWebWorkbench: { activeSheet = .webWorkbench },
+                        onOpenBrowser: { activeSheet = .agentBrowser },
+                        onInsertToolPrompt: { snippet in
+                            sessionViewMode = .dialogue
+                            input = snippet
+                        }
+                    )
                     if host.isStreaming,
                        let activeId = host.streamingSessionId,
                        activeId != liveBot.id,
@@ -610,36 +684,103 @@ public struct ChatView: View {
                         .padding(.vertical, 6)
                         .background(DSTheme.brand.opacity(0.08))
                     }
-                    ZStack(alignment: .bottomTrailing) {
-                        conversationScrollView(proxy: proxy)
-                        if !followsLiveOutput && (!sessionMessages.isEmpty || (host.isStreaming && host.streamingSessionId == bot.id)) {
-                            Button {
-                                followsLiveOutput = true
-                                withAnimation(.easeOut(duration: 0.2)) {
-                                    proxy.scrollTo("chat_bottom", anchor: .bottom)
-                                }
-                            } label: {
-                                HStack(spacing: 6) {
-                                    if host.isStreaming && host.streamingSessionId == bot.id {
-                                        Circle()
-                                            .fill(DSTheme.brand)
-                                            .frame(width: 7, height: 7)
-                                    }
-                                    Image(systemName: "arrow.down")
-                                        .font(.caption.weight(.bold))
-                                    Text(host.isStreaming && host.streamingSessionId == bot.id ? "回到最新输出" : "回到底部")
+                    if !liveBot.isPrivate, !browserController.currentURL.isEmpty {
+                        let isTakeoverActive = browserController.needsHumanTakeover || browserController.isHumanControlling
+                        Button {
+                            activeSheet = .agentBrowser
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: isTakeoverActive ? (browserController.needsHumanTakeover ? "hand.raised.fill" : "lock.fill") : (browserController.isLoading ? "globe.badge.chevron.backward" : "safari.fill"))
+                                    .font(.caption)
+                                    .foregroundStyle(isTakeoverActive ? .orange : DSTheme.brand)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(browserController.needsHumanTakeover
+                                         ? "内置浏览器 · 需要你手动接管"
+                                         : (browserController.isHumanControlling
+                                            ? "内置浏览器 · 人工接管中（已暂停 Bot）"
+                                            : (browserController.pageTitle.isEmpty ? (URL(string: browserController.currentURL)?.host ?? browserController.currentURL) : browserController.pageTitle)))
                                         .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(1)
+                                    if !browserController.lastActionSummary.isEmpty {
+                                        Text(browserController.lastActionSummary)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
                                 }
-                                .foregroundStyle(.primary)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
-                                .background(.ultraThinMaterial)
-                                .clipShape(Capsule())
-                                .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+                                Spacer()
+                                Text(browserController.needsHumanTakeover ? "立即接管" : (browserController.isHumanControlling ? "继续操作" : "查看 / 接管"))
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(isTakeoverActive ? .orange : DSTheme.brand)
                             }
-                            .padding(.trailing, 14)
-                            .padding(.bottom, 12)
-                            .transition(.opacity.combined(with: .move(edge: .bottom)))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 6)
+                            .background(isTakeoverActive ? Color.orange.opacity(0.14) : DSTheme.surfaceSecondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    if sessionViewMode == .trajectory {
+                        ChatTrajectoryView(
+                            activities: sessionActivities,
+                            audits: sessionAudits,
+                            turnCount: turnCount
+                        )
+                    } else {
+                        ZStack(alignment: .bottomTrailing) {
+                            conversationScrollView(proxy: proxy)
+                            if !liveBot.isPrivate {
+                                VStack {
+                                    Spacer()
+                                    Button {
+                                        activeSheet = .workspaceFiles
+                                    } label: {
+                                        Image(systemName: "chevron.left")
+                                            .font(.caption.weight(.bold))
+                                            .foregroundStyle(.secondary)
+                                            .frame(width: 22, height: 48)
+                                            .background(.ultraThinMaterial)
+                                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                            .overlay(
+                                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                                    .strokeBorder(Color.secondary.opacity(0.22), lineWidth: 0.75)
+                                            )
+                                    }
+                                    .buttonStyle(.plain)
+                                    .offset(x: 6)
+                                    .accessibilityLabel("打开工作区文件侧边栏")
+                                    Spacer()
+                                }
+                            }
+                            if !followsLiveOutput && (!sessionMessages.isEmpty || (host.isStreaming && host.streamingSessionId == bot.id)) {
+                                Button {
+                                    followsLiveOutput = true
+                                    withAnimation(.easeOut(duration: 0.2)) {
+                                        proxy.scrollTo("chat_bottom", anchor: .bottom)
+                                    }
+                                } label: {
+                                    HStack(spacing: 6) {
+                                        if host.isStreaming && host.streamingSessionId == bot.id {
+                                            Circle()
+                                                .fill(DSTheme.brand)
+                                                .frame(width: 7, height: 7)
+                                        }
+                                        Image(systemName: "arrow.down")
+                                            .font(.caption.weight(.bold))
+                                        Text(host.isStreaming && host.streamingSessionId == bot.id ? "回到最新输出" : "回到底部")
+                                            .font(.caption.weight(.semibold))
+                                    }
+                                    .foregroundStyle(.primary)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 8)
+                                    .background(.ultraThinMaterial)
+                                    .clipShape(Capsule())
+                                    .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+                                }
+                                .padding(.trailing, 14)
+                                .padding(.bottom, 12)
+                                .transition(.opacity.combined(with: .move(edge: .bottom)))
+                            }
                         }
                     }
                     conversationFooterNotices
@@ -664,6 +805,14 @@ public struct ChatView: View {
             .padding()
         }
         .scrollDismissesKeyboard(.interactively)
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 12)
+                .onChanged { value in
+                    if value.translation.height > 12 {
+                        followsLiveOutput = false
+                    }
+                }
+        )
         .onAppear {
             scrollToSearchResult(using: proxy)
         }
@@ -1032,7 +1181,16 @@ public struct ChatView: View {
             }
 
             DSMarkdownText(msg.content)
+                .equatable()
                 .contextMenu {
+                    if isUser && !host.isStreaming {
+                        Button {
+                            input = msg.content
+                            DSHaptics.impact(.light)
+                        } label: {
+                            Label("编辑并重发", systemImage: "pencil.line")
+                        }
+                    }
                     Button {
                         #if canImport(UIKit)
                         UIPasteboard.general.string = msg.content
@@ -1067,6 +1225,19 @@ public struct ChatView: View {
                         Label("存入常驻记忆", systemImage: "brain.head.profile")
                     }
                     if !isUser && !host.isStreaming {
+                        if msg.incomplete == true {
+                            Button {
+                                Task {
+                                    await host.sendMessage(
+                                        sessionId: bot.id,
+                                        text: "请从刚才中断的位置继续完成上面的回答，不要重复已输出的内容。",
+                                        model: selectedModel
+                                    )
+                                }
+                            } label: {
+                                Label("继续生成", systemImage: "play.circle")
+                            }
+                        }
                         Button {
                             Task { await host.regenerateLastReply(sessionId: bot.id, model: selectedModel) }
                         } label: {
@@ -1081,6 +1252,20 @@ public struct ChatView: View {
                         : Color.clear
                 )
                 .clipShape(RoundedRectangle(cornerRadius: DSTheme.cornerBubble, style: .continuous))
+
+            if !isUser && !liveBot.isPrivate {
+                MessageWorkspaceFileCards(text: msg.content, workspace: host.workspace)
+            }
+            if !isUser {
+                MessageFooterActionBar(
+                    text: msg.content,
+                    timestamp: msg.timestamp,
+                    canRegenerate: !host.isStreaming && msg.id == sessionMessages.last(where: { $0.role != "user" })?.id,
+                    onRegenerate: {
+                        Task { await host.regenerateLastReply(sessionId: bot.id, model: selectedModel) }
+                    }
+                )
+            }
         }
         .frame(maxWidth: .infinity, alignment: isUser && host.useBubbleLayout ? .trailing : .leading)
         .padding(8)
@@ -1174,43 +1359,190 @@ public struct ChatView: View {
         }
     }
 
+    private func exportSessionMarkdown() {
+        guard !liveBot.isPrivate else { return }
+        var lines: [String] = ["# \(liveBot.name) · 会话日志导出", ""]
+        for msg in sessionMessages {
+            let roleTitle = msg.role == "user" ? "用户" : liveBot.name
+            lines.append("## \(roleTitle)")
+            if !msg.reasoning.isEmpty {
+                lines.append("<details><summary>思考过程</summary>\n\n\(msg.reasoning)\n\n</details>")
+            }
+            lines.append(msg.content)
+            lines.append("")
+        }
+        let sessionActivities = host.dshToolActivities.filter { $0.sessionId == bot.id }
+        if !sessionActivities.isEmpty {
+            lines.append("## 执行轨迹（\(sessionActivities.count) 步）")
+            for (idx, act) in sessionActivities.enumerated() {
+                let dur = act.formattedDuration ?? "—"
+                lines.append("- **#\(idx + 1) \(act.displayLabel)** (`\(act.phase)`, \(dur)) \(act.fileSummary ?? "")")
+            }
+        }
+        let body = lines.joined(separator: "\n")
+        let safeName = liveBot.name.replacingOccurrences(of: "/", with: "_")
+        let dest = FileManager.default.temporaryDirectory.appendingPathComponent("\(safeName)-session-\(Int(Date().timeIntervalSince1970)).md")
+        guard (try? body.write(to: dest, atomically: true, encoding: .utf8)) != nil else { return }
+        #if canImport(UIKit)
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let root = scenes.first(where: { $0.activationState == .foregroundActive })?.windows.first(where: \.isKeyWindow)?.rootViewController
+            ?? scenes.first?.windows.first?.rootViewController
+        var presenter = root
+        while let next = presenter?.presentedViewController { presenter = next }
+        guard let presenter else { return }
+        let sheet = UIActivityViewController(activityItems: [dest], applicationActivities: nil)
+        sheet.popoverPresentationController?.sourceView = presenter.view
+        sheet.popoverPresentationController?.sourceRect = CGRect(x: presenter.view.bounds.midX, y: presenter.view.bounds.maxY - 60, width: 1, height: 1)
+        presenter.present(sheet, animated: true)
+        #endif
+    }
+
+    private func rewindLastUserTurn() {
+        guard let previous = host.rewindLastTurn(sessionId: bot.id) else {
+            actionStatus = "当前没有可回退的上一轮消息。"
+            return
+        }
+        input = previous
+        actionStatus = "已撤回上一轮并回填到输入框，可直接修改重发。"
+        DSHaptics.impact(.light)
+    }
+
     private var composerBar: some View {
         VStack(spacing: 0) {
             Divider()
-            if input.trimmingCharacters(in: .whitespaces).hasPrefix("/") {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        Button("/side 侧边对话") {
-                            input = ""
-                            activeSheet = .sideChat
-                        }
-                        .buttonStyle(.bordered)
-                        .font(.caption)
+            if showCommandPalette || input.trimmingCharacters(in: .whitespaces).hasPrefix("/") {
+                ChatSlashCommandPalette(
+                    query: input,
+                    isPrivate: liveBot.isPrivate,
+                    isGroup: liveBot.isGroup,
+                    isPlanMode: isPlanMode,
+                    thirdPartyTools: host.thirdPartyPluginTools,
+                    onPickFile: {
+                        showCommandPalette = false
+                        if input.hasPrefix("/") { input = "" }
+                        showFileImporter = true
+                    },
+                    onOpenGoal: {
+                        showCommandPalette = false
+                        if input.hasPrefix("/") { input = "" }
                         if liveBot.isGroup {
-                            Button("/goal 群目标") {
-                                input = ""
-                                activeSheet = .groupWorkspace
-                            }
-                            .buttonStyle(.bordered)
-                            .font(.caption)
+                            activeSheet = .groupWorkspace
+                        } else {
+                            input = "请帮我制定并跟踪以下长期目标：\n"
                         }
-                        Button("/compact 压缩上下文") {
-                            input = ""
-                            Task { await host.sendMessage(sessionId: bot.id, text: "/compact", model: selectedModel) }
+                    },
+                    onTogglePlanMode: {
+                        showCommandPalette = false
+                        if input.hasPrefix("/") { input = "" }
+                        withAnimation(.easeInOut(duration: 0.16)) {
+                            isPlanMode.toggle()
                         }
-                        .buttonStyle(.bordered)
-                        .font(.caption)
-                        Button("/clear 清空会话") {
-                            input = ""
-                            showClearConfirm = true
-                        }
-                        .buttonStyle(.bordered)
-                        .font(.caption)
+                        DSHaptics.impact(.light)
+                    },
+                    onQuoteChat: {
+                        showCommandPalette = false
+                        if input.hasPrefix("/") { input = "" }
+                        activeSheet = .referenceChatPicker
+                    },
+                    onCompact: {
+                        showCommandPalette = false
+                        input = ""
+                        Task { await host.sendMessage(sessionId: bot.id, text: "/compact", model: selectedModel) }
+                    },
+                    onOpenConfig: {
+                        showCommandPalette = false
+                        if input.hasPrefix("/") { input = "" }
+                        activeSheet = .sessionConfig
+                    },
+                    onOpenSchedules: {
+                        showCommandPalette = false
+                        if input.hasPrefix("/") { input = "" }
+                        activeSheet = .scheduleManager
+                    },
+                    onOpenSideChat: {
+                        showCommandPalette = false
+                        if input.hasPrefix("/") { input = "" }
+                        activeSheet = .sideChat
+                    },
+                    onOpenWorkspace: {
+                        showCommandPalette = false
+                        if input.hasPrefix("/") { input = "" }
+                        activeSheet = .workspaceFiles
+                    },
+                    onExport: {
+                        showCommandPalette = false
+                        if input.hasPrefix("/") { input = "" }
+                        exportSessionMarkdown()
+                    },
+                    onPurge: {
+                        showCommandPalette = false
+                        input = "/purge status"
+                    },
+                    onRewind: {
+                        showCommandPalette = false
+                        rewindLastUserTurn()
+                    },
+                    onOpenRules: {
+                        showCommandPalette = false
+                        if input.hasPrefix("/") { input = "" }
+                        activeSheet = .rulesEditor
+                    },
+                    onOpenSkills: {
+                        showCommandPalette = false
+                        if input.hasPrefix("/") { input = "" }
+                        activeSheet = .skillsManager
+                    },
+                    onClear: {
+                        showCommandPalette = false
+                        if input.hasPrefix("/") { input = "" }
+                        showClearConfirm = true
+                    },
+                    onInsertText: { snippet in
+                        showCommandPalette = false
+                        input = snippet
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
+                )
+            } else if !liveBot.isPrivate, let atRange = input.range(of: "@[^\\s@]*$", options: .regularExpression) {
+                let mentionQuery = String(input[atRange].dropFirst())
+                ChatAtMentionPalette(
+                    query: mentionQuery,
+                    workspace: host.workspace,
+                    bots: host.bots,
+                    currentBotId: liveBot.id,
+                    onSelectFile: { relPath in
+                        input.replaceSubrange(atRange, with: "\(relPath) ")
+                    },
+                    onSelectBot: { targetBot in
+                        if liveBot.isGroup {
+                            input.replaceSubrange(atRange, with: "@\(targetBot.name) ")
+                        } else {
+                            input.removeSubrange(atRange)
+                            referencedBot = targetBot
+                        }
+                    }
+                )
+            }
+            if isPlanMode {
+                HStack(spacing: 6) {
+                    Image(systemName: "list.bullet.clipboard.fill")
+                        .font(.caption)
+                        .foregroundStyle(DSTheme.brand)
+                    Text("计划模式已开启 · 将先输出分步方案再执行")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(DSTheme.brand)
+                    Spacer()
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.16)) { isPlanMode = false }
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
                 }
-                .background(DSTheme.surfaceSecondary.opacity(0.6))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 6)
+                .background(DSTheme.brand.opacity(0.09))
             }
             if !attachedFiles.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -1275,33 +1607,24 @@ public struct ChatView: View {
                 .background(Color.indigo.opacity(0.08))
             }
             HStack(spacing: 8) {
-                Menu {
-                    if !liveBot.isPrivate {
-                        Button {
-                            Task { @MainActor in
-                                try? await Task.sleep(nanoseconds: 200_000_000)
-                                showFileImporter = true
-                            }
-                        } label: {
-                            Label("选择任意文件（PDF/文档/代码/压缩包）", systemImage: "paperclip")
-                        }
-                        Button { activeSheet = .workspaceFiles } label: { Label("/files 浏览与编辑工作区", systemImage: "folder.fill") }
+                Button {
+                    withAnimation(.easeInOut(duration: 0.16)) {
+                        showCommandPalette.toggle()
                     }
-                    Button { activeSheet = .referenceChatPicker } label: { Label("引用历史对话作为上下文", systemImage: "quote.bubble") }
-                    Button { activeSheet = .sideChat } label: { Label("/side 侧边对话", systemImage: "bubble.left.and.exclamationmark.bubble.right") }
-                    if liveBot.isGroup { Button { activeSheet = .groupWorkspace } label: { Label("/goal 群目标与待办", systemImage: "target") } }
-                    Button { showClearConfirm = true } label: { Label("/clear 清空当前会话", systemImage: "trash") }
-                    Menu {
-                        ForEach(host.bots.filter { !$0.isPrivate && !$0.isGroup }) { member in
-                            Button("@\(member.name)") { input = "@\(member.name) " }
-                        }
-                    } label: {
-                        Label("@ 提及成员 Bot", systemImage: "at")
-                    }
+                    DSHaptics.impact(.light)
                 } label: {
-                    Image(systemName: "plus.circle.fill")
+                    Image(systemName: showCommandPalette ? "xmark.circle.fill" : "plus.circle.fill")
                         .font(.title3)
-                        .foregroundColor(.secondary)
+                        .foregroundColor(showCommandPalette ? DSTheme.brand : .secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("打开添加与指令面板")
+
+                if !liveBot.isPrivate {
+                    ChatPermissionQuickMenu(currentMode: liveBot.permissionMode) { nextMode in
+                        host.setPermissionMode(sessionId: liveBot.id, mode: nextMode)
+                        DSHaptics.impact(.light)
+                    }
                 }
 
                 if !liveBot.isPrivate {
@@ -1332,6 +1655,15 @@ public struct ChatView: View {
                     .padding(.vertical, 8)
                     .background(DSTheme.surfaceSecondary)
                     .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+
+                Button {
+                    activeSheet = .sessionConfig
+                } label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundColor(host.subagentEnabled ? DSTheme.brand : .secondary)
+                }
+                .help("模型、安全权限与智能体协作")
 
                 Button {
                     speechInput.toggle { transcript in
@@ -1394,8 +1726,57 @@ public struct ChatView: View {
                             return
                         }
                         if text == "/clear" {
+                            showCommandPalette = false
                             input = ""
                             showClearConfirm = true
+                            return
+                        }
+                        if text == "/plan" {
+                            showCommandPalette = false
+                            input = ""
+                            withAnimation(.easeInOut(duration: 0.16)) { isPlanMode.toggle() }
+                            return
+                        }
+                        if text == "/rewind" {
+                            showCommandPalette = false
+                            input = ""
+                            rewindLastUserTurn()
+                            return
+                        }
+                        if text == "/export", !liveBot.isPrivate {
+                            showCommandPalette = false
+                            input = ""
+                            exportSessionMarkdown()
+                            return
+                        }
+                        if text == "/rules", !liveBot.isPrivate {
+                            showCommandPalette = false
+                            input = ""
+                            activeSheet = .rulesEditor
+                            return
+                        }
+                        if text == "/skills", !liveBot.isPrivate {
+                            showCommandPalette = false
+                            input = ""
+                            activeSheet = .skillsManager
+                            return
+                        }
+                        if text == "/schedule", !liveBot.isPrivate {
+                            showCommandPalette = false
+                            input = ""
+                            activeSheet = .scheduleManager
+                            return
+                        }
+                        if text == "/permission" || text == "/model" {
+                            showCommandPalette = false
+                            input = ""
+                            activeSheet = .sessionConfig
+                            return
+                        }
+                        if text == "/browser", !liveBot.isPrivate {
+                            showCommandPalette = false
+                            input = ""
+                            activeSheet = .agentBrowser
                             return
                         }
                         var refPrefix = ""
@@ -1407,10 +1788,12 @@ public struct ChatView: View {
                                 refPrefix = "[引用历史会话「\(ref.name)」]\n\(snippet)\n\n"
                             }
                         }
+                        let planPrefix = isPlanMode ? "[计划模式：请先给出清晰的分步执行计划，待我确认后再执行任何修改操作]\n\n" : ""
                         let attachmentPrefix = attachedFiles.map { $0.promptPrefix() }.joined()
-                        let prefix = refPrefix + attachmentPrefix
+                        let prefix = planPrefix + refPrefix + attachmentPrefix
                         let body = text.isEmpty ? "请查看我刚附加的工作区文件。" : text
                         let payload = prefix + body
+                        showCommandPalette = false
                         input = ""
                         attachedFiles.removeAll()
                         referencedBot = nil
@@ -1426,6 +1809,42 @@ public struct ChatView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .background(DSTheme.surfacePrimary)
+
+            if !liveBot.isPrivate {
+                let sessionActs = host.dshToolActivities.filter { $0.sessionId == bot.id }
+                let turns = sessionMessages.filter { $0.role == "user" }.count
+                let steps = sessionActs.count
+                let toolDurationMs = sessionActs.compactMap(\.durationMs).reduce(0, +)
+                let msgChars = sessionMessages.reduce(0) { $0 + $1.content.count + $1.reasoning.count }
+                let outChars = sessionMessages.filter { $0.role != "user" }.reduce(0) { $0 + $1.content.count + $1.reasoning.count }
+                let sysTokens = max(1_200, liveBot.systemPrompt.count / 3 + 1_200)
+                let toolSchemaTokens = (host.customTools ? 3_800 : 0) + host.thirdPartyPluginTools.count * 260
+                let msgTokens = max(0, msgChars / 3)
+                let outTokens = max(0, outChars / 3)
+                ChatSessionTelemetryBar(
+                    turnCount: turns,
+                    stepCount: steps,
+                    toolDurationMs: toolDurationMs,
+                    firstTokenMs: host.streamFirstTokenMs,
+                    liveTelemetry: host.telemetryBySession[bot.id],
+                    systemPromptTokens: sysTokens,
+                    toolSchemaTokens: toolSchemaTokens,
+                    messageTokens: msgTokens,
+                    outputTokens: outTokens,
+                    contextLimit: 128_000,
+                    enabledPluginCount: host.installedPlugins.filter(\.enabled).count,
+                    onTapTrajectory: {
+                        withAnimation(.easeInOut(duration: 0.16)) {
+                            sessionViewMode = sessionViewMode == .trajectory ? .dialogue : .trajectory
+                        }
+                    },
+                    onTapCompact: {
+                        guard !host.isStreaming else { return }
+                        Task { await host.sendMessage(sessionId: bot.id, text: "/compact", model: selectedModel) }
+                    }
+                )
+                .background(DSTheme.surfacePrimary)
+            }
         }
     }
 

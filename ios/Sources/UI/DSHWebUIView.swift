@@ -18,17 +18,33 @@ private enum DSHWebViewportMode: String, CaseIterable, Identifiable {
     }
 }
 
+private enum DSHWebTextScale: Int, CaseIterable, Identifiable {
+    case compact = 90
+    case standard = 100
+    case large = 110
+    var id: Int { rawValue }
+    var label: String { "\(rawValue)%" }
+}
+
 /// Hosts the embedded official DSH Web UI (`@deepseek-ai/dsh-web-app` + `@deepseek-ai/dsh-web-frontend`)
-/// and any installed community `dsh-client-ui-*` plugins over the private loopback port.
+/// in an immersive mobile container featuring a floating top-right capsule (`••• | ✕`),
+/// synced dark/light chrome, injected sidebar "返回 DS Bot ⇄" bridge, and mobile-refined CSS.
 public struct DSHWebUIView: View {
     @ObservedObject var host: LocalAgentHost
+    @ObservedObject private var browserController = AgentBrowserController.shared
+    @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.colorScheme) private var systemColorScheme
     @State private var launchURL: URL?
     @State private var allowedPort: Int = 0
     @State private var errorMessage: String?
     @State private var loadProgress: Double = 0
     @State private var reloadToken = UUID()
+    @State private var webBackgroundColor: Color?
+    @State private var webIsDark: Bool?
+    @State private var showAgentBrowser = false
     @AppStorage("dsbot.web.viewportMode") private var viewportModeRaw: String = DSHWebViewportMode.responsive.rawValue
+    @AppStorage("dsbot.web.textScale") private var textScaleRaw: Int = DSHWebTextScale.standard.rawValue
 
     public init(host: LocalAgentHost) {
         self.host = host
@@ -38,52 +54,51 @@ public struct DSHWebUIView: View {
         DSHWebViewportMode(rawValue: viewportModeRaw) ?? .responsive
     }
 
+    private var textScale: DSHWebTextScale {
+        DSHWebTextScale(rawValue: textScaleRaw) ?? .standard
+    }
+
+    private var effectiveIsDark: Bool {
+        webIsDark ?? (systemColorScheme == .dark)
+    }
+
+    private var chromeBackground: Color {
+        webBackgroundColor ?? (effectiveIsDark ? Color(red: 0.08, green: 0.08, blue: 0.09) : DSTheme.canvas)
+    }
+
     public var body: some View {
         ZStack(alignment: .top) {
-            contentBody
-            if launchURL != nil, loadProgress > 0, loadProgress < 1.0 {
-                ProgressView(value: loadProgress, total: 1.0)
-                    .progressViewStyle(.linear)
-                    .tint(DSTheme.brand)
-                    .frame(height: 2)
-            }
-        }
-        .navigationTitle("DSH Web 工作台")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar(.hidden, for: .tabBar)
-        .toolbar {
-            ToolbarItemGroup(placement: .navigationBarTrailing) {
-                Menu {
-                    Picker("布局视口", selection: $viewportModeRaw) {
-                        ForEach(DSHWebViewportMode.allCases) { mode in
-                            Label(
-                                mode.rawValue,
-                                systemImage: mode == .desktop1280 ? "desktopcomputer" : "iphone"
-                            )
-                            .tag(mode.rawValue)
-                        }
+            chromeBackground
+                .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                // Dedicated top capsule bar area matching the Web UI theme so the floating
+                // `••• | ✕` capsule never overlaps the Web UI's own top-right toolbar icons.
+                HStack {
+                    Spacer()
+                    floatingCapsule
+                }
+                .padding(.horizontal, 14)
+                .padding(.top, 4)
+                .padding(.bottom, 6)
+                .background(chromeBackground)
+
+                ZStack(alignment: .top) {
+                    contentBody
+                    if launchURL != nil, loadProgress > 0, loadProgress < 1.0 {
+                        ProgressView(value: loadProgress, total: 1.0)
+                            .progressViewStyle(.linear)
+                            .tint(DSTheme.brand)
+                            .frame(height: 2)
                     }
-                    Divider()
-                    Button {
-                        reloadToken = UUID()
-                        Task { await loadWebUIInfo() }
-                    } label: {
-                        Label("刷新页面", systemImage: "arrow.clockwise")
-                    }
-                    Button {
-                        Task {
-                            launchURL = nil
-                            _ = await host.restartRuntime()
-                            reloadToken = UUID()
-                            await loadWebUIInfo()
-                        }
-                    } label: {
-                        Label("重启 DSH 引擎并刷新", systemImage: "power")
-                    }
-                } label: {
-                    Image(systemName: viewportMode == .desktop1280 ? "desktopcomputer" : "ellipsis.circle")
                 }
             }
+        }
+        .toolbar(.hidden, for: .navigationBar)
+        .toolbar(.hidden, for: .tabBar)
+        .preferredColorScheme(webIsDark.map { $0 ? .dark : .light })
+        .sheet(isPresented: $showAgentBrowser) {
+            AgentBrowserSheet(workspace: host.workspace)
         }
         .task(id: host.runtimeGeneration) {
             await loadWebUIInfo()
@@ -98,6 +113,102 @@ public struct DSHWebUIView: View {
         }
     }
 
+    private var floatingCapsule: some View {
+        let iconColor: Color = effectiveIsDark ? .white : .primary
+        let borderColor: Color = effectiveIsDark ? Color.white.opacity(0.18) : Color.black.opacity(0.12)
+        let fillColor: Color = effectiveIsDark ? Color.white.opacity(0.10) : Color.black.opacity(0.06)
+        let dividerColor: Color = effectiveIsDark ? Color.white.opacity(0.20) : Color.black.opacity(0.14)
+        let needsTakeover = browserController.needsHumanTakeover || browserController.isHumanControlling
+
+        return HStack(spacing: 0) {
+            Menu {
+                Picker("布局视口", selection: $viewportModeRaw) {
+                    ForEach(DSHWebViewportMode.allCases) { mode in
+                        Label(
+                            mode.rawValue,
+                            systemImage: mode == .desktop1280 ? "desktopcomputer" : "iphone"
+                        )
+                        .tag(mode.rawValue)
+                    }
+                }
+                Picker("页面缩放", selection: $textScaleRaw) {
+                    ForEach(DSHWebTextScale.allCases) { scale in
+                        Text("文字缩放 \(scale.label)").tag(scale.rawValue)
+                    }
+                }
+                Divider()
+                Button {
+                    showAgentBrowser = true
+                } label: {
+                    Label(
+                        needsTakeover ? "打开内置浏览器（等待接管）" : "打开 App 内置浏览器",
+                        systemImage: needsTakeover ? "hand.raised.fill" : "safari"
+                    )
+                }
+                Button {
+                    reloadToken = UUID()
+                    Task { await loadWebUIInfo() }
+                } label: {
+                    Label("刷新工作台", systemImage: "arrow.clockwise")
+                }
+                Button {
+                    Task {
+                        launchURL = nil
+                        _ = await host.restartRuntime()
+                        reloadToken = UUID()
+                        await loadWebUIInfo()
+                    }
+                } label: {
+                    Label("重启 DSH 引擎并刷新", systemImage: "power")
+                }
+                Divider()
+                Button {
+                    dismiss()
+                } label: {
+                    Label("返回 DS Bot", systemImage: "arrow.left.arrow.right")
+                }
+            } label: {
+                ZStack(alignment: .topTrailing) {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(iconColor)
+                        .frame(width: 42, height: 32)
+                        .contentShape(Rectangle())
+                    if needsTakeover {
+                        Circle()
+                            .fill(Color.orange)
+                            .frame(width: 7, height: 7)
+                            .offset(x: -7, y: 6)
+                    }
+                }
+            }
+
+            Rectangle()
+                .fill(dividerColor)
+                .frame(width: 0.75, height: 16)
+
+            Button {
+                dismiss()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(iconColor)
+                    .frame(width: 42, height: 32)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("关闭并返回 DS Bot")
+        }
+        .background(
+            Capsule(style: .continuous)
+                .fill(fillColor)
+        )
+        .overlay(
+            Capsule(style: .continuous)
+                .strokeBorder(borderColor, lineWidth: 0.75)
+        )
+    }
+
     @ViewBuilder
     private var contentBody: some View {
         if let url = launchURL, allowedPort > 0 {
@@ -106,8 +217,20 @@ public struct DSHWebUIView: View {
                 allowedPort: allowedPort,
                 reloadToken: reloadToken,
                 viewportMode: viewportMode,
+                textScalePercent: textScale.rawValue,
                 onProgress: { progress in
                     loadProgress = progress
+                },
+                onThemeChanged: { color, isDark in
+                    webBackgroundColor = color
+                    webIsDark = isDark
+                },
+                onNativeAction: { action in
+                    if action == "exitWebUI" {
+                        dismiss()
+                    } else if action == "openAgentBrowser" {
+                        showAgentBrowser = true
+                    }
                 },
                 onDisconnect: { reason in
                     launchURL = nil
@@ -130,9 +253,16 @@ public struct DSHWebUIView: View {
                 }
                 .buttonStyle(.borderedProminent)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding()
         } else {
-            ProgressView("正在连接本机 DSH Web 工作台…")
+            VStack(spacing: 10) {
+                ProgressView()
+                Text("正在连接本机 DSH Web 工作台…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
@@ -173,19 +303,33 @@ public struct DSHWebUIView: View {
     }
 }
 
+private final class WeakWebScriptMessageHandler: NSObject, WKScriptMessageHandler {
+    weak var target: WKScriptMessageHandler?
+    init(_ target: WKScriptMessageHandler) { self.target = target }
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        target?.userContentController(userContentController, didReceive: message)
+    }
+}
+
 private struct LoopbackWebView: UIViewRepresentable {
     let url: URL
     let allowedPort: Int
     let reloadToken: UUID
     let viewportMode: DSHWebViewportMode
+    let textScalePercent: Int
     let onProgress: (Double) -> Void
+    let onThemeChanged: (Color, Bool) -> Void
+    let onNativeAction: (String) -> Void
     let onDisconnect: (String) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
             allowedPort: allowedPort,
             viewportMode: viewportMode,
+            textScalePercent: textScalePercent,
             onProgress: onProgress,
+            onThemeChanged: onThemeChanged,
+            onNativeAction: onNativeAction,
             onDisconnect: onDisconnect
         )
     }
@@ -198,31 +342,139 @@ private struct LoopbackWebView: UIViewRepresentable {
       style.id = 'dsh-mobile-inject';
       style.textContent = [
         ':where(body) { --dsw-alias-bg-layer-4: color-mix(in srgb, var(--dsw-alias-bg-layer-3, #f3f4f6) 94%, var(--dsw-alias-label-primary, #111827) 6%); }',
-        'html, body, #root, #app { height: 100dvh; max-height: 100dvh; }',
-        'input, textarea, select { font-size: 16px !important; }',
+        'html, body { overscroll-behavior: none; -webkit-tap-highlight-color: transparent; }',
+        'html, body, #root, #app { height: var(--dsbot-vvh, 100dvh); max-height: var(--dsbot-vvh, 100dvh); }',
+        'body.dsbot-mobile-mode textarea, body.dsbot-mobile-mode input[type="text"], body.dsbot-mobile-mode input[type="search"], body.dsbot-mobile-mode input[type="url"], body.dsbot-mobile-mode input[type="email"], body.dsbot-mobile-mode input:not([type]) { font-size: 16px !important; }',
         'table { display: block; max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }',
         'pre { max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }',
         'body.dsbot-mobile-mode { padding-bottom: env(safe-area-inset-bottom, 0px); }',
-        'body.dsbot-mobile-mode [role="menu"], body.dsbot-mobile-mode [role="listbox"], body.dsbot-mobile-mode [role="dialog"] { max-width: calc(100vw - 16px) !important; box-sizing: border-box; }',
-        '@media (pointer: coarse) { body.dsbot-mobile-mode button, body.dsbot-mobile-mode [role="button"] { min-height: 36px; touch-action: manipulation; } }',
-        '@media (hover: none) { *:hover { transition: none; } }'
+        'body.dsbot-mobile-mode [role="menu"], body.dsbot-mobile-mode [role="listbox"], body.dsbot-mobile-mode [role="dialog"], body.dsbot-mobile-mode [data-radix-popper-content-wrapper] { max-width: calc(100vw - 16px) !important; box-sizing: border-box; }',
+        'body.dsbot-mobile-mode [role="menu"], body.dsbot-mobile-mode [role="listbox"] { border-radius: 14px; }',
+        '@media (pointer: coarse) { body.dsbot-mobile-mode button, body.dsbot-mobile-mode [role="button"] { min-height: 34px; touch-action: manipulation; } }',
+        '@media (hover: none) { *:hover { transition: none; } }',
+        '.dsbot-return-pill { display: inline-flex; align-items: center; gap: 8px; padding: 9px 14px; margin: 8px 10px 4px; border-radius: 999px; border: 1px solid rgba(128,128,128,0.22); background: rgba(128,128,128,0.12); color: inherit; font-size: 14px; font-weight: 500; cursor: pointer; width: fit-content; max-width: calc(100% - 20px); -webkit-tap-highlight-color: transparent; }',
+        '.dsbot-return-pill:active { opacity: 0.7; transform: scale(0.98); }'
       ].join('\\n');
       (document.head || document.documentElement).appendChild(style);
     })();
     """
 
-    private static let mobileDomAuditScript = """
+    /// Syncs visualViewport (iOS keyboard), reports Web UI theme color to SwiftUI chrome,
+    /// clamps accidental horizontal overflow, and injects the sidebar "返回 DS Bot ⇄" pill.
+    private static let mobileBridgeAndEnhancementScript = """
     (function() {
-      if (window.__dsbotMobileAuditInjected) return;
-      window.__dsbotMobileAuditInjected = true;
-      setTimeout(function() {
+      if (window.__dsbotMobileBridgeInstalled) return;
+      window.__dsbotMobileBridgeInstalled = true;
+
+      function postNative(payload) {
+        try {
+          if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.dsbotNative) {
+            window.webkit.messageHandlers.dsbotNative.postMessage(payload);
+          }
+        } catch (_) {}
+      }
+
+      // 1. iOS virtual keyboard height sync
+      function syncViewportHeight() {
+        try {
+          var h = (window.visualViewport && window.visualViewport.height) ? Math.round(window.visualViewport.height) : window.innerHeight;
+          if (h > 180) {
+            document.documentElement.style.setProperty('--dsbot-vvh', h + 'px');
+          }
+        } catch (_) {}
+      }
+      if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', syncViewportHeight, { passive: true });
+        window.visualViewport.addEventListener('scroll', syncViewportHeight, { passive: true });
+      }
+      window.addEventListener('resize', syncViewportHeight, { passive: true });
+      syncViewportHeight();
+
+      // 2. Sync Web UI dark/light background color to native top capsule chrome
+      var lastThemeKey = '';
+      function parseRGB(str) {
+        var m = String(str || '').match(/rgba?\\((\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)(?:\\s*,\\s*([\\d.]+))?\\)/);
+        if (!m) return null;
+        var a = m[4] !== undefined ? parseFloat(m[4]) : 1;
+        if (a < 0.05) return null;
+        return [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)];
+      }
+      function syncThemeToNative() {
+        try {
+          var bg = parseRGB(getComputedStyle(document.body || document.documentElement).backgroundColor)
+            || parseRGB(getComputedStyle(document.documentElement).backgroundColor);
+          if (!bg) return;
+          var luminance = (0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]) / 255;
+          var isDark = luminance < 0.5;
+          var key = bg.join(',') + ':' + (isDark ? '1' : '0');
+          if (key === lastThemeKey) return;
+          lastThemeKey = key;
+          postNative({ action: 'themeChanged', r: bg[0], g: bg[1], b: bg[2], isDark: isDark });
+        } catch (_) {}
+      }
+
+      // 3. Inject "返回 DS Bot ⇄" pill at the bottom of the DSH left sidebar
+      function ensureSidebarReturnPill() {
+        try {
+          if (document.getElementById('dsbot-return-pill')) return;
+          var candidates = Array.from(document.querySelectorAll('aside, nav, [class*="sidebar"], [class*="Sidebar"], [role="navigation"]'));
+          var target = candidates.find(function(el) {
+            var rect = el.getBoundingClientRect();
+            if (rect.width < 160 || rect.height < 300 || rect.left > 40) return false;
+            var txt = el.innerText || '';
+            return txt.includes('新会话') || txt.includes('工作区') || txt.includes('HARNESS') || txt.includes('Workspace');
+          });
+          if (!target) return;
+          var btn = document.createElement('button');
+          btn.id = 'dsbot-return-pill';
+          btn.type = 'button';
+          btn.className = 'dsbot-return-pill';
+          btn.innerHTML = '<span style="font-size:15px;line-height:1">🐳</span><span>返回 DS Bot</span><span style="opacity:0.65;font-size:13px">⇄</span>';
+          btn.addEventListener('click', function(ev) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            postNative({ action: 'exitWebUI' });
+          });
+          // Insert right before the bottom-most footer action if present, else append
+          var children = target.children;
+          if (children && children.length > 0) {
+            var last = children[children.length - 1];
+            if (last && (last.innerText || '').trim().length <= 12) {
+              target.insertBefore(btn, last);
+              return;
+            }
+          }
+          target.appendChild(btn);
+        } catch (_) {}
+      }
+
+      // 4. Horizontal overflow clamp in mobile mode
+      function auditOverflow() {
         try {
           if (document.body && document.body.classList.contains('dsbot-mobile-mode')
               && document.documentElement && document.documentElement.scrollWidth > window.innerWidth + 4) {
             document.documentElement.style.overflowX = 'clip';
           }
         } catch (_) {}
-      }, 2000);
+      }
+
+      var scheduled = false;
+      function schedulePass() {
+        if (scheduled) return;
+        scheduled = true;
+        setTimeout(function() {
+          scheduled = false;
+          syncThemeToNative();
+          ensureSidebarReturnPill();
+          auditOverflow();
+        }, 220);
+      }
+
+      var observer = new MutationObserver(schedulePass);
+      observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'data-theme', 'style'] });
+      schedulePass();
+      setTimeout(schedulePass, 1200);
+      setTimeout(schedulePass, 2600);
     })();
     """
 
@@ -230,13 +482,14 @@ private struct LoopbackWebView: UIViewRepresentable {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
         config.allowsInlineMediaPlayback = true
+        config.userContentController.add(WeakWebScriptMessageHandler(context.coordinator), name: "dsbotNative")
         config.userContentController.addUserScript(WKUserScript(
             source: Self.mobileStyleInjectScript,
             injectionTime: .atDocumentStart,
             forMainFrameOnly: true
         ))
         config.userContentController.addUserScript(WKUserScript(
-            source: Self.mobileDomAuditScript,
+            source: Self.mobileBridgeAndEnhancementScript,
             injectionTime: .atDocumentEnd,
             forMainFrameOnly: true
         ))
@@ -245,11 +498,15 @@ private struct LoopbackWebView: UIViewRepresentable {
         webView.uiDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = true
         webView.isOpaque = false
-        webView.backgroundColor = .systemBackground
+        webView.backgroundColor = .clear
+        webView.scrollView.backgroundColor = .clear
+        webView.scrollView.bounces = false
+        webView.scrollView.contentInsetAdjustmentBehavior = .never
         context.coordinator.observeProgress(of: webView)
         context.coordinator.lastLoadedURL = url
         context.coordinator.lastLoadedToken = reloadToken
         context.coordinator.viewportMode = viewportMode
+        context.coordinator.textScalePercent = textScalePercent
         webView.load(URLRequest(url: url))
         return webView
     }
@@ -257,9 +514,12 @@ private struct LoopbackWebView: UIViewRepresentable {
     func updateUIView(_ webView: WKWebView, context: Context) {
         context.coordinator.allowedPort = allowedPort
         context.coordinator.onProgress = onProgress
+        context.coordinator.onThemeChanged = onThemeChanged
+        context.coordinator.onNativeAction = onNativeAction
         context.coordinator.onDisconnect = onDisconnect
-        if context.coordinator.viewportMode != viewportMode {
+        if context.coordinator.viewportMode != viewportMode || context.coordinator.textScalePercent != textScalePercent {
             context.coordinator.viewportMode = viewportMode
+            context.coordinator.textScalePercent = textScalePercent
             context.coordinator.applyViewport(to: webView)
         }
         if context.coordinator.lastLoadedToken != reloadToken || context.coordinator.lastLoadedURL != url {
@@ -274,16 +534,20 @@ private struct LoopbackWebView: UIViewRepresentable {
         webView.stopLoading()
         webView.navigationDelegate = nil
         webView.uiDelegate = nil
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: "dsbotNative")
         webView.configuration.userContentController.removeAllUserScripts()
         webView.loadHTMLString("", baseURL: nil)
     }
 
-    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler {
         var allowedPort: Int
         var viewportMode: DSHWebViewportMode
+        var textScalePercent: Int
         var lastLoadedToken: UUID?
         var lastLoadedURL: URL?
         var onProgress: (Double) -> Void
+        var onThemeChanged: (Color, Bool) -> Void
+        var onNativeAction: (String) -> Void
         var onDisconnect: (String) -> Void
         private var progressObservation: NSKeyValueObservation?
         private var memoryTrimObserver: NSObjectProtocol?
@@ -293,13 +557,37 @@ private struct LoopbackWebView: UIViewRepresentable {
         init(
             allowedPort: Int,
             viewportMode: DSHWebViewportMode,
+            textScalePercent: Int,
             onProgress: @escaping (Double) -> Void,
+            onThemeChanged: @escaping (Color, Bool) -> Void,
+            onNativeAction: @escaping (String) -> Void,
             onDisconnect: @escaping (String) -> Void
         ) {
             self.allowedPort = allowedPort
             self.viewportMode = viewportMode
+            self.textScalePercent = textScalePercent
             self.onProgress = onProgress
+            self.onThemeChanged = onThemeChanged
+            self.onNativeAction = onNativeAction
             self.onDisconnect = onDisconnect
+        }
+
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard message.name == "dsbotNative",
+                  let body = message.body as? [String: Any],
+                  let action = body["action"] as? String else { return }
+            DispatchQueue.main.async {
+                if action == "themeChanged",
+                   let r = body["r"] as? Double,
+                   let g = body["g"] as? Double,
+                   let b = body["b"] as? Double,
+                   let isDark = body["isDark"] as? Bool {
+                    let color = Color(red: r / 255.0, green: g / 255.0, blue: b / 255.0)
+                    self.onThemeChanged(color, isDark)
+                } else {
+                    self.onNativeAction(action)
+                }
+            }
         }
 
         func observeProgress(of webView: WKWebView) {
@@ -339,6 +627,7 @@ private struct LoopbackWebView: UIViewRepresentable {
         func applyViewport(to webView: WKWebView) {
             let content = viewportMode.viewportContent
             let isMobile = viewportMode == .responsive ? "true" : "false"
+            let scale = max(80, min(textScalePercent, 130))
             let script = """
             (function() {
                 var meta = document.querySelector('meta[name="viewport"]');
@@ -348,6 +637,10 @@ private struct LoopbackWebView: UIViewRepresentable {
                     document.head.appendChild(meta);
                 }
                 meta.setAttribute('content', '\(content)');
+                if (document.documentElement) {
+                    document.documentElement.style.webkitTextSizeAdjust = '\(scale)%';
+                    document.documentElement.style.fontSize = '\(scale)%';
+                }
                 if (document.body) {
                     document.body.classList.toggle('dsbot-mobile-mode', \(isMobile));
                 }

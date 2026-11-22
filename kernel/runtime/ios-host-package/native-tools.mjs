@@ -445,6 +445,172 @@ function apply(context) {
         return await runtime.executeGitWorkspaceTool(args, exec)
       },
     }),
+    ...(() => {
+      async function runBrowserAction(action, args, exec, { mutating = false, askInStandard = false, summary = '' } = {}) {
+        const { rpc, runtime } = iosHost()
+        const sessionId = exec?.agent?.session?.id
+        const active = typeof sessionId === 'string' ? runtime.activeTurns.get(sessionId) : undefined
+        if (typeof sessionId === 'string' && sessionId.startsWith('ios:')) {
+          const botId = sessionId.slice(4)
+          if (runtime.privateBotIds?.has(botId)) {
+            throw new Error('私密会话禁止控制 App 内置浏览器。')
+          }
+        }
+        const permissionMode = active?.permissionMode ?? 'ask'
+        if (permissionMode === 'readOnly' && mutating) {
+          throw new Error(`只读保护模式已拦截网页交互操作 browser_${action}。`)
+        }
+        if (permissionMode !== 'autoReview' && askInStandard && context.approval?.request) {
+          const outcome = await context.approval.request({
+            agent: exec.agent,
+            toolName: `browser_${action}`,
+            ...(exec.callId ? { callId: exec.callId } : {}),
+            reason: summary || `Run in-app browser action: ${action}`,
+            displayReason: summary || `允许 Bot 在内置浏览器执行 ${action}？`,
+            signal: exec.signal,
+          })
+          if (outcome !== 'allowed-once') throw new Error(`用户未批准内置浏览器操作 browser_${action}`)
+        }
+        const result = await rpc.request('browser.action', { action, args: args ?? {} }, 35_000)
+        return { output: JSON.stringify(result, null, 2) }
+      }
+      return [
+        defineTool({
+          ...common, name: 'browser_open',
+          description: 'Open a public HTTPS URL inside the live iOS in-app WKWebView browser (visible to the user for live viewing or manual login takeover) and return the page title, visible text, and indexed interactive elements.',
+          parameters: {
+            url: { type: 'string', required: true, description: 'Public HTTPS URL to open.' },
+            maxChars: { type: 'number', description: 'Optional max text characters to return (default 8000).' },
+          },
+          timeoutMs: 45_000,
+          execute: (args, exec) => runBrowserAction('open', args, exec, {
+            mutating: false, askInStandard: true,
+            summary: `允许 Bot 在 App 内置浏览器中打开网页？\n${String(args?.url ?? '')}`,
+          }),
+        }),
+        defineTool({
+          ...common, name: 'browser_snapshot',
+          description: 'Read the current URL, title, visible text, and indexed interactive elements ([0], [1], ...) of the active iOS in-app browser page.',
+          parameters: {
+            maxChars: { type: 'number', description: 'Optional max text characters (500–16000, default 10000).' },
+          },
+          timeoutMs: 25_000,
+          execute: (args, exec) => runBrowserAction('snapshot', args, exec, { mutating: false, askInStandard: false }),
+        }),
+        defineTool({
+          ...common, name: 'browser_click',
+          description: 'Click an interactive element in the iOS in-app browser by snapshot index, CSS selector, or visible button/link text, then return the updated page snapshot.',
+          parameters: {
+            index: { type: 'number', description: 'Element index from the latest browser_snapshot.' },
+            selector: { type: 'string', description: 'Optional CSS selector.' },
+            text: { type: 'string', description: 'Optional visible text of the button or link.' },
+          },
+          timeoutMs: 35_000,
+          execute: (args, exec) => runBrowserAction('click', args, exec, {
+            mutating: true, askInStandard: true,
+            summary: `允许 Bot 点击内置浏览器页面元素？\n${JSON.stringify(args ?? {})}`,
+          }),
+        }),
+        defineTool({
+          ...common, name: 'browser_type',
+          description: 'Type text into an input or textarea in the iOS in-app browser (React/Vue SPA compatible) by snapshot index or CSS selector, optionally submitting the form.',
+          parameters: {
+            index: { type: 'number', description: 'Input element index from browser_snapshot.' },
+            selector: { type: 'string', description: 'Optional CSS selector for the input.' },
+            text: { type: 'string', required: true, description: 'Text to fill into the input.' },
+            submit: { type: 'boolean', description: 'Whether to submit the form or press Enter after typing.' },
+          },
+          timeoutMs: 35_000,
+          execute: (args, exec) => runBrowserAction('type', args, exec, {
+            mutating: true, askInStandard: true,
+            summary: `允许 Bot 在内置浏览器输入框填入内容${args?.submit ? '并提交' : ''}？\n长度：${String(args?.text ?? '').length} 字符`,
+          }),
+        }),
+        defineTool({
+          ...common, name: 'browser_select',
+          description: 'Select an option in a <select> dropdown in the iOS in-app browser by value, visible label, or optionIndex (avoids triggering native iOS picker sheets).',
+          parameters: {
+            index: { type: 'number', description: 'Select element index from browser_snapshot.' },
+            selector: { type: 'string', description: 'Optional CSS selector for the <select>.' },
+            value: { type: 'string', description: 'Option value attribute to select.' },
+            label: { type: 'string', description: 'Visible option text to match.' },
+            optionIndex: { type: 'number', description: 'Zero-based option index from browser_snapshot options array.' },
+          },
+          timeoutMs: 30_000,
+          execute: (args, exec) => runBrowserAction('select', args, exec, {
+            mutating: true, askInStandard: true,
+            summary: `允许 Bot 在内置浏览器下拉框中选择选项？\n${JSON.stringify(args ?? {})}`,
+          }),
+        }),
+        defineTool({
+          ...common, name: 'browser_press_key',
+          description: 'Send a keyboard key (Enter, Escape, Tab, ArrowDown, ArrowUp, Backspace, Space) to the focused element in the iOS in-app browser.',
+          parameters: {
+            key: { type: 'string', required: true, enum: ['Enter', 'Escape', 'Tab', 'ArrowDown', 'ArrowUp', 'Backspace', 'Space'], description: 'Keyboard key to dispatch.' },
+          },
+          timeoutMs: 25_000,
+          execute: (args, exec) => runBrowserAction('press_key', args, exec, {
+            mutating: true, askInStandard: false,
+          }),
+        }),
+        defineTool({
+          ...common, name: 'browser_scroll',
+          description: 'Scroll the active iOS in-app browser page (down, up, top, or bottom) and return the updated visible text.',
+          parameters: {
+            direction: { type: 'string', enum: ['down', 'up', 'top', 'bottom'], description: 'Scroll direction (default down).' },
+            amount: { type: 'number', description: 'Pixels to scroll for up/down (default 600).' },
+          },
+          timeoutMs: 25_000,
+          execute: (args, exec) => runBrowserAction('scroll', args, exec, { mutating: false, askInStandard: false }),
+        }),
+        defineTool({
+          ...common, name: 'browser_screenshot',
+          description: 'Capture a JPEG screenshot of the active iOS in-app browser viewport, save it to files/, and return Vision OCR text extracted from the screenshot.',
+          parameters: {},
+          timeoutMs: 25_000,
+          execute: (args, exec) => runBrowserAction('screenshot', args, exec, { mutating: false, askInStandard: false }),
+        }),
+        defineTool({
+          ...common, name: 'browser_back',
+          description: 'Navigate back one step in the iOS in-app browser history and return the updated page snapshot.',
+          parameters: {},
+          timeoutMs: 25_000,
+          execute: (args, exec) => runBrowserAction('back', args, exec, { mutating: false, askInStandard: false }),
+        }),
+        defineTool({
+          ...common, name: 'browser_wait',
+          description: 'Wait up to 20 seconds for a CSS selector or visible text substring to appear in the active iOS in-app browser page, then return the updated snapshot.',
+          parameters: {
+            selector: { type: 'string', description: 'Optional CSS selector to wait for.' },
+            text: { type: 'string', description: 'Optional visible text substring to wait for.' },
+            timeoutSeconds: { type: 'number', description: 'Max seconds to wait (1–20, default 8).' },
+          },
+          timeoutMs: 30_000,
+          execute: (args, exec) => runBrowserAction('wait', args, exec, { mutating: false, askInStandard: false }),
+        }),
+        defineTool({
+          ...common, name: 'browser_eval',
+          description: 'Evaluate a JavaScript expression inside the active iOS in-app browser page to extract structured data (tables, JSON, metrics).',
+          parameters: {
+            script: { type: 'string', required: true, description: 'JavaScript expression or function body to evaluate in the page.' },
+          },
+          timeoutMs: 30_000,
+          execute: (args, exec) => runBrowserAction('eval', args, exec, {
+            mutating: true, askInStandard: true,
+            summary: `允许 Bot 在内置浏览器当前页面执行数据提取脚本？\n${String(args?.script ?? '').slice(0, 240)}`,
+          }),
+        }),
+        defineTool({
+          ...common, name: 'browser_handoff',
+          description: 'Pause automation and notify the user to take over the live iOS in-app browser manually (for example, to sign in, complete 2FA, or solve a verification gate). Always call this instead of attempting to bypass login or verification gates.',
+          parameters: {
+            reason: { type: 'string', required: true, description: 'Clear Chinese explanation of what the user needs to do in the browser.' },
+          },
+          timeoutMs: 15_000,
+          execute: (args, exec) => runBrowserAction('handoff', args, exec, { mutating: false, askInStandard: false }),
+        }),
+      ]
+    })(),
   ]
   const removers = definitions.map((definition) => context.tools.register(definition))
   context.effect(() => () => { unregisterFetch(); removers.reverse().forEach((remove) => remove()) }, 'dsbot-ios.nativeTools')

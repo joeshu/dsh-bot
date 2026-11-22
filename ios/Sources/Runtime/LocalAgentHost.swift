@@ -112,6 +112,7 @@ public final class LocalAgentHost: ObservableObject {
     @Published public private(set) var pendingDSHQuestions: [PendingDSHQuestion] = []
     @Published public private(set) var dshToolActivities: [DSHToolActivity] = []
     @Published public private(set) var dshApprovalAudits: [DSHApprovalAudit] = []
+    @Published public private(set) var telemetryBySession: [String: SessionLiveTelemetry] = [:]
     @Published public private(set) var dshAgentPresets: [DSHAgentPresetOption] = [
         DSHAgentPresetOption(id: "standard", name: "标准模式", description: "DSH 标准编码工具集。", broken: nil),
         DSHAgentPresetOption(id: "cordis", name: "创造模式", description: "面向 DSH / Cordis 扩展的工具集。", broken: nil),
@@ -122,8 +123,10 @@ public final class LocalAgentHost: ObservableObject {
     @Published public private(set) var pluginSources: [DSHPluginSource] = []
     @Published public private(set) var pluginCatalog: [DSHPluginCatalogItem] = []
     @Published public private(set) var installedPlugins: [DSHInstalledPlugin] = []
+    @Published public private(set) var thirdPartyPluginTools: [RuntimePluginTool] = []
     @Published public private(set) var pluginSourceName: String?
     @Published public private(set) var pluginStatus: String?
+    @Published public private(set) var pluginInstallStage: String = ""
     @Published public private(set) var isLoadingPlugins = false
     @Published public private(set) var pluginCatalogTotal = 0
     @Published public private(set) var embeddedRuntimeLabel: String?
@@ -283,6 +286,23 @@ public final class LocalAgentHost: ObservableObject {
         }
     }
 
+    private var draftInputsBySession: [String: String] = [:]
+
+    public func draftInput(for sessionId: String) -> String {
+        if let cached = draftInputsBySession[sessionId] { return cached }
+        return UserDefaults.standard.string(forKey: "dsbot.draft.\(sessionId)") ?? ""
+    }
+
+    public func setDraftInput(_ text: String, for sessionId: String, isPrivate: Bool) {
+        if text.isEmpty {
+            draftInputsBySession.removeValue(forKey: sessionId)
+            if !isPrivate { UserDefaults.standard.removeObject(forKey: "dsbot.draft.\(sessionId)") }
+        } else {
+            draftInputsBySession[sessionId] = text
+            if !isPrivate { UserDefaults.standard.set(text, forKey: "dsbot.draft.\(sessionId)") }
+        }
+    }
+
     public func messages(for sessionId: String) -> [ChatMessageItem] {
         messagesBySession[sessionId] ?? []
     }
@@ -357,6 +377,27 @@ public final class LocalAgentHost: ObservableObject {
         DSHaptics.impact(.light)
     }
 
+    public func setReasoningEffort(sessionId: String, effort: String) {
+        guard ["low", "medium", "high"].contains(effort),
+              let index = bots.firstIndex(where: { $0.id == sessionId }) else { return }
+        guard bots[index].reasoningEffort != effort else { return }
+        bots[index].reasoningEffort = effort
+        persistWorkspace()
+        DSHaptics.impact(.light)
+    }
+
+    /// Rolls back the trailing assistant reply (if any) and the last user message in local session state,
+    /// returning the user's original prompt so it can be edited and resent cleanly (`rewind`).
+    @discardableResult
+    public func rewindLastTurn(sessionId: String) -> String? {
+        guard !isStreaming, var list = messagesBySession[sessionId], !list.isEmpty else { return nil }
+        guard let lastUserIdx = list.lastIndex(where: { $0.role == "user" }) else { return nil }
+        let userText = list[lastUserIdx].content
+        list.removeSubrange(lastUserIdx..<list.count)
+        messagesBySession[sessionId] = list
+        return userText
+    }
+
     public func setBotModel(sessionId: String, model: String) {
         let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
@@ -394,6 +435,9 @@ public final class LocalAgentHost: ObservableObject {
     public func syncFromWebWorkbench() async {
         guard state == .ready, !isStreaming else { return }
         await refreshSessionSummaries()
+        if let channel = rpc() {
+            await refreshPluginState(on: channel)
+        }
         if let visibleId = visibleChatSessionId,
            bots.first(where: { $0.id == visibleId })?.isPrivate != true {
             loadedHistoryIDs.remove(visibleId)
@@ -537,6 +581,7 @@ public final class LocalAgentHost: ObservableObject {
                 "sessionId": sessionId, "turnId": turnId, "model": model, "apiBaseURL": apiBaseURL,
                 "systemPrompt": bot?.systemPrompt ?? "", "isGroup": bot?.isGroup ?? false,
                 "agentPreset": bot?.agentPreset ?? "standard", "permissionMode": bot?.permissionMode ?? "ask",
+                "reasoningEffort": bot?.reasoningEffort ?? "medium",
                 "subagentEnabled": subagentEnabled, "webSearchEnabled": webSearchEnabled,
                 "customTools": customTools,
                 "redteamMode": bot?.redteamToolsEnabled ?? false,
@@ -676,13 +721,16 @@ public final class LocalAgentHost: ObservableObject {
         workspaceError = nil
     }
 
-    public func updateBot(id: String, name: String, roleLabel: String, model: String, systemPrompt: String = "", permissionMode: String? = nil, agentPreset: String? = nil, redteamToolsEnabled: Bool? = nil, redteamWriteEnabled: Bool? = nil, redteamSensitiveDataEnabled: Bool? = nil) {
+    public func updateBot(id: String, name: String, roleLabel: String, model: String, systemPrompt: String = "", permissionMode: String? = nil, agentPreset: String? = nil, reasoningEffort: String? = nil, redteamToolsEnabled: Bool? = nil, redteamWriteEnabled: Bool? = nil, redteamSensitiveDataEnabled: Bool? = nil) {
         guard let idx = bots.firstIndex(where: { $0.id == id }) else { return }
         bots[idx].name = name
         bots[idx].roleLabel = roleLabel
         bots[idx].model = model
         bots[idx].systemPrompt = systemPrompt
         if let permissionMode { bots[idx].permissionMode = permissionMode }
+        if let reasoningEffort, ["low", "medium", "high"].contains(reasoningEffort) {
+            bots[idx].reasoningEffort = reasoningEffort
+        }
         if streamingSessionId == id,
            (redteamToolsEnabled != nil || redteamWriteEnabled != nil || redteamSensitiveDataEnabled != nil) {
             pluginStatus = "当前 Bot 正在执行；红队权限会在本轮完成后修改。"
@@ -1301,7 +1349,9 @@ public final class LocalAgentHost: ObservableObject {
 
     public func installPlugin(_ item: DSHPluginCatalogItem) async {
         guard item.installable, let channel else { return }
+        pluginInstallStage = "正在准备下载 \(item.name)@\(item.version)…"
         pluginStatus = "正在下载并检查 \(item.name)@\(item.version)…"
+        defer { pluginInstallStage = "" }
         do {
             let outcome = try await channel.request("plugins.install.npm", params: [
                 "name": item.name, "version": item.version, "sourceId": item.sourceId
@@ -1314,7 +1364,9 @@ public final class LocalAgentHost: ObservableObject {
     public func installGithubPlugin(url: String) async {
         let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let channel else { return }
+        pluginInstallStage = "正在连接 GitHub 获取 \(trimmed)…"
         pluginStatus = "正在从 GitHub 下载并检查 \(trimmed)…"
+        defer { pluginInstallStage = "" }
         do {
             let outcome = try await channel.request("plugins.install.github", params: [
                 "url": trimmed
@@ -1344,17 +1396,70 @@ public final class LocalAgentHost: ObservableObject {
         } catch { pluginStatus = error.localizedDescription }
     }
 
+    public func disableAllThirdPartyPlugins() async {
+        guard let channel else { return }
+        do {
+            let outcome = try await channel.request("plugins.disableAll", timeoutSeconds: 60)
+            await refreshPluginState(on: channel)
+            let count = outcome["disabledCount"] as? Int ?? 0
+            pluginStatus = try await pluginMutationStatus(outcome, on: channel, applied: "已停用 \(count) 个第三方插件。")
+        } catch {
+            pluginStatus = "停用全部第三方插件失败：\(error.localizedDescription)"
+        }
+    }
+
+    public func loadPluginConfig(name: String) async throws -> String {
+        guard let channel else { throw IPCFrameError.channelClosed }
+        let res = try await channel.request("plugins.config.get", params: ["name": name], timeoutSeconds: 15)
+        let config = res["config"] as? [String: Any] ?? [:]
+        let data = try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys])
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    public func savePluginConfig(name: String, jsonText: String) async throws -> String {
+        guard let channel else { throw IPCFrameError.channelClosed }
+        let trimmed = jsonText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let raw = trimmed.isEmpty ? "{}" : trimmed
+        guard let data = raw.data(using: .utf8),
+              let parsed = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw IPCFrameError.remoteError(code: -32602, message: "配置必须是合法的 JSON 对象（例如 {}）。")
+        }
+        let outcome = try await channel.request("plugins.config.set", params: ["name": name, "config": parsed], timeoutSeconds: 15)
+        let msg = outcome["restartRequired"] as? Bool == true
+            ? "配置已保存，重启 DSH 引擎后生效。"
+            : "配置已保存。"
+        pluginStatus = msg
+        return msg
+    }
+
     public func installLocalPlugin(from url: URL) async {
         guard let channel else { return }
         let didAccess = url.startAccessingSecurityScopedResource()
         defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
+        pluginInstallStage = "正在读取本地插件包…"
+        defer { pluginInstallStage = "" }
         let importRoot = workspace.appendingPathComponent("plugin-imports", isDirectory: true)
-        let staged = importRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: importRoot, withIntermediateDirectories: true)
-            try FileManager.default.copyItem(at: url, to: staged)
+            let lowerName = url.lastPathComponent.lowercased()
+            let suffix: String
+            if lowerName.hasSuffix(".tar.gz") { suffix = ".tar.gz" }
+            else if lowerName.hasSuffix(".tgz") { suffix = ".tgz" }
+            else { suffix = "" }
+            let staged = importRoot.appendingPathComponent(UUID().uuidString + suffix, isDirectory: suffix.isEmpty)
+            var coordError: NSError?
+            var copyError: Error?
+            NSFileCoordinator().coordinate(readingItemAt: url, options: .withoutChanges, error: &coordError) { coordinatedURL in
+                do {
+                    try FileManager.default.copyItem(at: coordinatedURL, to: staged)
+                } catch {
+                    copyError = error
+                }
+            }
+            if let coordError { throw coordError }
+            if let copyError { throw copyError }
             defer { try? FileManager.default.removeItem(at: staged) }
-            pluginStatus = "正在检查本地 DSH bundle…"
+            pluginStatus = "正在检查本地 DSH 插件…"
             let outcome = try await channel.request("plugins.install.local", params: ["path": staged.path], timeoutSeconds: 120)
             await refreshPluginState(on: channel)
             pluginStatus = try await pluginMutationStatus(outcome, on: channel, applied: "本地插件已安装并启用。")
@@ -1389,6 +1494,9 @@ public final class LocalAgentHost: ObservableObject {
             let installed = try await rpc.request("plugins.installed.list", timeoutSeconds: 15)
             pluginSources = Self.decodeRows(sources["sources"], as: DSHPluginSource.self)
             installedPlugins = Self.decodeRows(installed["plugins"], as: DSHInstalledPlugin.self)
+            if let caps = try? await rpc.request("plugins.runtime.capabilities", timeoutSeconds: 10) {
+                thirdPartyPluginTools = Self.decodeRows(caps["thirdPartyTools"], as: RuntimePluginTool.self)
+            }
         } catch {
             pluginStatus = "读取插件 profile 失败：\(error.localizedDescription)"
         }
@@ -1839,6 +1947,12 @@ public final class LocalAgentHost: ObservableObject {
             let timeoutMs = Int32(params["timeoutMs"] as? Int ?? 2_000)
             return await self.workspaceCapabilities.evaluateQuickJSSandbox(script, timeoutMilliseconds: timeoutMs)
         }
+        await rpc.registerHandler(method: "browser.action") { [weak self] params in
+            guard let self else { throw IPCFrameError.channelClosed }
+            let action = params["action"] as? String ?? ""
+            let args = params["args"] as? [String: Any] ?? [:]
+            return try await AgentBrowserController.shared.handleAction(action, args: args, workspace: self.workspace)
+        }
         await rpc.registerHandler(method: "native.tool.execute") { [weak self] params in
             guard let self, let name = params["name"] as? String else { throw IPCFrameError.invalidJSON }
             var arguments = params["args"] as? [String: Any] ?? [:]
@@ -2004,7 +2118,7 @@ public final class LocalAgentHost: ObservableObject {
             grew = true
         }
         if !pendingContentBuffer.isEmpty {
-            liveStream.content += pendingContentBuffer
+            liveStream.appendContent(pendingContentBuffer)
             pendingContentBuffer = ""
             if !sentCancellation {
                 liveStream.phase = .generating
@@ -2043,6 +2157,23 @@ public final class LocalAgentHost: ObservableObject {
             }
         }
         if let sessionId = streamingSessionId {
+            var telemetry = telemetryBySession[sessionId] ?? SessionLiveTelemetry()
+            if let usage = params["usage"] as? [String: Any] {
+                telemetry.inputTokens += usage["inputTokens"] as? Int ?? 0
+                telemetry.cacheReadTokens += usage["cacheReadTokens"] as? Int ?? 0
+                telemetry.outputTokens += usage["outputTokens"] as? Int ?? 0
+            }
+            if let dur = params["durationMs"] as? Int, dur > 0 {
+                telemetry.modelDurationMs += dur
+            } else if let start = streamStartedAt {
+                telemetry.modelDurationMs += max(1, Int(Date().timeIntervalSince(start) * 1_000))
+            }
+            if let ttft = streamFirstTokenMs, ttft > 0 {
+                telemetry.ttftSumMs += ttft
+                telemetry.ttftSamples += 1
+            }
+            telemetryBySession[sessionId] = telemetry
+
             let authoritativeContent = (params["finalContent"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             let authoritativeReasoning = (params["finalReasoning"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             let finalText: String
@@ -2112,6 +2243,12 @@ public final class LocalAgentHost: ObservableObject {
                     self.resolveRuntimeReadiness(.remoteError(code: -32000, message: message))
                     self.effectiveWebSearchSendOriginalQuestion = false
                     self.state = .failed(message)
+                    continue
+                }
+                if method == "plugins.progress" {
+                    if let detail = params["detail"] as? String, !detail.isEmpty {
+                        self.pluginInstallStage = detail
+                    }
                     continue
                 }
                 if method.hasPrefix("approval.") {
@@ -2260,6 +2397,7 @@ public final class LocalAgentHost: ObservableObject {
             if let timestamp = params["timestamp"] { dshToolActivities[index].timestamp = Self.sessionDate(timestamp) }
             if let sequence = params["sequence"] as? Int { dshToolActivities[index].sequence = sequence }
             if let callSequence = params["callSequence"] as? Int { dshToolActivities[index].callSequence = callSequence }
+            if let durationMs = params["durationMs"] as? Int { dshToolActivities[index].durationMs = durationMs }
             if phase == "started", let sequence = params["sequence"] as? Int {
                 dshToolActivities[index].callSequence = sequence
             }
@@ -2276,7 +2414,8 @@ public final class LocalAgentHost: ObservableObject {
                 fileSummary: params["fileSummary"] as? String,
                 timestamp: Self.sessionDate(params["timestamp"]),
                 sequence: params["sequence"] as? Int,
-                callSequence: params["callSequence"] as? Int ?? (phase == "started" ? params["sequence"] as? Int : nil)
+                callSequence: params["callSequence"] as? Int ?? (phase == "started" ? params["sequence"] as? Int : nil),
+                durationMs: params["durationMs"] as? Int
             ))
         }
         let sessionActivities = dshToolActivities.filter { $0.sessionId == sessionId }
