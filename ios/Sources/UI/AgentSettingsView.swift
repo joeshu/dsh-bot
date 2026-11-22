@@ -174,8 +174,10 @@ public struct AgentSettingsFormSections: View {
         }
 
         Section("运行时诊断与配置备份") {
+            let memSnap = MemoryGovernor.shared.snapshot
             LabeledContent("应用版本", value: "\(host.appVersion) (\(host.buildNumber))")
             LabeledContent("内嵌引擎", value: host.embeddedRuntimeLabel ?? "Node.js + DSH 0.2.2-rc.5")
+            LabeledContent("内存 / V8 堆上限", value: String(format: "%.1f MB / %d MB (%@)", memSnap.physFootprintMB, memSnap.nodeHeapLimitMB, memSnap.tier.displayName))
             LabeledContent("Web 工作台", value: "Loopback 认证端口（支持 dsh-client-ui-*）")
             LabeledContent(
                 "本地 SQLite 存储",
@@ -197,17 +199,18 @@ public struct AgentSettingsFormSections: View {
                         guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
                         let info = try await rpc.request("agent.info")
                         let data = try JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys])
+                        let rawJSON = String(decoding: data, as: UTF8.self)
                         #if canImport(UIKit)
-                        UIPasteboard.general.string = String(decoding: data, as: UTF8.self)
+                        UIPasteboard.general.string = SecretRedactor.redactCommonTokens(rawJSON)
                         #endif
-                        status = "已复制运行时诊断 JSON 到剪贴板。"
+                        status = "已复制脱敏运行时诊断 JSON 到剪贴板。"
                         DSHaptics.notify(.success)
                     } catch {
                         status = error.localizedDescription
                     }
                 }
             } label: {
-                Label("复制运行时诊断 JSON", systemImage: "doc.on.doc")
+                Label("复制运行时诊断 JSON（已脱敏）", systemImage: "doc.on.doc")
             }
 
             ShareLink(

@@ -23,7 +23,30 @@ export function mountIOSPythonTool(ctx) {
       const { rpc, runtime } = iosHost()
       const sessionId = exec.agent.session.id
       const active = runtime.activeTurns.get(sessionId)
-      if (!active || active.done) throw new Error('Python execution is available only in an active native Bot turn')
+      if (!active || active.done) {
+        const code = String(args?.code ?? '')
+        if (!code.trim() || code.length > 16_000 || code.includes('\u0000')) {
+          throw new Error('Python source must be non-empty and within 16,000 characters.')
+        }
+        if (ctx.approval?.request) {
+          const outcome = await ctx.approval.request({
+            agent: exec.agent,
+            toolName: 'python_exec',
+            ...(exec.callId ? { callId: exec.callId } : {}),
+            reason: `Run offline Python/NumPy code (${code.length} chars)`,
+            displayReason: `允许在离线 Pyodide 沙盒运行以下 Python 代码？\n\n${code.slice(0, 4000)}`,
+            signal: exec.signal,
+          })
+          if (outcome !== 'allowed-once') throw new Error('User did not approve python_exec')
+        }
+        const res = await executeIOSPython({
+          code,
+          botId: sessionId,
+          turnId: exec.callId || `web_${Date.now()}`,
+          signal: exec.signal,
+        })
+        return { output: String(res?.output ?? '') }
+      }
       const botId = sessionId.startsWith('ios:') ? sessionId.slice(4) : sessionId
       const result = await rpc.request('native.tool.execute', {
         name: 'python_exec', args, botId, sessionId: botId, turnId: active.turnId, isGroup: active.isGroup,

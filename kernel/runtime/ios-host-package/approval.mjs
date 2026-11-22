@@ -19,7 +19,10 @@ function apply(ctx) {
     if (active.done) throw new Error('The DSH turn is already closed')
     const path = workspacePath(iosHost(), target)
     if (active.permissionMode === 'readOnly') {
-      throw new Error(`Read-only mode blocked ${operation} for files/${path}`)
+      throw new Error(`只读保护模式已拦截 ${operation}（files/${path}）`)
+    }
+    if (active.permissionMode === 'autoReview' && (operation === 'write' || operation === 'edit')) {
+      return next()
     }
     const outcome = await ctx.approval.request({
       agent: exec.agent,

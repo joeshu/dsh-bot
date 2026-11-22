@@ -150,6 +150,48 @@ function messageText(blocks) {
     .map((block) => block.text).join('')
 }
 
+export function flattenToolSchema(schema, defs = undefined, depth = 0) {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema) || depth > 12) return schema
+  const rootDefs = defs ?? schema.$defs ?? schema.definitions ?? {}
+  if (typeof schema.$ref === 'string') {
+    const key = schema.$ref.replace(/^#\/(\$defs|definitions)\//, '')
+    if (Object.hasOwn(rootDefs, key)) {
+      return flattenToolSchema(rootDefs[key], rootDefs, depth + 1)
+    }
+  }
+  const out = {}
+  for (const [k, v] of Object.entries(schema)) {
+    if (k === '$defs' || k === 'definitions' || k === '$schema' || k === '$ref') continue
+    if (k === 'const') {
+      out.enum = [v]
+      continue
+    }
+    if ((k === 'anyOf' || k === 'oneOf' || k === 'allOf') && Array.isArray(v)) {
+      const nonNull = v.filter((item) => item && item.type !== 'null')
+      if (nonNull.length === 1) {
+        Object.assign(out, flattenToolSchema(nonNull[0], rootDefs, depth + 1))
+        continue
+      }
+      out[k] = v.map((item) => flattenToolSchema(item, rootDefs, depth + 1))
+      continue
+    }
+    if (k === 'properties' && v && typeof v === 'object' && !Array.isArray(v)) {
+      const props = {}
+      for (const [pk, pv] of Object.entries(v)) {
+        props[pk] = flattenToolSchema(pv, rootDefs, depth + 1)
+      }
+      out.properties = props
+      continue
+    }
+    if (k === 'items' && v && typeof v === 'object') {
+      out.items = flattenToolSchema(v, rootDefs, depth + 1)
+      continue
+    }
+    out[k] = v
+  }
+  return out
+}
+
 function eventMessages(events, botId) {
   const messages = []
   for (const event of events) {
@@ -571,9 +613,12 @@ function redteamToolDenial(policy, name) {
   if (kind === 'unknown') return `iOS 未审核红队工具 ${name}，默认拒绝。`
   if (!policy.enabled || !runtime.redteamToolsEnabled) return '红队工具宿主或本 Bot 授权已关闭。'
   if (runtime.privateBotIds.has(policy.botId)) return '私密会话禁止调用 dsh-purge-safe 工具。'
+  if (REDTEAM_SENSITIVE_TOOL_NAMES.has(name) && policy.permissionMode === 'readOnly') {
+    return '只读保护模式禁止调用红队敏感工具。'
+  }
   if (REDTEAM_SENSITIVE_TOOL_NAMES.has(name) && !policy.sensitive) return `本 Bot 未获准访问敏感红队数据：${name}。`
   if (REDTEAM_WRITE_TOOL_NAMES.has(name) && (!policy.write || policy.permissionMode === 'readOnly')) {
-    if (policy.permissionMode === 'readOnly') return '只读模式禁止修改红队演练数据。'
+    if (policy.permissionMode === 'readOnly') return '只读保护模式禁止修改红队演练数据。'
     return REDTEAM_SENSITIVE_TOOL_NAMES.has(name)
       ? '敏感数据写入需要同时授予演练台写入权限。'
       : `本 Bot 未获准写入红队演练数据：${name}。`
@@ -584,8 +629,9 @@ function redteamToolDenial(policy, name) {
 function redteamToolNeedsApproval(policy, name) {
   const isSensitive = REDTEAM_SENSITIVE_TOOL_NAMES.has(name)
   const isWrite = REDTEAM_WRITE_TOOL_NAMES.has(name)
-  return (policy.permissionMode === 'ask' && (isWrite || isSensitive))
-    || (policy.permissionMode === 'autoReview' && isSensitive)
+  // Three-tier alignment: readOnly is blocked above; ask prompts on write/sensitive;
+  // autoReview (沙盒免打扰) auto-allows explicitly authorized redteam tools.
+  return policy.permissionMode === 'ask' && (isWrite || isSensitive)
 }
 
 function redteamApprovalKey(sessionId, callId) {
@@ -672,6 +718,15 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
       }
       if (deny.length) toolRestriction = agentCtx.tools.restrict({ deny })
       toolGuard = agentCtx.tools.guard((execution) => {
+        if (execution.name === 'subagent') {
+          const activeTurn = runtime.activeTurns.get(id)
+          if (activeTurn?.isGroup) {
+            activeTurn.groupHandoffCount = (activeTurn.groupHandoffCount ?? 0) + 1
+            if (activeTurn.groupHandoffCount > 12) {
+              return { reason: '群聊协作已达到单轮最大交接上限（12 次），已安全停止以防止无限循环。' }
+            }
+          }
+        }
         if (String(execution.name ?? '').startsWith('redteam_')) {
           const denial = redteamToolDenial(redteamPolicy, execution.name)
           if (denial) return { reason: denial }
@@ -1035,6 +1090,10 @@ async function startTurn(params, preparation) {
   if (redteamMode) await setRedteamToolsMounted(true).catch(() => {})
   const id = dshSessionId(botId)
   let active = runtime.activeAgents.get(id)
+  if (active && active.agentPreset !== agentPreset) {
+    await drainAndDispose(id, active)
+    active = undefined
+  }
   const options = {
     provider: 'deepseek-official', model: dshModel,
     reasoningEffort: reasoningEnabled ? 'high' : 'off',
@@ -1070,15 +1129,29 @@ async function startTurn(params, preparation) {
     if (boundary.lastTurn === 0 && selection !== agentPreset) {
       await ctx.agentPresets.select(handle.agent, agentPreset)
     }
-    active = { handle, agent: handle.agent, setPersona: composition.setPersona, setToolsEnabled: composition.setToolsEnabled, botId, agentPreset }
+    active = {
+      handle,
+      agent: handle.agent,
+      setPersona: composition.setPersona,
+      setToolsEnabled: composition.setToolsEnabled,
+      botId,
+      agentPreset,
+      frozenSystemPrompt: typeof params.systemPrompt === 'string' ? params.systemPrompt : '',
+      lastUsedAt: Date.now(),
+    }
     guardIOSBackgroundFollowups(active.agent)
     runtime.activeAgents.set(id, active)
+    await evictIdleAgentsIfNeeded(id)
   } else {
-    if (active.agentPreset !== agentPreset) {
-      throw new Error('DSH mode is fixed for this conversation. Create a new Bot conversation to switch modes.')
-    }
+    active.lastUsedAt = Date.now()
     active.agent.model.select(options)
-    active.setPersona(params.systemPrompt)
+    // Memory Freeze Semantics: keep the active session's system prompt prefix
+    // immutable across turns so DeepSeek Prompt Cache (~29x savings) stays hot.
+    // Only refresh when the caller explicitly requests a checkpoint refresh.
+    if (params.forceRefreshPersona === true) {
+      active.frozenSystemPrompt = typeof params.systemPrompt === 'string' ? params.systemPrompt : ''
+      active.setPersona(active.frozenSystemPrompt)
+    }
     active.setToolsEnabled(toolsEnabled, params.subagentEnabled === true, webSearchEnabled,
       redteamMode, redteamWriteEnabled, redteamSensitiveDataEnabled, permissionMode)
   }
@@ -1108,15 +1181,44 @@ async function startTurn(params, preparation) {
   void (async () => {
     let status = 'completed'
     let error
+    let turnUsage
     try {
       await active.agent.whenIdle()
       await ctx.sessions.flush(active.agent.session)
       const events = active.agent.session.snapshotEvents()
-      const end = [...events].reverse().find((event) => event.seq >= startSeq && event.type === 'turn/end')
+      const turnEvents = events.filter((event) => event.seq >= startSeq)
+      const end = [...turnEvents].reverse().find((event) => event.type === 'turn/end')
       const reason = end?.data.reason
       if (reason?.kind !== 'completed') {
         status = reason?.kind === 'aborted' ? 'aborted' : reason?.kind === 'error' ? 'error' : 'incomplete'
         if (typeof reason?.error?.message === 'string') error = reason.error.message
+      } else {
+        const hasAssistantOutput = turnEvents.some((event) => {
+          if (event.type === 'assistant/message') {
+            const blocks = event.data?.message?.content
+            if (typeof blocks === 'string' && blocks.trim().length > 0) return true
+            if (Array.isArray(blocks) && blocks.some((b) => (b?.type === 'text' && b.text?.trim()) || (b?.type === 'thinking' && b.thinking?.trim()) || b?.type === 'tool_use')) return true
+          }
+          return event.type === 'tool/call' || event.type === 'tool/result'
+        })
+        if (!hasAssistantOutput) {
+          status = 'error'
+          error = '模型返回空响应（0 输出），请重试或切换模型。'
+        }
+      }
+      let inputTokens = 0
+      let cacheReadTokens = 0
+      let outputTokens = 0
+      for (const event of turnEvents) {
+        const u = event.data?.message?.usage ?? event.data?.usage
+        if (u && typeof u === 'object') {
+          inputTokens += Number(u.input_tokens ?? u.inputTokens ?? 0) || 0
+          cacheReadTokens += Number(u.cache_read_input_tokens ?? u.cacheReadTokens ?? 0) || 0
+          outputTokens += Number(u.output_tokens ?? u.outputTokens ?? 0) || 0
+        }
+      }
+      if (inputTokens > 0 || cacheReadTokens > 0 || outputTokens > 0) {
+        turnUsage = { model: dshModel, inputTokens, cacheReadTokens, outputTokens }
       }
     } catch (reason) {
       status = 'error'
@@ -1125,11 +1227,29 @@ async function startTurn(params, preparation) {
       turn.done = true
       runtime.activeTurns.delete(id)
       clearRedteamApprovalGrants(id)
-      rpc.notify('chat.done', { sessionId: botId, turnId, status, ...(error ? { error } : {}) })
+      rpc.notify('chat.done', {
+        sessionId: botId,
+        turnId,
+        status,
+        ...(error ? { error } : {}),
+        ...(turnUsage ? { usage: turnUsage } : {}),
+      })
     }
   })()
   return { turnId, status: 'accepted', engine: 'node+dsh' }
 }
+
+rpc.handle('session.refreshPersona', async ({ sessionId, systemPrompt } = {}) => {
+  const botId = String(sessionId ?? '').trim()
+  if (!botId) return { refreshed: false }
+  const id = dshSessionId(botId)
+  const active = runtime.activeAgents.get(id)
+  if (!active) return { refreshed: false }
+  const nextPrompt = typeof systemPrompt === 'string' ? systemPrompt : ''
+  active.frozenSystemPrompt = nextPrompt
+  active.setPersona(nextPrompt)
+  return { refreshed: true }
+})
 
 async function drainAndDispose(id, active) {
   await ctx.subagents.drainDescendants([active.agent])
@@ -1137,6 +1257,29 @@ async function drainAndDispose(id, active) {
   await ctx.sessions.flush(active.agent.session)
   await active.handle.dispose()
   runtime.activeAgents.delete(id)
+}
+
+const MAX_ACTIVE_AGENTS = 3
+
+async function evictIdleAgentsIfNeeded(keepId) {
+  if (runtime.activeAgents.size <= MAX_ACTIVE_AGENTS) return
+  const candidates = [...runtime.activeAgents.entries()]
+    .filter(([id, active]) => {
+      if (id === keepId) return false
+      if (runtime.activeTurns.has(id)) return false
+      if (active.agent?.status === 'running') return false
+      const ownsJobs = (ctx.jobs?.list(id) ?? []).some((job) => job.owner === id)
+      return !ownsJobs
+    })
+    .sort((a, b) => (a[1].lastUsedAt ?? 0) - (b[1].lastUsedAt ?? 0))
+  for (const [id, active] of candidates) {
+    if (runtime.activeAgents.size <= MAX_ACTIVE_AGENTS) break
+    try {
+      await drainAndDispose(id, active)
+    } catch {
+      // Best-effort eviction; keep going if another idle agent can be freed.
+    }
+  }
 }
 
 function clearRedteamApprovalGrants(sessionId) {
@@ -1235,13 +1378,26 @@ rpc.handle('agent.suspend', async () => {
       return { suspended: false }
     }
   }
-  await runtime.persistence.flush()
+  await runtime.persistence.flush({ truncate: true })
   return { suspended: runtime.suspendGeneration === suspendGeneration && runtime.suspended }
 })
 rpc.handle('agent.resume', async () => {
   runtime.suspendGeneration += 1
   runtime.suspended = false
   return { suspended: false }
+})
+rpc.handle('runtime.health', async () => {
+  const mem = process.memoryUsage()
+  return {
+    ok: !runtime.shuttingDown,
+    suspended: runtime.suspended,
+    uptimeSeconds: Math.round(process.uptime()),
+    rssMB: Math.round((mem.rss / 1_048_576) * 10) / 10,
+    heapUsedMB: Math.round((mem.heapUsed / 1_048_576) * 10) / 10,
+    heapTotalMB: Math.round((mem.heapTotal / 1_048_576) * 10) / 10,
+    activeAgents: runtime.activeAgents.size,
+    activeTurns: runtime.activeTurns.size,
+  }
 })
 
 rpc.handle('session.list', async () => {
@@ -1693,6 +1849,9 @@ rpc.handle('session.clear', async ({ sessionId }) => {
 // Swift directly to its native workspace and are intentionally not reachable through this process.
 
 let redteamToolsFork = null
+let redteamMountInFlight = null
+let redteamMountError = ''
+let redteamSkillsCache = { dir: '', mtimeMs: 0, count: 0 }
 
 function redteamToolsModulePath() {
   const candidate = join(PROFILE_DIR, 'node_modules', 'dsh-purge-safe', 'lib', 'redteam', 'tools.js')
@@ -1706,17 +1865,24 @@ function redteamSkillsCount() {
   ]) {
     if (existsSync(dir)) {
       try {
-        return readdirSync(dir).filter((f) => f.endsWith('.md')).length
+        const mtimeMs = statSync(dir).mtimeMs
+        if (redteamSkillsCache.dir === dir && redteamSkillsCache.mtimeMs === mtimeMs) {
+          return redteamSkillsCache.count
+        }
+        const count = readdirSync(dir).filter((f) => f.endsWith('.md')).length
+        redteamSkillsCache = { dir, mtimeMs, count }
+        return count
       } catch { /* ignore */ }
     }
   }
   return 0
 }
 
-async function setRedteamToolsMounted(enabled) {
+async function performSetRedteamToolsMounted(enabled) {
   runtime.redteamToolsEnabled = enabled === true
   process.env.DS_BOT_IOS_REDTEAM_ENABLED = runtime.redteamToolsEnabled ? '1' : '0'
   if (!enabled) {
+    redteamMountError = ''
     runtime.redteamApprovalGrants.clear()
     for (const policy of runtime.redteamTurnPolicies.values()) policy.enabled = false
     if (redteamToolsFork) {
@@ -1727,15 +1893,43 @@ async function setRedteamToolsMounted(enabled) {
   }
   if (!redteamToolsFork) {
     const toolsPath = redteamToolsModulePath()
-    if (!toolsPath) return redteamStatus()
-    const mod = await import(pathToFileURL(toolsPath).href)
-    const plugin = mod?.default ?? mod
-    if (plugin && ctx) {
-      redteamToolsFork = ctx.plugin(plugin)
-      try { await redteamToolsFork.await?.() } catch { /* ignore */ }
+    if (!toolsPath) {
+      redteamMountError = '未找到 dsh-purge-safe/lib/redteam/tools.js'
+      return redteamStatus()
+    }
+    try {
+      redteamMountError = ''
+      const rev = (() => { try { return Math.floor(statSync(toolsPath).mtimeMs) } catch { return Date.now() } })()
+      const mod = await import(`${pathToFileURL(toolsPath).href}?rev=${rev}`)
+      const plugin = mod?.default ?? mod
+      if (plugin && ctx) {
+        const fork = ctx.plugin(plugin)
+        redteamToolsFork = fork
+        try {
+          await fork.await?.()
+        } catch (err) {
+          redteamToolsFork = null
+          try { await fork.dispose?.() } catch { /* ignore */ }
+          throw err
+        }
+      }
+    } catch (err) {
+      redteamToolsFork = null
+      redteamMountError = err instanceof Error ? err.message : String(err)
     }
   }
   return redteamStatus()
+}
+
+async function setRedteamToolsMounted(enabled) {
+  const prev = redteamMountInFlight ?? Promise.resolve()
+  const run = prev.catch(() => {}).then(() => performSetRedteamToolsMounted(enabled))
+  redteamMountInFlight = run
+  try {
+    return await run
+  } finally {
+    if (redteamMountInFlight === run) redteamMountInFlight = null
+  }
 }
 
 function redteamStatus() {
@@ -1744,7 +1938,8 @@ function redteamStatus() {
   const webLayerActive = runtime.activePluginRows.includes('dsh-purge-safe-redteam-ui')
   const storeReady = Boolean(ctx?.get?.('redteam'))
   const tools = registeredRedteamToolNames()
-  const compatibilityWarning = runtime.redteamCompatibility.reason
+  const compatibilityWarning = redteamMountError
+    || runtime.redteamCompatibility.reason
     || (!webLayerActive ? 'iOS DSH profile 未激活 dsh-purge-safe/redteam/ui 子层' : '')
   return {
     installed,
@@ -2404,10 +2599,16 @@ async function runSingleVirtualCommand(term, rawSegment) {
 
     case 'node':
     case 'js': {
-      const code = cmd === 'node' && (args[0] === '-e' || args[0] === '-p')
-        ? args.slice(1).join(' ')
-        : args.join(' ')
-      if (!code.trim()) throw new Error('用法: node -e "<JavaScript 表达式>"')
+      let code = ''
+      if (cmd === 'node' && (args[0] === '-e' || args[0] === '-p')) {
+        code = args.slice(1).join(' ')
+      } else if (cmd === 'node' && args[0] && /\.(?:m?js|cjs)$/i.test(args[0])) {
+        const resolved = resolveInsideWorkspaceFiles(term.cwd, args[0])
+        code = readFileSync(resolved.abs, 'utf8')
+      } else {
+        code = args.join(' ')
+      }
+      if (!code.trim()) throw new Error('用法: node -e "<JavaScript 表达式>" 或 node <file.js>')
       const logs = []
       const sandbox = {
         console: {
@@ -2486,7 +2687,7 @@ async function executeVirtualTerminalCommand(sessionId, commandLine) {
   if (term.history.length > 100) term.history.splice(0, term.history.length - 100)
   pushDevtoolsLog('info', 'terminal', `[${term.id}] $ ${raw}`)
 
-  const segments = raw.split(/\s*&&\s*/).filter(Boolean)
+  const segments = raw.split(/\s*(?:&&|;)\s*/).filter(Boolean)
   const outputs = []
   let exitCode = 0
   for (const seg of segments) {

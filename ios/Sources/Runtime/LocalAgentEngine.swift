@@ -427,8 +427,13 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
         case "side.ask": return try await sideChat(params)
         case "models.test": return try await listModels(params)
         case "memory.add":
-            return try await store.addMemory(botId: botId, title: params["title"] as? String ?? "",
-                                             content: params["content"] as? String ?? "", layer: params["layer"] as? String ?? "delta")
+            let title = params["title"] as? String ?? ""
+            let content = params["content"] as? String ?? ""
+            if case .hardBlock(let reason) = PrivacyGate.evaluateMemoryWrite(title: title, content: content) {
+                throw IPCFrameError.remoteError(code: -32602, message: "隐私闸门拦截：\(reason)")
+            }
+            return try await store.addMemory(botId: botId, title: title,
+                                             content: content, layer: params["layer"] as? String ?? "delta")
         case "memory.journal":
             return ["records": await store.memoryJournal(botId: botId)]
         case "memory.legacy":
@@ -831,9 +836,24 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
     }
 
     private func sandboxedWorkspaceFileURL(relativePath: String, allowEmpty: Bool) -> URL? {
-        let normalized = relativePath.replacingOccurrences(of: "\\", with: "/").trimmingCharacters(in: .whitespacesAndNewlines)
+        var normalized = relativePath.replacingOccurrences(of: "\\", with: "/").trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalized.contains("\0") { return nil }
+        if normalized == "/workspace" || normalized == "/workspace/" || normalized == "files" || normalized == "files/" || normalized == "." || normalized == "./" {
+            return allowEmpty ? workspaceFilesRoot() : nil
+        }
+        if normalized.hasPrefix("/workspace/") {
+            normalized = String(normalized.dropFirst("/workspace/".count))
+        } else if normalized.hasPrefix("files/") {
+            normalized = String(normalized.dropFirst("files/".count))
+        }
+        while normalized.hasPrefix("./") {
+            normalized = String(normalized.dropFirst(2))
+        }
+        while normalized.hasSuffix("/") {
+            normalized.removeLast()
+        }
         if normalized.isEmpty { return allowEmpty ? workspaceFilesRoot() : nil }
-        if normalized.hasPrefix("/") || normalized.contains("\0") { return nil }
+        if normalized.hasPrefix("/") { return nil }
         let parts = normalized.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
         guard !parts.isEmpty, !parts.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }) else { return nil }
         let base = workspaceFilesRoot().standardizedFileURL

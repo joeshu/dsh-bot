@@ -1,9 +1,116 @@
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import vm from 'node:vm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { iosHost } from './index.mjs'
 
 function resultText(value) {
   if (typeof value?.output === 'string') return [{ type: 'text', text: value.output }]
   return [{ type: 'text', text: JSON.stringify(value) }]
+}
+
+function resolveSandboxedWorkspacePath(workspace, rawPath = '') {
+  const root = resolve(workspace, 'files')
+  mkdirSync(root, { recursive: true })
+  let text = String(rawPath ?? '').replaceAll('\\', '/').trim()
+  if (text === '/workspace' || text === '/workspace/' || text === 'files' || text === 'files/' || text === '.' || text === './') {
+    return { root, abs: root, rel: '' }
+  }
+  if (text.startsWith('/workspace/')) text = text.slice('/workspace/'.length)
+  else if (text.startsWith('files/')) text = text.slice('files/'.length)
+  while (text.startsWith('./')) text = text.slice(2)
+  const abs = resolve(root, text)
+  const rel = relative(root, abs)
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error('Path escapes the iOS files/ workspace')
+  }
+  return { root, abs, rel: rel.split(sep).join('/') }
+}
+
+async function executeWebFallbackTool(context, name, args, exec) {
+  const { workspace } = iosHost()
+  if (name === 'js_eval') {
+    const script = String(args?.script ?? '')
+    const logs = []
+    const sandbox = {
+      console: {
+        log: (...items) => logs.push(items.map((x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')),
+        error: (...items) => logs.push(items.map((x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')),
+      },
+      Math, Date, JSON, Number, String, Boolean, Array, Object,
+    }
+    const result = vm.runInNewContext(script, sandbox, { timeout: 2_000 })
+    if (result !== undefined) logs.push(typeof result === 'string' ? result : JSON.stringify(result, null, 2))
+    return { output: logs.join('\n') }
+  }
+  if (name === 'workspace_list') {
+    const { abs } = resolveSandboxedWorkspacePath(workspace, args?.path ?? '')
+    const entries = readdirSync(abs, { withFileTypes: true })
+      .filter((e) => !e.name.startsWith('.'))
+      .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
+      .sort()
+    return { output: entries.length ? entries.join('\n') : '(空目录)' }
+  }
+  if (name === 'workspace_read') {
+    const { abs, rel } = resolveSandboxedWorkspacePath(workspace, args?.path ?? '')
+    if (!rel || !existsSync(abs) || !statSync(abs).isFile()) throw new Error(`File not found: files/${rel}`)
+    const content = readFileSync(abs, 'utf8')
+    return { output: content.length > 65_536 ? `${content.slice(0, 65_536)}\n…(truncated)` : content }
+  }
+  if (name === 'workspace_search') {
+    const query = String(args?.query ?? '').toLowerCase()
+    if (!query) throw new Error('workspace_search requires a non-empty query')
+    const { abs, root } = resolveSandboxedWorkspacePath(workspace, args?.path ?? '')
+    const hits = []
+    const walk = (dir) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name.startsWith('.') || hits.length >= 80) continue
+        const full = join(dir, entry.name)
+        if (entry.isDirectory()) walk(full)
+        else if (entry.isFile() && statSync(full).size <= 256 * 1024) {
+          const lines = readFileSync(full, 'utf8').split(/\r?\n/)
+          const display = relative(root, full).split(sep).join('/')
+          lines.forEach((line, idx) => {
+            if (hits.length < 80 && line.toLowerCase().includes(query)) {
+              hits.push(`${display}:${idx + 1}: ${line.slice(0, 240)}`)
+            }
+          })
+        }
+      }
+    }
+    walk(abs)
+    return { output: hits.length ? hits.join('\n') : '(无匹配结果)' }
+  }
+  if (name === 'workspace_write' || name === 'workspace_edit') {
+    const { abs, rel } = resolveSandboxedWorkspacePath(workspace, args?.path ?? '')
+    if (!rel) throw new Error('A file path inside files/ is required')
+    if (context.approval?.request) {
+      const outcome = await context.approval.request({
+        agent: exec.agent,
+        toolName: name,
+        ...(exec.callId ? { callId: exec.callId } : {}),
+        reason: `Modify workspace file files/${rel}`,
+        displayReason: `允许 ${name} 修改工作区文件 files/${rel}？`,
+        signal: exec.signal,
+      })
+      if (outcome !== 'allowed-once') throw new Error(`User did not approve ${name} for files/${rel}`)
+    }
+    if (name === 'workspace_write') {
+      const content = String(args?.content ?? '')
+      if (Buffer.byteLength(content, 'utf8') > 262_144) throw new Error('File write exceeds 256 KB limit')
+      mkdirSync(dirname(abs), { recursive: true })
+      writeFileSync(abs, content, 'utf8')
+      return { output: `已写入 files/${rel}（${Buffer.byteLength(content, 'utf8')} 字节）` }
+    }
+    if (!existsSync(abs)) throw new Error(`File not found: files/${rel}`)
+    const current = readFileSync(abs, 'utf8')
+    const oldText = String(args?.old_text ?? '')
+    const newText = String(args?.new_text ?? '')
+    if (!oldText || !current.includes(oldText)) throw new Error(`old_text not found in files/${rel}`)
+    writeFileSync(abs, current.replace(oldText, newText), 'utf8')
+    return { output: `已更新 files/${rel}` }
+  }
+  return undefined
 }
 
 function apply(context) {
@@ -14,7 +121,25 @@ function apply(context) {
     async fetch({ url }, signal) {
       const { rpc, runtime } = iosHost()
       const [turn] = runtime.activeTurns.values()
-      if (!turn || turn.done) throw new Error('Web fetch requires an active user turn')
+      if (!turn || turn.done) {
+        const parsed = new URL(String(url ?? ''))
+        if (parsed.protocol !== 'https:') throw new Error('web_fetch only supports HTTPS URLs')
+        const host = parsed.hostname.toLowerCase()
+        if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host.endsWith('.local')
+          || /^(10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host)) {
+          throw new Error('web_fetch blocked private or loopback address')
+        }
+        const timeoutSignal = AbortSignal.timeout(15_000)
+        const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
+        const resp = await globalThis.fetch(parsed.toString(), { signal: combinedSignal, redirect: 'follow' })
+        const text = (await resp.text()).slice(0, 131_072)
+        return {
+          url: resp.url || parsed.toString(),
+          status: resp.status,
+          contentType: resp.headers.get('content-type') || 'text/plain',
+          body: { content: text },
+        }
+      }
       const result = await rpc.request('native.tool.execute', {
         name: 'web_fetch', args: { url }, botId: turn.botId, sessionId: turn.botId,
         turnId: turn.turnId, isGroup: turn.isGroup,
@@ -30,7 +155,11 @@ function apply(context) {
     const { rpc, runtime } = iosHost()
     const id = exec.agent.session.id
     const active = runtime.activeTurns.get(id)
-    if (!active) throw new Error('The iOS tool bridge is available only during an active user turn')
+    if (!active) {
+      const fallback = await executeWebFallbackTool(context, name, args, exec)
+      if (fallback !== undefined) return fallback
+      throw new Error('The iOS tool bridge is available only during an active user turn')
+    }
     const botId = id.startsWith('ios:') ? id.slice(4) : id
     const result = await rpc.request('native.tool.execute', {
       name, args, botId, sessionId: botId, turnId: active.turnId, isGroup: active.isGroup,
@@ -63,7 +192,21 @@ function apply(context) {
       ...common, name: 'web_fetch', description: 'Fetch a text or HTML HTTPS page after the user approves its exact address.',
       parameters: { url: { type: 'string', required: true } }, timeoutMs: 70_000, execute: async (args, exec) => {
         const { runtime } = iosHost()
-        if (!runtime.activeTurns.has(exec.agent.session.id)) throw new Error('Only the parent Agent can request a web fetch')
+        if (exec?.agent?.session?.header?.parentSession != null) {
+          throw new Error('Only the parent Agent can request a web fetch')
+        }
+        const isNativeTurn = runtime.activeTurns.has(exec?.agent?.session?.id)
+        if (!isNativeTurn && context.approval?.request) {
+          const outcome = await context.approval.request({
+            agent: exec.agent,
+            toolName: 'web_fetch',
+            ...(exec.callId ? { callId: exec.callId } : {}),
+            reason: `Fetch HTTPS page: ${String(args?.url ?? '')}`,
+            displayReason: `允许访问以下 HTTPS 网页？\n${String(args?.url ?? '')}`,
+            signal: exec.signal,
+          })
+          if (outcome !== 'allowed-once') throw new Error('User did not approve web_fetch')
+        }
         const result = await context.web.fetch(args, exec.signal)
         return { output: result.body.content }
       },

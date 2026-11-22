@@ -61,9 +61,10 @@ public struct LongReplyReadingPill: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
-        .background(.ultraThinMaterial)
+        .background(DSTheme.surfaceElevated)
+        .overlay(Capsule().stroke(Color.secondary.opacity(0.18), lineWidth: 1))
         .clipShape(Capsule())
-        .shadow(radius: 2)
+        .shadow(color: .black.opacity(0.08), radius: 3, y: 1)
         .sheet(isPresented: $showOutline) {
             NavigationStack {
                 List(headings) { h in
@@ -158,6 +159,16 @@ public struct SideChatSheet: View {
                                             .padding(10)
                                             .background(msg.role == "You" ? DSTheme.brand.opacity(0.14) : Color(.secondarySystemBackground))
                                             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                            .contextMenu {
+                                                Button {
+                                                    #if canImport(UIKit)
+                                                    UIPasteboard.general.string = msg.text
+                                                    #endif
+                                                    DSHaptics.notify(.success)
+                                                } label: {
+                                                    Label("复制内容", systemImage: "doc.on.doc")
+                                                }
+                                            }
                                     }
                                     .id(idx)
                                 }
@@ -165,6 +176,7 @@ public struct SideChatSheet: View {
                             .padding()
                         }
                     }
+                    .scrollDismissesKeyboard(.interactively)
                     .onChange(of: messages.count) { count in
                         if count > 0 {
                             withAnimation { proxy.scrollTo(count - 1, anchor: .bottom) }
@@ -355,6 +367,8 @@ public struct GroupWorkspaceSheet: View {
             }
             .navigationTitle("群协作面板 (/goal)")
             .navigationBarTitleDisplayMode(.inline)
+            .scrollDismissesKeyboard(.interactively)
+            .refreshable { await reload() }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("完成") { dismiss() }
@@ -569,6 +583,12 @@ public struct MemoryVaultView: View {
                     ToolbarItem(placement: .topBarLeading) { Button("取消") { showAddMemory = false } }
                     ToolbarItem(placement: .topBarTrailing) {
                         Button("保存") {
+                            let decision = PrivacyGate.evaluateMemoryWrite(title: newMemTitle, content: newMemContent)
+                            if case .hardBlock(let reason) = decision {
+                                status = "隐私闸门拦截：\(reason)"
+                                DSHaptics.notify(.error)
+                                return
+                            }
                             Task {
                                 do {
                                     guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
@@ -578,7 +598,11 @@ public struct MemoryVaultView: View {
                                     newMemTitle = ""
                                     newMemContent = ""
                                     showAddMemory = false
-                                    status = ""
+                                    if case .softWarn(let reason) = decision {
+                                        status = "已保存（隐私提示：\(reason)）"
+                                    } else {
+                                        status = ""
+                                    }
                                     await reload()
                                 } catch { status = error.localizedDescription }
                             }
@@ -660,6 +684,7 @@ private struct DSHUsageRollup: Identifiable {
 
 public struct ConnectorsAndUsageView: View {
     @ObservedObject var host: LocalAgentHost
+    @ObservedObject private var costGovernor = CostBudgetGovernor.shared
     @State private var usageTotals = DSHUsageTotals()
     @State private var botUsage: [DSHUsageRollup] = []
     @State private var modelUsage: [DSHUsageRollup] = []
@@ -728,6 +753,48 @@ public struct ConnectorsAndUsageView: View {
                     Text("另有 \(unreadUsageSessions.formatted()) 个会话日志无法读取，统计可能不完整。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                }
+            }
+
+            Section("成本估算与预算守卫（3 态显示）") {
+                let primaryModel = modelUsage.first?.id ?? ModelProvider.defaultModel
+                let costState = CostBudgetGovernor.estimateCost(
+                    model: primaryModel,
+                    inputTokens: usageTotals.inputTokens,
+                    cacheReadTokens: usageTotals.cacheReadTokens,
+                    outputTokens: usageTotals.outputTokens
+                )
+                let cacheRatio = CostBudgetGovernor.cacheHitRatio(
+                    inputTokens: usageTotals.inputTokens,
+                    cacheReadTokens: usageTotals.cacheReadTokens
+                )
+                LabeledContent("预估费用（\(primaryModel)）", value: costState.formattedLabel)
+                LabeledContent("今日累计预估", value: String(format: "$%.4f", costGovernor.todayEstimatedSpendUSD))
+                LabeledContent("Prompt Cache 命中率", value: String(format: "%.1f%%", cacheRatio * 100))
+                if let warning = costGovernor.activeBudgetWarning {
+                    Text(warning)
+                        .font(.caption)
+                        .foregroundStyle(DSTheme.warning)
+                }
+                Stepper(
+                    value: $costGovernor.dailyBudgetUSD,
+                    in: 0...100,
+                    step: 0.5
+                ) {
+                    LabeledContent(
+                        "每日预算上限",
+                        value: costGovernor.dailyBudgetUSD > 0
+                            ? String(format: "$%.2f / 天", costGovernor.dailyBudgetUSD)
+                            : "不限制"
+                    )
+                }
+                if costGovernor.dailyBudgetUSD > 0 {
+                    Picker("超额策略", selection: $costGovernor.budgetAction) {
+                        ForEach(BudgetGuardAction.allCases) { action in
+                            Text(action.displayName).tag(action)
+                        }
+                    }
+                    .pickerStyle(.segmented)
                 }
             }
 
@@ -957,7 +1024,10 @@ public struct WorkspaceFilesView: View {
     }
 
     @State private var entries: [FileEntry] = []
-    @State private var selectedPreview: (url: URL, name: String, content: String)?
+    @State private var searchText = ""
+    @State private var selectedPreview: (url: URL, name: String, content: String, isEditable: Bool)?
+    @State private var editedPreviewContent = ""
+    @State private var isEditingPreview = false
     @State private var showImporter = false
     @State private var showNewFile = false
     @State private var newFileName = ""
@@ -974,6 +1044,12 @@ public struct WorkspaceFilesView: View {
         return dir
     }
 
+    private var filteredEntries: [FileEntry] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return entries }
+        return entries.filter { $0.name.localizedCaseInsensitiveContains(query) }
+    }
+
     public var body: some View {
         List {
             Section {
@@ -981,19 +1057,19 @@ public struct WorkspaceFilesView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Section("工作区文件（files/ · \(entries.count) 项）") {
-                if entries.isEmpty {
+            Section("工作区文件（files/ · \(filteredEntries.count) 项）") {
+                if filteredEntries.isEmpty {
                     DSEmptyStateView(
                         icon: "folder.badge.plus",
-                        title: "工作区暂无文件",
-                        subtitle: "点击右上角新建文本/代码文件，或从系统文件 App 导入文档与图片。",
-                        actionTitle: "新建文件"
+                        title: entries.isEmpty ? "工作区暂无文件" : "无匹配文件",
+                        subtitle: entries.isEmpty ? "点击右上角新建文本/代码文件，或从系统文件 App 导入文档与图片。" : "尝试更换搜索关键词。",
+                        actionTitle: entries.isEmpty ? "新建文件" : nil
                     ) {
                         showNewFile = true
                     }
                     .listRowBackground(Color.clear)
                 } else {
-                    ForEach(entries) { entry in
+                    ForEach(filteredEntries) { entry in
                         Button {
                             preview(entry)
                         } label: {
@@ -1025,6 +1101,7 @@ public struct WorkspaceFilesView: View {
                 Section { Text(status).font(.caption).foregroundStyle(.secondary) }
             }
         }
+        .searchable(text: $searchText, prompt: "筛选工作区文件名")
         .navigationTitle("工作区文件")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -1082,25 +1159,57 @@ public struct WorkspaceFilesView: View {
         }
         .sheet(isPresented: Binding(
             get: { selectedPreview != nil },
-            set: { if !$0 { selectedPreview = nil } }
+            set: { if !$0 { selectedPreview = nil; isEditingPreview = false } }
         )) {
             if let preview = selectedPreview {
                 NavigationStack {
-                    ScrollView {
-                        Text(preview.content)
-                            .font(.caption.monospaced())
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding()
-                            .textSelection(.enabled)
+                    Group {
+                        if isEditingPreview && preview.isEditable {
+                            TextEditor(text: $editedPreviewContent)
+                                .font(.caption.monospaced())
+                                .padding(8)
+                        } else {
+                            ScrollView {
+                                Text(preview.content)
+                                    .font(.caption.monospaced())
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding()
+                                    .textSelection(.enabled)
+                            }
+                        }
                     }
                     .navigationTitle(preview.name)
                     .navigationBarTitleDisplayMode(.inline)
                     .toolbar {
                         ToolbarItemGroup(placement: .topBarTrailing) {
+                            if preview.isEditable {
+                                if isEditingPreview {
+                                    Button("保存") {
+                                        do {
+                                            try Data(editedPreviewContent.utf8).write(to: preview.url, options: .atomic)
+                                            selectedPreview = (preview.url, preview.name, editedPreviewContent, true)
+                                            isEditingPreview = false
+                                            status = "已保存：files/\(preview.name)"
+                                            reload()
+                                        } catch {
+                                            status = "保存失败：\(error.localizedDescription)"
+                                        }
+                                    }
+                                    .fontWeight(.semibold)
+                                } else {
+                                    Button("编辑") {
+                                        editedPreviewContent = preview.content
+                                        isEditingPreview = true
+                                    }
+                                }
+                            }
                             ShareLink(item: preview.url) {
                                 Image(systemName: "square.and.arrow.up")
                             }
-                            Button("完成") { selectedPreview = nil }
+                            Button("完成") {
+                                selectedPreview = nil
+                                isEditingPreview = false
+                            }
                         }
                     }
                 }
@@ -1133,9 +1242,12 @@ public struct WorkspaceFilesView: View {
         }
         let slice = data.prefix(65_536)
         if let text = String(data: slice, encoding: .utf8) {
-            selectedPreview = (entry.url, entry.name, data.count > 65_536 ? text + "\n…(已截断)" : text)
+            let truncated = data.count > 65_536
+            selectedPreview = (entry.url, entry.name, truncated ? text + "\n…(已截断，仅只读预览)" : text, !truncated)
+            isEditingPreview = false
         } else {
-            selectedPreview = (entry.url, entry.name, "二进制文件（\(data.count) 字节），可使用右上角分享导出。")
+            selectedPreview = (entry.url, entry.name, "二进制文件（\(data.count) 字节），可使用右上角分享导出。", false)
+            isEditingPreview = false
         }
     }
 }
@@ -1152,6 +1264,7 @@ public struct SkillsManagerView: View {
     }
 
     @State private var skills: [SkillEntry] = []
+    @State private var searchText = ""
     @State private var editingSkill: SkillEntry?
     @State private var editContent = ""
     @State private var showCreate = false
@@ -1178,6 +1291,32 @@ public struct SkillsManagerView: View {
         return dir
     }
 
+    private func skillSummary(_ content: String) -> String {
+        for line in content.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.lowercased().hasPrefix("description:") {
+                let value = trimmed.dropFirst("description:".count).trimmingCharacters(in: .whitespacesAndNewlines)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                if !value.isEmpty { return value }
+            }
+        }
+        return content
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && $0 != "---" && !$0.lowercased().hasPrefix("name:") }
+            .prefix(2)
+            .joined(separator: " ")
+    }
+
+    private var filteredSkills: [SkillEntry] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return skills }
+        return skills.filter {
+            $0.name.localizedCaseInsensitiveContains(query)
+                || skillSummary($0.content).localizedCaseInsensitiveContains(query)
+        }
+    }
+
     public var body: some View {
         List {
             Section {
@@ -1185,26 +1324,26 @@ public struct SkillsManagerView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Section("已安装技能（\(skills.count)）") {
-                if skills.isEmpty {
+            Section("已安装技能（\(filteredSkills.count)）") {
+                if filteredSkills.isEmpty {
                     DSEmptyStateView(
                         icon: "wand.and.stars",
-                        title: "暂无自定义技能",
-                        subtitle: "点击右上角 + 新建一个 SKILL.md，赋予智能体可复用的标准作业流程。",
-                        actionTitle: "新建 SKILL.md"
+                        title: skills.isEmpty ? "暂无自定义技能" : "无匹配技能",
+                        subtitle: skills.isEmpty ? "点击右上角 + 新建一个 SKILL.md，赋予智能体可复用的标准作业流程。" : "尝试更换搜索关键词。",
+                        actionTitle: skills.isEmpty ? "新建 SKILL.md" : nil
                     ) {
                         showCreate = true
                     }
                     .listRowBackground(Color.clear)
                 } else {
-                    ForEach(skills) { skill in
+                    ForEach(filteredSkills) { skill in
                         Button {
                             editingSkill = skill
                             editContent = skill.content
                         } label: {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(skill.name).font(.subheadline.weight(.semibold))
-                                Text(skill.content.split(separator: "\n").prefix(2).joined(separator: " "))
+                                Text(skillSummary(skill.content))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                     .lineLimit(2)
@@ -1223,6 +1362,7 @@ public struct SkillsManagerView: View {
                 Section { Text(status).font(.caption).foregroundStyle(.secondary) }
             }
         }
+        .searchable(text: $searchText, prompt: "搜索技能名称或描述")
         .navigationTitle("Skill 技能管理")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {

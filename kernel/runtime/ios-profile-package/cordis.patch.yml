@@ -506,7 +506,7 @@
       name: '@deepseek-ai/dsh-session-turn-outline'
 
     - id: directory-picker
-      name: '@deepseek-ai/dsh-host-directory-picker-browse'
+      name: '@dsbot/dsh-ios-host/ios-directory-picker-browse'
 
     - id: plugin-inventory
       name: '@deepseek-ai/dsh-host-plugin-inventory'
@@ -534,6 +534,8 @@
 
     - id: workspace-controller
       name: '@deepseek-ai/dsh-api-workspace-controller'
+      config:
+        documentsDirectory: !!js process.env.DSH_HOME + '/files'
 
     - id: attachments
       name: '@deepseek-ai/dsh-attachment-local'
@@ -683,6 +685,9 @@
 
     - id: ui-workspace
       name: '@deepseek-ai/dsh-client-ui-workspace'
+
+    - id: ui-directory-picker-browse
+      name: '@deepseek-ai/dsh-client-ui-directory-picker-browse'
 
     - id: ui-brand-official
       name: '@deepseek-ai/dsh-client-ui-brand-official'

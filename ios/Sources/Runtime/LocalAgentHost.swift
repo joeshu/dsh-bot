@@ -319,9 +319,9 @@ public struct BotProfile: Identifiable, Codable, Equatable {
 
     public var permissionModeLabel: String {
         switch permissionMode {
-        case "autoReview": return "自动审查"
-        case "readOnly": return "只读模式"
-        default: return "每次询问"
+        case "autoReview": return "沙盒免打扰"
+        case "readOnly": return "只读保护"
+        default: return "标准审批"
         }
     }
 
@@ -425,6 +425,7 @@ public final class LocalAgentHost: ObservableObject {
     private var historyEpochs: [String: UUID] = [:]
     private var legacyMessagesBySession: [String: [ChatMessageItem]] = [:]
     @Published public private(set) var streamingSessionId: String?
+    @Published public var visibleChatSessionId: String?
     @Published public private(set) var streamingReasoning: String = ""
     @Published public private(set) var streamingContent: String = ""
     @Published public private(set) var isStreaming: Bool = false
@@ -455,6 +456,7 @@ public final class LocalAgentHost: ObservableObject {
     private var pluginCatalogRequest = UUID()
     private var pluginCatalogQuery = ""
     @Published public private(set) var activeTurnId: String?
+    private var groupLeaseWatchdogTask: Task<Void, Never>?
     @Published public var useBubbleLayout: Bool = (UserDefaults.standard.object(forKey: "dsbot.useBubbleLayout") as? Bool) ?? true {
         didSet { UserDefaults.standard.set(useBubbleLayout, forKey: "dsbot.useBubbleLayout") }
     }
@@ -530,7 +532,18 @@ public final class LocalAgentHost: ObservableObject {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         guard let data = try? encoder.encode(payload) else { return "{}" }
-        return String(decoding: data, as: UTF8.self)
+        return SecretRedactor.redactCommonTokens(String(decoding: data, as: UTF8.self))
+    }
+
+    public func refreshSessionPersona(botId: String) async -> Bool {
+        guard let channel else { return false }
+        let prompt = bots.first(where: { $0.id == botId })?.systemPrompt ?? ""
+        let res = try? await channel.request(
+            "session.refreshPersona",
+            params: ["sessionId": botId, "systemPrompt": prompt],
+            timeoutSeconds: 10
+        )
+        return res?["refreshed"] as? Bool == true
     }
 
     func refreshModels() async throws -> (latency: Int, count: Int) {
@@ -642,14 +655,34 @@ public final class LocalAgentHost: ObservableObject {
     }
 
     public func setAgentPreset(sessionId: String, presetId: String) {
-        guard dshAgentPresets.contains(where: { $0.id == presetId && $0.isAvailable }),
+        guard !isStreaming,
+              dshAgentPresets.contains(where: { $0.id == presetId && $0.isAvailable }),
               let index = bots.firstIndex(where: { $0.id == sessionId }) else { return }
-        guard messagesBySession[sessionId]?.isEmpty != false else {
-            pluginStatus = "DSH 模式在会话开始后固定；请新建 Bot 会话再切换模式。"
-            return
-        }
         guard bots[index].agentPreset != presetId else { return }
         bots[index].agentPreset = presetId
+        persistWorkspace()
+        DSHaptics.impact(.light)
+    }
+
+    public func setPermissionMode(sessionId: String, mode: String) {
+        guard !isStreaming,
+              ["ask", "autoReview", "readOnly"].contains(mode),
+              let index = bots.firstIndex(where: { $0.id == sessionId }) else { return }
+        guard bots[index].permissionMode != mode else { return }
+        bots[index].permissionMode = mode
+        if mode == "readOnly", bots[index].agentPreset == "redteam" {
+            bots[index].agentPreset = "standard"
+        }
+        persistWorkspace()
+        DSHaptics.impact(.light)
+    }
+
+    public func setBotModel(sessionId: String, model: String) {
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let index = bots.firstIndex(where: { $0.id == sessionId }) else { return }
+        guard bots[index].model != trimmed else { return }
+        bots[index].model = trimmed
         persistWorkspace()
     }
 
@@ -735,7 +768,24 @@ public final class LocalAgentHost: ObservableObject {
             lastStreamError = "消息超过 256 KB。"
             return
         }
-        if bots.first(where: { $0.id == sessionId })?.isPrivate == true,
+        switch CostBudgetGovernor.shared.evaluateCurrentDailySpend() {
+        case .block(let reason):
+            lastStreamError = reason
+            DSHaptics.notify(.warning)
+            return
+        case .warn(let reason):
+            CostBudgetGovernor.shared.activeBudgetWarning = reason
+        case .allow:
+            CostBudgetGovernor.shared.activeBudgetWarning = nil
+        }
+        let targetBot = bots.first(where: { $0.id == sessionId })
+        if let preset = targetBot?.agentPreset, (preset == "ptc-python" || preset == "cordis"),
+           !MemoryGovernor.shared.canAdmitHeavyWork() {
+            lastStreamError = "系统可用内存不足（< 180 MB），已拦截重型工具执行以避免闪退，请关闭其他应用后重试。"
+            DSHaptics.notify(.warning)
+            return
+        }
+        if targetBot?.isPrivate == true,
            !(await syncPrivateSessionAccess(on: channel)) {
             lastStreamError = "私密会话 Web API 隔离尚未同步；请稍后重试。"
             return
@@ -758,6 +808,15 @@ public final class LocalAgentHost: ObservableObject {
         let bot = bots.first(where: { $0.id == sessionId })
         let legacyHistory = (legacyMessagesBySession[sessionId] ?? []).suffix(12).map { message in
             ["role": message.role, "content": String(message.content.prefix(12_000))]
+        }
+        if bot?.isGroup == true {
+            groupLeaseWatchdogTask?.cancel()
+            groupLeaseWatchdogTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 90_000_000_000)
+                guard let self, self.activeTurnId == turnId, self.isStreaming else { return }
+                self.lastStreamError = "群聊编排超过 90 秒租约（interrupted），已安全中止等待。"
+                await self.abortActiveTurn()
+            }
         }
         do {
             _ = try await channel.request("chat.send", params: [
@@ -931,8 +990,8 @@ public final class LocalAgentHost: ObservableObject {
         if let agentPreset, agentPreset != bots[idx].agentPreset {
             if !dshAgentPresets.contains(where: { $0.id == agentPreset && $0.isAvailable }) {
                 pluginStatus = "所选 DSH 模式不可用；请刷新运行时模式列表后重试。"
-            } else if hasSessionHistory(id) {
-                pluginStatus = "DSH 模式在会话开始后固定；请新建 Bot 会话再切换模式。"
+            } else if streamingSessionId == id {
+                pluginStatus = "当前 Bot 正在生成；请等待本轮完成后再切换模式。"
             } else {
                 bots[idx].agentPreset = agentPreset
             }
@@ -967,6 +1026,10 @@ public final class LocalAgentHost: ObservableObject {
         }
         if let sensitiveDataEnabled {
             bots[index].redteamSensitiveDataEnabled = bots[index].redteamToolsEnabled && sensitiveDataEnabled
+        }
+        if bots[index].agentPreset == "redteam",
+           (!bots[index].redteamToolsEnabled || !bots[index].redteamWriteEnabled || !bots[index].redteamSensitiveDataEnabled || bots[index].permissionMode == "readOnly") {
+            bots[index].agentPreset = "standard"
         }
         persistWorkspace()
     }
@@ -1025,12 +1088,28 @@ public final class LocalAgentHost: ObservableObject {
             throw IPCFrameError.remoteError(code: -32602, message: "只能附加普通文件。")
         }
         let maxImportBytes = 2 * 1024 * 1024
-        if let size = values.fileSize, size > maxImportBytes {
-            throw IPCFrameError.remoteError(code: -32602, message: "单个附件不能超过 2 MB。")
-        }
-        let data = try Data(contentsOf: sourceURL)
-        guard data.count <= maxImportBytes else {
-            throw IPCFrameError.remoteError(code: -32602, message: "单个附件不能超过 2 MB。")
+        let maxRawImageBytes = 25 * 1024 * 1024
+        let sourceExt = sourceURL.pathExtension.lowercased()
+        let isImage = ["png", "jpg", "jpeg", "heic", "heif", "webp", "bmp", "tif", "tiff"].contains(sourceExt)
+        let data: Data
+        if isImage, let size = values.fileSize, size > maxImportBytes {
+            guard size <= maxRawImageBytes else {
+                throw IPCFrameError.remoteError(code: -32602, message: "单张图片不能超过 25 MB。")
+            }
+            guard let downsampled = MemoryGovernor.downsampleImage(at: sourceURL, maxPixelSize: 1568, compressionQuality: 0.82),
+                  downsampled.count <= maxImportBytes else {
+                throw IPCFrameError.remoteError(code: -32602, message: "图片压缩后仍超过 2 MB，请裁剪后重试。")
+            }
+            data = downsampled
+        } else {
+            if let size = values.fileSize, size > maxImportBytes {
+                throw IPCFrameError.remoteError(code: -32602, message: "单个附件不能超过 2 MB。")
+            }
+            let rawData = try Data(contentsOf: sourceURL)
+            guard rawData.count <= maxImportBytes else {
+                throw IPCFrameError.remoteError(code: -32602, message: "单个附件不能超过 2 MB。")
+            }
+            data = rawData
         }
         let rawName = sourceURL.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
         let safeChars = rawName.map { ch -> Character in
@@ -1190,6 +1269,15 @@ public final class LocalAgentHost: ObservableObject {
             }
             await refreshPluginState(on: rpc)
             await synchronizeRedteamHost(on: rpc)
+            MemoryGovernor.shared.onCriticalPressure = { [weak self] in
+                guard let self else { return }
+                Task { @MainActor in
+                    if self.isStreaming {
+                        self.lastStreamError = "系统内存紧张，已安全暂停当前生成以保护进度。"
+                        await self.abortActiveTurn()
+                    }
+                }
+            }
             state = .ready
         } catch {
             resolveRuntimeReadiness(.remoteError(code: -32000, message: error.localizedDescription))
@@ -1211,7 +1299,19 @@ public final class LocalAgentHost: ObservableObject {
     }
 
     public func resumeFromBackground() async {
-        _ = try? await channel?.request("agent.resume")
+        MemoryGovernor.shared.refreshSnapshot()
+        guard let channel else { return }
+        _ = try? await channel.request("agent.resume")
+        do {
+            let health = try await channel.request("runtime.health", timeoutSeconds: 4)
+            if health["ok"] as? Bool != true, state == .ready, !isStreaming {
+                _ = await restartRuntime()
+            }
+        } catch {
+            if state == .ready, !isStreaming {
+                _ = await restartRuntime()
+            }
+        }
     }
 
     public func abortActiveTurn() async {
@@ -2004,6 +2104,20 @@ public final class LocalAgentHost: ObservableObject {
             messagesBySession[sessionId, default: []].append(item)
             persistWorkspace()
         }
+        if let usage = params["usage"] as? [String: Any] {
+            let model = usage["model"] as? String ?? ModelProvider.defaultModel
+            let inputTokens = usage["inputTokens"] as? Int ?? 0
+            let cacheReadTokens = usage["cacheReadTokens"] as? Int ?? 0
+            let outputTokens = usage["outputTokens"] as? Int ?? 0
+            CostBudgetGovernor.shared.recordUsage(
+                model: model,
+                inputTokens: inputTokens,
+                cacheReadTokens: cacheReadTokens,
+                outputTokens: outputTokens
+            )
+        }
+        groupLeaseWatchdogTask?.cancel()
+        groupLeaseWatchdogTask = nil
         streamingReasoning = ""
         streamingContent = ""
         streamingSessionId = nil
@@ -2082,25 +2196,46 @@ public final class LocalAgentHost: ObservableObject {
 
         let botMode = bots.first(where: { $0.id == sessionId })?.permissionMode ?? "ask"
         let lowerTool = tool.lowercased()
-        let isWriteOrMutate = lowerTool.contains("write") || lowerTool.contains("edit") || lowerTool.contains("patch") || lowerTool.contains("delete") || lowerTool.contains("memory")
-        let isLowRiskReadOnly = lowerTool.contains("workspace_list") || lowerTool.contains("workspace_read") || lowerTool.contains("workspace_search") || lowerTool == "read" || lowerTool == "grep" || lowerTool == "glob" || lowerTool.contains("device_status") || lowerTool.contains("device.status") || lowerTool.contains("remote_mcp_list")
+        let isWriteOrMutate = lowerTool.contains("write") || lowerTool.contains("edit") || lowerTool.contains("patch")
+            || lowerTool.contains("delete") || lowerTool.contains("memory") || lowerTool == "terminal_exec"
+            || lowerTool.hasPrefix("redteam_")
+        let isHighRiskOrExternal = lowerTool.contains("delete") || lowerTool == "python_exec"
+            || lowerTool == "run_code" || lowerTool == "python_job_start"
+            || lowerTool == "remote_mcp_call" || lowerTool == "web_fetch"
+        let isSandboxDevEligible = lowerTool == "read" || lowerTool == "grep" || lowerTool == "glob"
+            || lowerTool == "write" || lowerTool == "edit" || lowerTool == "apply_patch" || lowerTool == "patch"
+            || lowerTool == "workspace_list" || lowerTool == "workspace_read" || lowerTool == "workspace_search"
+            || lowerTool == "workspace_write" || lowerTool == "workspace_edit"
+            || lowerTool == "terminal_exec" || lowerTool == "git_workspace"
+            || lowerTool == "memory_save" || lowerTool == "group_todo_add"
+            || lowerTool == "web_search" || lowerTool == "device_status" || lowerTool == "remote_mcp_list"
+            || lowerTool.hasPrefix("redteam_")
 
         let approval = PendingApproval(id: id, sessionId: sessionId, turnId: turnId, tool: tool, summary: summary, isDSH: params["source"] as? String == "dsh")
         pendingApprovals.append(approval)
 
         if botMode == "readOnly" && isWriteOrMutate {
-            autoReviewLog.insert("[\(Date().formatted(date: .omitted, time: .shortened))] 只读拦截：\(tool)", at: 0)
+            autoReviewLog.insert("[\(Date().formatted(date: .omitted, time: .shortened))] 只读保护拦截：\(tool)", at: 0)
             if autoReviewLog.count > 40 { autoReviewLog = Array(autoReviewLog.prefix(40)) }
             Task { await respondToApproval(id: id, approved: false) }
             return
         }
 
-        if (autoReviewEnabled || botMode == "autoReview") && isLowRiskReadOnly {
-            autoReviewLog.insert("[\(Date().formatted(date: .omitted, time: .shortened))] 自动放行：\(tool)", at: 0)
+        if (autoReviewEnabled || botMode == "autoReview") && isSandboxDevEligible && !isHighRiskOrExternal {
+            autoReviewLog.insert("[\(Date().formatted(date: .omitted, time: .shortened))] 沙盒免打扰放行：\(tool)", at: 0)
             if autoReviewLog.count > 40 { autoReviewLog = Array(autoReviewLog.prefix(40)) }
             Task { await respondToApproval(id: id, approved: true) }
             return
         }
+    }
+
+    public func approveAndSwitchToAutoReview(id: String) async {
+        if let approval = pendingApprovals.first(where: { $0.id == id }),
+           let index = bots.firstIndex(where: { $0.id == approval.sessionId }) {
+            bots[index].permissionMode = "autoReview"
+            persistWorkspace()
+        }
+        await respondToApproval(id: id, approved: true)
     }
 
     private func handleDSHQuestionNotification(method: String, params: [String: Any]) {
@@ -2142,12 +2277,14 @@ public final class LocalAgentHost: ObservableObject {
               let callId = params["callId"] as? String, !callId.isEmpty else { return }
         let phase = params["phase"] as? String ?? "started"
         let toolName = params["toolName"] as? String ?? "DSH tool"
+        let redactedArgs = (params["arguments"] as? String).map { SecretRedactor.redactCommonTokens($0) }
+        let redactedResult = (params["result"] as? String).map { SecretRedactor.redactCommonTokens($0) }
         if let index = dshToolActivities.firstIndex(where: {
             $0.sessionId == sessionId && $0.callId == callId
         }) {
             dshToolActivities[index].phase = phase
-            if let arguments = params["arguments"] as? String { dshToolActivities[index].arguments = arguments }
-            if let result = params["result"] as? String { dshToolActivities[index].result = result }
+            if let arguments = redactedArgs { dshToolActivities[index].arguments = arguments }
+            if let result = redactedResult { dshToolActivities[index].result = result }
             if let fileSummary = params["fileSummary"] as? String { dshToolActivities[index].fileSummary = fileSummary }
             if let timestamp = params["timestamp"] { dshToolActivities[index].timestamp = Self.sessionDate(timestamp) }
             if let sequence = params["sequence"] as? Int { dshToolActivities[index].sequence = sequence }
@@ -2163,8 +2300,8 @@ public final class LocalAgentHost: ObservableObject {
                 turnId: turnId,
                 toolName: toolName,
                 phase: phase,
-                arguments: params["arguments"] as? String ?? "",
-                result: params["result"] as? String ?? "",
+                arguments: redactedArgs ?? "",
+                result: redactedResult ?? "",
                 fileSummary: params["fileSummary"] as? String,
                 timestamp: Self.sessionDate(params["timestamp"]),
                 sequence: params["sequence"] as? Int,

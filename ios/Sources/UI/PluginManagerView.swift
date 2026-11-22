@@ -36,11 +36,19 @@ public struct PluginManagerView: View {
     @State private var newSourceURL = ""
     @State private var githubRepoURL = ""
     @State private var showFolderPicker = false
+    @State private var isInstalling = false
     @State private var pendingInstall: PendingPluginInstall?
     @State private var pendingRemoval: DSHInstalledPlugin?
 
     public init(host: LocalAgentHost) {
         self.host = host
+    }
+
+    private var hasPendingRestart: Bool {
+        !host.isDSHRecoveryMode && (
+            host.installedPlugins.contains(where: { $0.desiredEnabled != $0.enabled })
+                || (host.pluginStatus?.contains("重启") == true)
+        )
     }
 
     public var body: some View {
@@ -60,6 +68,26 @@ public struct PluginManagerView: View {
                     AgentSettingsFormSections(host: host)
 
                 case .plugins:
+                    if hasPendingRestart {
+                        Section {
+                            DSBannerCard(
+                                icon: "arrow.triangle.2.circlepath.circle.fill",
+                                tint: DSTheme.warning,
+                                message: "检测到插件安装/更新或开关变更，重启 DSH 引擎后即可生效。",
+                                actionTitle: "立即重启"
+                            ) {
+                                Task {
+                                    let result = await host.restartRuntime()
+                                    host.setPluginStatus(result)
+                                    await host.refreshPluginState()
+                                    await host.refreshRedteamStatus()
+                                }
+                            }
+                        }
+                        .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
+                        .listRowBackground(Color.clear)
+                    }
+
                     pluginSecurityNoticeSection
 
                     Section {
@@ -78,6 +106,17 @@ public struct PluginManagerView: View {
                         discoverSection
                     case .sources:
                         sourcesSection
+                    }
+
+                    if isInstalling {
+                        Section {
+                            HStack(spacing: 10) {
+                                ProgressView()
+                                Text("正在下载、校验依赖并写入 DSH Profile…")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
                     }
 
                     if let status = host.pluginStatus, !status.isEmpty {
@@ -101,7 +140,7 @@ public struct PluginManagerView: View {
                         } label: {
                             Image(systemName: "arrow.clockwise")
                         }
-                        .disabled(host.state != .ready)
+                        .disabled(host.state != .ready || isInstalling)
                     }
                 }
             }
@@ -134,10 +173,12 @@ public struct PluginManagerView: View {
             }
             .alert(item: $pendingInstall) { target in
                 Alert(
-                    title: Text("安装第三方插件代码？"),
-                    message: Text("插件代码将在 DSH Node 进程中运行，可访问应用沙盒和网络。仅继续安装你已审阅并信任的插件。"),
+                    title: Text("安装 / 更新第三方插件代码？"),
+                    message: Text("插件代码将在 DSH Node 进程中运行，可访问应用沙盒和网络。支持已安装插件就地安全更新（失败自动回滚）。仅继续安装你已审阅并信任的插件。"),
                     primaryButton: .default(Text("继续安装")) {
+                        isInstalling = true
                         Task {
+                            defer { isInstalling = false }
                             switch target {
                             case .catalog(let plugin): await host.installPlugin(plugin)
                             case .github(let url):
@@ -361,10 +402,11 @@ public struct PluginManagerView: View {
             } label: {
                 Label("从本地文件夹导入 DSH Bundle", systemImage: "folder")
             }
+            .disabled(isInstalling || host.state != .ready)
         }
 
-        Section("从 GitHub 仓库直接安装") {
-            TextField("https://github.com/owner/repo 或 owner/repo", text: $githubRepoURL)
+        Section("从 GitHub 仓库直接安装 / 更新") {
+            TextField("https://github.com/owner/repo 或 owner/repo@branch", text: $githubRepoURL)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .keyboardType(.URL)
@@ -373,10 +415,10 @@ public struct PluginManagerView: View {
                 guard !target.isEmpty else { return }
                 pendingInstall = .github(target)
             } label: {
-                Label("下载并安装 GitHub 插件", systemImage: "arrow.down.circle")
+                Label(isInstalling ? "正在安装…" : "下载并安装 / 更新 GitHub 插件", systemImage: "arrow.down.circle")
             }
-            .disabled(githubRepoURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || host.state != .ready)
-            Text("适用于尚未收录到公共索引源的 DSH 插件仓库（如 joeshu/dsh-purge-safe）。")
+            .disabled(isInstalling || githubRepoURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || host.state != .ready)
+            Text("支持仓库地址、分支（/tree/分支）、Release 标签（/releases/tag/v1.0）及已安装插件的就地原子更新（如 CallMeGuLab/dsh-purge-safe）。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -518,6 +560,14 @@ public struct PluginDetailView: View {
     @ObservedObject var host: LocalAgentHost
     let pluginId: String
     @State private var confirmUninstall = false
+    @State private var auditLoading = false
+    @State private var auditRiskLevel: String = ""
+    @State private var auditFileCount: Int = 0
+    @State private var auditTotalKB: Int = 0
+    @State private var auditDshEngine: String = ""
+    @State private var auditDshCompatible: Bool = true
+    @State private var auditFindings: [String] = []
+    @State private var auditError: String = ""
 
     public init(host: LocalAgentHost, pluginId: String) {
         self.host = host
@@ -526,6 +576,15 @@ public struct PluginDetailView: View {
 
     private var plugin: DSHInstalledPlugin? {
         host.installedPlugins.first(where: { $0.id == pluginId })
+    }
+
+    private var riskBadge: (label: String, color: Color) {
+        switch auditRiskLevel {
+        case "elevated": return ("需留意权限", DSTheme.warning)
+        case "standard": return ("常规网络能力", DSTheme.brand)
+        case "low": return ("低风险纯沙盒", DSTheme.success)
+        default: return ("待体检", .secondary)
+        }
     }
 
     public var body: some View {
@@ -575,6 +634,37 @@ public struct PluginDetailView: View {
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                     }
+                }
+
+                Section("安全与健康体检") {
+                    if auditLoading {
+                        ProgressView("正在扫描插件代码与依赖契约…")
+                    } else if !auditError.isEmpty {
+                        Text(auditError).font(.caption).foregroundStyle(.secondary)
+                    } else if !auditRiskLevel.isEmpty {
+                        LabeledContent("静态风险评级") {
+                            DSStatusBadge(riskBadge.label, color: riskBadge.color)
+                        }
+                        LabeledContent("DSH 引擎契约", value: "\(auditDshEngine) · \(auditDshCompatible ? "兼容" : "不兼容")")
+                        LabeledContent("文件数 / 磁盘占用", value: "\(auditFileCount) 个文件 · \(auditTotalKB) KB")
+                        if auditFindings.isEmpty {
+                            Text("未检出子进程、动态求值或网络调用特征。")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(auditFindings, id: \.self) { finding in
+                                Text("• \(finding)")
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    Button {
+                        Task { await runAudit(name: plugin.name) }
+                    } label: {
+                        Label("重新执行安全体检", systemImage: "checkmark.shield")
+                    }
+                    .disabled(auditLoading)
                 }
 
                 let components = plugin.components.isEmpty
@@ -629,6 +719,11 @@ public struct PluginDetailView: View {
         }
         .navigationTitle(plugin?.name ?? "插件详情")
         .navigationBarTitleDisplayMode(.inline)
+        .task(id: plugin?.name) {
+            if let name = plugin?.name {
+                await runAudit(name: name)
+            }
+        }
         .confirmationDialog("确定卸载插件「\(plugin?.name ?? "")」？", isPresented: $confirmUninstall, titleVisibility: .visible) {
             Button("卸载", role: .destructive) {
                 if let target = plugin {
@@ -639,6 +734,24 @@ public struct PluginDetailView: View {
                 }
             }
             Button("取消", role: .cancel) {}
+        }
+    }
+
+    private func runAudit(name: String) async {
+        guard let rpc = host.rpc() else { return }
+        auditLoading = true
+        auditError = ""
+        defer { auditLoading = false }
+        do {
+            let res = try await rpc.request("plugins.audit", params: ["name": name], timeoutSeconds: 15)
+            auditRiskLevel = res["riskLevel"] as? String ?? "low"
+            auditFileCount = res["fileCount"] as? Int ?? 0
+            auditTotalKB = res["totalKB"] as? Int ?? 0
+            auditDshEngine = res["dshEngine"] as? String ?? "未声明"
+            auditDshCompatible = res["dshCompatible"] as? Bool ?? true
+            auditFindings = res["findings"] as? [String] ?? []
+        } catch {
+            auditError = "安全体检失败：\(error.localizedDescription)"
         }
     }
 }

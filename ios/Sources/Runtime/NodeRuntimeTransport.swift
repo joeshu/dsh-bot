@@ -51,13 +51,15 @@ public final class NodeRuntimeTransport: IPCByteTransport, @unchecked Sendable {
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
+        let oldSpaceMB = MemoryGovernor.recommendedNodeOldSpaceMB()
         arguments = [
-            "node", "--no-warnings", "--expose-internals", entry.path,
+            "node", "--no-warnings", "--expose-internals", "--max-old-space-size=\(oldSpaceMB)", entry.path,
             "--ipc-fd=\(nodeFD)",
             "--workspace=\(workspace.path)",
             "--database=\(database.path)",
             "--api-base=\(apiBaseURL)",
             "--private-session-ids=\(privateIdsToken)",
+            "--worker-heap-mb=\(oldSpaceMB)",
         ]
     }
 

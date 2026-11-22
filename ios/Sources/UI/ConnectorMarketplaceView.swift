@@ -109,6 +109,7 @@ public struct ConnectorMarketplaceView: View {
     @State private var savedConnectors: [(id: String, type: String, name: String, endpoint: String)] = []
     @State private var activeItem: ConnectorCatalogItem?
     @State private var showCustomSheet = false
+    @State private var pendingDeleteConnector: (id: String, name: String)?
     @State private var statusBanner = ""
 
     public init(host: LocalAgentHost) {
@@ -204,7 +205,7 @@ public struct ConnectorMarketplaceView: View {
                                     .buttonStyle(.bordered)
                                     .font(.caption)
                                     Button(role: .destructive) {
-                                        Task { await deleteConnector(id: c.id) }
+                                        pendingDeleteConnector = (c.id, c.name)
                                     } label: {
                                         Image(systemName: "trash")
                                             .font(.caption)
@@ -312,6 +313,22 @@ public struct ConnectorMarketplaceView: View {
         }
         .task { await reload() }
         .refreshable { await reload() }
+        .confirmationDialog(
+            "确定移除连接器「\(pendingDeleteConnector?.name ?? "")」及其 Keychain 凭据？",
+            isPresented: Binding(
+                get: { pendingDeleteConnector != nil },
+                set: { if !$0 { pendingDeleteConnector = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("移除连接器", role: .destructive) {
+                if let target = pendingDeleteConnector {
+                    pendingDeleteConnector = nil
+                    Task { await deleteConnector(id: target.id) }
+                }
+            }
+            Button("取消", role: .cancel) { pendingDeleteConnector = nil }
+        }
     }
 
     private func reload() async {

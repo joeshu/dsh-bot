@@ -137,6 +137,7 @@ public struct ScheduleManagerView: View {
     }
 
     private func reload() async {
+        guard !isLoading else { return }
         isLoading = true
         defer { isLoading = false }
         do {
@@ -149,6 +150,8 @@ public struct ScheduleManagerView: View {
                 ($0["scheduledAt"] as? String ?? "") < ($1["scheduledAt"] as? String ?? "")
             }
             errorMessage = ""
+        } catch is CancellationError {
+            return
         } catch {
             errorMessage = "无法读取定时任务：\(error.localizedDescription)"
         }
@@ -171,6 +174,8 @@ public struct ScheduleManagerView: View {
             }
             errorMessage = ""
             await reload()
+        } catch is CancellationError {
+            return
         } catch {
             errorMessage = "定时任务操作失败：\(error.localizedDescription)"
         }

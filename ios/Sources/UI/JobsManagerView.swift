@@ -1,4 +1,7 @@
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
 
 public struct JobsBotPickerView: View {
     @ObservedObject var host: LocalAgentHost
@@ -338,7 +341,18 @@ private struct JobOutputView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) { Button("完成") { dismiss() } }
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if !output.isEmpty {
+                    Button {
+                        #if canImport(UIKit)
+                        UIPasteboard.general.string = SecretRedactor.redactCommonTokens(output)
+                        #endif
+                        DSHaptics.notify(.success)
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                    }
+                    .accessibilityLabel("复制脱敏任务输出")
+                }
                 Button {
                     Task { await reload() }
                 } label: {

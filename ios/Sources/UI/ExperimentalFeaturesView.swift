@@ -1,5 +1,8 @@
 import SwiftUI
 import UniformTypeIdentifiers
+#if canImport(UIKit)
+import UIKit
+#endif
 
 public struct ExperimentalFeaturesView: View {
     @ObservedObject var host: LocalAgentHost
@@ -540,6 +543,7 @@ public struct GitWorktreeTrackerView: View {
 
 public struct BackendDevToolsInspectorView: View {
     @ObservedObject var host: LocalAgentHost
+    @ObservedObject private var memoryGovernor = MemoryGovernor.shared
     @State private var nodeVersion: String = "-"
     @State private var dshVersion: String = "-"
     @State private var uptimeSeconds: Int = 0
@@ -554,6 +558,20 @@ public struct BackendDevToolsInspectorView: View {
 
     public var body: some View {
         Form {
+            Section("iOS 宿主机 Jetsam 与内存治理") {
+                let snap = memoryGovernor.snapshot
+                LabeledContent("物理内存占用 (phys_footprint)", value: String(format: "%.1f MB", snap.physFootprintMB))
+                LabeledContent("Jetsam 可用余量", value: snap.availableMB > 0 ? String(format: "%.1f MB", snap.availableMB) : "模拟器/未知")
+                LabeledContent("内存压力等级", value: snap.tier.displayName)
+                LabeledContent("NodeMobile V8 堆上限", value: "\(snap.nodeHeapLimitMB) MB")
+                LabeledContent("打开文件描述符 (FD)", value: "\(snap.openFDCount)")
+                LabeledContent("MetricKit 遥测", value: snap.lastMetricSummary)
+                Button("刷新内存快照") {
+                    memoryGovernor.refreshSnapshot()
+                }
+                .font(.caption)
+            }
+
             Section("NodeMobile 与 DSH 内核实时指标") {
                 LabeledContent("Node.js 版本", value: nodeVersion)
                 LabeledContent("DSH 核心版本", value: dshVersion)
@@ -642,6 +660,7 @@ public struct BackendDevToolsInspectorView: View {
     }
 
     private func refreshInspector() async {
+        memoryGovernor.refreshSnapshot()
         guard let rpc = host.rpc() else { return }
         if let res = try? await rpc.request("devtools.inspect", timeoutSeconds: 10) {
             nodeVersion = res["nodeVersion"] as? String ?? "-"
@@ -662,9 +681,10 @@ public struct BackendDevToolsInspectorView: View {
         guard let rpc = host.rpc() else { return }
         do {
             let res = try await rpc.request("devtools.eval", params: ["expression": evalExpression], timeoutSeconds: 10)
-            evalOutput = res["output"] as? String ?? ""
+            let raw = res["output"] as? String ?? ""
+            evalOutput = SecretRedactor.redactCommonTokens(raw)
         } catch {
-            evalOutput = "错误：\(error.localizedDescription)"
+            evalOutput = "错误：\(SecretRedactor.redactCommonTokens(error.localizedDescription))"
         }
     }
 }
@@ -818,21 +838,46 @@ public struct SessionDiagnosticsSheet: View {
                 }
 
                 Section("运行时与存储") {
+                    let memSnap = MemoryGovernor.shared.snapshot
                     LabeledContent("内嵌引擎", value: host.embeddedRuntimeLabel ?? "NodeMobile 24.22.3")
                     LabeledContent("SQLite 大小", value: ByteCountFormatter.string(fromByteCount: host.sqliteDatabaseSizeBytes(), countStyle: .file))
+                    LabeledContent("物理内存 / Jetsam 余量", value: String(format: "%.1f MB / %.1f MB", memSnap.physFootprintMB, memSnap.availableMB))
+                    LabeledContent("压力等级 / 打开 FD", value: "\(memSnap.tier.displayName) · \(memSnap.openFDCount) FD")
                     LabeledContent("自动授权审查", value: host.autoReviewEnabled ? "已开启" : "关闭")
+                    Button {
+                        let mem = MemoryGovernor.shared.refreshSnapshot()
+                        let rawReport = """
+                        DS-Bot Session Diagnostics
+                        sessionId: \(bot.id)
+                        model: \(bot.model)
+                        preset: \(bot.agentPreset)
+                        messages: user=\(userCount), assistant=\(assistantCount)
+                        physFootprintMB: \(String(format: "%.1f", mem.physFootprintMB))
+                        availableMB: \(String(format: "%.1f", mem.availableMB))
+                        pressureTier: \(mem.tier.rawValue)
+                        openFD: \(mem.openFDCount)
+                        nodeHeapCapMB: \(mem.nodeHeapLimitMB)
+                        """
+                        #if canImport(UIKit)
+                        UIPasteboard.general.string = SecretRedactor.redactCommonTokens(rawReport)
+                        #endif
+                        DSHaptics.notify(.success)
+                    } label: {
+                        Label("复制脱敏诊断摘要", systemImage: "doc.on.doc")
+                    }
                 }
 
                 if !host.autoReviewLog.isEmpty {
                     Section("自动审查审计记录") {
                         ForEach(host.autoReviewLog.prefix(15), id: \.self) { line in
-                            Text(line).font(.caption.monospaced()).foregroundStyle(.secondary)
+                            Text(SecretRedactor.redactCommonTokens(line)).font(.caption.monospaced()).foregroundStyle(.secondary)
                         }
                     }
                 }
             }
             .navigationTitle("会话数据诊断")
             .navigationBarTitleDisplayMode(.inline)
+            .onAppear { MemoryGovernor.shared.refreshSnapshot() }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("完成") { dismiss() }

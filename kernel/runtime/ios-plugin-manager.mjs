@@ -147,6 +147,14 @@ async function stageWritablePurgeSafeAiBase(pluginRoot) {
   await mkdir(join(writableAiBase, 'dsh-agent-instructions', 'lib'), { recursive: true })
   process.env.DSH_BASE = writableAiBase
 
+  const stampPath = join(dshHome, 'dsh-purge-safe', 'writable-host', '.ios-stage-stamp')
+  const pluginPkg = await readFile(join(pluginRoot, 'package.json'), 'utf8').then(JSON.parse).catch(() => ({}))
+  const expectedStamp = `${pluginPkg.version ?? '0'}|0.2.2-rc.5`
+  const currentStamp = await readFile(stampPath, 'utf8').catch(() => '')
+  if (currentStamp.trim() === expectedStamp) {
+    return writableAiBase
+  }
+
   let coreMod
   try {
     coreMod = await import(pathToFileURL(join(pluginRoot, 'lib', 'core.js')).href)
@@ -196,6 +204,7 @@ async function stageWritablePurgeSafeAiBase(pluginRoot) {
       await copyFile(src, dst)
     }
   }
+  await writeFile(stampPath, `${expectedStamp}\n`, 'utf8').catch(() => {})
   return writableAiBase
 }
 
@@ -560,6 +569,16 @@ async function writePendingRemovals(profileDir, pending) {
 }
 
 export async function cleanupPendingPluginRemovals(profileDir) {
+  try {
+    const entries = await readdir(profileDir, { withFileTypes: true })
+    for (const entry of entries) {
+      if (/^\.ios-plugin-(?:staging|download|github|backup)-/.test(entry.name)) {
+        const orphan = resolve(profileDir, entry.name)
+        assertInside(profileDir, orphan)
+        await rm(orphan, { recursive: true, force: true }).catch(() => {})
+      }
+    }
+  } catch { /* ignore */ }
   const pending = await readPendingRemovals(profileDir)
   if (!pending.length) return
   const manifest = readProfileManifest('dsh', profileDir)
@@ -857,6 +876,9 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
       if (manifest.peerDependenciesMeta?.[name]?.optional) continue
       const version = versions.get(name)
       if (!version || !semver.satisfies(version, range, { includePrerelease: true })) {
+        if (name.startsWith('@deepseek-ai/cordis') || name.startsWith('@deepseek-ai/dsh-')) {
+          throw new Error(`插件与本机核心框架不兼容（DSH/Cordis 契约冲突）：要求 ${name}@${range}，本机为 ${version ?? '未安装'}`)
+        }
         throw new Error(`插件 peer dependency 不兼容：${name}@${range}`)
       }
     }
@@ -987,27 +1009,39 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
       const available = await assertDependenciesAvailable(manifest, staged)
       if (available.has(manifest.name)) throw new Error('插件名称与已经内嵌的 DSH runtime 包冲突')
       const active = await installedPlugins()
-      if (active.some((item) => item.name === manifest.name)) throw new Error(`${manifest.name} 已安装；请先卸载再重新安装此版本`)
+      const alreadyInstalled = active.some((item) => item.name === manifest.name)
       const target = resolve(profileDir, 'node_modules', ...manifest.name.split('/'))
       assertInside(resolve(profileDir, 'node_modules'), target)
       await mkdir(dirname(target), { recursive: true })
+      const backup = alreadyInstalled ? join(profileDir, `.ios-plugin-backup-${randomUUID()}`) : null
+      if (backup) {
+        try { await rename(target, backup) } catch (err) {
+          if (err?.code !== 'ENOENT') throw err
+        }
+      }
       await rename(staged, target)
       const previous = readProfileManifest('dsh', profileDir)
-      const bundles = previous.dsh?.profile?.bundles ?? [PROFILE_BUNDLE]
+      const existingBundles = previous.dsh?.profile?.bundles ?? [PROFILE_BUNDLE]
+      const nextBundles = existingBundles.includes(manifest.name) ? existingBundles : [...existingBundles, manifest.name]
       const dependencies = { ...previous.dependencies, [manifest.name]: manifest.version }
       let composition
       try {
-        composition = await stageProfile(previous, { ...previous, dependencies }, [...bundles, manifest.name], manifest.name)
+        composition = await stageProfile(previous, { ...previous, dependencies }, nextBundles, alreadyInstalled ? undefined : manifest.name)
       } catch (error) {
         await rm(target, { recursive: true, force: true })
+        if (backup) await rename(backup, target).catch(() => {})
         throw error
       }
+      if (backup) await rm(backup, { recursive: true, force: true }).catch(() => {})
       return {
         name: manifest.name,
         version: manifest.version,
         enabled: true,
-        restartRequired: Boolean(composition?.restartReason),
-        ...(composition?.restartReason ? { restartReason: composition.restartReason } : {}),
+        upgraded: alreadyInstalled,
+        restartRequired: Boolean(composition?.restartReason) || alreadyInstalled,
+        ...(composition?.restartReason
+          ? { restartReason: composition.restartReason }
+          : (alreadyInstalled ? { restartReason: '已就地更新插件，请重启 DSH 引擎以加载新版本。' } : {})),
       }
     } finally {
       await rm(staged, { recursive: true, force: true })
@@ -1153,6 +1187,8 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
       owner = parts[0]
       repo = parts[1].replace(/\.git$/i, '')
       if (parts.length >= 4 && parts[2] === 'tree') ref = parts.slice(3).join('/')
+      else if (parts.length >= 5 && parts[2] === 'releases' && parts[3] === 'tag') ref = parts.slice(4).join('/')
+      else if (parts.length >= 4 && parts[2] === 'commit') ref = parts[3]
       else if (url.hash && url.hash.length > 1) ref = decodeURIComponent(url.hash.slice(1))
     }
     if (!/^[A-Za-z0-9_.-]{1,100}$/.test(owner) || !/^[A-Za-z0-9_.-]{1,100}$/.test(repo)) {
@@ -1166,12 +1202,18 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
     const { owner, repo, ref } = parseGithubSpec(rawSpec)
     let targetRef = ref
     if (!targetRef) {
-      const metaBuf = await fetchBuffer(`https://api.github.com/repos/${owner}/${repo}`, 2 * 1024 * 1024, 15_000)
-      let meta
-      try { meta = JSON.parse(metaBuf.toString('utf8')) } catch { throw new Error('GitHub API 返回了无效数据') }
-      targetRef = typeof meta.default_branch === 'string' && meta.default_branch ? meta.default_branch : 'main'
+      try {
+        const metaBuf = await fetchBuffer(`https://api.github.com/repos/${owner}/${repo}`, 2 * 1024 * 1024, 15_000)
+        const meta = JSON.parse(metaBuf.toString('utf8'))
+        if (typeof meta.default_branch === 'string' && meta.default_branch) {
+          targetRef = meta.default_branch
+        }
+      } catch {
+        // Bypass GitHub REST API anonymous rate limits (403/429) via codeload HEAD archive
+        targetRef = 'HEAD'
+      }
     }
-    const tarballUrl = `https://codeload.github.com/${owner}/${repo}/tar.gz/${encodeURIComponent(targetRef)}`
+    const tarballUrl = `https://codeload.github.com/${owner}/${repo}/tar.gz/${encodeURIComponent(targetRef || 'HEAD')}`
     const bytes = await fetchBuffer(tarballUrl, MAX_ARCHIVE_BYTES, 45_000)
     const staging = join(profileDir, `.ios-plugin-github-${randomUUID()}`)
     await mkdir(staging)
@@ -1184,7 +1226,66 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
     }
   }
 
+  async function auditInstalledPlugin(name) {
+    validatePackageName(name)
+    const nodeModules = resolve(profileDir, 'node_modules')
+    const root = resolve(nodeModules, ...name.split('/'))
+    assertInside(nodeModules, root)
+    let manifest
+    try { manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8')) } catch {
+      throw new Error(`找不到已安装插件 ${name}`)
+    }
+    let fileCount = 0
+    let totalBytes = 0
+    const findings = []
+    async function scan(dir, depth = 0) {
+      if (depth > 10) return
+      for (const entry of await readdir(dir, { withFileTypes: true })) {
+        if (entry.name === 'node_modules' && depth === 0) continue
+        const full = join(dir, entry.name)
+        const info = await lstat(full)
+        if (info.isDirectory()) {
+          await scan(full, depth + 1)
+        } else if (info.isFile()) {
+          fileCount += 1
+          totalBytes += info.size
+          const ext = extname(entry.name).toLowerCase()
+          if (['.js', '.mjs', '.cjs'].includes(ext) && info.size <= 1024 * 1024) {
+            const src = await readFile(full, 'utf8')
+            if (/(?:from\s*|require\s*\(\s*)['"](?:node:)?child_process['"]/.test(src)) {
+              findings.push(`子进程调用引用 (${relative(root, full)})`)
+            }
+            if (/\beval\s*\(|new\s+Function\s*\(/.test(src)) {
+              findings.push(`动态代码求值 (${relative(root, full)})`)
+            }
+            if (/\bfetch\s*\(|https?\.request\s*\(/.test(src)) {
+              findings.push(`网络请求能力 (${relative(root, full)})`)
+            }
+          }
+        }
+      }
+    }
+    await scan(root)
+    const uniqueFindings = [...new Set(findings)].slice(0, 10)
+    const dshEngine = typeof manifest.engines?.dsh === 'string' ? manifest.engines.dsh : '未声明'
+    const dshCompatible = dshEngine === '未声明' || semver.satisfies('0.2.2-rc.5', dshEngine, { includePrerelease: true })
+    return {
+      name: manifest.name,
+      version: manifest.version,
+      fileCount,
+      totalKB: Math.max(1, Math.round(totalBytes / 1024)),
+      dshEngine,
+      dshCompatible,
+      patchEntry: manifest.dsh?.bundle?.patch ?? '缺失',
+      findings: uniqueFindings,
+      riskLevel: uniqueFindings.some((f) => f.includes('子进程') || f.includes('动态代码'))
+        ? 'elevated'
+        : (uniqueFindings.length > 0 ? 'standard' : 'low'),
+    }
+  }
+
   rpc.handle('plugins.installed.list', async () => ({ plugins: await installedPlugins() }))
+  rpc.handle('plugins.audit', async ({ name }) => auditInstalledPlugin(String(name ?? '')))
   rpc.handle('plugins.install.npm', async (params) => mutateProfile(() =>
     installFromNpm(String(params.name ?? ''), String(params.version ?? ''), String(params.sourceId ?? ''))))
   rpc.handle('plugins.install.github', async ({ url }) => mutateProfile(() =>

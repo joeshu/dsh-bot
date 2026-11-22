@@ -50,8 +50,10 @@ public struct ChatView: View {
     @State private var followsLiveOutput = true
     @State private var showClearConfirm = false
     @State private var showEditBot = false
+    @State private var showBotProfile = false
     @State private var showMemory = false
     @State private var showFileImporter = false
+    @State private var showWorkspaceFiles = false
     @State private var showDiagnostics = false
     @State private var showScheduleManager = false
     @State private var showJobsManager = false
@@ -127,31 +129,50 @@ public struct ChatView: View {
         }
         .navigationTitle(liveBot.name)
         .onChange(of: liveBot.model) { selectedModel = host.modelSelection($0) }
+        .onChange(of: selectedModel) { nextModel in
+            host.setBotModel(sessionId: liveBot.id, model: nextModel)
+        }
         .onChange(of: host.apiBaseURL) { _ in selectedModel = host.modelSelection(liveBot.model) }
-        .onDisappear { if liveBot.isPrivate { lockPrivateConversation() } }
+        .onAppear {
+            host.visibleChatSessionId = liveBot.id
+        }
+        .onDisappear {
+            if host.visibleChatSessionId == liveBot.id { host.visibleChatSessionId = nil }
+            if liveBot.isPrivate { lockPrivateConversation() }
+        }
         .onChange(of: chatScenePhase) { phase in
             if phase == .background && liveBot.isPrivate { lockPrivateConversation() }
         }
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.hidden, for: .tabBar)
         .toolbar {
             if !isLocked {
                 ToolbarItem(placement: .principal) {
-                    VStack(spacing: 1) {
-                        HStack(spacing: 5) {
-                            Text(liveBot.name)
-                                .font(.subheadline.weight(.semibold))
-                                .lineLimit(1)
-                            if liveBot.isPrivate {
-                                Image(systemName: "lock.fill")
-                                    .font(.caption2)
-                                    .foregroundStyle(DSTheme.warning)
+                    Button {
+                        showBotProfile = true
+                    } label: {
+                        VStack(spacing: 1) {
+                            HStack(spacing: 4) {
+                                Text(liveBot.name)
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                if liveBot.isPrivate {
+                                    Image(systemName: "lock.fill")
+                                        .font(.caption2)
+                                        .foregroundStyle(DSTheme.warning)
+                                }
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 9, weight: .semibold))
+                                    .foregroundStyle(.tertiary)
                             }
+                            Text("\(host.agentPresetName(liveBot.agentPreset)) · \(selectedModel) · \(liveBot.permissionModeLabel)")
+                                .font(.system(size: 10.5, weight: .medium))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
                         }
-                        Text("\(host.agentPresetName(liveBot.agentPreset)) · \(selectedModel) · \(liveBot.permissionModeLabel)")
-                            .font(.system(size: 10.5, weight: .medium))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
                     }
+                    .buttonStyle(.plain)
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     if host.sessionDiagnosticsEnabled {
@@ -165,7 +186,17 @@ public struct ChatView: View {
 
                     // Menu 1: High-frequency session workspace & tasks drawer
                     Menu {
-                        Section("会话工具与任务") {
+                        Section("会话工具与工作区") {
+                            Button {
+                                showBotProfile = true
+                            } label: {
+                                Label("智能体档案（5-Tab）", systemImage: "person.text.rectangle")
+                            }
+                            Button {
+                                showWorkspaceFiles = true
+                            } label: {
+                                Label("工作区文件 (files/)", systemImage: "folder.fill")
+                            }
                             Button {
                                 showSideChat = true
                             } label: {
@@ -176,6 +207,14 @@ public struct ChatView: View {
                             } label: {
                                 Label("当前 Bot 记忆库", systemImage: "brain.head.profile")
                             }
+                            Button {
+                                Task { await host.sendMessage(sessionId: liveBot.id, text: "/compact", model: selectedModel) }
+                            } label: {
+                                Label("压缩当前上下文 (/compact)", systemImage: "arrow.down.right.and.arrow.up.left")
+                            }
+                            .disabled(host.isStreaming || sessionMessages.isEmpty)
+                        }
+                        Section("任务与协作") {
                             Button {
                                 showScheduleManager = true
                             } label: {
@@ -218,7 +257,16 @@ public struct ChatView: View {
                                     Text(host.agentPresetName(liveBot.agentPreset)).tag(liveBot.agentPreset)
                                 }
                             }
-                            .disabled(host.hasSessionHistory(bot.id) || host.isStreaming)
+                            .disabled(host.isStreaming)
+                            Picker("审批档位：\(liveBot.permissionModeLabel)", selection: Binding(
+                                get: { liveBot.permissionMode },
+                                set: { host.setPermissionMode(sessionId: liveBot.id, mode: $0) }
+                            )) {
+                                Text("只读保护").tag("readOnly")
+                                Text("标准审批").tag("ask")
+                                Text("沙盒免打扰").tag("autoReview")
+                            }
+                            .disabled(host.isStreaming)
                         }
                         if host.usesOfficialModels || !host.models.isEmpty {
                             ModelSelectionView(host: host, model: $selectedModel, allowsTyping: false)
@@ -248,7 +296,7 @@ public struct ChatView: View {
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 } else {
-                                    Text("审批策略：\(liveBot.permissionModeLabel)。每次询问会逐次确认写入和敏感操作；自动审查仍会确认敏感操作；只读模式禁止写入。")
+                                    Text("审批档位：\(liveBot.permissionModeLabel)。只读保护拦截红队写入与敏感工具；标准审批逐次确认；沙盒免打扰自动放行已授权的红队工具并记录审计日志。")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
@@ -309,8 +357,32 @@ public struct ChatView: View {
         .sheet(isPresented: $showMemory) {
             if !isLocked { NavigationStack { MemoryVaultView(host: host, botId: liveBot.id) } }
         }
+        .sheet(isPresented: $showWorkspaceFiles) {
+            if !isLocked {
+                NavigationStack {
+                    WorkspaceFilesView(host: host)
+                        .toolbar {
+                            ToolbarItem(placement: .topBarLeading) {
+                                Button("关闭") { showWorkspaceFiles = false }
+                            }
+                        }
+                }
+            }
+        }
         .sheet(isPresented: $showEditBot) {
             if !isLocked { EditBotSheet(bot: liveBot, host: host) }
+        }
+        .sheet(isPresented: $showBotProfile) {
+            if !isLocked {
+                BotProfileSheet(
+                    bot: liveBot,
+                    host: host,
+                    onOpenMemory: { showMemory = true },
+                    onOpenRoutines: { showScheduleManager = true },
+                    onOpenEditSettings: { showEditBot = true },
+                    onOpenDiagnostics: { showDiagnostics = true }
+                )
+            }
         }
         .sheet(isPresented: $showDiagnostics) {
             if !isLocked { SessionDiagnosticsSheet(host: host, bot: liveBot) }
@@ -422,8 +494,10 @@ public struct ChatView: View {
         showScheduleManager = false
         showJobsManager = false
         showEditBot = false
+        showBotProfile = false
         showMemory = false
         showFileImporter = false
+        showWorkspaceFiles = false
         attachedFile = nil
         speechInput.stop()
         showClearConfirm = false
@@ -574,9 +648,15 @@ public struct ChatView: View {
     @ViewBuilder
     private var conversationPendingSection: some View {
         ForEach(host.pendingApprovals.filter { $0.sessionId == bot.id }) { approval in
-            DSHPendingApprovalCard(approval: approval) { approved in
-                Task { await host.respondToApproval(id: approval.id, approved: approved) }
-            }
+            DSHPendingApprovalCard(
+                approval: approval,
+                onRespond: { approved in
+                    Task { await host.respondToApproval(id: approval.id, approved: approved) }
+                },
+                onApproveAndTrustSandbox: {
+                    Task { await host.approveAndSwitchToAutoReview(id: approval.id) }
+                }
+            )
         }
 
         ForEach(host.pendingDSHQuestions.filter { $0.sessionId == bot.id }) { request in
@@ -595,6 +675,18 @@ public struct ChatView: View {
 
     @ViewBuilder
     private var conversationFooterNotices: some View {
+        if let budgetWarn = CostBudgetGovernor.shared.activeBudgetWarning {
+            DSBannerCard(
+                icon: "dollarsign.circle.fill",
+                tint: DSTheme.warning,
+                message: budgetWarn,
+                actionTitle: "知道了"
+            ) {
+                CostBudgetGovernor.shared.activeBudgetWarning = nil
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 6)
+        }
         if host.lastErrorSessionId == bot.id, let errMsg = host.lastStreamError, !host.isStreaming {
             DSBannerCard(
                 icon: "exclamationmark.triangle.fill",
@@ -662,8 +754,12 @@ public struct ChatView: View {
             return ["帮我整理一份私密备忘并存入常驻记忆", "总结这段敏感文本的要点"]
         } else if liveBot.agentPreset == "ptc-python" {
             return ["用离线 Python 与 NumPy 模拟一个蒙特卡洛分布并汇总统计", "分析工作区文件并用 Python 处理数据"]
+        } else if liveBot.agentPreset == "cordis" {
+            return ["检查当前 DSH 运行时已注册的工具与 Cordis 服务", "帮我在工作区编写一个示例 SKILL.md 并校验格式"]
+        } else if liveBot.agentPreset == "redteam" {
+            return ["查看当前授权红队演练台的资产与阶段进度", "汇总当前演练发现并生成待复核清单"]
         }
-        return ["用端侧 JS 沙盒计算 10 万年化 6% 复利 5 年", "查看当前 iPhone 设备状态", "帮我拟一份会议议程"]
+        return ["用端侧 JS 沙盒计算 10 万年化 6% 复利 5 年", "查看当前工作区 files/ 中的文件", "帮我拟一份会议议程"]
     }
 
     private var emptyWelcomeView: some View {
@@ -1017,6 +1113,7 @@ public struct ChatView: View {
                 Menu {
                     if !liveBot.isPrivate {
                         Button { showFileImporter = true } label: { Label("附加文件到工作区", systemImage: "paperclip") }
+                        Button { showWorkspaceFiles = true } label: { Label("/files 浏览与编辑工作区", systemImage: "folder.fill") }
                     }
                     Button { showReferenceChatPicker = true } label: { Label("引用历史对话作为上下文", systemImage: "quote.bubble") }
                     Button { showSideChat = true } label: { Label("/side 侧边对话", systemImage: "bubble.left.and.exclamationmark.bubble.right") }
@@ -1035,7 +1132,7 @@ public struct ChatView: View {
                         .foregroundColor(.secondary)
                 }
 
-                TextField(host.isStreaming && host.streamingSessionId == bot.id ? "输入插话引导内容（Steer）…" : "给 \(liveBot.name) 发消息（支持 /side、/goal）…", text: $input, axis: .vertical)
+                TextField(host.isStreaming && host.streamingSessionId == bot.id ? "输入插话引导内容（Steer）…" : "给 \(liveBot.name) 发消息（/side /files /clear）…", text: $input, axis: .vertical)
                     .lineLimit(1...4)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
@@ -1085,6 +1182,16 @@ public struct ChatView: View {
                         if text == "/side" {
                             input = ""
                             showSideChat = true
+                            return
+                        }
+                        if text == "/files", !liveBot.isPrivate {
+                            input = ""
+                            showWorkspaceFiles = true
+                            return
+                        }
+                        if text == "/profile" {
+                            input = ""
+                            showBotProfile = true
                             return
                         }
                         if text == "/goal", liveBot.isGroup {

@@ -184,7 +184,7 @@ export class SQLiteSessionPersistence extends SessionPersistence {
   constructor(ctx) {
     super(ctx)
     this.db = new DatabaseSync(databasePath)
-    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;')
+    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; PRAGMA cache_size = -4000; PRAGMA temp_store = MEMORY; PRAGMA mmap_size = 0;')
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
         id TEXT PRIMARY KEY NOT NULL,
@@ -265,7 +265,10 @@ export class SQLiteSessionPersistence extends SessionPersistence {
     this.handles.delete(handle)
     if (this.writeOwners.get(handle.id) === handle) this.writeOwners.delete(handle.id)
   }
-  checkpoint() { this.db.exec('PRAGMA wal_checkpoint(FULL)') }
+  checkpoint(mode = 'FULL') {
+    const safeMode = mode === 'TRUNCATE' || mode === 'RESTART' || mode === 'PASSIVE' ? mode : 'FULL'
+    this.db.exec(`PRAGMA wal_checkpoint(${safeMode})`)
+  }
 
   async create(header, options = {}) {
     abortIfRequested(options.signal)
@@ -320,13 +323,13 @@ export class SQLiteSessionPersistence extends SessionPersistence {
     if (writer) await writer.flush()
   }
 
-  async flush() {
+  async flush(options = {}) {
     const errors = []
     for (const handle of [...this.writeOwners.values()]) {
       try { await handle.flush() } catch (error) { errors.push(error) }
     }
     if (errors.length) throw new AggregateError(errors, 'DSH SQLite session flush failed')
-    this.checkpoint()
+    this.checkpoint(options?.truncate ? 'TRUNCATE' : 'FULL')
   }
 
   async delete(id) {

@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 @main
 public struct DSBotStandaloneApp: App {
@@ -17,22 +18,41 @@ public struct DSBotStandaloneApp: App {
                     }
                 }
                 .task {
+                    MemoryGovernor.shared.startMonitoring()
                     if host.state == .idle {
                         await host.boot()
                     }
                 }
                 .onChange(of: scenePhase) { newPhase in
-                    Task {
-                        switch newPhase {
-                        case .background:
-                            await host.suspendForBackground()
-                        case .active:
-                            await host.resumeFromBackground()
-                        default:
-                            break
-                        }
+                    switch newPhase {
+                    case .background:
+                        performGuardedBackgroundSuspend()
+                    case .active:
+                        Task { await host.resumeFromBackground() }
+                    default:
+                        break
                     }
                 }
+        }
+    }
+
+    @MainActor
+    private func performGuardedBackgroundSuspend() {
+        var bgTaskID: UIBackgroundTaskIdentifier = .invalid
+        bgTaskID = UIApplication.shared.beginBackgroundTask(withName: "DSBotSQLiteWALFlush") {
+            if bgTaskID != .invalid {
+                UIApplication.shared.endBackgroundTask(bgTaskID)
+                bgTaskID = .invalid
+            }
+        }
+        Task { @MainActor in
+            defer {
+                if bgTaskID != .invalid {
+                    UIApplication.shared.endBackgroundTask(bgTaskID)
+                    bgTaskID = .invalid
+                }
+            }
+            await host.suspendForBackground()
         }
     }
 }

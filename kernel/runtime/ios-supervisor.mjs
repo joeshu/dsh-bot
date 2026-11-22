@@ -35,11 +35,21 @@ function stopWorker() {
   stopTimer = setTimeout(() => { void stopping.terminate() }, 7_000).unref()
 }
 
+const parsedWorkerHeapMB = Number(option('worker-heap-mb'))
+const workerHeapMB = Number.isFinite(parsedWorkerHeapMB) && parsedWorkerHeapMB >= 128 && parsedWorkerHeapMB <= 1024
+  ? Math.floor(parsedWorkerHeapMB)
+  : 320
+
 function launch() {
   const threadDecoder = new FrameDecoder()
   let bootError
   const thread = new Worker(new URL('./dsh-ios-entry.mjs', import.meta.url), {
-    argv: args, workerData: { supervised: true, safeMode, recoveringRevision },
+    argv: args,
+    workerData: { supervised: true, safeMode, recoveringRevision },
+    resourceLimits: {
+      maxOldGenerationSizeMb: workerHeapMB,
+      maxYoungGenerationSizeMb: 32,
+    },
   })
   worker = thread
   startupTimer = setTimeout(() => { void thread.terminate() }, 25_000).unref()

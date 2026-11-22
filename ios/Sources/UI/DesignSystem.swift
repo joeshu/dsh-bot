@@ -81,8 +81,32 @@ public enum DSHaptics {
     public enum NotifyKind { case success, warning, error }
 }
 
+private final class DSMarkdownBlockCache: @unchecked Sendable {
+    static let shared = DSMarkdownBlockCache()
+    private let cache: NSCache<NSString, NSAttributedString> = {
+        let c = NSCache<NSString, NSAttributedString>()
+        c.countLimit = 400
+        return c
+    }()
+
+    func attributedString(for markdown: String) -> AttributedString? {
+        let key = markdown as NSString
+        if let cached = cache.object(forKey: key) {
+            return AttributedString(cached)
+        }
+        guard let parsed = try? AttributedString(
+            markdown: markdown,
+            options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        ) else {
+            return nil
+        }
+        cache.setObject(NSAttributedString(parsed), forKey: key)
+        return parsed
+    }
+}
+
 /// Renders Markdown natively with styled fenced code blocks (with one-tap copy confirmation),
-/// Markdown headings, and rich inline `AttributedString(markdown:)` formatting.
+/// Markdown headings, and cached inline `AttributedString(markdown:)` formatting.
 public struct DSMarkdownText: View {
     let raw: String
     @State private var copiedBlockId: Int?
@@ -149,10 +173,7 @@ public struct DSMarkdownText: View {
                     .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.secondary.opacity(0.18), lineWidth: 1))
                     .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                 case .prose(_, let text):
-                    if let attr = try? AttributedString(
-                        markdown: text,
-                        options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-                    ) {
+                    if let attr = DSMarkdownBlockCache.shared.attributedString(for: text) {
                         Text(attr).textSelection(.enabled)
                     } else {
                         Text(text).textSelection(.enabled)
@@ -264,7 +285,7 @@ public struct PrivateBotLockOverlay: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(.ultraThinMaterial)
+        .background(DSTheme.surfacePrimary)
     }
 
     private func authenticate() {

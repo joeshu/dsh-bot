@@ -277,10 +277,24 @@ public struct DSHApprovalAuditCard: View {
 public struct DSHPendingApprovalCard: View {
     let approval: PendingApproval
     let onRespond: (Bool) -> Void
+    let onApproveAndTrustSandbox: (() -> Void)?
 
-    public init(approval: PendingApproval, onRespond: @escaping (Bool) -> Void) {
+    public init(
+        approval: PendingApproval,
+        onRespond: @escaping (Bool) -> Void,
+        onApproveAndTrustSandbox: (() -> Void)? = nil
+    ) {
         self.approval = approval
         self.onRespond = onRespond
+        self.onApproveAndTrustSandbox = onApproveAndTrustSandbox
+    }
+
+    private var canUpgradeToSandboxAuto: Bool {
+        let lower = approval.tool.lowercased()
+        return lower == "write" || lower == "edit" || lower == "apply_patch" || lower == "patch"
+            || lower == "workspace_write" || lower == "workspace_edit"
+            || lower == "terminal_exec" || lower == "web_search" || lower == "memory_save"
+            || lower.hasPrefix("redteam_")
     }
 
     public var body: some View {
@@ -342,6 +356,18 @@ public struct DSHPendingApprovalCard: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
+            }
+            if canUpgradeToSandboxAuto, let onApproveAndTrustSandbox {
+                Button {
+                    DSHaptics.notify(.success)
+                    onApproveAndTrustSandbox()
+                } label: {
+                    Label("批准并将本 Bot 切至「沙盒免打扰」", systemImage: "bolt.shield.fill")
+                        .font(.caption.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .tint(DSTheme.success)
             }
         }
         .padding(14)
@@ -458,10 +484,10 @@ public struct CreateBotSheet: View {
                         .frame(minHeight: 72)
                 }
                 Section("权限预设与空间隔离") {
-                    Picker("工具审批策略", selection: $permissionMode) {
-                        Text("每次询问").tag("ask")
-                        Text("自动审查").tag("autoReview")
-                        Text("只读模式").tag("readOnly")
+                    Picker("审批档位", selection: $permissionMode) {
+                        Text("只读保护").tag("readOnly")
+                        Text("标准审批").tag("ask")
+                        Text("沙盒免打扰").tag("autoReview")
                     }
                     Toggle("创建群会话与共享待办", isOn: $isGroup)
                         .onChange(of: isGroup) { v in if v { isPrivate = false } }
@@ -578,20 +604,18 @@ public struct EditBotSheet: View {
                             Text(host.agentPresetName(agentPreset)).tag(agentPreset)
                         }
                     }
-                    .disabled(host.hasSessionHistory(bot.id) || host.isStreaming)
-                    if host.hasSessionHistory(bot.id) {
-                        Text("会话产生历史记录后模式已固定；如需切换模式请新建智能体。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+                    .disabled(host.isStreaming)
+                    Text("支持随时无损切换模式（保留全部聊天历史，下轮发送自动热切换 DSH 工具与引擎配置）。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-                Section("权限预设") {
-                    Picker("工具审批策略", selection: $permissionMode) {
-                        Text("每次询问").tag("ask")
-                        Text("自动审查").tag("autoReview")
-                        Text("只读模式").tag("readOnly")
+                Section("审批档位（三档治理）") {
+                    Picker("工具审批档位", selection: $permissionMode) {
+                        Text("只读保护").tag("readOnly")
+                        Text("标准审批").tag("ask")
+                        Text("沙盒免打扰").tag("autoReview")
                     }
-                    Text("自动审查会放行只读查询工具；只读模式会拦截写入/修改类工具。")
+                    Text("• 只读保护：拦截全部写入/修改/删除。\n• 标准审批：写入、终端、Python 与外部调用逐次确认。\n• 沙盒免打扰：自动放行 files/ 内常规写入、编辑、终端与搜索；删除、Python、MCP 与网页抓取仍逐次确认。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

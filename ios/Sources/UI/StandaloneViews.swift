@@ -15,21 +15,123 @@ public struct MainTabView: View {
         host.pendingApprovals.count + host.pendingDSHQuestions.count
     }
 
-    public var body: some View {
-        TabView {
-            SessionsTabView(host: host)
-                .tabItem { Label("会话", systemImage: "bubble.left.and.bubble.right.fill") }
-                .badge(pendingInboxCount > 0 ? pendingInboxCount : 0)
+    @State private var dismissedPulseTurnId: String?
 
-            BotRosterTabView(host: host)
-                .tabItem { Label("智能体", systemImage: "person.2.crop.square.stack.fill") }
+    private var pulseSessionId: String? {
+        host.streamingSessionId ?? host.pendingApprovals.first?.sessionId
+    }
 
-            ToolsHubTabView(host: host)
-                .tabItem { Label("工作台", systemImage: "square.grid.2x2.fill") }
-
-            PluginManagerView(host: host)
-                .tabItem { Label("探索与设置", systemImage: "slider.horizontal.2.square") }
+    private var showPulseBar: Bool {
+        guard let sid = pulseSessionId else { return false }
+        if host.visibleChatSessionId == sid { return false }
+        if let activeTurn = host.activeTurnId, dismissedPulseTurnId == activeTurn, host.pendingApprovals.isEmpty {
+            return false
         }
+        return host.isStreaming || !host.pendingApprovals.isEmpty
+    }
+
+    public var body: some View {
+        ZStack(alignment: .bottom) {
+            TabView {
+                SessionsTabView(host: host)
+                    .tabItem { Label("会话", systemImage: "bubble.left.and.bubble.right.fill") }
+                    .badge(pendingInboxCount > 0 ? pendingInboxCount : 0)
+
+                BotRosterTabView(host: host)
+                    .tabItem { Label("智能体", systemImage: "person.2.crop.square.stack.fill") }
+
+                ToolsHubTabView(host: host)
+                    .tabItem { Label("工作台", systemImage: "square.grid.2x2.fill") }
+
+                PluginManagerView(host: host)
+                    .tabItem { Label("探索与设置", systemImage: "slider.horizontal.2.square") }
+            }
+
+            if showPulseBar {
+                GlobalBotPulseBar(host: host) {
+                    dismissedPulseTurnId = host.activeTurnId
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 58)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: showPulseBar)
+        .onChange(of: host.activeTurnId) { _ in
+            dismissedPulseTurnId = nil
+        }
+    }
+}
+
+private struct GlobalBotPulseBar: View {
+    @ObservedObject var host: LocalAgentHost
+    let onDismiss: () -> Void
+
+    private var activeBotName: String {
+        if let sid = host.streamingSessionId ?? host.pendingApprovals.first?.sessionId,
+           let bot = host.bots.first(where: { $0.id == sid }) {
+            return bot.name
+        }
+        return "智能体"
+    }
+
+    private var statusSubtitle: String {
+        if let approval = host.pendingApprovals.first {
+            return "待审批：\(approval.tool)"
+        }
+        if let activeTool = host.dshToolActivities.last(where: { $0.phase == "started" }) {
+            return "正在执行：\(activeTool.toolName)"
+        }
+        return "正在生成回复…"
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: host.pendingApprovals.isEmpty ? "waveform" : "exclamationmark.shield.fill")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(host.pendingApprovals.isEmpty ? DSTheme.brand : DSTheme.warning)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(activeBotName)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                Text(statusSubtitle)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 4)
+            if let approval = host.pendingApprovals.first {
+                Button("批准") {
+                    Task { await host.respondToApproval(id: approval.id, approved: true) }
+                }
+                .font(.caption.weight(.semibold))
+                .buttonStyle(.borderedProminent)
+                .controlSize(.mini)
+            }
+            if host.isStreaming {
+                Button("停止") {
+                    Task { await host.abortActiveTurn() }
+                }
+                .font(.caption.weight(.semibold))
+                .buttonStyle(.bordered)
+                .tint(DSTheme.danger)
+                .controlSize(.mini)
+            }
+            if host.pendingApprovals.isEmpty {
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("隐藏状态条")
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(.regularMaterial, in: Capsule())
+        .overlay(Capsule().stroke(Color.secondary.opacity(0.22), lineWidth: 0.75))
+        .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
     }
 }
 
@@ -39,6 +141,8 @@ public struct SessionsTabView: View {
     @ObservedObject var host: LocalAgentHost
     @State private var searchText = ""
     @State private var showCreateSheet = false
+    @State private var editingBot: BotProfile?
+    @State private var profileBot: BotProfile?
 
     public init(host: LocalAgentHost) {
         self.host = host
@@ -134,7 +238,7 @@ public struct SessionsTabView: View {
                                         size: 44
                                     )
                                     VStack(alignment: .leading, spacing: 4) {
-                                        HStack(spacing: 6) {
+                                        HStack(spacing: 5) {
                                             Text(bot.name)
                                                 .font(.headline)
                                                 .lineLimit(1)
@@ -149,6 +253,11 @@ public struct SessionsTabView: View {
                                                 presetId: bot.agentPreset,
                                                 label: host.agentPresetName(bot.agentPreset)
                                             )
+                                            if bot.permissionMode == "autoReview" {
+                                                DSStatusBadge("免打扰", color: DSTheme.success)
+                                            } else if bot.permissionMode == "readOnly" {
+                                                DSStatusBadge("只读", color: .secondary)
+                                            }
                                         }
                                         Text(lastPreview(for: bot, matching: matchedMessage))
                                             .font(.caption)
@@ -171,6 +280,14 @@ public struct SessionsTabView: View {
                                 }
                                 .padding(.vertical, 4)
                             }
+                            .swipeActions(edge: .trailing) {
+                                Button("编辑") { editingBot = bot }
+                                    .tint(DSTheme.brand)
+                                if !bot.isPrivate {
+                                    Button("档案") { profileBot = bot }
+                                        .tint(.indigo)
+                                }
+                            }
                         }
                     }
                 }
@@ -181,6 +298,13 @@ public struct SessionsTabView: View {
             .searchable(text: $searchText, prompt: "搜索会话与公开历史消息")
             .toolbar {
                 ToolbarItemGroup(placement: .topBarTrailing) {
+                    NavigationLink {
+                        DSHWebUIView(host: host)
+                    } label: {
+                        Image(systemName: "macwindow.on.rectangle")
+                    }
+                    .help("打开 DSH Web 工作台")
+
                     NavigationLink {
                         SessionInboxView(host: host)
                     } label: {
@@ -199,6 +323,19 @@ public struct SessionsTabView: View {
             }
             .sheet(isPresented: $showCreateSheet) {
                 CreateBotSheet(host: host)
+            }
+            .sheet(item: $editingBot) { target in
+                EditBotSheet(bot: target, host: host)
+            }
+            .sheet(item: $profileBot) { target in
+                BotProfileSheet(
+                    bot: target,
+                    host: host,
+                    onOpenMemory: {},
+                    onOpenRoutines: {},
+                    onOpenEditSettings: { editingBot = target },
+                    onOpenDiagnostics: {}
+                )
             }
         }
     }
@@ -235,6 +372,7 @@ public struct BotRosterTabView: View {
     @State private var searchText = ""
     @State private var showCreateSheet = false
     @State private var editingBot: BotProfile?
+    @State private var profileBot: BotProfile?
     @State private var pendingDeleteBot: BotProfile?
 
     public init(host: LocalAgentHost) {
@@ -344,6 +482,12 @@ public struct BotRosterTabView: View {
                                         editingBot = bot
                                     }
                                     .tint(DSTheme.brand)
+                                    if !bot.isPrivate {
+                                        Button("档案") {
+                                            profileBot = bot
+                                        }
+                                        .tint(.indigo)
+                                    }
                                 }
                             }
                         }
@@ -365,6 +509,16 @@ public struct BotRosterTabView: View {
             }
             .sheet(item: $editingBot) { target in
                 EditBotSheet(bot: target, host: host)
+            }
+            .sheet(item: $profileBot) { target in
+                BotProfileSheet(
+                    bot: target,
+                    host: host,
+                    onOpenMemory: {},
+                    onOpenRoutines: {},
+                    onOpenEditSettings: { editingBot = target },
+                    onOpenDiagnostics: {}
+                )
             }
             .confirmationDialog(
                 "确定删除「\(pendingDeleteBot?.name ?? "")」及其全部聊天记录？",
@@ -390,6 +544,7 @@ public struct BotRosterTabView: View {
 
 public struct ToolsHubTabView: View {
     @ObservedObject var host: LocalAgentHost
+    @ObservedObject private var memoryGovernor = MemoryGovernor.shared
 
     public init(host: LocalAgentHost) {
         self.host = host
@@ -429,10 +584,11 @@ public struct ToolsHubTabView: View {
                 }
 
                 Section {
+                    let memMB = memoryGovernor.snapshot.physFootprintMB
                     WidgetBlueprintCardView(
                         title: "端侧运行态势（实时）",
                         metrics: [
-                            WidgetMetricItem(label: "应用版本", value: host.appVersion),
+                            WidgetMetricItem(label: "端侧内存", value: memMB > 0 ? String(format: "%.0f MB", memMB) : host.appVersion),
                             WidgetMetricItem(label: "智能体 / 群", value: "\(host.bots.count)"),
                             WidgetMetricItem(label: "已缓存会话", value: "\(host.messagesBySession.count)"),
                             WidgetMetricItem(label: "待处理项", value: "\(host.pendingApprovals.count + host.pendingDSHQuestions.count)")
@@ -441,6 +597,41 @@ public struct ToolsHubTabView: View {
                 }
                 .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 6, trailing: 16))
                 .listRowBackground(Color.clear)
+
+                Section("开发者沙盒工具（桌面级适配）") {
+                    NavigationLink {
+                        VirtualTerminalFeatureView(host: host)
+                    } label: {
+                        toolRow(
+                            icon: "terminal.fill",
+                            color: .teal,
+                            title: "沙盒虚拟终端 (PTY)",
+                            subtitle: "在 /workspace 安全执行 shell、node、python 与目录巡检"
+                        )
+                    }
+
+                    NavigationLink {
+                        GitWorktreeTrackerView(host: host)
+                    } label: {
+                        toolRow(
+                            icon: "arrow.triangle.branch",
+                            color: .indigo,
+                            title: "Git 工作树与 PR 追踪",
+                            subtitle: "查看本地变更 Diff、快照提交与 GitHub Pull Requests"
+                        )
+                    }
+
+                    NavigationLink {
+                        BackendDevToolsInspectorView(host: host)
+                    } label: {
+                        toolRow(
+                            icon: "wrench.and.screwdriver.fill",
+                            color: .blue,
+                            title: "后端 DevTools 与 Jetsam 遥测",
+                            subtitle: "查看 Node/V8/Jetsam 内存水位、Cordis Fiber 树与 REPL 控制台"
+                        )
+                    }
+                }
 
                 Section("任务与沙盒执行") {
                     NavigationLink {

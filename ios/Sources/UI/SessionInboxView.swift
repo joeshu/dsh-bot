@@ -18,30 +18,55 @@ struct SessionInboxView: View {
                 Section("待审批工具调用 (\(host.pendingApprovals.count))") {
                     ForEach(host.pendingApprovals) { approval in
                         if let bot = host.bots.first(where: { $0.id == approval.sessionId }) {
-                            NavigationLink {
-                                ChatView(bot: bot, host: host)
-                            } label: {
-                                HStack(spacing: 12) {
-                                    DSBotAvatar(
-                                        initials: bot.name,
-                                        color: DSTheme.botAvatarColor(bot),
-                                        isPrivate: bot.isPrivate,
-                                        size: 38
-                                    )
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        HStack(spacing: 6) {
-                                            Text(bot.isPrivate ? "私密会话" : bot.name)
-                                                .font(.subheadline.weight(.semibold))
-                                            DSStatusBadge("待审批", color: DSTheme.warning, icon: "hand.raised.fill")
+                            VStack(alignment: .leading, spacing: 8) {
+                                NavigationLink {
+                                    ChatView(bot: bot, host: host)
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        DSBotAvatar(
+                                            initials: bot.name,
+                                            color: DSTheme.botAvatarColor(bot),
+                                            isPrivate: bot.isPrivate,
+                                            size: 38
+                                        )
+                                        VStack(alignment: .leading, spacing: 3) {
+                                            HStack(spacing: 6) {
+                                                Text(bot.isPrivate ? "私密会话" : bot.name)
+                                                    .font(.subheadline.weight(.semibold))
+                                                DSStatusBadge("待审批", color: DSTheme.warning, icon: "hand.raised.fill")
+                                            }
+                                            Text(bot.isPrivate ? "需解锁私密会话后查看并确认工具审批" : "工具：\(approval.tool) · \(approval.summary)")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                                .lineLimit(2)
                                         }
-                                        Text(bot.isPrivate ? "需解锁私密会话后查看并确认工具审批" : "工具：\(approval.tool) · \(approval.summary)")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                            .lineLimit(2)
                                     }
+                                    .padding(.vertical, 2)
                                 }
-                                .padding(.vertical, 2)
+                                if !bot.isPrivate {
+                                    HStack(spacing: 10) {
+                                        Button {
+                                            Task { await host.respondToApproval(id: approval.id, approved: true) }
+                                        } label: {
+                                            Label("批准执行", systemImage: "checkmark.circle.fill")
+                                                .font(.caption.weight(.semibold))
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                        .controlSize(.small)
+
+                                        Button(role: .destructive) {
+                                            Task { await host.respondToApproval(id: approval.id, approved: false) }
+                                        } label: {
+                                            Label("拒绝", systemImage: "xmark.circle")
+                                                .font(.caption.weight(.semibold))
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
+                                    }
+                                    .padding(.leading, 50)
+                                }
                             }
+                            .padding(.vertical, 2)
                         }
                     }
                 }
