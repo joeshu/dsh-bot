@@ -242,7 +242,7 @@ public final class LocalAgentHost: ObservableObject {
     private let migrateOfficialKey: Bool
     private let keychain: KeychainBridge
     private let workspaceCapabilities: LocalAgentTransport
-    private let workspace: URL
+    public let workspace: URL
     private let persistQueue = DispatchQueue(label: "io.github.dsbot.workspace.persist", qos: .utility)
     private var workspaceReadable = true
     private var uiNotifContinuation: AsyncStream<(String, [String: Any])>.Continuation?
@@ -435,9 +435,7 @@ public final class LocalAgentHost: ObservableObject {
     public func syncFromWebWorkbench() async {
         guard state == .ready, !isStreaming else { return }
         await refreshSessionSummaries()
-        if let channel = rpc() {
-            await refreshPluginState(on: channel)
-        }
+        await refreshPluginState()
         if let visibleId = visibleChatSessionId,
            bots.first(where: { $0.id == visibleId })?.isPrivate != true {
             loadedHistoryIDs.remove(visibleId)

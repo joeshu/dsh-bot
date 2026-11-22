@@ -63,7 +63,7 @@ public struct DSHWebUIView: View {
     }
 
     private var chromeBackground: Color {
-        webBackgroundColor ?? (effectiveIsDark ? Color(red: 0.08, green: 0.08, blue: 0.09) : DSTheme.canvas)
+        webBackgroundColor ?? (effectiveIsDark ? Color(red: 0.08, green: 0.08, blue: 0.09) : DSTheme.surfacePrimary)
     }
 
     public var body: some View {

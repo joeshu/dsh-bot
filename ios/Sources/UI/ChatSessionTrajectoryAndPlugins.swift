@@ -296,7 +296,7 @@ struct ChatTrajectoryView: View {
                 }
             }
         }
-        .background(DSTheme.canvas)
+        .background(DSTheme.surfacePrimary)
     }
 
     private func trajectoryRow(step: Int, item: DSHToolActivity) -> some View {
@@ -343,7 +343,8 @@ struct ChatTrajectoryView: View {
                     .lineLimit(1)
             }
 
-            if isExpanded, let summary = item.summary, !summary.isEmpty {
+            if isExpanded, !item.result.isEmpty {
+                let summary = item.result
                 Text(summary)
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(item.phase == "failed" ? DSTheme.danger : .secondary)

@@ -142,7 +142,7 @@ public struct AgentBrowserSheet: View {
                                 .padding(.horizontal, 20)
                             }
                         }
-                        .background(DSTheme.canvas)
+                        .background(DSTheme.surfacePrimary)
                     }
                 }
 
