@@ -1158,7 +1158,7 @@ public struct ChatView: View {
             }
 
             if !msg.reasoning.isEmpty {
-                DisclosureGroup("深度思考过程") {
+                DisclosureGroup("深度思考过程 · \(msg.reasoning.count) 字") {
                     Text(msg.reasoning)
                         .font(.caption)
                         .foregroundColor(.secondary)
@@ -1223,6 +1223,13 @@ public struct ChatView: View {
                         }
                     } label: {
                         Label("存入常驻记忆", systemImage: "brain.head.profile")
+                    }
+                    if !host.isStreaming {
+                        Button(role: .destructive) {
+                            host.deleteMessage(sessionId: bot.id, messageId: msg.id)
+                        } label: {
+                            Label("删除此条消息", systemImage: "trash")
+                        }
                     }
                     if !isUser && !host.isStreaming {
                         if msg.incomplete == true {

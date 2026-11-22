@@ -286,8 +286,16 @@ async function apply(ctx) {
     else delete browserPeer.principal
   }, 'dsbot-ios.private-session-access')
 
+  function hasPrivateRootPrefix(sessionId) {
+    if (typeof sessionId !== 'string') return false
+    for (const root of privateRoots) {
+      if (sessionId === root || sessionId.startsWith(`${root}:`)) return true
+    }
+    return false
+  }
+
   function isPrivateSession(sessionId) {
-    return privateSessions.has(sessionId)
+    return privateSessions.has(sessionId) || hasPrivateRootPrefix(sessionId)
   }
 
   function hasPrivateDescendant(sessionId) {
@@ -311,7 +319,7 @@ async function apply(ctx) {
       let current = sessionId
       const seen = new Set()
       while (current && !seen.has(current)) {
-        if (privateRoots.has(current)) {
+        if (privateRoots.has(current) || hasPrivateRootPrefix(current)) {
           privateSessions.add(sessionId)
           break
         }

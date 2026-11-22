@@ -328,16 +328,17 @@ public struct BotProfile: Identifiable, Codable, Equatable {
     public var permissionMode: String // "ask" | "autoReview" | "readOnly"
     public var agentPreset: String // "standard" | "cordis" | "ptc-python" | "minimal" | "redteam"
     public var reasoningEffort: String // "low" | "medium" | "high"
+    public var disabledTools: [String]
     public var redteamToolsEnabled: Bool
     public var redteamWriteEnabled: Bool
     public var redteamSensitiveDataEnabled: Bool
 
     enum CodingKeys: String, CodingKey {
-        case id, name, roleLabel, model, systemPrompt, isMain, isPrivate, isGroup, section, permissionMode, agentPreset, reasoningEffort
+        case id, name, roleLabel, model, systemPrompt, isMain, isPrivate, isGroup, section, permissionMode, agentPreset, reasoningEffort, disabledTools
         case redteamToolsEnabled, redteamWriteEnabled, redteamSensitiveDataEnabled
     }
 
-    public init(id: String, name: String, roleLabel: String, model: String = "deepseek-flash", systemPrompt: String = "", isMain: Bool = false, isPrivate: Bool = false, isGroup: Bool = false, section: String = "默认团队", permissionMode: String = "ask", agentPreset: String = "standard", reasoningEffort: String = "medium", redteamToolsEnabled: Bool = false, redteamWriteEnabled: Bool = false, redteamSensitiveDataEnabled: Bool = false) {
+    public init(id: String, name: String, roleLabel: String, model: String = "deepseek-flash", systemPrompt: String = "", isMain: Bool = false, isPrivate: Bool = false, isGroup: Bool = false, section: String = "默认团队", permissionMode: String = "ask", agentPreset: String = "standard", reasoningEffort: String = "medium", disabledTools: [String] = [], redteamToolsEnabled: Bool = false, redteamWriteEnabled: Bool = false, redteamSensitiveDataEnabled: Bool = false) {
         self.id = id
         self.name = name
         self.roleLabel = roleLabel
@@ -350,6 +351,7 @@ public struct BotProfile: Identifiable, Codable, Equatable {
         self.permissionMode = permissionMode
         self.agentPreset = agentPreset
         self.reasoningEffort = ["low", "medium", "high"].contains(reasoningEffort) ? reasoningEffort : "medium"
+        self.disabledTools = disabledTools
         self.redteamToolsEnabled = !isPrivate && redteamToolsEnabled
         self.redteamWriteEnabled = !isPrivate && redteamToolsEnabled && redteamWriteEnabled
         self.redteamSensitiveDataEnabled = !isPrivate && redteamToolsEnabled && redteamSensitiveDataEnabled
@@ -370,6 +372,7 @@ public struct BotProfile: Identifiable, Codable, Equatable {
         agentPreset = try c.decodeIfPresent(String.self, forKey: .agentPreset) ?? "standard"
         let storedEffort = try c.decodeIfPresent(String.self, forKey: .reasoningEffort) ?? "medium"
         reasoningEffort = ["low", "medium", "high"].contains(storedEffort) ? storedEffort : "medium"
+        disabledTools = try c.decodeIfPresent([String].self, forKey: .disabledTools) ?? []
         let storedRedteamToolsEnabled = try c.decodeIfPresent(Bool.self, forKey: .redteamToolsEnabled) ?? false
         let storedRedteamWriteEnabled = try c.decodeIfPresent(Bool.self, forKey: .redteamWriteEnabled) ?? false
         let storedRedteamSensitiveDataEnabled = try c.decodeIfPresent(Bool.self, forKey: .redteamSensitiveDataEnabled) ?? false

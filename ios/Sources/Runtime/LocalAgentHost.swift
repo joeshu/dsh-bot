@@ -398,6 +398,21 @@ public final class LocalAgentHost: ObservableObject {
         return userText
     }
 
+    /// Removes a single message from the local session transcript (P1-2).
+    public func deleteMessage(sessionId: String, messageId: String) {
+        guard !isStreaming, var list = messagesBySession[sessionId] else { return }
+        list.removeAll { $0.id == messageId }
+        messagesBySession[sessionId] = list
+        DSHaptics.impact(.light)
+    }
+
+    /// Updates per-Bot disabled tool names (P1-17).
+    public func setDisabledTools(botId: String, disabledTools: [String]) {
+        guard let index = bots.firstIndex(where: { $0.id == botId }) else { return }
+        bots[index].disabledTools = Array(Set(disabledTools)).sorted()
+        persistWorkspace()
+    }
+
     public func setBotModel(sessionId: String, model: String) {
         let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
@@ -580,6 +595,7 @@ public final class LocalAgentHost: ObservableObject {
                 "systemPrompt": bot?.systemPrompt ?? "", "isGroup": bot?.isGroup ?? false,
                 "agentPreset": bot?.agentPreset ?? "standard", "permissionMode": bot?.permissionMode ?? "ask",
                 "reasoningEffort": bot?.reasoningEffort ?? "medium",
+                "disabledTools": bot?.disabledTools ?? [],
                 "subagentEnabled": subagentEnabled, "webSearchEnabled": webSearchEnabled,
                 "customTools": customTools,
                 "redteamMode": bot?.redteamToolsEnabled ?? false,
@@ -1524,7 +1540,11 @@ public final class LocalAgentHost: ObservableObject {
 
     private func deleteDSHSession(_ sessionId: String) async {
         guard let channel else { return }
-        _ = try? await channel.request("session.clear", params: ["sessionId": sessionId], timeoutSeconds: 60)
+        do {
+            _ = try await channel.request("session.clear", params: ["sessionId": sessionId], timeoutSeconds: 60)
+        } catch {
+            workspaceError = "清理 DSH 会话失败（\(sessionId)）：\(error.localizedDescription)"
+        }
     }
 
     private func schedulePrivateSessionAccessSync() {

@@ -14,6 +14,34 @@ public struct MCPToolDescriptor: Identifiable, Equatable {
     }
 }
 
+public struct MCPResourceDescriptor: Identifiable, Equatable {
+    public let id: String
+    public let uri: String
+    public let name: String
+    public let description: String
+    public let mimeType: String
+
+    public init(uri: String, name: String, description: String = "", mimeType: String = "text/plain") {
+        self.id = uri
+        self.uri = uri
+        self.name = name
+        self.description = description
+        self.mimeType = mimeType
+    }
+}
+
+public struct MCPPromptDescriptor: Identifiable, Equatable {
+    public let id: String
+    public let name: String
+    public let description: String
+
+    public init(name: String, description: String = "") {
+        self.id = name
+        self.name = name
+        self.description = description
+    }
+}
+
 enum RemoteMCPError: Error, LocalizedError {
     case http(Int)
     case invalidResponse
@@ -87,6 +115,58 @@ public actor RemoteMCPClient {
         }
         let raw = String(decoding: try JSONSerialization.data(withJSONObject: result), as: UTF8.self)
         return SecretRedactor.redactCommonTokens(raw)
+    }
+
+    public func listResources(endpoint: String, keychainAccount: String? = nil) async throws -> [MCPResourceDescriptor] {
+        let result = try await request(endpoint: endpoint, keychainAccount: keychainAccount, method: "resources/list", params: [:])
+        guard let rows = result["resources"] as? [[String: Any]] else { return [] }
+        return rows.compactMap { row in
+            guard let uri = row["uri"] as? String, !uri.isEmpty else { return nil }
+            return MCPResourceDescriptor(
+                uri: uri,
+                name: row["name"] as? String ?? uri,
+                description: row["description"] as? String ?? "",
+                mimeType: row["mimeType"] as? String ?? "text/plain"
+            )
+        }
+    }
+
+    public func readResource(endpoint: String, uri: String, keychainAccount: String? = nil) async throws -> String {
+        let result = try await request(endpoint: endpoint, keychainAccount: keychainAccount, method: "resources/read", params: ["uri": uri])
+        if let contents = result["contents"] as? [[String: Any]] {
+            let texts = contents.compactMap { $0["text"] as? String }
+            if !texts.isEmpty { return SecretRedactor.redactCommonTokens(texts.joined(separator: "\n")) }
+        }
+        let raw = String(decoding: try JSONSerialization.data(withJSONObject: result), as: UTF8.self)
+        return SecretRedactor.redactCommonTokens(raw)
+    }
+
+    public func listPrompts(endpoint: String, keychainAccount: String? = nil) async throws -> [MCPPromptDescriptor] {
+        let result = try await request(endpoint: endpoint, keychainAccount: keychainAccount, method: "prompts/list", params: [:])
+        guard let rows = result["prompts"] as? [[String: Any]] else { return [] }
+        return rows.compactMap { row in
+            guard let name = row["name"] as? String, !name.isEmpty else { return nil }
+            return MCPPromptDescriptor(name: name, description: row["description"] as? String ?? "")
+        }
+    }
+
+    public func getPrompt(endpoint: String, name: String, arguments: [String: String] = [:], keychainAccount: String? = nil) async throws -> String {
+        let result = try await request(endpoint: endpoint, keychainAccount: keychainAccount, method: "prompts/get", params: ["name": name, "arguments": arguments])
+        if let messages = result["messages"] as? [[String: Any]] {
+            let lines = messages.compactMap { msg -> String? in
+                if let content = msg["content"] as? [String: Any], let text = content["text"] as? String {
+                    return text
+                }
+                return nil
+            }
+            if !lines.isEmpty { return SecretRedactor.redactCommonTokens(lines.joined(separator: "\n\n")) }
+        }
+        let raw = String(decoding: try JSONSerialization.data(withJSONObject: result), as: UTF8.self)
+        return SecretRedactor.redactCommonTokens(raw)
+    }
+
+    public func ping(endpoint: String, keychainAccount: String? = nil) async -> Bool {
+        (try? await request(endpoint: endpoint, keychainAccount: keychainAccount, method: "ping", params: [:])) != nil
     }
 
     private func request(endpoint: String, keychainAccount: String?, method: String, params: [String: Any]) async throws -> [String: Any] {

@@ -365,6 +365,24 @@ test('v3 web-ui: DSHWebUIView provides immersive floating capsule, sidebar retur
   assert.match(webUISrc, /themeChanged/, 'DSHWebUIView must sync Web UI theme color to native top bar')
 })
 
+test('v3 roadmap: canonical ipc-protocol, main-CI kernel-tests gate, multi-thread private isolation, real reasoningEffort & per-Bot disabledTools', async () => {
+  const repoRoot = join(__dirname, '..', '..')
+  const runtimeProtocol = readFileSync(join(runtimeDir, 'ipc-protocol.mjs'), 'utf8')
+  const prepareScript = readFileSync(join(repoRoot, 'scripts/prepare-dsh-runtime.py'), 'utf8')
+  const ciWorkflow = readFileSync(join(repoRoot, '.github/workflows/ios-ipa-build.yml'), 'utf8')
+  const entrySrc = readFileSync(join(runtimeDir, 'dsh-ios-entry.mjs'), 'utf8')
+  const privateAccessSrc = readFileSync(join(runtimeDir, 'ios-host-package/private-session-access.mjs'), 'utf8')
+
+  assert.ok(!runtimeProtocol.includes('../src/ipc-protocol.mjs'), 'kernel/runtime/ipc-protocol.mjs must be canonical, not a re-export')
+  assert.ok(prepareScript.includes('ROOT / "kernel" / "runtime" / "ipc-protocol.mjs"'), 'prepare-dsh-runtime.py must package kernel/runtime/ipc-protocol.mjs')
+  assert.match(ciWorkflow, /kernel-tests:/, 'ios-ipa-build.yml must include kernel-tests job')
+  assert.match(ciWorkflow, /needs:\s*\[kernel-tests,/, 'candidate job must depend on kernel-tests')
+  assert.match(privateAccessSrc, /hasPrivateRootPrefix/, 'private-session-access.mjs must isolate multi-thread ios:<botId>:<threadId> children')
+  assert.match(entrySrc, /reasoningEffort:\s*reasoningEnabled\s*\?\s*requestedEffort\s*:\s*'off'/, 'dsh-ios-entry.mjs must pass real reasoningEffort to DSH agentOptions')
+  assert.match(entrySrc, /normalizedDisabledTools/, 'dsh-ios-entry.mjs must enforce per-Bot disabledTools denylist')
+})
+
+
 
 
 

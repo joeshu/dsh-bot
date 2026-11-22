@@ -814,10 +814,12 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
     setPersona(systemPrompt)
     refreshWorkspaceRules()
     setToolsEnabled = (enabled, allowSubagent, allowWebSearch, allowRedteam = false,
-      allowRedteamWrites = false, allowRedteamSensitive = false, redteamPermissionMode = 'ask', reasoningEffort = 'medium') => {
+      allowRedteamWrites = false, allowRedteamSensitive = false, redteamPermissionMode = 'ask',
+      reasoningEffort = 'medium', disabledTools = []) => {
       refreshWorkspaceRules()
       setReasoningEffort(reasoningEffort)
       const normalizedPermissionMode = ['ask', 'autoReview', 'readOnly'].includes(redteamPermissionMode) ? redteamPermissionMode : 'ask'
+      const normalizedDisabledTools = Array.isArray(disabledTools) ? [...new Set(disabledTools.map(String).filter(Boolean))].sort() : []
       const rtTools = registeredRedteamToolNames()
       const policyKey = JSON.stringify({
         enabled,
@@ -828,6 +830,7 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
         allowRedteamSensitive,
         normalizedPermissionMode,
         rtTools,
+        normalizedDisabledTools,
       })
       // Keep system prompt prefix and Cordis guards untouched across identical turns to maximize Prompt Cache hits
       if (policyKey === lastToolsPolicyKey) {
@@ -860,7 +863,7 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
               description: String(tool.description ?? '').replace(/\s+/g, ' ').trim().slice(0, 120),
             }))
         : []
-      const deny = enabled ? [] : [...DISABLED_TOOL_NAMES].filter((name) => globalToolNames.has(name))
+      const deny = enabled ? [...normalizedDisabledTools] : [...DISABLED_TOOL_NAMES].filter((name) => globalToolNames.has(name))
       if (!allowSubagent || !enabled) deny.push('subagent')
       if (enabled && !allowWebSearch) deny.push('web_search')
       if (!allowRedteam || !enabled) {
@@ -1073,9 +1076,10 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
     setup,
     setPersona: (value) => setPersona(value),
     setToolsEnabled: (enabled, allowSubagent, allowWebSearch, allowRedteam = false,
-      allowRedteamWrites = false, allowRedteamSensitive = false, redteamPermissionMode = 'ask', reasoningEffort = 'medium') =>
+      allowRedteamWrites = false, allowRedteamSensitive = false, redteamPermissionMode = 'ask',
+      reasoningEffort = 'medium', disabledTools = []) =>
       setToolsEnabled(enabled, allowSubagent, allowWebSearch, allowRedteam,
-        allowRedteamWrites, allowRedteamSensitive, redteamPermissionMode, reasoningEffort),
+        allowRedteamWrites, allowRedteamSensitive, redteamPermissionMode, reasoningEffort, disabledTools),
     id,
   }
 }
@@ -1334,9 +1338,11 @@ async function startTurn(params, preparation) {
     await drainAndDispose(id, active)
     active = undefined
   }
+  const requestedEffort = ['low', 'medium', 'high'].includes(params.reasoningEffort) ? params.reasoningEffort : 'medium'
+  const disabledTools = Array.isArray(params.disabledTools) ? params.disabledTools.map(String).filter(Boolean) : []
   const options = {
     provider: 'deepseek-official', model: dshModel,
-    reasoningEffort: reasoningEnabled ? 'high' : 'off',
+    reasoningEffort: reasoningEnabled ? requestedEffort : 'off',
   }
   if (!active) {
     const composition = setupAgent({
@@ -1397,7 +1403,7 @@ async function startTurn(params, preparation) {
     }
     active.setToolsEnabled(toolsEnabled, params.subagentEnabled === true, webSearchEnabled,
       redteamMode, redteamWriteEnabled, redteamSensitiveDataEnabled, permissionMode,
-      typeof params.reasoningEffort === 'string' ? params.reasoningEffort : 'medium')
+      requestedEffort, disabledTools)
   }
 
   if (preparation.cancelled || runtime.suspended) {

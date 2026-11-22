@@ -441,6 +441,52 @@ struct ChatSessionConfigSheet: View {
                         }
                     }
                 }
+
+                if !bot.isPrivate {
+                    Section("本 Bot 逐工具白名单") {
+                        let toggleableTools: [(id: String, title: String)] = [
+                            ("web_fetch", "联网抓取网页 (web_fetch)"),
+                            ("browser_open", "App 内置浏览器 (browser_*)"),
+                            ("terminal_exec", "沙盒虚拟终端 (terminal_exec)"),
+                            ("git_workspace", "工作区 Git 追踪 (git_workspace)"),
+                            ("python_exec", "离线 Python 沙盒 (python_exec)"),
+                            ("js_eval", "QuickJS 沙盒 (js_eval)"),
+                        ]
+                        ForEach(toggleableTools, id: \.id) { tool in
+                            let isAllowed = !bot.disabledTools.contains(tool.id)
+                            Toggle(tool.title, isOn: Binding(
+                                get: { isAllowed },
+                                set: { enabled in
+                                    var next = Set(bot.disabledTools)
+                                    if enabled {
+                                        next.remove(tool.id)
+                                        if tool.id == "browser_open" {
+                                            for name in ["browser_open", "browser_snapshot", "browser_click", "browser_type", "browser_select", "browser_press_key", "browser_scroll", "browser_screenshot", "browser_back", "browser_wait", "browser_eval", "browser_handoff"] {
+                                                next.remove(name)
+                                            }
+                                        }
+                                    } else {
+                                        next.insert(tool.id)
+                                        if tool.id == "browser_open" {
+                                            for name in ["browser_open", "browser_snapshot", "browser_click", "browser_type", "browser_select", "browser_press_key", "browser_scroll", "browser_screenshot", "browser_back", "browser_wait", "browser_eval", "browser_handoff"] {
+                                                next.insert(name)
+                                            }
+                                        }
+                                    }
+                                    host.setDisabledTools(botId: bot.id, disabledTools: Array(next))
+                                }
+                            ))
+                        }
+                    }
+
+                    Section("模板与备份") {
+                        Button {
+                            exportBotJSON()
+                        } label: {
+                            Label("导出本 Bot 配置（JSON，不含密钥）", systemImage: "square.and.arrow.up")
+                        }
+                    }
+                }
             }
             .navigationTitle("会话配置")
             .navigationBarTitleDisplayMode(.inline)
@@ -450,7 +496,29 @@ struct ChatSessionConfigSheet: View {
                 }
             }
         }
-        .presentationDetents([.medium])
+        .presentationDetents([.medium, .large])
+    }
+
+    private func exportBotJSON() {
+        let payload = BotExportPayload(from: bot)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(payload) else { return }
+        let safe = bot.name.replacingOccurrences(of: "/", with: "_")
+        let dest = FileManager.default.temporaryDirectory.appendingPathComponent("\(safe)-bot-config.json")
+        guard (try? data.write(to: dest, options: .atomic)) != nil else { return }
+        #if canImport(UIKit)
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let root = scenes.first(where: { $0.activationState == .foregroundActive })?.windows.first(where: \.isKeyWindow)?.rootViewController
+            ?? scenes.first?.windows.first?.rootViewController
+        var presenter = root
+        while let next = presenter?.presentedViewController { presenter = next }
+        guard let presenter else { return }
+        let sheet = UIActivityViewController(activityItems: [dest], applicationActivities: nil)
+        sheet.popoverPresentationController?.sourceView = presenter.view
+        sheet.popoverPresentationController?.sourceRect = CGRect(x: presenter.view.bounds.midX, y: presenter.view.bounds.maxY - 60, width: 1, height: 1)
+        presenter.present(sheet, animated: true)
+        #endif
     }
 }
 
@@ -1497,4 +1565,110 @@ struct ChatAtMentionPalette: View {
         }
     }
 }
+
+/// Multi-thread switcher & organizer sheet for a Bot (P1-1: 一 Bot 多会话 + 置顶/归档/重命名/删除).
+struct BotThreadsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let bot: BotProfile
+    @ObservedObject var threadStore: BotThreadStore
+    let onSelectThread: (BotThread) -> Void
+    let onDeleteSession: (String) -> Void
+
+    @State private var newTitle = ""
+    @State private var showArchived = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("新建独立话题") {
+                    HStack {
+                        TextField("话题名称（留空自动命名）", text: $newTitle)
+                        Button("新建") {
+                            let created = threadStore.createThread(for: bot.id, title: newTitle)
+                            newTitle = ""
+                            onSelectThread(created)
+                            dismiss()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    }
+                }
+
+                let active = threadStore.activeThread(for: bot.id)
+                let threads = threadStore.threads(for: bot.id, includeArchived: showArchived)
+                Section("「\(bot.name)」的话题列表（\(threads.count)）") {
+                    ForEach(threads) { thread in
+                        Button {
+                            threadStore.selectThread(thread)
+                            onSelectThread(thread)
+                            dismiss()
+                        } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: thread.isPinned ? "pin.fill" : (thread.isDefault ? "bubble.left.and.bubble.right.fill" : "bubble.left"))
+                                    .foregroundStyle(thread.id == active.id ? DSTheme.brand : .secondary)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    HStack(spacing: 6) {
+                                        Text(thread.title)
+                                            .font(.subheadline.weight(thread.id == active.id ? .semibold : .regular))
+                                            .foregroundStyle(.primary)
+                                        if thread.isArchived {
+                                            Text("已归档")
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    Text(thread.createdAt, style: .date)
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                }
+                                Spacer()
+                                if thread.id == active.id {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundStyle(DSTheme.brand)
+                                }
+                            }
+                        }
+                        .swipeActions(edge: .leading) {
+                            Button {
+                                threadStore.togglePin(botId: bot.id, threadId: thread.id)
+                            } label: {
+                                Label(thread.isPinned ? "取消置顶" : "置顶", systemImage: thread.isPinned ? "pin.slash" : "pin")
+                            }
+                            .tint(.orange)
+                        }
+                        .swipeActions(edge: .trailing) {
+                            if !thread.isDefault {
+                                Button(role: .destructive) {
+                                    if let removedSessionId = threadStore.deleteThread(botId: bot.id, threadId: thread.id) {
+                                        onDeleteSession(removedSessionId)
+                                    }
+                                } label: {
+                                    Label("删除", systemImage: "trash")
+                                }
+                                Button {
+                                    threadStore.toggleArchive(botId: bot.id, threadId: thread.id)
+                                } label: {
+                                    Label(thread.isArchived ? "取消归档" : "归档", systemImage: "archivebox")
+                                }
+                                .tint(.indigo)
+                            }
+                        }
+                    }
+                }
+
+                Section {
+                    Toggle("显示已归档话题", isOn: $showArchived)
+                }
+            }
+            .navigationTitle("多话题切换")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
 

@@ -234,6 +234,7 @@ public struct SettingsAndExploreTabView: View {
 /// Dedicated Model Service & Keychain Credentials screen.
 public struct ModelServiceSettingsView: View {
     @ObservedObject var host: LocalAgentHost
+    @ObservedObject private var providerStore = ProviderProfileStore.shared
     @State private var apiKey = ""
     @State private var status = ""
     @State private var keyConfigured = false
@@ -322,6 +323,58 @@ public struct ModelServiceSettingsView: View {
                 Section("操作状态") {
                     Text(status).font(.caption).foregroundStyle(.secondary)
                 }
+            }
+
+            Section("已保存的多端点档案（按域名隔离 Keychain）") {
+                ForEach(providerStore.profiles) { profile in
+                    let active = host.apiBaseURL == profile.apiBaseURL
+                    Button {
+                        host.apiBaseURL = profile.apiBaseURL
+                        DSHaptics.impact(.light)
+                        status = "已切换至档案「\(profile.name)」"
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(profile.name)
+                                    .font(.subheadline.weight(.medium))
+                                    .foregroundStyle(.primary)
+                                Text(profile.apiBaseURL)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            Spacer()
+                            if active {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(DSTheme.brand)
+                            }
+                        }
+                    }
+                    .swipeActions(edge: .trailing) {
+                        if profile.id != "deepseek-official" {
+                            Button(role: .destructive) {
+                                providerStore.delete(id: profile.id)
+                            } label: {
+                                Label("删除", systemImage: "trash")
+                            }
+                        }
+                    }
+                }
+                Button {
+                    let trimmed = host.apiBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let hostName = URL(string: trimmed)?.host ?? "自定义端点"
+                    providerStore.upsert(ProviderProfile(
+                        name: hostName,
+                        apiBaseURL: trimmed,
+                        defaultModel: host.models.first ?? ModelProvider.defaultModel
+                    ))
+                    status = "已将 \(hostName) 保存到端点档案列表。"
+                    DSHaptics.notify(.success)
+                } label: {
+                    Label("保存当前地址为新档案", systemImage: "plus.circle")
+                        .font(.subheadline)
+                }
+                .disabled(host.apiBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .scrollDismissesKeyboard(.interactively)

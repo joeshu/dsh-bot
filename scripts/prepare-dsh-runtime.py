@@ -16,7 +16,7 @@ FILES = {
     "dsh-ios-entry.mjs": SOURCE / "dsh-ios-entry.mjs",
     "ios-plugin-manager.mjs": SOURCE / "ios-plugin-manager.mjs",
     "sqlite-session-persistence.mjs": SOURCE / "sqlite-session-persistence.mjs",
-    "ipc-protocol.mjs": ROOT / "kernel" / "src" / "ipc-protocol.mjs",
+    "ipc-protocol.mjs": ROOT / "kernel" / "runtime" / "ipc-protocol.mjs",
 }
 UPSTREAM_COMMIT = "9c2670d3bce5275e0d1610272958121af87787bb"
 IOS_PROFILE_BUNDLE = "@dsbot/dsh-ios-profile"
