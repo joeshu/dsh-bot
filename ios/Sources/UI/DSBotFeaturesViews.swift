@@ -61,7 +61,7 @@ public struct LongReplyReadingPill: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
-        .background(DSTheme.surfaceElevated)
+        .background(DSTheme.surfacePrimary)
         .overlay(Capsule().stroke(Color.secondary.opacity(0.18), lineWidth: 1))
         .clipShape(Capsule())
         .shadow(color: .black.opacity(0.08), radius: 3, y: 1)
