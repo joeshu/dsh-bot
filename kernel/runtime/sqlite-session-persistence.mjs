@@ -183,30 +183,8 @@ class SQLiteSessionHandle {
 export class SQLiteSessionPersistence extends SessionPersistence {
   constructor(ctx) {
     super(ctx)
-    this.db = new DatabaseSync(databasePath)
-    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; PRAGMA cache_size = -4000; PRAGMA temp_store = MEMORY; PRAGMA mmap_size = 0;')
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS sessions (
-        id TEXT PRIMARY KEY NOT NULL,
-        header_json TEXT NOT NULL,
-        inherited_event_count INTEGER NOT NULL,
-        next_seq INTEGER NOT NULL DEFAULT 0,
-        revision INTEGER NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL,
-        last_activity_at INTEGER,
-        last_message_preview TEXT
-      );
-      CREATE TABLE IF NOT EXISTS session_events (
-        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-        seq INTEGER NOT NULL,
-        event_json TEXT NOT NULL,
-        PRIMARY KEY (session_id, seq)
-      );
-    `)
-    const sessionColumns = new Set(this.db.prepare('PRAGMA table_info(sessions)').all().map((row) => row.name))
-    if (!sessionColumns.has('last_activity_at')) this.db.exec('ALTER TABLE sessions ADD COLUMN last_activity_at INTEGER')
-    if (!sessionColumns.has('last_message_preview')) this.db.exec('ALTER TABLE sessions ADD COLUMN last_message_preview TEXT')
-    this.backfillSessionSummaries()
+    this._db = null
+    this.openDatabase({ runMigrations: true })
     this.handles = new Set()
     this.writeOwners = new Map()
     const persistence = this
@@ -216,7 +194,7 @@ export class SQLiteSessionPersistence extends SessionPersistence {
         for (const handle of [...persistence.handles]) {
           try { await handle.close() } catch (error) { errors.push(error) }
         }
-        try { persistence.checkpoint(); persistence.db.close() } catch (error) { errors.push(error) }
+        try { persistence.closeDatabaseHandle() } catch (error) { errors.push(error) }
         if (errors.length) throw new AggregateError(errors, 'DSH SQLite persistence shutdown failed')
       }
       yield ctx.on('session/event', (session, event) => {
@@ -228,6 +206,68 @@ export class SQLiteSessionPersistence extends SessionPersistence {
         if (writer) void writer.close().catch((error) => ctx.logger.warn(`DSH SQLite final flush failed for ${session.id}: ${String(error)}`))
       })
     }, 'dsh-ios.sqliteSessionPersistence')
+  }
+
+  get db() {
+    if (!this._db) this.openDatabase({ runMigrations: false })
+    return this._db
+  }
+
+  openDatabase({ runMigrations = false } = {}) {
+    if (this._db) return this._db
+    const db = new DatabaseSync(databasePath)
+    db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; PRAGMA cache_size = -4000; PRAGMA temp_store = MEMORY; PRAGMA mmap_size = 0;')
+    this._db = db
+    if (runMigrations) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS sessions (
+          id TEXT PRIMARY KEY NOT NULL,
+          header_json TEXT NOT NULL,
+          inherited_event_count INTEGER NOT NULL,
+          next_seq INTEGER NOT NULL DEFAULT 0,
+          revision INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL,
+          last_activity_at INTEGER,
+          last_message_preview TEXT
+        );
+        CREATE TABLE IF NOT EXISTS session_events (
+          session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          seq INTEGER NOT NULL,
+          event_json TEXT NOT NULL,
+          PRIMARY KEY (session_id, seq)
+        );
+      `)
+      const sessionColumns = new Set(db.prepare('PRAGMA table_info(sessions)').all().map((row) => row.name))
+      if (!sessionColumns.has('last_activity_at')) db.exec('ALTER TABLE sessions ADD COLUMN last_activity_at INTEGER')
+      if (!sessionColumns.has('last_message_preview')) db.exec('ALTER TABLE sessions ADD COLUMN last_message_preview TEXT')
+      this.backfillSessionSummaries()
+    }
+    return db
+  }
+
+  closeDatabaseHandle() {
+    if (!this._db) return
+    try {
+      this._db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+    } finally {
+      const db = this._db
+      this._db = null
+      db.close()
+    }
+  }
+
+  async suspendDatabase() {
+    await this.flush({ truncate: true })
+    if (this.handles.size === 0) {
+      this.closeDatabaseHandle()
+      return { closed: true }
+    }
+    return { closed: false, openHandles: this.handles.size }
+  }
+
+  resumeDatabase() {
+    this.openDatabase({ runMigrations: false })
+    return { open: Boolean(this._db) }
   }
 
   handlesFor(id) { return [...this.handles].filter((handle) => handle.id === id) }

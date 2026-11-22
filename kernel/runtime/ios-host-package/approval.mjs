@@ -1,11 +1,29 @@
-import { relative, resolve, sep } from 'node:path'
+import { realpathSync } from 'node:fs'
+import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { iosHost } from './index.mjs'
 
+function canonicalize(targetPath) {
+  let current = resolve(targetPath)
+  const suffix = []
+  for (let depth = 0; depth < 64; depth++) {
+    try {
+      const real = realpathSync(current)
+      return suffix.length ? resolve(real, ...suffix) : real
+    } catch {
+      const parent = dirname(current)
+      if (parent === current) break
+      suffix.unshift(basename(current))
+      current = parent
+    }
+  }
+  return resolve(targetPath)
+}
+
 function workspacePath(host, target) {
-  const root = resolve(host.workspace, 'files')
-  const absolute = resolve(String(target?.displayPath ?? ''))
+  const root = canonicalize(resolve(host.workspace, 'files'))
+  const absolute = canonicalize(String(target?.displayPath ?? ''))
   const path = relative(root, absolute)
-  if (!path || path === '..' || path.startsWith(`..${sep}`) || resolve(root, path) !== absolute) {
+  if (!path || path === '..' || path.startsWith(`..${sep}`) || isAbsolute(path)) {
     throw new Error('DSH file tools may only modify files inside the iOS files/ workspace')
   }
   return path.split(sep).join('/')
@@ -21,7 +39,7 @@ function apply(ctx) {
     if (active.permissionMode === 'readOnly') {
       throw new Error(`只读保护模式已拦截 ${operation}（files/${path}）`)
     }
-    if (active.permissionMode === 'autoReview' && (operation === 'write' || operation === 'edit')) {
+    if (active.permissionMode === 'autoReview') {
       return next()
     }
     const outcome = await ctx.approval.request({

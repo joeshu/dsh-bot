@@ -20,34 +20,22 @@ public enum BotProfileTab: String, CaseIterable, Identifiable {
     }
 }
 
-/// Unified 5-Tab Bot Profile Sheet (Work / Memory / Files / Routines / Settings)
-/// with persisted last-selected tab via `@AppStorage`.
+/// Self-contained 5-Tab Bot Profile Sheet (概览 / 记忆 / 文件 / 定时 / 设置)
+/// with persisted last-selected tab via `@AppStorage`. Works identically from
+/// SessionsTabView, BotRosterTabView, and ChatView with zero dead closures.
 public struct BotProfileSheet: View {
     let bot: BotProfile
     @ObservedObject var host: LocalAgentHost
-    let onOpenMemory: () -> Void
-    let onOpenRoutines: () -> Void
-    let onOpenEditSettings: () -> Void
-    let onOpenDiagnostics: () -> Void
 
     @AppStorage("dsbot.profile.selectedTab") private var selectedTabRaw: String = BotProfileTab.work.rawValue
     @State private var refreshStatus: String = ""
+    @State private var showEditSettings = false
+    @State private var showDiagnostics = false
     @Environment(\.dismiss) private var dismiss
 
-    public init(
-        bot: BotProfile,
-        host: LocalAgentHost,
-        onOpenMemory: @escaping () -> Void,
-        onOpenRoutines: @escaping () -> Void,
-        onOpenEditSettings: @escaping () -> Void,
-        onOpenDiagnostics: @escaping () -> Void
-    ) {
+    public init(bot: BotProfile, host: LocalAgentHost) {
         self.bot = bot
         self.host = host
-        self.onOpenMemory = onOpenMemory
-        self.onOpenRoutines = onOpenRoutines
-        self.onOpenEditSettings = onOpenEditSettings
-        self.onOpenDiagnostics = onOpenDiagnostics
     }
 
     private var selectedTab: Binding<BotProfileTab> {
@@ -90,6 +78,12 @@ public struct BotProfileSheet: View {
                     Button("关闭") { dismiss() }
                 }
             }
+            .sheet(isPresented: $showEditSettings) {
+                EditBotSheet(bot: liveBot, host: host)
+            }
+            .sheet(isPresented: $showDiagnostics) {
+                SessionDiagnosticsSheet(host: host, bot: liveBot)
+            }
         }
     }
 
@@ -114,8 +108,8 @@ public struct BotProfileSheet: View {
             Section("智能体信息") {
                 LabeledContent("角色定位", value: liveBot.roleLabel)
                 LabeledContent("默认模型", value: host.modelSelection(liveBot.model))
-                LabeledContent("DSH 模式", value: liveBot.agentPreset)
-                LabeledContent("权限策略", value: liveBot.permissionMode)
+                LabeledContent("DSH 模式", value: host.agentPresetName(liveBot.agentPreset))
+                LabeledContent("审批档位", value: liveBot.permissionModeLabel)
                 LabeledContent("本地消息数", value: "\(host.messages(for: liveBot.id).count)")
             }
             Section("近期工具调用") {
@@ -127,7 +121,7 @@ public struct BotProfileSheet: View {
                             HStack {
                                 Text(act.toolName).font(.subheadline.weight(.medium))
                                 Spacer()
-                                Text(act.phase).font(.caption2).foregroundStyle(.secondary)
+                                Text(act.phaseLabel).font(.caption2).foregroundStyle(.secondary)
                             }
                             if let summary = act.fileSummary {
                                 Text(summary).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
@@ -178,7 +172,7 @@ public struct BotProfileSheet: View {
                             Text(act.fileSummary ?? act.toolName)
                                 .font(.caption.monospaced())
                                 .lineLimit(2)
-                            Text("\(act.toolName) · \(act.phase)")
+                            Text("\(act.toolName) · \(act.phaseLabel)")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
@@ -209,8 +203,7 @@ public struct BotProfileSheet: View {
                     Label("查看后台计算任务 (Jobs)", systemImage: "hourglass")
                 }
                 Button {
-                    dismiss()
-                    onOpenDiagnostics()
+                    showDiagnostics = true
                 } label: {
                     Label("查看会话诊断与内存水位", systemImage: "stethoscope")
                 }
@@ -258,8 +251,7 @@ public struct BotProfileSheet: View {
                 LabeledContent("群聊协作", value: liveBot.isGroup ? "群聊（90s 租约保护）" : "单聊")
                 LabeledContent("红队演练工具", value: liveBot.redteamToolsEnabled ? "已授权" : "关闭")
                 Button {
-                    dismiss()
-                    onOpenEditSettings()
+                    showEditSettings = true
                 } label: {
                     Label("编辑智能体人设与高级配置", systemImage: "slider.horizontal.3")
                 }

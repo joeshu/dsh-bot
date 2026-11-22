@@ -46,8 +46,11 @@ function hasUnsafeRegexFeatures(pattern) {
   return false
 }
 
-function globExpression(pattern) {
+function globExpression(rawPattern) {
+  // Collapse redundant repeated globs like **/**/** to prevent polynomial backtracking
+  const pattern = String(rawPattern ?? '').replace(/(?:\*\*\/){2,}/g, '**/').replace(/\*{3,}/g, '**')
   let expression = '^'
+  let braceDepth = 0
   for (let index = 0; index < pattern.length; index++) {
     const char = pattern[index]
     if (char === '*' && pattern[index + 1] === '*') {
@@ -58,12 +61,27 @@ function globExpression(pattern) {
       } else expression += '.*'
     } else if (char === '*') expression += '[^/]*'
     else if (char === '?') expression += '[^/]'
-    else if (char === '{') expression += '(?:'
-    else if (char === '}') expression += ')'
-    else if (char === ',') expression += '|'
-    else if (char === '[') expression += '['
-    else if (char === ']' || char === '-') expression += char
-    else expression += /[\\^$.*+?()[\]{}|]/.test(char) ? `\\${char}` : char
+    else if (char === '{') {
+      if (braceDepth >= 2) throw new Error('Glob brace nesting exceeds safe depth (2)')
+      braceDepth++
+      expression += '(?:'
+    } else if (char === '}') {
+      if (braceDepth > 0) {
+        braceDepth--
+        expression += ')'
+      } else {
+        expression += '\\}'
+      }
+    } else if (char === ',' && braceDepth > 0) {
+      expression += '|'
+    } else {
+      // Escape regex metacharacters including unbalanced '[' and ']' safely
+      expression += /[\\^$.*+?()[\]{}|]/.test(char) ? `\\${char}` : char
+    }
+  }
+  while (braceDepth > 0) {
+    expression += ')'
+    braceDepth--
   }
   return new RegExp(`${expression}$`)
 }
@@ -80,11 +98,15 @@ async function searchRoot(ctx, exec, requestedPath) {
 
 async function* walk(ctx, root, exec, limits = {}) {
   const maxVisited = limits.maxVisited ?? MAX_VISITED_ENTRIES
+  const visitedDirs = new Set()
   const stack = [root]
   let visited = 0
   while (stack.length && visited < maxVisited) {
     exec.signal?.throwIfAborted()
     const directory = stack.pop()
+    const dirKey = String(ctx.fs.processPath(directory))
+    if (visitedDirs.has(dirKey)) continue
+    visitedDirs.add(dirKey)
     const entries = await ctx.fs.listDir(directory, exec.signal)
     for (const entry of entries) {
       if (++visited > maxVisited) return

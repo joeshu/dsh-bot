@@ -601,25 +601,47 @@ const REDTEAM_SENSITIVE_TOOL_NAMES = new Set([
   'redteam_batch', 'redteam_pivot_probe', 'redteam_data_proof', 'redteam_cleanup',
 ])
 
-function redteamToolClass(name) {
-  if (REDTEAM_READ_TOOL_NAMES.has(name)) return 'read'
-  if (REDTEAM_WRITE_TOOL_NAMES.has(name)) return 'write'
-  if (REDTEAM_SENSITIVE_TOOL_NAMES.has(name)) return 'sensitive'
-  return 'unknown'
+function redteamToolFlags(name) {
+  const isKnownRead = REDTEAM_READ_TOOL_NAMES.has(name)
+  const isKnownWrite = REDTEAM_WRITE_TOOL_NAMES.has(name)
+  const isKnownSensitive = REDTEAM_SENSITIVE_TOOL_NAMES.has(name)
+  if (isKnownRead || isKnownWrite || isKnownSensitive) {
+    return {
+      known: true,
+      read: isKnownRead && !isKnownWrite && !isKnownSensitive,
+      write: isKnownWrite,
+      sensitive: isKnownSensitive,
+    }
+  }
+  // Future-proof heuristic fallback for newly added dsh-purge-safe `redteam_*` tools:
+  // keeps strict read/write/sensitive/3-tier governance without hard-breaking on plugin upgrades.
+  if (typeof name !== 'string' || !/^redteam_[a-z0-9_]{2,64}$/.test(name)) {
+    return { known: false, read: false, write: false, sensitive: false }
+  }
+  const sensitive = /(?:credential|access|session|webshell|tunnel|poc|pivot|cleanup|proof|proxy|attack_file|agent_slot|template_refresh)/.test(name)
+  const readOnlySuffix = /(?:_list|_get|_query|_search|_stats|_status|_info|_graph|_report|_timeline|_index|_check|_catalog|_digest|_targets|_next|_action|_path|_chain|_roles|_prompt)$/.test(name)
+  const writeVerb = /(?:_add|_update|_delete|_remove|_save|_set|_open|_bind|_reset|_create|_edit|_run|_use|_probe|_hit|_assess|_batch|_import|_refresh|_sync|_ack)/.test(name)
+  const write = writeVerb || (sensitive && !readOnlySuffix)
+  const read = !write && !sensitive && readOnlySuffix
+  if (!read && !write && !sensitive) {
+    // Unknown verb defaults conservatively to write so it cannot bypass readOnly or ask approval
+    return { known: true, read: false, write: true, sensitive: false }
+  }
+  return { known: true, read, write, sensitive }
 }
 
 function redteamToolDenial(policy, name) {
-  const kind = redteamToolClass(name)
-  if (kind === 'unknown') return `iOS 未审核红队工具 ${name}，默认拒绝。`
+  const flags = redteamToolFlags(name)
+  if (!flags.known) return `iOS 未审核红队工具 ${name}，默认拒绝。`
   if (!policy.enabled || !runtime.redteamToolsEnabled) return '红队工具宿主或本 Bot 授权已关闭。'
-  if (runtime.privateBotIds.has(policy.botId)) return '私密会话禁止调用 dsh-purge-safe 工具。'
-  if (REDTEAM_SENSITIVE_TOOL_NAMES.has(name) && policy.permissionMode === 'readOnly') {
+  if (policy.botId && runtime.privateBotIds.has(policy.botId)) return '私密会话禁止调用 dsh-purge-safe 工具。'
+  if (flags.sensitive && policy.permissionMode === 'readOnly') {
     return '只读保护模式禁止调用红队敏感工具。'
   }
-  if (REDTEAM_SENSITIVE_TOOL_NAMES.has(name) && !policy.sensitive) return `本 Bot 未获准访问敏感红队数据：${name}。`
-  if (REDTEAM_WRITE_TOOL_NAMES.has(name) && (!policy.write || policy.permissionMode === 'readOnly')) {
+  if (flags.sensitive && !policy.sensitive) return `本 Bot 未获准访问敏感红队数据：${name}。`
+  if (flags.write && (!policy.write || policy.permissionMode === 'readOnly')) {
     if (policy.permissionMode === 'readOnly') return '只读保护模式禁止修改红队演练数据。'
-    return REDTEAM_SENSITIVE_TOOL_NAMES.has(name)
+    return flags.sensitive
       ? '敏感数据写入需要同时授予演练台写入权限。'
       : `本 Bot 未获准写入红队演练数据：${name}。`
   }
@@ -627,15 +649,49 @@ function redteamToolDenial(policy, name) {
 }
 
 function redteamToolNeedsApproval(policy, name) {
-  const isSensitive = REDTEAM_SENSITIVE_TOOL_NAMES.has(name)
-  const isWrite = REDTEAM_WRITE_TOOL_NAMES.has(name)
+  const flags = redteamToolFlags(name)
   // Three-tier alignment: readOnly is blocked above; ask prompts on write/sensitive;
   // autoReview (沙盒免打扰) auto-allows explicitly authorized redteam tools.
-  return policy.permissionMode === 'ask' && (isWrite || isSensitive)
+  return policy.permissionMode === 'ask' && (flags.write || flags.sensitive)
 }
 
 function redteamApprovalKey(sessionId, callId) {
   return `${String(sessionId ?? '')}:${String(callId ?? '')}`
+}
+
+function resolveRedteamPolicyForAgent(agent) {
+  const sessionId = String(agent?.session?.id ?? '')
+  if (!sessionId) return undefined
+  const direct = runtime.redteamTurnPolicies.get(sessionId)
+  if (direct) return direct
+  // Walk parentSession chain (depth <= 8) so authorized RedTeam Subagents inherit parent policy
+  try {
+    const sessionsSvc = ctx?.get?.('sessions')
+    const allRows = typeof sessionsSvc?.list === 'function' ? sessionsSvc.list() : []
+    const byId = new Map(allRows.map((row) => [String(row?.id ?? row?.header?.id ?? ''), row]))
+    let cursor = String(agent?.session?.header?.parentSession ?? byId.get(sessionId)?.header?.parentSession ?? '')
+    const visited = new Set([sessionId])
+    for (let depth = 0; cursor && depth < 8 && !visited.has(cursor); depth += 1) {
+      visited.add(cursor)
+      const inherited = runtime.redteamTurnPolicies.get(cursor)
+      if (inherited) {
+        return { ...inherited, inheritedFrom: cursor }
+      }
+      cursor = String(byId.get(cursor)?.header?.parentSession ?? '')
+    }
+  } catch { /* fall through */ }
+  // Non-native Web UI session: honor explicit iOS Web RedTeam permissions
+  if (!sessionId.startsWith('ios:') && runtime.redteamToolsEnabled && runtime.redteamWebPermissions.read) {
+    return {
+      botId: '',
+      enabled: true,
+      write: runtime.redteamWebPermissions.write === true,
+      sensitive: runtime.redteamWebPermissions.sensitive === true,
+      permissionMode: 'ask',
+      isWeb: true,
+    }
+  }
+  return undefined
 }
 
 function registeredRedteamToolNames() {
@@ -671,6 +727,7 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
     let toolRestriction
     let toolGuard
     let redteamPreExecuteDisposer
+    let lastToolsPolicyKey = ''
     setPersona = (value) => {
       personaDisposer?.()
       personaDisposer = undefined
@@ -681,6 +738,24 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
     setPersona(systemPrompt)
     setToolsEnabled = (enabled, allowSubagent, allowWebSearch, allowRedteam = false,
       allowRedteamWrites = false, allowRedteamSensitive = false, redteamPermissionMode = 'ask') => {
+      const normalizedPermissionMode = ['ask', 'autoReview', 'readOnly'].includes(redteamPermissionMode) ? redteamPermissionMode : 'ask'
+      const rtTools = registeredRedteamToolNames()
+      const policyKey = JSON.stringify({
+        enabled,
+        allowSubagent,
+        allowWebSearch,
+        allowRedteam,
+        allowRedteamWrites,
+        allowRedteamSensitive,
+        normalizedPermissionMode,
+        rtTools,
+      })
+      // Keep system prompt prefix and Cordis guards untouched across identical turns to maximize Prompt Cache hits
+      if (policyKey === lastToolsPolicyKey) {
+        return
+      }
+      lastToolsPolicyKey = policyKey
+
       toolRestriction?.()
       toolRestriction = undefined
       toolGuard?.()
@@ -694,13 +769,12 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
         enabled: enabled && allowRedteam,
         write: allowRedteamWrites,
         sensitive: allowRedteamSensitive,
-        permissionMode: ['ask', 'autoReview', 'readOnly'].includes(redteamPermissionMode) ? redteamPermissionMode : 'ask',
+        permissionMode: normalizedPermissionMode,
       }
       const globalToolNames = new Set(ctx.tools.definitions().map((tool) => tool.name))
       const deny = enabled ? [] : [...DISABLED_TOOL_NAMES].filter((name) => globalToolNames.has(name))
       if (!allowSubagent || !enabled) deny.push('subagent')
       if (enabled && !allowWebSearch) deny.push('web_search')
-      const rtTools = registeredRedteamToolNames()
       if (!allowRedteam || !enabled) {
         deny.push(...rtTools)
       } else {
@@ -713,7 +787,7 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
         redteamPromptDisposer = agentCtx.systemPrompt.section({
           name: 'dsbot-ios-redteam-mode',
           order: 850,
-          text: `dsh-purge-safe 红队演练工具已获本 Bot 授权。只允许在用户明确授权的演练范围内查询与记录；不得自行扩大范围。敏感资料、凭据、入口、PoC、网络探测和清理操作会经过额外授权/审批。iOS 已关闭插件补丁应用、工具审批旁路和子代理审批接管。当前可用工具：${allowedRedteamTools.join(', ')}。`,
+          text: `dsh-purge-safe 红队演练工具已获本 Bot 授权。只允许在用户明确授权的演练范围内查询与记录；不得自行扩大范围。当前可用工具（${allowedRedteamTools.length} 项）：${allowedRedteamTools.join(', ')}。`,
         })
       }
       if (deny.length) toolRestriction = agentCtx.tools.restrict({ deny })
@@ -891,14 +965,17 @@ async function boot() {
     const name = String(execution?.name ?? '')
     if (!name.startsWith('redteam_')) return undefined
     const sessionId = String(execution.agent?.session?.id ?? '')
-    const policy = runtime.redteamTurnPolicies.get(sessionId)
-    if (!policy) return { reason: 'iOS Web/非原生会话没有 dsh-purge-safe Bot 工具授权。' }
+    const policy = resolveRedteamPolicyForAgent(execution.agent)
+    if (!policy) return { reason: '当前会话尚未获得 dsh-purge-safe 红队工具授权。' }
     const denial = redteamToolDenial(policy, name)
     if (denial) return { reason: denial }
-    if (redteamToolNeedsApproval(policy, name)) {
+    if (!policy.isWeb && redteamToolNeedsApproval(policy, name)) {
       const key = redteamApprovalKey(sessionId, execution.callId)
+      const parentKey = policy.inheritedFrom ? redteamApprovalKey(policy.inheritedFrom, execution.callId) : ''
       const approved = runtime.redteamApprovalGrants.get(key) === true
+        || (parentKey && runtime.redteamApprovalGrants.get(parentKey) === true)
       runtime.redteamApprovalGrants.delete(key)
+      if (parentKey) runtime.redteamApprovalGrants.delete(parentKey)
       if (!approved) return { reason: '此红队工具调用没有通过 iOS 会话审批，已拒绝执行。' }
     }
     return undefined
@@ -1079,15 +1156,19 @@ async function startTurn(params, preparation) {
   const redteamWriteEnabled = redteamMode && params.redteamWriteEnabled === true
   const redteamSensitiveDataEnabled = redteamMode && params.redteamSensitiveDataEnabled === true
   const agentPreset = typeof params.agentPreset === 'string' ? params.agentPreset : ctx.agentPresets.defaultId
+  if (agentPreset === 'redteam' && !redteamMode) {
+    throw new Error('红队模式要求开启全局红队宿主并授予本 Bot 红队工具权限（私密会话不可使用）。')
+  }
+  if (redteamMode) {
+    const rtMountStatus = await setRedteamToolsMounted(true)
+    if (agentPreset === 'redteam' && !rtMountStatus.redteamModeActive) {
+      throw new Error(`dsh-purge-safe 红队工具未能挂载：${rtMountStatus.compatibilityWarning || '请检查插件状态并重启引擎'}`)
+    }
+  }
   const availablePresets = await ctx.agentPresets.list()
   if (!availablePresets.some((preset) => preset.id === agentPreset && !preset.broken)) {
     throw new Error(`Unknown or unavailable DSH mode: ${agentPreset}`)
   }
-  if (agentPreset === 'redteam'
-    && (!redteamMode || !redteamWriteEnabled || !redteamSensitiveDataEnabled || permissionMode === 'readOnly')) {
-    throw new Error('红队模式要求当前 Bot 获准使用工具、写入演练台并访问敏感资料；只读模式不可使用。')
-  }
-  if (redteamMode) await setRedteamToolsMounted(true).catch(() => {})
   const id = dshSessionId(botId)
   let active = runtime.activeAgents.get(id)
   if (active && active.agentPreset !== agentPreset) {
@@ -1125,9 +1206,12 @@ async function startTurn(params, preparation) {
       await ctx.workingDirectory.set(handle.agent, WORKSPACE_FILES)
     }
     const selection = ctx.agentPresets.presetForSession(handle.agent.session)
-    const boundary = ctx.agents.turnBoundaryOf(handle.agent.session)
-    if (boundary.lastTurn === 0 && selection !== agentPreset) {
-      await ctx.agentPresets.select(handle.agent, agentPreset)
+    if (selection !== agentPreset) {
+      try {
+        await ctx.agentPresets.select(handle.agent, agentPreset)
+      } catch {
+        // Preset already mounted via setupAgent; ignore if session header is immutable
+      }
     }
     active = {
       handle,
@@ -1378,16 +1462,31 @@ rpc.handle('agent.suspend', async () => {
       return { suspended: false }
     }
   }
-  await runtime.persistence.flush({ truncate: true })
-  return { suspended: runtime.suspendGeneration === suspendGeneration && runtime.suspended }
+  let sqliteClosed = false
+  if (typeof runtime.persistence?.suspendDatabase === 'function') {
+    const res = await runtime.persistence.suspendDatabase()
+    sqliteClosed = res?.closed === true
+  } else {
+    await runtime.persistence.flush({ truncate: true })
+  }
+  return { suspended: runtime.suspendGeneration === suspendGeneration && runtime.suspended, sqliteClosed }
 })
 rpc.handle('agent.resume', async () => {
   runtime.suspendGeneration += 1
   runtime.suspended = false
+  if (typeof runtime.persistence?.resumeDatabase === 'function') {
+    runtime.persistence.resumeDatabase()
+  }
   return { suspended: false }
 })
 rpc.handle('runtime.health', async () => {
   const mem = process.memoryUsage()
+  const webPort = ctx?.webServer?.port
+  let webServerAlive = false
+  if (Number.isInteger(webPort) && webPort > 0) {
+    const listener = ctx?.webServer?.server
+    webServerAlive = listener ? listener.listening !== false : true
+  }
   return {
     ok: !runtime.shuttingDown,
     suspended: runtime.suspended,
@@ -1397,6 +1496,8 @@ rpc.handle('runtime.health', async () => {
     heapTotalMB: Math.round((mem.heapTotal / 1_048_576) * 10) / 10,
     activeAgents: runtime.activeAgents.size,
     activeTurns: runtime.activeTurns.size,
+    webPort: Number.isInteger(webPort) ? webPort : 0,
+    webServerAlive,
   }
 })
 
@@ -1851,6 +1952,7 @@ rpc.handle('session.clear', async ({ sessionId }) => {
 let redteamToolsFork = null
 let redteamMountInFlight = null
 let redteamMountError = ''
+let redteamMountDurationMs = 0
 let redteamSkillsCache = { dir: '', mtimeMs: 0, count: 0 }
 
 function redteamToolsModulePath() {
@@ -1883,6 +1985,7 @@ async function performSetRedteamToolsMounted(enabled) {
   process.env.DS_BOT_IOS_REDTEAM_ENABLED = runtime.redteamToolsEnabled ? '1' : '0'
   if (!enabled) {
     redteamMountError = ''
+    redteamMountDurationMs = 0
     runtime.redteamApprovalGrants.clear()
     for (const policy of runtime.redteamTurnPolicies.values()) policy.enabled = false
     if (redteamToolsFork) {
@@ -1891,12 +1994,18 @@ async function performSetRedteamToolsMounted(enabled) {
     }
     return redteamStatus()
   }
+  // Self-heal stale Cordis fork if tools were unexpectedly unregistered or fork disposed
+  if (redteamToolsFork && registeredRedteamToolNames().length === 0) {
+    try { await redteamToolsFork.dispose?.() } catch { /* ignore */ }
+    redteamToolsFork = null
+  }
   if (!redteamToolsFork) {
     const toolsPath = redteamToolsModulePath()
     if (!toolsPath) {
       redteamMountError = '未找到 dsh-purge-safe/lib/redteam/tools.js'
       return redteamStatus()
     }
+    const startedAt = Date.now()
     try {
       redteamMountError = ''
       const rev = (() => { try { return Math.floor(statSync(toolsPath).mtimeMs) } catch { return Date.now() } })()
@@ -1913,8 +2022,10 @@ async function performSetRedteamToolsMounted(enabled) {
           throw err
         }
       }
+      redteamMountDurationMs = Math.max(1, Date.now() - startedAt)
     } catch (err) {
       redteamToolsFork = null
+      redteamMountDurationMs = 0
       redteamMountError = err instanceof Error ? err.message : String(err)
     }
   }
@@ -1954,6 +2065,7 @@ function redteamStatus() {
     toolCount: tools.length,
     tools,
     skillCount: redteamSkillsCount(),
+    mountDurationMs: redteamMountDurationMs,
   }
 }
 
@@ -2091,7 +2203,7 @@ rpc.handle('side.cancel', async (params = {}) => {
 
 // ── iOS Experimental Desktop Capabilities: Sandboxed Virtual Terminal (PTY), Git Worktree & PR Tracker, and Cordis/Node DevTools Inspector ──
 
-import { copyFileSync, lstatSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { copyFileSync, lstatSync, readFileSync, realpathSync, renameSync, rmSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import vm from 'node:vm'
@@ -2099,6 +2211,9 @@ import vm from 'node:vm'
 const virtualTerminals = new Map()
 const devtoolsLogs = []
 const MAX_DEVTOOLS_LOGS = 200
+const MAX_TERMINAL_READ_BYTES = 1_048_576
+const MAX_WALK_FILES = 1_500
+const MAX_WALK_DEPTH = 12
 
 function pushDevtoolsLog(level, category, message) {
   devtoolsLogs.push({
@@ -2109,6 +2224,23 @@ function pushDevtoolsLog(level, category, message) {
     message: String(message ?? '').slice(0, 4_000),
   })
   if (devtoolsLogs.length > MAX_DEVTOOLS_LOGS) devtoolsLogs.splice(0, devtoolsLogs.length - MAX_DEVTOOLS_LOGS)
+}
+
+function canonicalizeWorkspacePath(targetPath) {
+  let current = resolve(targetPath)
+  const suffix = []
+  for (let depth = 0; depth < 64; depth++) {
+    try {
+      const real = realpathSync(current)
+      return suffix.length ? resolve(real, ...suffix) : real
+    } catch {
+      const parent = dirname(current)
+      if (parent === current) break
+      suffix.unshift(basename(current))
+      current = parent
+    }
+  }
+  return resolve(targetPath)
 }
 
 function getVirtualTerminalSession(sessionId = 'default') {
@@ -2133,14 +2265,18 @@ function getVirtualTerminalSession(sessionId = 'default') {
 }
 
 function resolveInsideWorkspaceFiles(virtualCwd, targetPath = '.') {
-  const root = resolve(WORKSPACE_FILES)
+  const rawRoot = resolve(WORKSPACE_FILES)
+  mkdirSync(rawRoot, { recursive: true })
+  const root = canonicalizeWorkspacePath(rawRoot)
   const raw = String(targetPath || '.').trim()
+  if (raw.includes('\0')) throw new Error('权限拒绝：路径包含非法空字节')
   const baseVirtual = virtualCwd.startsWith('/') ? virtualCwd.slice(1) : virtualCwd
-  const combined = raw.startsWith('/workspace')
+  const candidate = raw.startsWith('/workspace')
     ? resolve(root, raw.slice('/workspace'.length).replace(/^\/+/, ''))
     : raw.startsWith('/')
       ? resolve(root, raw.replace(/^\/+/, ''))
       : resolve(root, baseVirtual, raw)
+  const combined = canonicalizeWorkspacePath(candidate)
   const rel = relative(root, combined)
   if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
     throw new Error(`权限拒绝：路径越出 iOS 沙盒工作区 (${targetPath})`)
@@ -2174,18 +2310,25 @@ function tokenizeShellWords(input) {
   return tokens
 }
 
-function walkWorkspaceTree(dirAbs, baseAbs = resolve(WORKSPACE_FILES), out = []) {
+function walkWorkspaceTree(dirAbs, baseAbs = resolve(WORKSPACE_FILES), out = [], opts = {}, depth = 0) {
+  const includeContent = opts.includeContent !== false
+  if (depth > MAX_WALK_DEPTH || out.length >= MAX_WALK_FILES) return out
   let entries = []
   try { entries = readdirSync(dirAbs, { withFileTypes: true }) } catch { return out }
   for (const entry of entries) {
-    if (entry.name === '.DS_Store' || entry.name === '.dsbot-ios-workspace-root' || entry.name === '.dsbot-git-tracker.json') continue
+    if (out.length >= MAX_WALK_FILES) break
+    if (entry.name === '.DS_Store' || entry.name === '.dsbot-ios-workspace-root' || entry.name === '.dsbot-git-tracker.json' || entry.isSymbolicLink()) continue
     const full = join(dirAbs, entry.name)
     const rel = relative(baseAbs, full).split(sep).join('/')
     if (entry.isDirectory()) {
-      walkWorkspaceTree(full, baseAbs, out)
+      walkWorkspaceTree(full, baseAbs, out, opts, depth + 1)
     } else if (entry.isFile()) {
       try {
         const st = statSync(full)
+        if (!includeContent) {
+          out.push({ path: rel, size: st.size, mtimeMs: Math.round(st.mtimeMs), sha: '', content: null })
+          continue
+        }
         const buf = st.size <= 524_288 ? readFileSync(full) : null
         const sha = buf ? createHash('sha1').update(buf).digest('hex') : `size:${st.size}`
         out.push({
@@ -2198,7 +2341,7 @@ function walkWorkspaceTree(dirAbs, baseAbs = resolve(WORKSPACE_FILES), out = [])
       } catch { /* ignore */ }
     }
   }
-  return out.sort((a, b) => a.path.localeCompare(b.path))
+  return depth === 0 ? out.sort((a, b) => a.path.localeCompare(b.path)) : out
 }
 
 function gitTrackerFilePath() {
@@ -2449,9 +2592,10 @@ async function runSingleVirtualCommand(term, rawSegment) {
       const outputs = []
       for (const arg of args) {
         const resolved = resolveInsideWorkspaceFiles(term.cwd, arg)
-        if (!existsSync(resolved.abs) || statSync(resolved.abs).isDirectory()) {
-          throw new Error(`cat: 无法读取文件: ${arg}`)
-        }
+        if (!existsSync(resolved.abs)) throw new Error(`cat: 无法读取文件: ${arg}`)
+        const st = statSync(resolved.abs)
+        if (st.isDirectory()) throw new Error(`cat: 无法读取目录: ${arg}`)
+        if (st.size > MAX_TERMINAL_READ_BYTES) throw new Error(`cat: 文件超过 1 MiB 限制 (${arg})`)
         outputs.push(readFileSync(resolved.abs, 'utf8').slice(0, 32_000))
       }
       return outputs.join('\n')
@@ -2472,6 +2616,8 @@ async function runSingleVirtualCommand(term, rawSegment) {
       }
       if (!fileArgs.length) throw new Error(`${cmd}: 请指定文件名`)
       const resolved = resolveInsideWorkspaceFiles(term.cwd, fileArgs[0])
+      const st = statSync(resolved.abs)
+      if (!st.isFile() || st.size > MAX_TERMINAL_READ_BYTES) throw new Error(`${cmd}: 仅支持 1 MiB 以内的普通文件`)
       const lines = readFileSync(resolved.abs, 'utf8').split(/\r?\n/)
       return (cmd === 'head' ? lines.slice(0, count) : lines.slice(-count)).join('\n')
     }
@@ -2480,6 +2626,8 @@ async function runSingleVirtualCommand(term, rawSegment) {
       if (!args.length) throw new Error('wc: 请指定文件名')
       const fileArg = args.find((a) => !a.startsWith('-'))
       const resolved = resolveInsideWorkspaceFiles(term.cwd, fileArg)
+      const st = statSync(resolved.abs)
+      if (!st.isFile() || st.size > MAX_TERMINAL_READ_BYTES) throw new Error('wc: 仅支持 1 MiB 以内的普通文件')
       const content = readFileSync(resolved.abs, 'utf8')
       const lines = content.split(/\r?\n/).length
       const words = content.trim() ? content.trim().split(/\s+/).length : 0
@@ -2523,9 +2671,18 @@ async function runSingleVirtualCommand(term, rawSegment) {
       if (paths.length < 2) throw new Error('mv: 用法 mv <src> <dst>')
       const src = resolveInsideWorkspaceFiles(term.cwd, paths[0])
       const dst = resolveInsideWorkspaceFiles(term.cwd, paths[1])
+      if (src.abs === canonicalizeWorkspacePath(WORKSPACE_FILES)) throw new Error('mv: 禁止移动工作区根目录')
       mkdirSync(dirname(dst.abs), { recursive: true })
-      copyFileSync(src.abs, dst.abs)
-      rmSync(src.abs, { recursive: true, force: true })
+      try {
+        renameSync(src.abs, dst.abs)
+      } catch (err) {
+        if (err?.code === 'EXDEV') {
+          copyFileSync(src.abs, dst.abs)
+          rmSync(src.abs, { recursive: true, force: true })
+        } else {
+          throw err
+        }
+      }
       return ''
     }
 
@@ -2533,9 +2690,10 @@ async function runSingleVirtualCommand(term, rawSegment) {
       const recursive = args.some((a) => a.startsWith('-') && (a.includes('r') || a.includes('R')))
       const targets = args.filter((a) => !a.startsWith('-'))
       if (!targets.length) throw new Error('rm: 请指定要删除的路径')
+      const rootCanonical = canonicalizeWorkspacePath(WORKSPACE_FILES)
       for (const t of targets) {
         const resolved = resolveInsideWorkspaceFiles(term.cwd, t)
-        if (resolved.abs === resolve(WORKSPACE_FILES)) throw new Error('rm: 禁止删除工作区根目录')
+        if (resolved.abs === rootCanonical) throw new Error('rm: 禁止删除工作区根目录')
         rmSync(resolved.abs, { recursive, force: true })
       }
       return ''
@@ -2558,10 +2716,18 @@ async function runSingleVirtualCommand(term, rawSegment) {
     case 'find': {
       const startArg = args[0] && !args[0].startsWith('-') ? args[0] : '.'
       const nameIdx = args.indexOf('-name')
-      const pattern = nameIdx >= 0 && args[nameIdx + 1] ? args[nameIdx + 1].replace(/\*/g, '.*') : null
-      const regex = pattern ? new RegExp(`^${pattern}$`, 'i') : null
+      let regex = null
+      if (nameIdx >= 0 && args[nameIdx + 1]) {
+        const rawGlob = String(args[nameIdx + 1]).slice(0, 128)
+        const escaped = rawGlob
+          .replace(/[\\^$.+()[\]{}|]/g, '\\$&')
+          .replace(/\*{2,}/g, '*')
+          .replace(/\*/g, '.*')
+          .replace(/\?/g, '.')
+        regex = new RegExp(`^${escaped}$`, 'i')
+      }
       const resolved = resolveInsideWorkspaceFiles(term.cwd, startArg)
-      const files = walkWorkspaceTree(resolved.abs, resolved.abs)
+      const files = walkWorkspaceTree(resolved.abs, resolved.abs, [], { includeContent: false })
       return files
         .filter((f) => !regex || regex.test(basename(f.path)))
         .map((f) => `./${f.path}`)
@@ -2578,6 +2744,7 @@ async function runSingleVirtualCommand(term, rawSegment) {
       const hits = []
       const scanFile = (absPath, display) => {
         try {
+          if (statSync(absPath).size > 262_144) return
           const text = readFileSync(absPath, 'utf8')
           text.split(/\r?\n/).forEach((l, idx) => {
             if (l.toLowerCase().includes(query.toLowerCase()) && hits.length < 100) {
@@ -2589,7 +2756,7 @@ async function runSingleVirtualCommand(term, rawSegment) {
       if (st.isFile()) {
         scanFile(resolved.abs, targetArg)
       } else {
-        for (const f of walkWorkspaceTree(resolved.abs, resolved.abs)) {
+        for (const f of walkWorkspaceTree(resolved.abs, resolved.abs, [], { includeContent: false })) {
           scanFile(join(resolved.abs, f.path), f.path)
           if (hits.length >= 100) break
         }
@@ -2604,20 +2771,27 @@ async function runSingleVirtualCommand(term, rawSegment) {
         code = args.slice(1).join(' ')
       } else if (cmd === 'node' && args[0] && /\.(?:m?js|cjs)$/i.test(args[0])) {
         const resolved = resolveInsideWorkspaceFiles(term.cwd, args[0])
+        const st = statSync(resolved.abs)
+        if (!st.isFile() || st.size > 262_144) throw new Error('node: 脚本文件超过 256 KB 限制')
         code = readFileSync(resolved.abs, 'utf8')
       } else {
         code = args.join(' ')
       }
       if (!code.trim()) throw new Error('用法: node -e "<JavaScript 表达式>" 或 node <file.js>')
-      const logs = []
-      const sandbox = {
-        console: {
-          log: (...items) => logs.push(items.map((x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')),
-          error: (...items) => logs.push(items.map((x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')),
-        },
-        Math, Date, JSON, Number, String, Boolean, Array, Object,
+      if (rpc && typeof rpc.request === 'function') {
+        const res = await rpc.request('sandbox.js_eval', { script: code, timeoutMs: 3_000 }, 8_000)
+        if (res?.ok === false) throw new Error(String(res.error || 'JavaScript 执行失败'))
+        return String(res?.output ?? '')
       }
-      const result = vm.runInNewContext(code, sandbox, { timeout: 3_000 })
+      const logs = []
+      const sandboxCtx = vm.createContext(Object.create(null), { codeGeneration: { strings: false, wasm: false } })
+      sandboxCtx.__emit = (line) => { if (logs.length < 200) logs.push(String(line).slice(0, 2000)) }
+      vm.runInContext(
+        'globalThis.console = Object.freeze({ log: (...a) => __emit(a.map(String).join(" ")), error: (...a) => __emit(a.map(String).join(" ")) });',
+        sandboxCtx,
+        { timeout: 500 }
+      )
+      const result = vm.runInContext(code, sandboxCtx, { timeout: 3_000 })
       if (result !== undefined) logs.push(typeof result === 'string' ? result : JSON.stringify(result, null, 2))
       return logs.join('\n')
     }
@@ -2714,12 +2888,13 @@ runtime.executeVirtualTerminal = async (args, exec) => {
   const command = String(args?.command ?? '').trim()
   if (!command) throw new Error('terminal_exec requires a non-empty command')
   const active = runtime.activeTurns.get(sessionId)
-  if (active && active.permissionMode !== 'autoReview') {
-    const isMutating = /\b(rm|mv|cp|mkdir|touch|export|commit|node|python|python3)\b|>/.test(command)
-    if (isMutating || active.permissionMode === 'readOnly') {
-      if (active.permissionMode === 'readOnly' && isMutating) {
-        throw new Error(`Read-only mode blocked terminal command: ${command}`)
-      }
+  const isMutating = /\b(rm|mv|cp|mkdir|touch|export|commit|node|js|python|python3)\b|>/.test(command)
+  if (active) {
+    if (active.permissionMode === 'readOnly' && isMutating) {
+      throw new Error(`只读保护模式已拦截终端命令：${command}`)
+    }
+    // autoReview (沙盒免打扰): auto-allow all sandbox terminal commands without manual interruption
+    if (active.permissionMode !== 'autoReview' && isMutating) {
       const outcome = await ctx.approval.request({
         agent: exec.agent,
         toolName: 'terminal_exec',
@@ -2730,13 +2905,26 @@ runtime.executeVirtualTerminal = async (args, exec) => {
       })
       if (outcome !== 'allowed-once') throw new Error('User did not approve terminal_exec command')
     }
+  } else if (isMutating && ctx.approval?.request) {
+    // Web UI session: request browser approval for mutating / python / rm commands
+    const outcome = await ctx.approval.request({
+      agent: exec.agent,
+      toolName: 'terminal_exec',
+      ...(exec.callId ? { callId: exec.callId } : {}),
+      reason: `Execute sandboxed virtual terminal command: ${command}`,
+      displayReason: `允许在 iOS 沙盒持久终端执行命令？\n$ ${command}`,
+      signal: exec.signal,
+    })
+    if (outcome !== 'allowed-once') throw new Error('User did not approve terminal_exec command')
   }
   const res = await executeVirtualTerminalCommand(sessionId, command)
   return { output: `[cwd: ${res.cwd}] (exit ${res.exitCode})\n${res.output || '(done)'}` }
 }
 
-runtime.executeGitWorkspaceTool = async (args) => {
+runtime.executeGitWorkspaceTool = async (args, exec) => {
   const action = String(args?.action ?? 'status')
+  const sessionId = exec?.agent?.session?.id
+  const active = typeof sessionId === 'string' ? runtime.activeTurns.get(sessionId) : undefined
   if (action === 'status') {
     const st = computeWorkspaceGitStatus()
     return { output: JSON.stringify(st, null, 2) }
@@ -2745,10 +2933,35 @@ runtime.executeGitWorkspaceTool = async (args) => {
     return { output: computeWorkspaceGitDiff(args?.path) }
   }
   if (action === 'snapshot') {
+    if (active?.permissionMode === 'readOnly') {
+      throw new Error('只读保护模式已拦截 git_workspace snapshot')
+    }
+    if ((!active || active.permissionMode !== 'autoReview') && ctx.approval?.request) {
+      const outcome = await ctx.approval.request({
+        agent: exec.agent,
+        toolName: 'git_workspace',
+        ...(exec.callId ? { callId: exec.callId } : {}),
+        reason: 'Create a workspace Git baseline snapshot',
+        displayReason: '允许创建工作区 Git 基线快照？',
+        signal: exec.signal,
+      })
+      if (outcome !== 'allowed-once') throw new Error('User did not approve git_workspace snapshot')
+    }
     const st = takeWorkspaceGitSnapshot('Agent workspace snapshot')
     return { output: JSON.stringify(st, null, 2) }
   }
   if (action === 'pr_list') {
+    if (ctx.approval?.request && (!active || active.permissionMode !== 'autoReview')) {
+      const outcome = await ctx.approval.request({
+        agent: exec.agent,
+        toolName: 'git_workspace',
+        ...(exec.callId ? { callId: exec.callId } : {}),
+        reason: `Fetch public GitHub PR list for ${String(args?.repo ?? 'bound repo')}`,
+        displayReason: `允许联网查询 GitHub Pull Requests（${String(args?.repo ?? '已绑定仓库')}）？`,
+        signal: exec.signal,
+      })
+      if (outcome !== 'allowed-once') throw new Error('User did not approve git_workspace pr_list')
+    }
     const prs = await fetchGithubPullRequests(args?.repo)
     return { output: JSON.stringify(prs, null, 2) }
   }
@@ -2815,22 +3028,30 @@ rpc.handle('devtools.inspect', async () => {
   }
 })
 
+function redactDiagnosticSecrets(text) {
+  return String(text ?? '')
+    .replace(/\b(?:sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AIza[0-9A-Za-z\-_]{30,})\b/g, '[secret:REDACTED]')
+    .replace(/Bearer\s+[A-Za-z0-9._-]{16,}/g, 'Bearer [secret:REDACTED]')
+}
+
 rpc.handle('devtools.eval', async ({ expression } = {}) => {
   const expr = String(expression ?? '').trim()
   if (!expr) throw new Error('请输入要评估的诊断表达式')
   pushDevtoolsLog('info', 'devtools.eval', expr)
-  const sandbox = {
+  // Deep JSON-snapshot into an isolated null-prototype VM context with string codegen disabled
+  // so diagnostic expressions can inspect runtime telemetry without host prototype escape.
+  const snapshotJSON = JSON.stringify({
     process: {
       version: process.version,
       versions: process.versions,
       platform: process.platform,
       arch: process.arch,
-      uptime: () => process.uptime(),
-      memoryUsage: () => process.memoryUsage(),
+      uptimeSeconds: Math.round(process.uptime()),
+      memoryUsage: process.memoryUsage(),
       env: {
-        DSH_HOME: process.env.DSH_HOME,
-        DSH_BASE: process.env.DSH_BASE,
-        DS_BOT_IOS_HOST: process.env.DS_BOT_IOS_HOST,
+        DSH_HOME: process.env.DSH_HOME ?? '',
+        DSH_BASE: process.env.DSH_BASE ?? '',
+        DS_BOT_IOS_HOST: process.env.DS_BOT_IOS_HOST ?? '',
       },
     },
     runtime: {
@@ -2841,12 +3062,22 @@ rpc.handle('devtools.eval', async ({ expression } = {}) => {
       redteamToolsEnabled: runtime.redteamToolsEnabled,
     },
     tools: (ctx?.tools?.definitions?.() ?? []).map((t) => t.name),
-    cordisEntries: [...(ctx?.loader?.entries?.() ?? [])].map((e) => ({ id: e.options?.id, name: e.options?.name, state: e.fiber?.state })),
-    JSON, Math, Date, Object, Array, String, Number, Boolean,
-  }
-  const result = vm.runInNewContext(expr, sandbox, { timeout: 2_000 })
+    cordisEntries: [...(ctx?.loader?.entries?.() ?? [])].map((e) => ({
+      id: e.options?.id,
+      name: e.options?.name,
+      state: e.fiber?.state,
+    })),
+  })
+  const sandboxCtx = vm.createContext(Object.create(null), { codeGeneration: { strings: false, wasm: false } })
+  sandboxCtx.__snapshotJSON = snapshotJSON
+  vm.runInContext(
+    'const __s = JSON.parse(__snapshotJSON); globalThis.process = __s.process; globalThis.process.uptime = () => __s.process.uptimeSeconds; globalThis.process.memoryUsage = () => __s.process.memoryUsage; globalThis.runtime = __s.runtime; globalThis.tools = __s.tools; globalThis.cordisEntries = __s.cordisEntries; delete globalThis.__snapshotJSON;',
+    sandboxCtx,
+    { timeout: 500 }
+  )
+  const result = vm.runInContext(expr, sandboxCtx, { timeout: 2_000 })
   const formatted = typeof result === 'string' ? result : JSON.stringify(result, null, 2)
-  return { output: String(formatted ?? 'undefined').slice(0, 16_000) }
+  return { output: redactDiagnosticSecrets(String(formatted ?? 'undefined')).slice(0, 16_000) }
 })
 
 // Approval notifications stay inside Swift and do not transit Node.

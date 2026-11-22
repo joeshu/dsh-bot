@@ -1,12 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-private enum ExploreRootMode: String, CaseIterable, Identifiable {
-    case settings = "引擎与设置"
-    case plugins = "插件与红队"
-    var id: String { rawValue }
-}
-
 private enum PluginManagerSection: String, CaseIterable, Identifiable {
     case installed = "已安装"
     case discover = "发现"
@@ -30,7 +24,6 @@ private enum PendingPluginInstall: Identifiable {
 
 public struct PluginManagerView: View {
     @ObservedObject var host: LocalAgentHost
-    @State private var rootMode: ExploreRootMode = .settings
     @State private var section: PluginManagerSection = .installed
     @State private var searchText = ""
     @State private var newSourceURL = ""
@@ -52,165 +45,146 @@ public struct PluginManagerView: View {
     }
 
     public var body: some View {
-        NavigationStack {
-            Form {
+        Form {
+            if hasPendingRestart {
                 Section {
-                    Picker("模块", selection: $rootMode) {
-                        ForEach(ExploreRootMode.allCases) { mode in
-                            Text(mode.rawValue).tag(mode)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                }
-
-                switch rootMode {
-                case .settings:
-                    AgentSettingsFormSections(host: host)
-
-                case .plugins:
-                    if hasPendingRestart {
-                        Section {
-                            DSBannerCard(
-                                icon: "arrow.triangle.2.circlepath.circle.fill",
-                                tint: DSTheme.warning,
-                                message: "检测到插件安装/更新或开关变更，重启 DSH 引擎后即可生效。",
-                                actionTitle: "立即重启"
-                            ) {
-                                Task {
-                                    let result = await host.restartRuntime()
-                                    host.setPluginStatus(result)
-                                    await host.refreshPluginState()
-                                    await host.refreshRedteamStatus()
-                                }
-                            }
-                        }
-                        .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
-                        .listRowBackground(Color.clear)
-                    }
-
-                    pluginSecurityNoticeSection
-
-                    Section {
-                        Picker("插件视图", selection: $section) {
-                            ForEach(PluginManagerSection.allCases) { item in
-                                Text(item.rawValue).tag(item)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                    }
-
-                    switch section {
-                    case .installed:
-                        installedSection
-                    case .discover:
-                        discoverSection
-                    case .sources:
-                        sourcesSection
-                    }
-
-                    if isInstalling {
-                        Section {
-                            HStack(spacing: 10) {
-                                ProgressView()
-                                Text("正在下载、校验依赖并写入 DSH Profile…")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-
-                    if let status = host.pluginStatus, !status.isEmpty {
-                        Section("插件操作状态") {
-                            Text(status).font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                }
-            }
-            .scrollDismissesKeyboard(.interactively)
-            .navigationTitle("探索与设置")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                if rootMode == .plugins {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button {
-                            Task {
-                                await host.refreshPluginState()
-                                await host.refreshRedteamStatus()
-                            }
-                        } label: {
-                            Image(systemName: "arrow.clockwise")
-                        }
-                        .disabled(host.state != .ready || isInstalling)
-                    }
-                }
-            }
-            .task {
-                await host.refreshPluginState()
-                await host.refreshRedteamStatus()
-                if host.pluginSources.contains(where: { $0.enabled }) {
-                    await host.discoverPlugins()
-                }
-            }
-            .onChange(of: section) { nextSection in
-                if nextSection == .discover,
-                   host.pluginSources.contains(where: { $0.enabled }),
-                   host.pluginCatalog.isEmpty,
-                   !host.isLoadingPlugins {
-                    Task { await host.discoverPlugins(query: searchText) }
-                }
-            }
-            .fileImporter(
-                isPresented: $showFolderPicker,
-                allowedContentTypes: [.folder],
-                allowsMultipleSelection: false
-            ) { result in
-                switch result {
-                case .success(let urls):
-                    if let url = urls.first { pendingInstall = .local(url) }
-                case .failure(let error):
-                    host.setPluginStatus(error.localizedDescription)
-                }
-            }
-            .alert(item: $pendingInstall) { target in
-                Alert(
-                    title: Text("安装 / 更新第三方插件代码？"),
-                    message: Text("插件代码将在 DSH Node 进程中运行，可访问应用沙盒和网络。支持已安装插件就地安全更新（失败自动回滚）。仅继续安装你已审阅并信任的插件。"),
-                    primaryButton: .default(Text("继续安装")) {
-                        isInstalling = true
+                    DSBannerCard(
+                        icon: "arrow.triangle.2.circlepath.circle.fill",
+                        tint: DSTheme.warning,
+                        message: "检测到插件安装/更新或开关变更，重启 DSH 引擎后即可生效。",
+                        actionTitle: "立即重启"
+                    ) {
                         Task {
-                            defer { isInstalling = false }
-                            switch target {
-                            case .catalog(let plugin): await host.installPlugin(plugin)
-                            case .github(let url):
-                                await host.installGithubPlugin(url: url)
-                                githubRepoURL = ""
-                            case .local(let url): await host.installLocalPlugin(from: url)
-                            }
-                            await host.refreshRedteamStatus()
-                        }
-                    },
-                    secondaryButton: .cancel(Text("取消"))
-                )
-            }
-            .confirmationDialog(
-                "确定卸载插件「\(pendingRemoval?.name ?? "")」？",
-                isPresented: Binding(
-                    get: { pendingRemoval != nil },
-                    set: { if !$0 { pendingRemoval = nil } }
-                ),
-                titleVisibility: .visible
-            ) {
-                Button("卸载", role: .destructive) {
-                    if let target = pendingRemoval {
-                        pendingRemoval = nil
-                        Task {
-                            await host.removePlugin(target)
+                            let result = await host.restartRuntime()
+                            host.setPluginStatus(result)
+                            await host.refreshPluginState()
                             await host.refreshRedteamStatus()
                         }
                     }
                 }
-                Button("取消", role: .cancel) { pendingRemoval = nil }
+                .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
+                .listRowBackground(Color.clear)
             }
+
+            pluginSecurityNoticeSection
+
+            Section {
+                Picker("插件视图", selection: $section) {
+                    ForEach(PluginManagerSection.allCases) { item in
+                        Text(item.rawValue).tag(item)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+
+            switch section {
+            case .installed:
+                installedSection
+            case .discover:
+                discoverSection
+            case .sources:
+                sourcesSection
+            }
+
+            if isInstalling {
+                Section {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text("正在下载、校验依赖并写入 DSH Profile…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            if let status = host.pluginStatus, !status.isEmpty {
+                Section("插件操作状态") {
+                    Text(status).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .scrollDismissesKeyboard(.interactively)
+        .navigationTitle("插件与红队宿主")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    Task {
+                        await host.refreshPluginState()
+                        await host.refreshRedteamStatus()
+                    }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .disabled(host.state != .ready || isInstalling)
+            }
+        }
+        .task {
+            await host.refreshPluginState()
+            await host.refreshRedteamStatus()
+            if host.pluginSources.contains(where: { $0.enabled }) {
+                await host.discoverPlugins()
+            }
+        }
+        .onChange(of: section) { nextSection in
+            if nextSection == .discover,
+               host.pluginSources.contains(where: { $0.enabled }),
+               host.pluginCatalog.isEmpty,
+               !host.isLoadingPlugins {
+                Task { await host.discoverPlugins(query: searchText) }
+            }
+        }
+        .fileImporter(
+            isPresented: $showFolderPicker,
+            allowedContentTypes: [.folder],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                if let url = urls.first { pendingInstall = .local(url) }
+            case .failure(let error):
+                host.setPluginStatus(error.localizedDescription)
+            }
+        }
+        .alert(item: $pendingInstall) { target in
+            Alert(
+                title: Text("安装 / 更新第三方插件代码？"),
+                message: Text("插件代码将在 DSH Node 进程中运行，可访问应用沙盒和网络。支持已安装插件就地安全更新（失败自动回滚）。仅继续安装你已审阅并信任的插件。"),
+                primaryButton: .default(Text("继续安装")) {
+                    isInstalling = true
+                    Task {
+                        defer { isInstalling = false }
+                        switch target {
+                        case .catalog(let plugin): await host.installPlugin(plugin)
+                        case .github(let url):
+                            await host.installGithubPlugin(url: url)
+                            githubRepoURL = ""
+                        case .local(let url): await host.installLocalPlugin(from: url)
+                        }
+                        await host.refreshRedteamStatus()
+                    }
+                },
+                secondaryButton: .cancel(Text("取消"))
+            )
+        }
+        .confirmationDialog(
+            "确定卸载插件「\(pendingRemoval?.name ?? "")」？",
+            isPresented: Binding(
+                get: { pendingRemoval != nil },
+                set: { if !$0 { pendingRemoval = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("卸载", role: .destructive) {
+                if let target = pendingRemoval {
+                    pendingRemoval = nil
+                    Task {
+                        await host.removePlugin(target)
+                        await host.refreshRedteamStatus()
+                    }
+                }
+            }
+            Button("取消", role: .cancel) { pendingRemoval = nil }
         }
     }
 

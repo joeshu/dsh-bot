@@ -1,5 +1,7 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
+import { lookup as dnsLookup } from 'node:dns/promises'
+import { isIP } from 'node:net'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import vm from 'node:vm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { iosHost } from './index.mjs'
@@ -9,17 +11,155 @@ function resultText(value) {
   return [{ type: 'text', text: JSON.stringify(value) }]
 }
 
+function canonicalizePath(targetPath) {
+  let current = resolve(targetPath)
+  const suffix = []
+  for (let depth = 0; depth < 64; depth++) {
+    try {
+      const real = realpathSync(current)
+      return suffix.length ? resolve(real, ...suffix) : real
+    } catch {
+      const parent = dirname(current)
+      if (parent === current) break
+      suffix.unshift(basename(current))
+      current = parent
+    }
+  }
+  return resolve(targetPath)
+}
+
+function isPrivateOrReservedIPv4(ip) {
+  const parts = ip.split('.').map(Number)
+  if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true
+  const [a, b] = parts
+  if (a === 0 || a === 10 || a === 127) return true
+  if (a === 100 && b >= 64 && b <= 127) return true // CGNAT 100.64.0.0/10
+  if (a === 169 && b === 254) return true // link-local / cloud metadata
+  if (a === 172 && b >= 16 && b <= 31) return true
+  if (a === 192 && b === 168) return true
+  if (a === 192 && b === 0 && parts[2] === 0) return true
+  if (a === 198 && (b === 18 || b === 19)) return true
+  if (a >= 224) return true // multicast / reserved
+  return false
+}
+
+export function isPrivateOrReservedIP(raw) {
+  const ip = String(raw ?? '').trim().toLowerCase().replace(/^\[|\]$/g, '').split('%')[0]
+  const ver = isIP(ip)
+  if (ver === 4) return isPrivateOrReservedIPv4(ip)
+  if (ver === 6) {
+    if (ip === '::' || ip === '::1') return true
+    if (ip.startsWith('fc') || ip.startsWith('fd')) return true // ULA fc00::/7
+    if (/^fe[89ab]/.test(ip)) return true // link-local fe80::/10
+    if (ip.startsWith('ff')) return true // multicast
+    const mappedV4 = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(ip)
+    if (mappedV4) return isPrivateOrReservedIPv4(mappedV4[1])
+    const mappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(ip)
+    if (mappedHex) {
+      const hi = parseInt(mappedHex[1], 16)
+      const lo = parseInt(mappedHex[2], 16)
+      return isPrivateOrReservedIPv4(`${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`)
+    }
+    return false
+  }
+  return true
+}
+
+async function assertSafePublicHttpsUrl(rawUrl) {
+  let parsed
+  try {
+    parsed = new URL(String(rawUrl ?? ''))
+  } catch {
+    throw new Error('web_fetch requires a valid HTTPS URL')
+  }
+  if (parsed.protocol !== 'https:' || parsed.username || parsed.password) {
+    throw new Error('web_fetch only supports credential-free HTTPS URLs')
+  }
+  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '')
+  if (!host || host === 'localhost' || host.endsWith('.local') || host.endsWith('.internal')) {
+    throw new Error('web_fetch blocked private or loopback address')
+  }
+  if (isIP(host)) {
+    if (isPrivateOrReservedIP(host)) throw new Error('web_fetch blocked private or loopback address')
+    return parsed
+  }
+  const resolved = await dnsLookup(host, { all: true, verbatim: true })
+  if (!Array.isArray(resolved) || resolved.length === 0) {
+    throw new Error(`web_fetch could not resolve host: ${host}`)
+  }
+  for (const record of resolved) {
+    if (isPrivateOrReservedIP(record.address)) {
+      throw new Error('web_fetch blocked private or loopback address')
+    }
+  }
+  return parsed
+}
+
+async function safePublicHttpsFetch(rawUrl, { maxBytes = 131_072, maxRedirects = 5, timeoutMs = 15_000, signal } = {}) {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs)
+  const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
+  let current = await assertSafePublicHttpsUrl(rawUrl)
+  let resp
+  for (let hop = 0; ; hop++) {
+    resp = await globalThis.fetch(current.toString(), { signal: combinedSignal, redirect: 'manual' })
+    if (![301, 302, 303, 307, 308].includes(resp.status)) break
+    const location = resp.headers.get('location')
+    await resp.body?.cancel().catch(() => {})
+    if (!location || hop >= maxRedirects) throw new Error('web_fetch rejected invalid or excessive redirects')
+    current = await assertSafePublicHttpsUrl(new URL(location, current).toString())
+  }
+  const reader = resp.body?.getReader()
+  if (!reader) {
+    return {
+      url: current.toString(),
+      status: resp.status,
+      contentType: resp.headers.get('content-type') || 'text/plain',
+      body: { content: '' },
+    }
+  }
+  const chunks = []
+  let total = 0
+  let truncated = false
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      const remaining = maxBytes - total
+      if (value.byteLength > remaining) {
+        chunks.push(Buffer.from(value.subarray(0, remaining)))
+        total += remaining
+        truncated = true
+        await reader.cancel().catch(() => {})
+        break
+      }
+      chunks.push(Buffer.from(value))
+      total += value.byteLength
+    }
+  } finally {
+    reader.releaseLock?.()
+  }
+  const text = Buffer.concat(chunks, total).toString('utf8')
+  return {
+    url: current.toString(),
+    status: resp.status,
+    contentType: resp.headers.get('content-type') || 'text/plain',
+    body: { content: truncated ? `${text}\n…(truncated at ${maxBytes} bytes)` : text },
+  }
+}
+
 function resolveSandboxedWorkspacePath(workspace, rawPath = '') {
-  const root = resolve(workspace, 'files')
-  mkdirSync(root, { recursive: true })
+  const rawRoot = resolve(workspace, 'files')
+  mkdirSync(rawRoot, { recursive: true })
+  const root = canonicalizePath(rawRoot)
   let text = String(rawPath ?? '').replaceAll('\\', '/').trim()
+  if (text.includes('\0')) throw new Error('Path contains invalid null byte')
   if (text === '/workspace' || text === '/workspace/' || text === 'files' || text === 'files/' || text === '.' || text === './') {
     return { root, abs: root, rel: '' }
   }
   if (text.startsWith('/workspace/')) text = text.slice('/workspace/'.length)
   else if (text.startsWith('files/')) text = text.slice('files/'.length)
   while (text.startsWith('./')) text = text.slice(2)
-  const abs = resolve(root, text)
+  const abs = canonicalizePath(resolve(root, text))
   const rel = relative(root, abs)
   if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
     throw new Error('Path escapes the iOS files/ workspace')
@@ -27,21 +167,32 @@ function resolveSandboxedWorkspacePath(workspace, rawPath = '') {
   return { root, abs, rel: rel.split(sep).join('/') }
 }
 
+async function runHardenedQuickJS(rpc, script, timeoutMs = 2_000, signal) {
+  if (rpc && typeof rpc.request === 'function') {
+    const res = await rpc.request('sandbox.js_eval', { script, timeoutMs }, Math.max(5_000, timeoutMs + 3_000), signal)
+    if (res?.ok === false) throw new Error(String(res.error || 'JavaScript evaluation failed'))
+    return { output: String(res?.output ?? '') }
+  }
+  // Strict fallback only when native QuickJS RPC is unavailable (headless tests):
+  // null-prototype context + disabled string codegen, zero host intrinsics passed in.
+  const logs = []
+  const ctx = vm.createContext(Object.create(null), { codeGeneration: { strings: false, wasm: false } })
+  ctx.__emit = (line) => { if (logs.length < 200) logs.push(String(line).slice(0, 2000)) }
+  vm.runInContext(
+    'globalThis.console = Object.freeze({ log: (...a) => __emit(a.map(String).join(" ")), error: (...a) => __emit(a.map(String).join(" ")) });',
+    ctx,
+    { timeout: 500 }
+  )
+  const result = vm.runInContext(script, ctx, { timeout: timeoutMs })
+  if (result !== undefined) logs.push(typeof result === 'string' ? result : JSON.stringify(result, null, 2))
+  return { output: logs.join('\n') }
+}
+
 async function executeWebFallbackTool(context, name, args, exec) {
-  const { workspace } = iosHost()
+  const { workspace, rpc } = iosHost()
   if (name === 'js_eval') {
     const script = String(args?.script ?? '')
-    const logs = []
-    const sandbox = {
-      console: {
-        log: (...items) => logs.push(items.map((x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')),
-        error: (...items) => logs.push(items.map((x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')),
-      },
-      Math, Date, JSON, Number, String, Boolean, Array, Object,
-    }
-    const result = vm.runInNewContext(script, sandbox, { timeout: 2_000 })
-    if (result !== undefined) logs.push(typeof result === 'string' ? result : JSON.stringify(result, null, 2))
-    return { output: logs.join('\n') }
+    return await runHardenedQuickJS(rpc, script, 2_000, exec?.signal)
   }
   if (name === 'workspace_list') {
     const { abs } = resolveSandboxedWorkspacePath(workspace, args?.path ?? '')
@@ -54,6 +205,8 @@ async function executeWebFallbackTool(context, name, args, exec) {
   if (name === 'workspace_read') {
     const { abs, rel } = resolveSandboxedWorkspacePath(workspace, args?.path ?? '')
     if (!rel || !existsSync(abs) || !statSync(abs).isFile()) throw new Error(`File not found: files/${rel}`)
+    const info = statSync(abs)
+    if (info.size > 512 * 1024) throw new Error(`File exceeds 512 KB read limit: files/${rel}`)
     const content = readFileSync(abs, 'utf8')
     return { output: content.length > 65_536 ? `${content.slice(0, 65_536)}\n…(truncated)` : content }
   }
@@ -62,11 +215,18 @@ async function executeWebFallbackTool(context, name, args, exec) {
     if (!query) throw new Error('workspace_search requires a non-empty query')
     const { abs, root } = resolveSandboxedWorkspacePath(workspace, args?.path ?? '')
     const hits = []
-    const walk = (dir) => {
-      for (const entry of readdirSync(dir, { withFileTypes: true })) {
-        if (entry.name.startsWith('.') || hits.length >= 80) continue
-        const full = join(dir, entry.name)
-        if (entry.isDirectory()) walk(full)
+    const visited = new Set()
+    const walk = (dir, depth = 0) => {
+      if (depth > 12 || hits.length >= 80) return
+      const canonicalDir = canonicalizePath(dir)
+      const dirRel = relative(root, canonicalDir)
+      if (dirRel === '..' || dirRel.startsWith(`..${sep}`) || isAbsolute(dirRel)) return
+      if (visited.has(canonicalDir)) return
+      visited.add(canonicalDir)
+      for (const entry of readdirSync(canonicalDir, { withFileTypes: true })) {
+        if (entry.name.startsWith('.') || entry.isSymbolicLink() || hits.length >= 80) continue
+        const full = join(canonicalDir, entry.name)
+        if (entry.isDirectory()) walk(full, depth + 1)
         else if (entry.isFile() && statSync(full).size <= 256 * 1024) {
           const lines = readFileSync(full, 'utf8').split(/\r?\n/)
           const display = relative(root, full).split(sep).join('/')
@@ -120,25 +280,9 @@ function apply(context) {
     available: () => true,
     async fetch({ url }, signal) {
       const { rpc, runtime } = iosHost()
-      const [turn] = runtime.activeTurns.values()
+      const turn = runtime.activeTurns.size === 1 ? [...runtime.activeTurns.values()][0] : undefined
       if (!turn || turn.done) {
-        const parsed = new URL(String(url ?? ''))
-        if (parsed.protocol !== 'https:') throw new Error('web_fetch only supports HTTPS URLs')
-        const host = parsed.hostname.toLowerCase()
-        if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host.endsWith('.local')
-          || /^(10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host)) {
-          throw new Error('web_fetch blocked private or loopback address')
-        }
-        const timeoutSignal = AbortSignal.timeout(15_000)
-        const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
-        const resp = await globalThis.fetch(parsed.toString(), { signal: combinedSignal, redirect: 'follow' })
-        const text = (await resp.text()).slice(0, 131_072)
-        return {
-          url: resp.url || parsed.toString(),
-          status: resp.status,
-          contentType: resp.headers.get('content-type') || 'text/plain',
-          body: { content: text },
-        }
+        return await safePublicHttpsFetch(url, { maxBytes: 131_072, maxRedirects: 5, timeoutMs: 15_000, signal })
       }
       const result = await rpc.request('native.tool.execute', {
         name: 'web_fetch', args: { url }, botId: turn.botId, sessionId: turn.botId,

@@ -80,6 +80,10 @@ private final class MetricKitRelay: NSObject, MXMetricManagerSubscriber {
     }
 }
 
+public extension Notification.Name {
+    static let dsbotMemoryPressureTrim = Notification.Name("DSBotMemoryPressureTrim")
+}
+
 /// Centralized Jetsam / Memory / FD governor for the standalone iOS host.
 @MainActor
 public final class MemoryGovernor: ObservableObject {
@@ -90,8 +94,11 @@ public final class MemoryGovernor: ObservableObject {
 
     /// Optional callback invoked on MainActor when pressure enters `.critical`.
     public var onCriticalPressure: (() -> Void)?
+    /// Optional callback invoked on MainActor whenever tier escalates to `.warning`, `.urgent`, or `.critical`.
+    public var onPressureTrim: ((MemoryPressureTier) -> Void)?
 
     private var pressureSource: DispatchSourceMemoryPressure?
+    private var memoryWarningObserver: NSObjectProtocol?
     private var metricRelay: MetricKitRelay?
     private var metricKitDeliveries: Int = 0
     private var lastMetricSummary: String = "尚无 MetricKit 报告"
@@ -128,13 +135,23 @@ public final class MemoryGovernor: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.refreshSnapshot(osEvent: event)
-                if self.tier == .critical {
-                    self.onCriticalPressure?()
-                }
+                self.dispatchPressureActions()
             }
         }
         source.resume()
         pressureSource = source
+
+        memoryWarningObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.refreshSnapshot(osEvent: .warning)
+                self.dispatchPressureActions()
+            }
+        }
 
         metricRelay = MetricKitRelay { [weak self] summary in
             Task { @MainActor [weak self] in
@@ -143,6 +160,16 @@ public final class MemoryGovernor: ObservableObject {
                 self.lastMetricSummary = summary
                 self.refreshSnapshot()
             }
+        }
+    }
+
+    private func dispatchPressureActions() {
+        if tier != .normal {
+            NotificationCenter.default.post(name: .dsbotMemoryPressureTrim, object: tier.rawValue)
+            onPressureTrim?(tier)
+        }
+        if tier == .critical {
+            onCriticalPressure?()
         }
     }
 

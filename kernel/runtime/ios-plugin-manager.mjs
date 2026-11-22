@@ -1,5 +1,6 @@
 import { randomUUID, createHash } from 'node:crypto'
-import { copyFile, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
+import { isIP } from 'node:net'
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { gunzipSync } from 'node:zlib'
@@ -111,11 +112,36 @@ function packageName(value) {
     && !value.split('/').some((part) => part === '.' || part === '..')
 }
 
+function isBlockedPluginHost(rawHost) {
+  const host = String(rawHost ?? '').trim().toLowerCase().replace(/^\[|\]$/g, '').split('%')[0]
+  if (!host || host === 'localhost' || host.endsWith('.local') || host.endsWith('.internal')) return true
+  const ver = isIP(host)
+  if (ver === 4) {
+    const [a, b] = host.split('.').map(Number)
+    return a === 0 || a === 10 || a === 127
+      || (a === 100 && b >= 64 && b <= 127)
+      || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168)
+      || a >= 224
+  }
+  if (ver === 6) {
+    return host === '::' || host === '::1'
+      || host.startsWith('fc') || host.startsWith('fd')
+      || /^fe[89ab]/.test(host) || host.startsWith('ff')
+      || host.startsWith('::ffff:')
+  }
+  return false
+}
+
 function httpsURL(value) {
   let url
   try { url = new URL(value) } catch { throw new TypeError('需要完整的 HTTPS URL') }
   if (url.protocol !== 'https:' || !url.hostname || url.username || url.password) {
     throw new TypeError('插件索引与包下载只接受 HTTPS 地址')
+  }
+  if (isBlockedPluginHost(url.hostname)) {
+    throw new TypeError('插件索引与包下载禁止访问本机或内网地址')
   }
   return url
 }
@@ -144,20 +170,27 @@ async function stageWritablePurgeSafeAiBase(pluginRoot) {
   const bundledAiBase = join(bundledNodeModules, '@deepseek-ai')
   const writableRoot = join(dshHome, 'dsh-purge-safe', 'writable-host', 'node_modules')
   const writableAiBase = join(writableRoot, '@deepseek-ai')
+  const sentinelTarget = join(writableAiBase, 'dsh-agent-instructions', 'lib', 'index.js')
   await mkdir(join(writableAiBase, 'dsh-agent-instructions', 'lib'), { recursive: true })
   process.env.DSH_BASE = writableAiBase
 
   const stampPath = join(dshHome, 'dsh-purge-safe', 'writable-host', '.ios-stage-stamp')
   const pluginPkg = await readFile(join(pluginRoot, 'package.json'), 'utf8').then(JSON.parse).catch(() => ({}))
-  const expectedStamp = `${pluginPkg.version ?? '0'}|0.2.2-rc.5`
+  const bundledStampMtime = await lstat(join(bundledAiBase, 'dsh-agent-instructions', 'lib', 'index.js'))
+    .then((st) => Math.floor(st.mtimeMs))
+    .catch(() => 0)
+  const expectedStamp = `${pluginPkg.version ?? '0'}|0.2.2-rc.5|${bundledStampMtime}|${IOS_CORE_WRITABLE_MARKER}`
   const currentStamp = await readFile(stampPath, 'utf8').catch(() => '')
-  if (currentStamp.trim() === expectedStamp) {
+  const sentinelExists = await lstat(sentinelTarget).then(() => true).catch(() => false)
+  if (currentStamp.trim() === expectedStamp && sentinelExists) {
     return writableAiBase
   }
 
   let coreMod
+  const coreFilePath = join(pluginRoot, 'lib', 'core.js')
   try {
-    coreMod = await import(pathToFileURL(join(pluginRoot, 'lib', 'core.js')).href)
+    const coreRev = await lstat(coreFilePath).then((st) => Math.floor(st.mtimeMs)).catch(() => Date.now())
+    coreMod = await import(`${pathToFileURL(coreFilePath).href}?rev=${coreRev}`)
   } catch {
     return writableAiBase
   }
@@ -184,26 +217,22 @@ async function stageWritablePurgeSafeAiBase(pluginRoot) {
     relFiles.add(join('@earendil-works', 'pi-ai', 'dist', 'api', apiFile))
   }
 
-  for (const rel of relFiles) {
+  // Parallel staging copy (3-5x faster cold boot after plugin install/upgrade)
+  const copyList = [...relFiles]
+  await Promise.all(copyList.map(async (rel) => {
     const src = join(bundledNodeModules, rel)
     const dst = join(writableRoot, rel)
     try {
       await lstat(src)
     } catch {
-      continue
+      return
     }
-    let dstExists = false
-    try {
-      await lstat(dst)
-      dstExists = true
-    } catch {
-      dstExists = false
-    }
-    if (!dstExists) {
+    const dstExists = await lstat(dst).then(() => true).catch(() => false)
+    if (!dstExists || currentStamp.trim() !== expectedStamp) {
       await mkdir(dirname(dst), { recursive: true })
       await copyFile(src, dst)
     }
-  }
+  }))
   await writeFile(stampPath, `${expectedStamp}\n`, 'utf8').catch(() => {})
   return writableAiBase
 }
@@ -420,6 +449,10 @@ async function unpackNpmTarball(compressed, destination, { stripSingleRoot = fal
       if (type === '5' || name.endsWith('/')) {
         await mkdir(output, { recursive: true })
       } else {
+        const lowerExt = extname(output).toLowerCase()
+        if (['.node', '.dylib', '.so', '.dll', '.exe'].includes(lowerExt)) {
+          throw new Error(`插件包含原生二进制文件 (${parts.slice(1).join('/')})，iOS 沙箱不支持未签名原生模块`)
+        }
         fileCount++
         unpacked += size
         if (fileCount > MAX_PACKAGE_FILES || unpacked > MAX_UNPACKED_BYTES) throw new RangeError('插件包解压后超过安全上限')
@@ -1129,6 +1162,9 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
       await updatePendingRemoval(name, false)
       throw error
     }
+    if (name === 'dsh-purge-safe') {
+      await rm(join(workspace, 'dsh-purge-safe', 'writable-host'), { recursive: true, force: true }).catch(() => {})
+    }
     return { removed: true, name, restartRequired: Boolean(composition?.restartReason),
       ...(composition?.restartReason ? { restartReason: composition.restartReason } : {}) }
   }
@@ -1238,37 +1274,83 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
     let fileCount = 0
     let totalBytes = 0
     const findings = []
+    let hasElevatedRisk = false
     async function scan(dir, depth = 0) {
       if (depth > 10) return
       for (const entry of await readdir(dir, { withFileTypes: true })) {
         if (entry.name === 'node_modules' && depth === 0) continue
         const full = join(dir, entry.name)
         const info = await lstat(full)
+        if (info.isSymbolicLink()) {
+          findings.push(`包含符号链接 (${relative(root, full)})`)
+          hasElevatedRisk = true
+          continue
+        }
         if (info.isDirectory()) {
           await scan(full, depth + 1)
         } else if (info.isFile()) {
           fileCount += 1
           totalBytes += info.size
           const ext = extname(entry.name).toLowerCase()
-          if (['.js', '.mjs', '.cjs'].includes(ext) && info.size <= 1024 * 1024) {
+          if (['.js', '.mjs', '.cjs', '.ts', '.mts'].includes(ext) && info.size <= 1024 * 1024) {
             const src = await readFile(full, 'utf8')
+            const relFile = relative(root, full)
             if (/(?:from\s*|require\s*\(\s*)['"](?:node:)?child_process['"]/.test(src)) {
-              findings.push(`子进程调用引用 (${relative(root, full)})`)
+              findings.push(`子进程调用引用 (${relFile})`)
+              hasElevatedRisk = true
             }
-            if (/\beval\s*\(|new\s+Function\s*\(/.test(src)) {
-              findings.push(`动态代码求值 (${relative(root, full)})`)
+            if (/\beval\s*\(|new\s+Function\s*\(|constructor\s*\(\s*['"]return\s+process['"]/.test(src)) {
+              findings.push(`动态代码求值 / 原型链构造 (${relFile})`)
+              hasElevatedRisk = true
             }
-            if (/\bfetch\s*\(|https?\.request\s*\(/.test(src)) {
-              findings.push(`网络请求能力 (${relative(root, full)})`)
+            if (/(?:from\s*|require\s*\(\s*)['"](?:node:)?(?:vm|worker_threads|module)['"]|createRequire\s*\(/.test(src)) {
+              findings.push(`VM / 线程 / 动态模块加载 (${relFile})`)
+              hasElevatedRisk = true
+            }
+            if (/dsh-sessions\.sqlite|dsh-storage\.sqlite/.test(src)) {
+              findings.push(`直接引用会话 SQLite 数据库 (${relFile})`)
+              hasElevatedRisk = true
+            }
+            if (/['"]approval\/request['"]|['"]system-prompt['"]/.test(src)) {
+              findings.push(`挂钩审批流或系统提示词 (${relFile})`)
+              hasElevatedRisk = true
+            }
+            if (/\bprocess\.env\b/.test(src)) {
+              findings.push(`读取进程环境变量 (${relFile})`)
+            }
+            if (/\bfetch\s*\(|https?\.request\s*\(|new\s+WebSocket\s*\(/.test(src)) {
+              findings.push(`外部网络请求能力 (${relFile})`)
             }
           }
         }
       }
     }
     await scan(root)
-    const uniqueFindings = [...new Set(findings)].slice(0, 10)
+
+    // #12213: Audit both engines.dsh and Cordis/DSH peerDependencies explicitly
+    const peerIssues = []
+    const peerDeps = manifest.peerDependencies && typeof manifest.peerDependencies === 'object' ? manifest.peerDependencies : {}
+    for (const [peerName, range] of Object.entries(peerDeps)) {
+      if (typeof range !== 'string' || !range.trim()) continue
+      if (peerName === '@deepseek-ai/cordis') {
+        if (!semver.satisfies('4.1.0', range, { includePrerelease: true })) {
+          peerIssues.push(`${peerName} 要求 ${range}（宿主 4.1.0）`)
+        }
+      } else if (peerName.startsWith('@deepseek-ai/dsh-')) {
+        if (!semver.satisfies('0.2.2-rc.5', range, { includePrerelease: true })) {
+          peerIssues.push(`${peerName} 要求 ${range}（宿主 0.2.2-rc.5）`)
+        }
+      }
+    }
+    for (const issue of peerIssues) {
+      findings.push(`依赖版本冲突：${issue}`)
+      hasElevatedRisk = true
+    }
+
+    const uniqueFindings = [...new Set(findings)].slice(0, 14)
     const dshEngine = typeof manifest.engines?.dsh === 'string' ? manifest.engines.dsh : '未声明'
-    const dshCompatible = dshEngine === '未声明' || semver.satisfies('0.2.2-rc.5', dshEngine, { includePrerelease: true })
+    const engineMatches = dshEngine === '未声明' || semver.satisfies('0.2.2-rc.5', dshEngine, { includePrerelease: true })
+    const dshCompatible = engineMatches && peerIssues.length === 0
     return {
       name: manifest.name,
       version: manifest.version,
@@ -1276,9 +1358,10 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
       totalKB: Math.max(1, Math.round(totalBytes / 1024)),
       dshEngine,
       dshCompatible,
+      peerIssues,
       patchEntry: manifest.dsh?.bundle?.patch ?? '缺失',
       findings: uniqueFindings,
-      riskLevel: uniqueFindings.some((f) => f.includes('子进程') || f.includes('动态代码'))
+      riskLevel: hasElevatedRisk
         ? 'elevated'
         : (uniqueFindings.length > 0 ? 'standard' : 'low'),
     }
@@ -1291,9 +1374,14 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
   rpc.handle('plugins.install.github', async ({ url }) => mutateProfile(() =>
     installFromGithub(String(url ?? ''))))
   rpc.handle('plugins.install.local', async ({ path }) => {
-    const resolved = resolve(String(path ?? ''))
-    const allowed = resolve(importRoot) + sep
-    if (!resolved.startsWith(allowed)) throw new Error('本地插件只能从应用内的导入暂存目录读取')
+    const allowedRoot = await realpath(importRoot).catch(() => resolve(importRoot))
+    const resolved = await realpath(resolve(String(path ?? ''))).catch(() => {
+      throw new Error('本地插件目录不存在或无法解析')
+    })
+    const rel = relative(allowedRoot, resolved)
+    if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+      throw new Error('本地插件只能从应用内的导入暂存目录读取')
+    }
     return mutateProfile(() => installDirectory(resolved))
   })
   rpc.handle('plugins.enable', async ({ name, enabled }) =>

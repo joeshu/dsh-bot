@@ -1,21 +1,23 @@
 import { realpathSync } from 'node:fs'
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { FsError } from '@deepseek-ai/dsh-fs'
 import LocalFileSystem from '@deepseek-ai/dsh-fs-local'
 
 function canonicalize(targetPath) {
-  const abs = resolve(targetPath)
-  try {
-    return realpathSync(abs)
-  } catch {
-    const parent = dirname(abs)
-    if (parent === abs) return abs
+  let current = resolve(targetPath)
+  const suffix = []
+  for (let depth = 0; depth < 64; depth++) {
     try {
-      return resolve(realpathSync(parent), abs.slice(parent.length + (parent.endsWith(sep) ? 0 : 1)))
+      const real = realpathSync(current)
+      return suffix.length ? resolve(real, ...suffix) : real
     } catch {
-      return abs
+      const parent = dirname(current)
+      if (parent === current) break
+      suffix.unshift(basename(current))
+      current = parent
     }
   }
+  return resolve(targetPath)
 }
 
 export default class IosSandboxedFileSystem extends LocalFileSystem {

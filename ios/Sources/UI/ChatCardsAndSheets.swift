@@ -382,6 +382,14 @@ public struct DSHPendingApprovalCard: View {
 
 // MARK: - 5. Create Bot / Group Sheet
 
+public enum CreateBotInitialKind: String, Identifiable {
+    case standard
+    case group
+    case privateSpace
+
+    public var id: String { rawValue }
+}
+
 public struct CreateBotSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var host: LocalAgentHost
@@ -389,16 +397,18 @@ public struct CreateBotSheet: View {
     @State private var roleLabel = ""
     @State private var model = ModelProvider.defaultModel
     @State private var systemPrompt = ""
-    @State private var isPrivate = false
-    @State private var isGroup = false
+    @State private var isPrivate: Bool
+    @State private var isGroup: Bool
     @State private var permissionMode = "ask"
     @State private var agentPreset = "standard"
     @State private var redteamToolsEnabled = false
     @State private var redteamWriteEnabled = false
     @State private var redteamSensitiveDataEnabled = false
 
-    public init(host: LocalAgentHost) {
+    public init(host: LocalAgentHost, initialKind: CreateBotInitialKind = .standard) {
         self.host = host
+        _isGroup = State(initialValue: initialKind == .group)
+        _isPrivate = State(initialValue: initialKind == .privateSpace)
     }
 
     private static let presets: [(title: String, icon: String, role: String, model: String, prompt: String)] = [
@@ -411,7 +421,6 @@ public struct CreateBotSheet: View {
 
     private func redteamPresetAllowed(_ preset: DSHAgentPresetOption) -> Bool {
         preset.isAvailable && !isPrivate && host.redteamModeEnabled && redteamToolsEnabled
-            && redteamWriteEnabled && redteamSensitiveDataEnabled && permissionMode != "readOnly"
     }
 
     public var body: some View {
@@ -583,7 +592,6 @@ public struct EditBotSheet: View {
 
     private var redteamPresetAllowed: Bool {
         !bot.isPrivate && host.redteamModeEnabled && redteamToolsEnabled
-            && redteamWriteEnabled && redteamSensitiveDataEnabled && permissionMode != "readOnly"
     }
 
     public var body: some View {
@@ -615,7 +623,7 @@ public struct EditBotSheet: View {
                         Text("标准审批").tag("ask")
                         Text("沙盒免打扰").tag("autoReview")
                     }
-                    Text("• 只读保护：拦截全部写入/修改/删除。\n• 标准审批：写入、终端、Python 与外部调用逐次确认。\n• 沙盒免打扰：自动放行 files/ 内常规写入、编辑、终端与搜索；删除、Python、MCP 与网页抓取仍逐次确认。")
+                    Text("• 只读保护：拦截全部写入、删除、终端变更与代码执行。\n• 标准审批：写入、删除、终端、Python、联网与红队工具逐次人工确认。\n• 沙盒免打扰：所有已授权沙盒工具（含读写删除、终端、Python 与已授权红队工具）全程自动放行并记录审计日志，无需人工弹窗确认。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

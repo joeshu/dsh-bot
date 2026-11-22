@@ -3,9 +3,20 @@ import SwiftUI
 import UIKit
 #endif
 
-/// Native 4-Tab Agent Navigation (Sessions / Agents / Workbench / Explore & Settings).
+private enum AppTab: Hashable {
+    case sessions
+    case agents
+    case workbench
+    case settings
+}
+
+/// Native 4-Tab Agent Navigation (会话 / 智能体 / 工作台 / 设置)
+/// with iPadOS adaptive sidebar (iOS 18+) and iOS 26 Liquid Glass progressive enhancement.
 public struct MainTabView: View {
     @ObservedObject var host: LocalAgentHost
+    @State private var selectedTab: AppTab = .sessions
+    @State private var dismissedPulseTurnId: String?
+    @State private var pulseTargetBot: BotProfile?
 
     public init(host: LocalAgentHost) {
         self.host = host
@@ -15,10 +26,13 @@ public struct MainTabView: View {
         host.pendingApprovals.count + host.pendingDSHQuestions.count
     }
 
-    @State private var dismissedPulseTurnId: String?
-
     private var pulseSessionId: String? {
         host.streamingSessionId ?? host.pendingApprovals.first?.sessionId
+    }
+
+    private var activePulseBot: BotProfile? {
+        guard let sid = pulseSessionId else { return nil }
+        return host.bots.first(where: { $0.id == sid })
     }
 
     private var showPulseBar: Bool {
@@ -30,27 +44,53 @@ public struct MainTabView: View {
         return host.isStreaming || !host.pendingApprovals.isEmpty
     }
 
+    @ViewBuilder
+    private var rootTabView: some View {
+        let base = TabView(selection: $selectedTab) {
+            SessionsTabView(host: host)
+                .tabItem { Label("会话", systemImage: "bubble.left.and.bubble.right.fill") }
+                .badge(pendingInboxCount > 0 ? pendingInboxCount : 0)
+                .tag(AppTab.sessions)
+
+            BotRosterTabView(host: host)
+                .tabItem { Label("智能体", systemImage: "person.2.crop.square.stack.fill") }
+                .tag(AppTab.agents)
+
+            ToolsHubTabView(host: host)
+                .tabItem { Label("工作台", systemImage: "square.grid.2x2.fill") }
+                .tag(AppTab.workbench)
+
+            SettingsAndExploreTabView(host: host)
+                .tabItem { Label("设置", systemImage: "gearshape.fill") }
+                .tag(AppTab.settings)
+        }
+        if #available(iOS 26.0, *) {
+            base
+                .tabViewStyle(.sidebarAdaptable)
+                .tabBarMinimizeBehavior(.onScrollDown)
+        } else if #available(iOS 18.0, *) {
+            base.tabViewStyle(.sidebarAdaptable)
+        } else {
+            base
+        }
+    }
+
     public var body: some View {
         ZStack(alignment: .bottom) {
-            TabView {
-                SessionsTabView(host: host)
-                    .tabItem { Label("会话", systemImage: "bubble.left.and.bubble.right.fill") }
-                    .badge(pendingInboxCount > 0 ? pendingInboxCount : 0)
-
-                BotRosterTabView(host: host)
-                    .tabItem { Label("智能体", systemImage: "person.2.crop.square.stack.fill") }
-
-                ToolsHubTabView(host: host)
-                    .tabItem { Label("工作台", systemImage: "square.grid.2x2.fill") }
-
-                PluginManagerView(host: host)
-                    .tabItem { Label("探索与设置", systemImage: "slider.horizontal.2.square") }
-            }
+            rootTabView
 
             if showPulseBar {
-                GlobalBotPulseBar(host: host) {
-                    dismissedPulseTurnId = host.activeTurnId
-                }
+                GlobalBotPulseBar(
+                    host: host,
+                    onTapOpen: {
+                        if let bot = activePulseBot {
+                            pulseTargetBot = bot
+                        }
+                    },
+                    onDismiss: {
+                        dismissedPulseTurnId = host.activeTurnId
+                    }
+                )
                 .padding(.horizontal, 12)
                 .padding(.bottom, 58)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -60,11 +100,22 @@ public struct MainTabView: View {
         .onChange(of: host.activeTurnId) { _ in
             dismissedPulseTurnId = nil
         }
+        .sheet(item: $pulseTargetBot) { target in
+            NavigationStack {
+                ChatView(bot: target, host: host)
+                    .toolbar {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button("完成") { pulseTargetBot = nil }
+                        }
+                    }
+            }
+        }
     }
 }
 
 private struct GlobalBotPulseBar: View {
     @ObservedObject var host: LocalAgentHost
+    let onTapOpen: () -> Void
     let onDismiss: () -> Void
 
     private var activeBotName: String {
@@ -85,20 +136,26 @@ private struct GlobalBotPulseBar: View {
         return "正在生成回复…"
     }
 
-    var body: some View {
+    private var barContent: some View {
         HStack(spacing: 10) {
-            Image(systemName: host.pendingApprovals.isEmpty ? "waveform" : "exclamationmark.shield.fill")
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(host.pendingApprovals.isEmpty ? DSTheme.brand : DSTheme.warning)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(activeBotName)
-                    .font(.caption.weight(.semibold))
-                    .lineLimit(1)
-                Text(statusSubtitle)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+            Button(action: onTapOpen) {
+                HStack(spacing: 10) {
+                    Image(systemName: host.pendingApprovals.isEmpty ? "waveform" : "exclamationmark.shield.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(host.pendingApprovals.isEmpty ? DSTheme.brand : DSTheme.warning)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(activeBotName)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        Text(statusSubtitle)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
             }
+            .buttonStyle(.plain)
             Spacer(minLength: 4)
             if let approval = host.pendingApprovals.first {
                 Button("批准") {
@@ -129,9 +186,20 @@ private struct GlobalBotPulseBar: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
-        .background(.regularMaterial, in: Capsule())
-        .overlay(Capsule().stroke(Color.secondary.opacity(0.22), lineWidth: 0.75))
-        .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+    }
+
+    @ViewBuilder
+    var body: some View {
+        if #available(iOS 26.0, *) {
+            barContent
+                .glassEffect(.regular, in: Capsule())
+                .shadow(color: .black.opacity(0.10), radius: 8, y: 3)
+        } else {
+            barContent
+                .background(.regularMaterial, in: Capsule())
+                .overlay(Capsule().stroke(Color.secondary.opacity(0.22), lineWidth: 0.75))
+                .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+        }
     }
 }
 
@@ -140,7 +208,7 @@ private struct GlobalBotPulseBar: View {
 public struct SessionsTabView: View {
     @ObservedObject var host: LocalAgentHost
     @State private var searchText = ""
-    @State private var showCreateSheet = false
+    @State private var createKind: CreateBotInitialKind?
     @State private var editingBot: BotProfile?
     @State private var profileBot: BotProfile?
 
@@ -313,29 +381,37 @@ public struct SessionsTabView: View {
                     }
                     .help("待处理收件箱")
 
-                    Button {
-                        showCreateSheet = true
+                    Menu {
+                        Button {
+                            createKind = .standard
+                        } label: {
+                            Label("新建智能体", systemImage: "person.badge.plus")
+                        }
+                        Button {
+                            createKind = .group
+                        } label: {
+                            Label("新建协作群聊", systemImage: "person.3.fill")
+                        }
+                        Button {
+                            createKind = .privateSpace
+                        } label: {
+                            Label("新建私密会话 (Face ID)", systemImage: "lock.shield.fill")
+                        }
                     } label: {
                         Image(systemName: "plus.circle.fill")
                             .font(.title3)
                     }
+                    .help("新建智能体或协作群聊")
                 }
             }
-            .sheet(isPresented: $showCreateSheet) {
-                CreateBotSheet(host: host)
+            .sheet(item: $createKind) { kind in
+                CreateBotSheet(host: host, initialKind: kind)
             }
             .sheet(item: $editingBot) { target in
                 EditBotSheet(bot: target, host: host)
             }
             .sheet(item: $profileBot) { target in
-                BotProfileSheet(
-                    bot: target,
-                    host: host,
-                    onOpenMemory: {},
-                    onOpenRoutines: {},
-                    onOpenEditSettings: { editingBot = target },
-                    onOpenDiagnostics: {}
-                )
+                BotProfileSheet(bot: target, host: host)
             }
         }
     }
@@ -370,7 +446,7 @@ public struct BotRosterTabView: View {
     @ObservedObject var host: LocalAgentHost
     @State private var filter: RosterFilter = .all
     @State private var searchText = ""
-    @State private var showCreateSheet = false
+    @State private var createKind: CreateBotInitialKind?
     @State private var editingBot: BotProfile?
     @State private var profileBot: BotProfile?
     @State private var pendingDeleteBot: BotProfile?
@@ -423,7 +499,7 @@ public struct BotRosterTabView: View {
                             subtitle: "你可以点击右上角新建自定义智能体、协作群聊或私密会话。",
                             actionTitle: "新建智能体"
                         ) {
-                            showCreateSheet = true
+                            createKind = filter == .group ? .group : (filter == .privateSpace ? .privateSpace : .standard)
                         }
                     }
                     .listRowBackground(Color.clear)
@@ -499,26 +575,35 @@ public struct BotRosterTabView: View {
             .navigationTitle("智能体团队")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button { showCreateSheet = true } label: {
+                    Menu {
+                        Button {
+                            createKind = .standard
+                        } label: {
+                            Label("新建智能体", systemImage: "person.badge.plus")
+                        }
+                        Button {
+                            createKind = .group
+                        } label: {
+                            Label("新建协作群聊", systemImage: "person.3.fill")
+                        }
+                        Button {
+                            createKind = .privateSpace
+                        } label: {
+                            Label("新建私密会话 (Face ID)", systemImage: "lock.shield.fill")
+                        }
+                    } label: {
                         Label("新建", systemImage: "plus.circle.fill")
                     }
                 }
             }
-            .sheet(isPresented: $showCreateSheet) {
-                CreateBotSheet(host: host)
+            .sheet(item: $createKind) { kind in
+                CreateBotSheet(host: host, initialKind: kind)
             }
             .sheet(item: $editingBot) { target in
                 EditBotSheet(bot: target, host: host)
             }
             .sheet(item: $profileBot) { target in
-                BotProfileSheet(
-                    bot: target,
-                    host: host,
-                    onOpenMemory: {},
-                    onOpenRoutines: {},
-                    onOpenEditSettings: { editingBot = target },
-                    onOpenDiagnostics: {}
-                )
+                BotProfileSheet(bot: target, host: host)
             }
             .confirmationDialog(
                 "确定删除「\(pendingDeleteBot?.name ?? "")」及其全部聊天记录？",
@@ -545,6 +630,7 @@ public struct BotRosterTabView: View {
 public struct ToolsHubTabView: View {
     @ObservedObject var host: LocalAgentHost
     @ObservedObject private var memoryGovernor = MemoryGovernor.shared
+    @ObservedObject private var budgetGovernor = CostAndBudgetGovernor.shared
 
     public init(host: LocalAgentHost) {
         self.host = host
@@ -585,12 +671,16 @@ public struct ToolsHubTabView: View {
 
                 Section {
                     let memMB = memoryGovernor.snapshot.physFootprintMB
+                    let memText = memMB > 0
+                        ? String(format: "%.0f MB · %@", memMB, memoryGovernor.tier.displayName)
+                        : host.appVersion
+                    let spendText = CostDisplayState.exact(budgetGovernor.todayEstimatedSpendUSD).formattedText
                     WidgetBlueprintCardView(
                         title: "端侧运行态势（实时）",
                         metrics: [
-                            WidgetMetricItem(label: "端侧内存", value: memMB > 0 ? String(format: "%.0f MB", memMB) : host.appVersion),
+                            WidgetMetricItem(label: "端侧内存", value: memText),
+                            WidgetMetricItem(label: "今日花费", value: spendText),
                             WidgetMetricItem(label: "智能体 / 群", value: "\(host.bots.count)"),
-                            WidgetMetricItem(label: "已缓存会话", value: "\(host.messagesBySession.count)"),
                             WidgetMetricItem(label: "待处理项", value: "\(host.pendingApprovals.count + host.pendingDSHQuestions.count)")
                         ]
                     )
@@ -727,10 +817,10 @@ public struct ToolsHubTabView: View {
                     }
                 }
 
-                Section("DSH Agent 模式说明") {
-                    Label("新建 / 编辑 Bot，或在空会话右上角菜单切换 4 种模式", systemImage: "slider.horizontal.3")
+                Section("DSH Agent 模式与审批说明") {
+                    Label("任意会话中途均可无损热切换 5 种模式与 3 档审批", systemImage: "slider.horizontal.3")
                         .font(.subheadline.weight(.medium))
-                    Text("• 标准模式：工作区读写/补丁/搜索、Skill、计划、提问、待办、Schedule 与 Jobs。\n• 创造模式：额外挂载只读 Cordis API 检查器。\n• PTC 开发模式：在离线 Pyodide Worker 中运行经完整源码审批的 Python/NumPy 程序并编排受控工具。\n• 轻量模式：仅只读文件与轻量对话。")
+                    Text("• 标准模式：工作区读写/补丁/搜索、Skill、计划、提问、待办、Schedule 与 Jobs。\n• 创造模式：额外挂载只读 Cordis API 检查器，适合插件研发。\n• PTC 开发模式：在离线 Pyodide Worker 中运行经源码审批的 Python/NumPy 程序并编排受控工具。\n• 轻量模式：仅只读文件与轻量对话，节省上下文与开销。\n• 红队演练模式：已安装并授权 dsh-purge-safe 后按三档审批可控挂载。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

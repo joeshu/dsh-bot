@@ -135,3 +135,113 @@ test('v3 governance: ios-plugin-manager supports atomic in-place upgrade, GitHub
   assert.match(pm, /releases' && parts\[3\] === 'tag'/)
   assert.match(pm, /rpc\.handle\('plugins\.audit'/)
 })
+
+test('v3 governance: zero-lock SQLite close-on-suspend, --safe-mode supervisor flag, and webServerAlive health probe', () => {
+  const sqliteSource = readFileSync(join(runtimeDir, 'sqlite-session-persistence.mjs'), 'utf8')
+  assert.match(sqliteSource, /get db\(\)/)
+  assert.match(sqliteSource, /closeDatabaseHandle\(\)/)
+  assert.match(sqliteSource, /async suspendDatabase\(\)/)
+  assert.match(sqliteSource, /resumeDatabase\(\)/)
+  const supervisor = readFileSync(join(runtimeDir, 'ios-supervisor.mjs'), 'utf8')
+  assert.match(supervisor, /args\.includes\('--safe-mode'\)/)
+  const entry = readFileSync(join(runtimeDir, 'dsh-ios-entry.mjs'), 'utf8')
+  assert.match(entry, /suspendDatabase/)
+  assert.match(entry, /resumeDatabase/)
+  assert.match(entry, /webServerAlive/)
+})
+
+test('v3 security: zero unsafe vm.runInNewContext in runtime and QuickJS RPC routing enabled', () => {
+  const entry = readFileSync(join(runtimeDir, 'dsh-ios-entry.mjs'), 'utf8')
+  const nativeTools = readFileSync(join(runtimeDir, 'ios-host-package', 'native-tools.mjs'), 'utf8')
+  assert.doesNotMatch(entry, /vm\.runInNewContext\s*\(/)
+  assert.doesNotMatch(nativeTools, /vm\.runInNewContext\s*\(/)
+  assert.match(entry, /sandbox\.js_eval/)
+  assert.match(nativeTools, /sandbox\.js_eval/)
+  assert.match(entry, /codeGeneration:\s*\{\s*strings:\s*false,\s*wasm:\s*false\s*\}/)
+  assert.match(entry, /redactDiagnosticSecrets/)
+})
+
+test('v3 security: web_fetch blocks IPv4/IPv6/mapped-IPv6/CGNAT/link-local SSRF, redirects, and unbounded bodies', async () => {
+  const nativeToolsPath = join(runtimeDir, 'ios-host-package', 'native-tools.mjs')
+  const nativeToolsSource = readFileSync(nativeToolsPath, 'utf8')
+  assert.match(nativeToolsSource, /redirect:\s*'manual'/)
+  assert.match(nativeToolsSource, /dnsLookup\(/)
+  assert.match(nativeToolsSource, /body\?\.getReader\(\)/)
+  assert.match(nativeToolsSource, /isPrivateOrReservedIP/)
+  // Verify exact IP classification logic against edge cases
+  const { isIP } = await import('node:net')
+  const classifyBlock = nativeToolsSource.match(/function isPrivateOrReservedIPv4[\s\S]*?^}/m)?.[0]
+  assert.ok(classifyBlock, 'isPrivateOrReservedIPv4 must exist')
+  const fn = new Function(
+    'isIP',
+    nativeToolsSource.slice(
+      nativeToolsSource.indexOf('function isPrivateOrReservedIPv4'),
+      nativeToolsSource.indexOf('async function assertSafePublicHttpsUrl')
+    ).replace('export function isPrivateOrReservedIP', 'function isPrivateOrReservedIP')
+      + '\nreturn isPrivateOrReservedIP;'
+  )(isIP)
+  for (const blocked of [
+    '127.0.0.1', '127.0.0.2', '10.0.0.1', '100.64.0.1', '169.254.169.254',
+    '172.16.0.1', '192.168.1.1', '0.0.0.0', '::1', '::', 'fc00::1', 'fd12::1',
+    'fe80::1', '::ffff:127.0.0.1', '::ffff:169.254.169.254', '::ffff:7f00:1',
+  ]) {
+    assert.equal(fn(blocked), true, `Expected ${blocked} to be blocked`)
+  }
+  for (const allowed of ['1.1.1.1', '8.8.8.8', '93.184.216.34', '2606:4700:4700::1111']) {
+    assert.equal(fn(allowed), false, `Expected ${allowed} to be allowed`)
+  }
+})
+
+test('v3 security: recursive symlink jail, terminal_exec 3-tier policy, plugin binary/SSRF/audit hardening, and WKDownloadDelegate', () => {
+  for (const rel of [
+    'ios-host-package/sandbox-fs.mjs',
+    'ios-host-package/ios-directory-picker-browse.mjs',
+    'ios-host-package/approval.mjs',
+    'ios-host-package/native-tools.mjs',
+    'dsh-ios-entry.mjs',
+  ]) {
+    const src = readFileSync(join(runtimeDir, rel), 'utf8')
+    assert.match(src, /suffix\.unshift\(basename\(current\)\)/, `${rel} must recursively canonicalize nonexistent symlink ancestors`)
+  }
+  const entry = readFileSync(join(runtimeDir, 'dsh-ios-entry.mjs'), 'utf8')
+  assert.match(entry, /if \(active\.permissionMode !== 'autoReview' && isMutating\)/)
+  assert.match(entry, /else if \(isMutating && ctx\.approval\?\.request\)/)
+  const pm = readFileSync(join(runtimeDir, 'ios-plugin-manager.mjs'), 'utf8')
+  assert.match(pm, /isBlockedPluginHost/)
+  assert.match(pm, /\['\.node', '\.dylib', '\.so', '\.dll', '\.exe'\]/)
+  assert.match(pm, /peerIssues/)
+  assert.match(pm, /await realpath\(importRoot\)/)
+  const webView = readFileSync(join(runtimeDir, '..', '..', 'ios', 'Sources', 'UI', 'DSHWebUIView.swift'), 'utf8')
+  assert.match(webView, /WKDownloadDelegate/)
+  assert.match(webView, /decidePolicyFor navigationResponse/)
+  assert.doesNotMatch(webView, /scheme == "about" \|\| scheme == "blob" \|\| scheme == "data"/)
+})
+
+test('v3 redteam: future-proof heuristic classifier, subagent/Web policy inheritance, Prompt Cache memoization, stale fork self-heal, and parallel staging', () => {
+  const entry = readFileSync(join(runtimeDir, 'dsh-ios-entry.mjs'), 'utf8')
+  assert.match(entry, /function redteamToolFlags\(name\)/)
+  assert.match(entry, /function resolveRedteamPolicyForAgent\(agent\)/)
+  assert.match(entry, /if \(policyKey === lastToolsPolicyKey\)/)
+  assert.match(entry, /if \(redteamToolsFork && registeredRedteamToolNames\(\)\.length === 0\)/)
+  assert.match(entry, /mountDurationMs:\s*redteamMountDurationMs/)
+
+  // Execute redteamToolFlags directly on new hypothetical dsh-purge-safe tools
+  const fnBlock = entry.slice(
+    entry.indexOf('const REDTEAM_READ_TOOL_NAMES'),
+    entry.indexOf('function redteamToolDenial')
+  )
+  const redteamToolFlags = new Function(`${fnBlock}\nreturn redteamToolFlags;`)()
+  assert.deepEqual(redteamToolFlags('redteam_cve_search'), { known: true, read: true, write: false, sensitive: false })
+  assert.deepEqual(redteamToolFlags('redteam_note_add'), { known: true, read: false, write: true, sensitive: false })
+  assert.deepEqual(redteamToolFlags('redteam_poc_delete'), { known: true, read: false, write: true, sensitive: true })
+  assert.deepEqual(redteamToolFlags('redteam_credential_list'), { known: true, read: false, write: false, sensitive: true })
+  assert.equal(redteamToolFlags('not_redteam_tool').known, false)
+
+  const pm = readFileSync(join(runtimeDir, 'ios-plugin-manager.mjs'), 'utf8')
+  assert.match(pm, /coreFilePath\)\.href\}\?rev=\$\{coreRev\}/)
+  assert.match(pm, /await Promise\.all\(copyList\.map/)
+  assert.match(pm, /if \(name === 'dsh-purge-safe'\)/)
+})
+
+
+

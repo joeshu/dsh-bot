@@ -79,13 +79,14 @@ public actor RemoteMCPClient {
                                        method: "tools/call", params: ["name": name, "arguments": arguments])
         if result["isError"] as? Bool == true {
             let texts = (result["content"] as? [[String: Any]] ?? []).compactMap { $0["text"] as? String }
-            throw RemoteMCPError.toolError(texts.joined(separator: "\n"))
+            throw RemoteMCPError.toolError(SecretRedactor.redactCommonTokens(texts.joined(separator: "\n")))
         }
         if let content = result["content"] as? [[String: Any]] {
             let texts = content.compactMap { $0["text"] as? String }
-            if !texts.isEmpty { return texts.joined(separator: "\n") }
+            if !texts.isEmpty { return SecretRedactor.redactCommonTokens(texts.joined(separator: "\n")) }
         }
-        return String(decoding: try JSONSerialization.data(withJSONObject: result), as: UTF8.self)
+        let raw = String(decoding: try JSONSerialization.data(withJSONObject: result), as: UTF8.self)
+        return SecretRedactor.redactCommonTokens(raw)
     }
 
     private func request(endpoint: String, keychainAccount: String?, method: String, params: [String: Any]) async throws -> [String: Any] {

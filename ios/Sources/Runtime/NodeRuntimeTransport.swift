@@ -17,12 +17,18 @@ public final class NodeRuntimeTransport: IPCByteTransport, @unchecked Sendable {
     private var closed = false
     private var launched = false
 
-    public static func prepare(apiBaseURL: String, workspace: URL = defaultWorkspace, privateSessionIDs: [String] = []) throws -> NodeRuntimeTransport {
-        try NodeRuntimeTransport(apiBaseURL: apiBaseURL, workspace: workspace, privateSessionIDs: privateSessionIDs)
+    public static func prepare(
+        apiBaseURL: String,
+        workspace: URL = defaultWorkspace,
+        privateSessionIDs: [String] = [],
+        safeMode: Bool = false
+    ) throws -> NodeRuntimeTransport {
+        try NodeRuntimeTransport(apiBaseURL: apiBaseURL, workspace: workspace, privateSessionIDs: privateSessionIDs, safeMode: safeMode)
     }
 
-    private init(apiBaseURL: String, workspace: URL, privateSessionIDs: [String]) throws {
+    private init(apiBaseURL: String, workspace: URL, privateSessionIDs: [String], safeMode: Bool) throws {
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        Self.applyIOSStorageProtection(to: workspace)
         guard let runtimeDirectory = Bundle.main.resourceURL?.appendingPathComponent("DSHRuntime", isDirectory: true) else {
             throw IPCFrameError.remoteError(code: -32000, message: "Embedded DSH runtime resources are missing.")
         }
@@ -52,7 +58,7 @@ public final class NodeRuntimeTransport: IPCByteTransport, @unchecked Sendable {
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
         let oldSpaceMB = MemoryGovernor.recommendedNodeOldSpaceMB()
-        arguments = [
+        var args = [
             "node", "--no-warnings", "--expose-internals", "--max-old-space-size=\(oldSpaceMB)", entry.path,
             "--ipc-fd=\(nodeFD)",
             "--workspace=\(workspace.path)",
@@ -61,6 +67,28 @@ public final class NodeRuntimeTransport: IPCByteTransport, @unchecked Sendable {
             "--private-session-ids=\(privateIdsToken)",
             "--worker-heap-mb=\(oldSpaceMB)",
         ]
+        if safeMode {
+            args.append("--safe-mode")
+        }
+        arguments = args
+    }
+
+    /// Apply iOS CompleteUntilFirstUserAuthentication protection to the workspace/SQLite
+    /// directory and exclude rebuildable runtime caches from iCloud backup.
+    private static func applyIOSStorageProtection(to workspace: URL) {
+        let fm = FileManager.default
+        try? fm.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: workspace.path
+        )
+        for cacheFolder in [".cache", "tmp", "node_modules"] {
+            var dirURL = workspace.appendingPathComponent(cacheFolder, isDirectory: true)
+            if fm.fileExists(atPath: dirURL.path) {
+                var resourceValues = URLResourceValues()
+                resourceValues.isExcludedFromBackup = true
+                try? dirURL.setResourceValues(resourceValues)
+            }
+        }
     }
 
     /// Start Node after IPC handlers are installed so the runtime's ready handshake cannot race registration.

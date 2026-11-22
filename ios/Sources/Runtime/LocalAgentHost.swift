@@ -10,332 +10,6 @@ import Vision
 import UIKit
 #endif
 
-public enum LocalAgentState: Equatable {
-    case idle
-    case starting
-    case ready
-    case failed(String)
-}
-
-public struct PendingApproval: Identifiable, Equatable {
-    public let id: String
-    public let sessionId: String
-    public let turnId: String
-    public let tool: String
-    public let summary: String
-    public let isDSH: Bool
-}
-
-public struct DSHQuestionOption: Identifiable, Equatable {
-    public let label: String
-    public let description: String
-    public var id: String { label }
-}
-
-public struct DSHQuestionItem: Identifiable, Equatable {
-    public let id: String
-    public let question: String
-    public let detail: String
-    public let header: String
-    public let multiSelect: Bool
-    public let options: [DSHQuestionOption]
-}
-
-public struct PendingDSHQuestion: Identifiable, Equatable {
-    public let id: String
-    public let sessionId: String
-    public let turnId: String
-    public let questions: [DSHQuestionItem]
-}
-
-public struct DSHAgentPresetOption: Identifiable, Equatable {
-    public let id: String
-    public let name: String
-    public let description: String
-    public let broken: String?
-
-    public var isAvailable: Bool { broken == nil }
-}
-
-public struct DSHToolActivity: Identifiable, Equatable {
-    public let id: String
-    public let callId: String
-    public let sessionId: String
-    public let turnId: String
-    public let toolName: String
-    public var phase: String
-    public var arguments: String
-    public var result: String
-    public var fileSummary: String? = nil
-    public var timestamp: Date
-    public var sequence: Int?
-    public var callSequence: Int?
-
-    public var phaseLabel: String {
-        switch phase {
-        case "started": return "运行中"
-        case "completed": return "已完成"
-        case "failed": return "失败"
-        case "cancelled": return "已取消"
-        case "unknown": return "结果未知"
-        default: return phase
-        }
-    }
-}
-
-public struct DSHToolActivityHistoryPage: Equatable {
-    public let arguments: String
-    public let argumentsNext: Int
-    public let argumentsTotalBytes: Int
-    public let result: String
-    public let resultNext: Int
-    public let resultTotalBytes: Int
-    public let phase: String
-}
-
-public struct DSHApprovalAudit: Identifiable, Equatable {
-    public let id: String
-    public let sessionId: String
-    public var toolName: String
-    public var outcome: String
-    public var timestamp: Date
-    public var sequence: Int?
-
-    public var outcomeLabel: String {
-        switch outcome {
-        case "allowed-once": return "已批准"
-        case "rejected": return "已拒绝"
-        case "cancelled": return "已取消"
-        case "unavailable": return "审批不可用，已拒绝"
-        default: return "结果未知"
-        }
-    }
-}
-
-public struct DSHPluginSource: Identifiable, Decodable, Equatable {
-    public let id: String
-    public let name: String
-    public let url: String
-    public let enabled: Bool
-    public let builtIn: Bool
-}
-
-public struct DSHPluginCatalogItem: Identifiable, Decodable, Equatable {
-    public let name: String
-    public let title: String
-    public let description: String
-    public let version: String
-    public let homepage: String
-    public let repositoryURL: String
-    public let category: String
-    public let sourceId: String
-    public let sourceName: String
-    public let installable: Bool
-    public let installSource: String
-
-    public var id: String { "\(sourceId):\(name)" }
-}
-
-public struct RedteamPluginStatus: Equatable {
-    public var installed: Bool = false
-    public var pluginActive: Bool = false
-    public var storeReady: Bool = false
-    public var redteamModeActive: Bool = false
-    public var toolCount: Int = 0
-    public var tools: [String] = []
-    public var skillCount: Int = 0
-    public var rootPatchDisabled: Bool = true
-    public var hostEnabled: Bool = false
-    public var webWorkbenchSupported: Bool = false
-    public var compatibilityWarning: String = ""
-    public var webReadAllowed: Bool = false
-    public var webWriteAllowed: Bool = false
-    public var webSensitiveAllowed: Bool = false
-
-    public init() {}
-
-    init(_ dict: [String: Any]) {
-        installed = dict["installed"] as? Bool ?? false
-        pluginActive = dict["pluginActive"] as? Bool ?? false
-        storeReady = dict["storeReady"] as? Bool ?? false
-        redteamModeActive = dict["redteamModeActive"] as? Bool ?? false
-        toolCount = dict["toolCount"] as? Int ?? 0
-        tools = dict["tools"] as? [String] ?? []
-        skillCount = dict["skillCount"] as? Int ?? 0
-        rootPatchDisabled = dict["rootPatchDisabled"] as? Bool ?? true
-        hostEnabled = dict["hostEnabled"] as? Bool ?? false
-        webWorkbenchSupported = dict["webWorkbenchSupported"] as? Bool ?? false
-        compatibilityWarning = dict["compatibilityWarning"] as? String ?? ""
-        let webPermissions = dict["webPermissions"] as? [String: Any] ?? [:]
-        webReadAllowed = webPermissions["read"] as? Bool ?? false
-        webWriteAllowed = webPermissions["write"] as? Bool ?? false
-        webSensitiveAllowed = webPermissions["sensitive"] as? Bool ?? false
-    }
-}
-
-public struct DSHPluginComponent: Identifiable, Decodable, Equatable {
-    public let id: String
-    public let name: String
-    public let description: String
-    public let active: Bool
-
-    enum CodingKeys: String, CodingKey { case id, name, description, active }
-
-    public init(id: String, name: String, description: String = "", active: Bool = false) {
-        self.id = id
-        self.name = name
-        self.description = description
-        self.active = active
-    }
-
-    public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = try c.decode(String.self, forKey: .id)
-        name = try c.decodeIfPresent(String.self, forKey: .name) ?? id
-        description = try c.decodeIfPresent(String.self, forKey: .description) ?? ""
-        active = try c.decodeIfPresent(Bool.self, forKey: .active) ?? false
-    }
-}
-
-public struct DSHInstalledPlugin: Identifiable, Decodable, Equatable {
-    public let name: String
-    public let version: String
-    public let enabled: Bool
-    public let desiredEnabled: Bool
-    public let compatibility: String
-    public let description: String
-    public let sourceLabel: String
-    public let components: [DSHPluginComponent]
-    public var id: String { name }
-
-    enum CodingKeys: String, CodingKey {
-        case name, version, enabled, desiredEnabled, compatibility, description, sourceLabel, components
-    }
-
-    public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        name = try c.decode(String.self, forKey: .name)
-        version = try c.decodeIfPresent(String.self, forKey: .version) ?? "0.0.0"
-        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
-        desiredEnabled = try c.decodeIfPresent(Bool.self, forKey: .desiredEnabled) ?? enabled
-        compatibility = try c.decodeIfPresent(String.self, forKey: .compatibility) ?? "unverified"
-        description = try c.decodeIfPresent(String.self, forKey: .description) ?? ""
-        sourceLabel = try c.decodeIfPresent(String.self, forKey: .sourceLabel) ?? "npm"
-        components = try c.decodeIfPresent([DSHPluginComponent].self, forKey: .components) ?? []
-    }
-
-    var compatibilityLabel: String {
-        switch compatibility {
-        case "web-ui": return "Web UI 插件"
-        case "host-only": return "仅 Host 功能"
-        case "verified": return "已验证"
-        default: return "待验证"
-        }
-    }
-}
-
-public struct ChatMessageItem: Identifiable, Codable, Equatable {
-    public let id: String
-    public let sessionId: String
-    public let role: String // "user" | "assistant"
-    public let content: String
-    public let reasoning: String
-    public let timestamp: Date
-    public var sequence: Int?
-    var historyPreview: Bool?
-    var transcript: [ProviderMessage]?
-    var providerProfile: String?
-    var incomplete: Bool?
-
-    public init(id: String = UUID().uuidString, sessionId: String, role: String, content: String, reasoning: String = "", timestamp: Date = Date(), sequence: Int? = nil) {
-        self.id = id
-        self.sessionId = sessionId
-        self.role = role
-        self.content = content
-        self.reasoning = reasoning
-        self.timestamp = timestamp
-        self.sequence = sequence
-    }
-}
-
-public struct BotProfile: Identifiable, Codable, Equatable {
-    public let id: String
-    public var name: String
-    public var roleLabel: String
-    public var model: String
-    public var systemPrompt: String
-    public var isMain: Bool
-    public var isPrivate: Bool
-    public var isGroup: Bool
-    public var section: String
-    public var permissionMode: String // "ask" | "autoReview" | "readOnly"
-    public var agentPreset: String // "standard" | "cordis"
-    public var redteamToolsEnabled: Bool
-    public var redteamWriteEnabled: Bool
-    public var redteamSensitiveDataEnabled: Bool
-
-    enum CodingKeys: String, CodingKey {
-        case id, name, roleLabel, model, systemPrompt, isMain, isPrivate, isGroup, section, permissionMode, agentPreset
-        case redteamToolsEnabled, redteamWriteEnabled, redteamSensitiveDataEnabled
-    }
-
-    public init(id: String, name: String, roleLabel: String, model: String = "deepseek-flash", systemPrompt: String = "", isMain: Bool = false, isPrivate: Bool = false, isGroup: Bool = false, section: String = "默认团队", permissionMode: String = "ask", agentPreset: String = "standard", redteamToolsEnabled: Bool = false, redteamWriteEnabled: Bool = false, redteamSensitiveDataEnabled: Bool = false) {
-        self.id = id
-        self.name = name
-        self.roleLabel = roleLabel
-        self.model = model
-        self.systemPrompt = systemPrompt
-        self.isMain = isMain
-        self.isPrivate = isPrivate
-        self.isGroup = isGroup
-        self.section = section
-        self.permissionMode = permissionMode
-        self.agentPreset = agentPreset
-        self.redteamToolsEnabled = !isPrivate && redteamToolsEnabled
-        self.redteamWriteEnabled = !isPrivate && redteamToolsEnabled && redteamWriteEnabled
-        self.redteamSensitiveDataEnabled = !isPrivate && redteamToolsEnabled && redteamSensitiveDataEnabled
-    }
-
-    public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = try c.decode(String.self, forKey: .id)
-        name = try c.decode(String.self, forKey: .name)
-        roleLabel = try c.decode(String.self, forKey: .roleLabel)
-        model = try c.decodeIfPresent(String.self, forKey: .model) ?? ModelProvider.defaultModel
-        systemPrompt = try c.decodeIfPresent(String.self, forKey: .systemPrompt) ?? ""
-        isMain = try c.decodeIfPresent(Bool.self, forKey: .isMain) ?? false
-        isPrivate = try c.decodeIfPresent(Bool.self, forKey: .isPrivate) ?? false
-        isGroup = try c.decodeIfPresent(Bool.self, forKey: .isGroup) ?? false
-        section = try c.decodeIfPresent(String.self, forKey: .section) ?? "默认团队"
-        permissionMode = try c.decodeIfPresent(String.self, forKey: .permissionMode) ?? "ask"
-        agentPreset = try c.decodeIfPresent(String.self, forKey: .agentPreset) ?? "standard"
-        let storedRedteamToolsEnabled = try c.decodeIfPresent(Bool.self, forKey: .redteamToolsEnabled) ?? false
-        let storedRedteamWriteEnabled = try c.decodeIfPresent(Bool.self, forKey: .redteamWriteEnabled) ?? false
-        let storedRedteamSensitiveDataEnabled = try c.decodeIfPresent(Bool.self, forKey: .redteamSensitiveDataEnabled) ?? false
-        redteamToolsEnabled = !isPrivate && storedRedteamToolsEnabled
-        redteamWriteEnabled = !isPrivate && redteamToolsEnabled && storedRedteamWriteEnabled
-        redteamSensitiveDataEnabled = !isPrivate && redteamToolsEnabled && storedRedteamSensitiveDataEnabled
-    }
-
-    public var permissionModeLabel: String {
-        switch permissionMode {
-        case "autoReview": return "沙盒免打扰"
-        case "readOnly": return "只读保护"
-        default: return "标准审批"
-        }
-    }
-
-    public var agentPresetLabel: String {
-        switch agentPreset {
-        case "cordis": return "创造模式"
-        case "ptc-python": return "PTC 开发模式"
-        case "minimal": return "轻量模式"
-        case "standard": return "标准模式"
-        default: return agentPreset
-        }
-    }
-}
-
 @MainActor
 public final class LocalAgentHost: ObservableObject {
     public static let shared = LocalAgentHost()
@@ -1027,8 +701,7 @@ public final class LocalAgentHost: ObservableObject {
         if let sensitiveDataEnabled {
             bots[index].redteamSensitiveDataEnabled = bots[index].redteamToolsEnabled && sensitiveDataEnabled
         }
-        if bots[index].agentPreset == "redteam",
-           (!bots[index].redteamToolsEnabled || !bots[index].redteamWriteEnabled || !bots[index].redteamSensitiveDataEnabled || bots[index].permissionMode == "readOnly") {
+        if bots[index].agentPreset == "redteam", !bots[index].redteamToolsEnabled {
             bots[index].agentPreset = "standard"
         }
         persistWorkspace()
@@ -1218,7 +891,12 @@ public final class LocalAgentHost: ObservableObject {
                 bots: bots,
                 tombstones: UserDefaults.standard.stringArray(forKey: "dsbot.privateSessionTombstones") ?? []
             )
-            let transport = try NodeRuntimeTransport.prepare(apiBaseURL: apiBaseURL, privateSessionIDs: privateIds)
+            let safeModeBoot = SafeModeBootGuard.shared.beginBootAttempt()
+            let transport = try NodeRuntimeTransport.prepare(
+                apiBaseURL: apiBaseURL,
+                privateSessionIDs: privateIds,
+                safeMode: safeModeBoot
+            )
             let rpc = IPCChannel(transport: transport)
             channel = rpc
             await rpc.onClose { [weak self] in
@@ -1269,15 +947,20 @@ public final class LocalAgentHost: ObservableObject {
             }
             await refreshPluginState(on: rpc)
             await synchronizeRedteamHost(on: rpc)
+            MemoryGovernor.shared.onPressureTrim = { _ in
+                DSMarkdownText.clearRenderCache()
+            }
             MemoryGovernor.shared.onCriticalPressure = { [weak self] in
                 guard let self else { return }
                 Task { @MainActor in
+                    DSMarkdownText.clearRenderCache()
                     if self.isStreaming {
                         self.lastStreamError = "系统内存紧张，已安全暂停当前生成以保护进度。"
                         await self.abortActiveTurn()
                     }
                 }
             }
+            SafeModeBootGuard.shared.markBootReady()
             state = .ready
         } catch {
             resolveRuntimeReadiness(.remoteError(code: -32000, message: error.localizedDescription))
@@ -1304,7 +987,10 @@ public final class LocalAgentHost: ObservableObject {
         _ = try? await channel.request("agent.resume")
         do {
             let health = try await channel.request("runtime.health", timeoutSeconds: 4)
-            if health["ok"] as? Bool != true, state == .ready, !isStreaming {
+            let isHealthy = health["ok"] as? Bool == true
+            let webPort = health["webPort"] as? Int ?? 0
+            let webAlive = webPort == 0 || (health["webServerAlive"] as? Bool ?? true)
+            if (!isHealthy || !webAlive), state == .ready, !isStreaming {
                 _ = await restartRuntime()
             }
         } catch {
@@ -1971,6 +1657,12 @@ public final class LocalAgentHost: ObservableObject {
                 params: params["params"] as? [String: Any] ?? [:]
             )
         }
+        await rpc.registerHandler(method: "sandbox.js_eval") { [weak self] params in
+            guard let self else { throw IPCFrameError.channelClosed }
+            let script = params["script"] as? String ?? ""
+            let timeoutMs = Int32(params["timeoutMs"] as? Int ?? 2_000)
+            return await self.workspaceCapabilities.evaluateQuickJSSandbox(script, timeoutMilliseconds: timeoutMs)
+        }
         await rpc.registerHandler(method: "native.tool.execute") { [weak self] params in
             guard let self, let name = params["name"] as? String else { throw IPCFrameError.invalidJSON }
             var arguments = params["args"] as? [String: Any] ?? [:]
@@ -1995,6 +1687,13 @@ public final class LocalAgentHost: ObservableObject {
                 turnId: params["turnId"] as? String ?? "",
                 isGroup: params["isGroup"] as? Bool ?? false,
                 pythonRunner: { code, botId, turnId in
+                    let admitted = await MainActor.run { MemoryGovernor.shared.canAdmitHeavyWork() }
+                    guard admitted else {
+                        throw IPCFrameError.remoteError(
+                            code: -32000,
+                            message: "当前设备可用内存偏低（MemoryGovernor 处于紧张/临界档位），已暂缓启动离线 Python WASM 工作线程以防闪退。请关闭后台重型应用后重试。"
+                        )
+                    }
                     let result = try await rpc.request("python.execute", params: [
                         "botId": botId, "turnId": turnId, "code": code,
                     ], timeoutSeconds: 60)
@@ -2198,17 +1897,7 @@ public final class LocalAgentHost: ObservableObject {
         let lowerTool = tool.lowercased()
         let isWriteOrMutate = lowerTool.contains("write") || lowerTool.contains("edit") || lowerTool.contains("patch")
             || lowerTool.contains("delete") || lowerTool.contains("memory") || lowerTool == "terminal_exec"
-            || lowerTool.hasPrefix("redteam_")
-        let isHighRiskOrExternal = lowerTool.contains("delete") || lowerTool == "python_exec"
-            || lowerTool == "run_code" || lowerTool == "python_job_start"
-            || lowerTool == "remote_mcp_call" || lowerTool == "web_fetch"
-        let isSandboxDevEligible = lowerTool == "read" || lowerTool == "grep" || lowerTool == "glob"
-            || lowerTool == "write" || lowerTool == "edit" || lowerTool == "apply_patch" || lowerTool == "patch"
-            || lowerTool == "workspace_list" || lowerTool == "workspace_read" || lowerTool == "workspace_search"
-            || lowerTool == "workspace_write" || lowerTool == "workspace_edit"
-            || lowerTool == "terminal_exec" || lowerTool == "git_workspace"
-            || lowerTool == "memory_save" || lowerTool == "group_todo_add"
-            || lowerTool == "web_search" || lowerTool == "device_status" || lowerTool == "remote_mcp_list"
+            || lowerTool == "python_exec" || lowerTool == "run_code" || lowerTool == "python_job_start"
             || lowerTool.hasPrefix("redteam_")
 
         let approval = PendingApproval(id: id, sessionId: sessionId, turnId: turnId, tool: tool, summary: summary, isDSH: params["source"] as? String == "dsh")
@@ -2221,7 +1910,7 @@ public final class LocalAgentHost: ObservableObject {
             return
         }
 
-        if (autoReviewEnabled || botMode == "autoReview") && isSandboxDevEligible && !isHighRiskOrExternal {
+        if autoReviewEnabled || botMode == "autoReview" {
             autoReviewLog.insert("[\(Date().formatted(date: .omitted, time: .shortened))] 沙盒免打扰放行：\(tool)", at: 0)
             if autoReviewLog.count > 40 { autoReviewLog = Array(autoReviewLog.prefix(40)) }
             Task { await respondToApproval(id: id, approved: true) }

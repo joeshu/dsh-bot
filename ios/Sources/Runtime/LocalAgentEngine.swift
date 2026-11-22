@@ -253,6 +253,20 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
         self.mcp = mcp ?? RemoteMCPClient(keychain: keychain)
     }
 
+    /// Evaluates untrusted JavaScript inside the native C QuickJS sandbox
+    /// (16 MB heap limit, 256 KB stack limit, monotonic interrupt timeout, zero Node/FS/host bindings).
+    func evaluateQuickJSSandbox(_ script: String, timeoutMilliseconds: Int32 = 2_000) async -> [String: Any] {
+        let clamped = max(100, min(timeoutMilliseconds, 5_000))
+        let result = await js.evaluate(script, timeoutMilliseconds: clamped)
+        var lines = result.logs
+        if !result.value.isEmpty { lines.append(result.value) }
+        return [
+            "ok": result.ok,
+            "output": lines.joined(separator: "\n"),
+            "error": result.error ?? ""
+        ]
+    }
+
     public func setReceiveHandler(_ handler: @escaping (Data) -> Void) {
         io.async { if !self.closed { self.receiver = handler } }
     }

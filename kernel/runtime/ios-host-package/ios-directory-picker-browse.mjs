@@ -4,18 +4,20 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { DirectoryPicker, DirectoryPickerError } from '@deepseek-ai/dsh-host-directory-picker'
 
 function canonicalize(targetPath) {
-  const abs = resolve(targetPath)
-  try {
-    return realpathSync(abs)
-  } catch {
-    const parent = dirname(abs)
-    if (parent === abs) return abs
+  let current = resolve(targetPath)
+  const suffix = []
+  for (let depth = 0; depth < 64; depth++) {
     try {
-      return resolve(realpathSync(parent), abs.slice(parent.length + (parent.endsWith(sep) ? 0 : 1)))
+      const real = realpathSync(current)
+      return suffix.length ? resolve(real, ...suffix) : real
     } catch {
-      return abs
+      const parent = dirname(current)
+      if (parent === current) break
+      suffix.unshift(basename(current))
+      current = parent
     }
   }
+  return resolve(targetPath)
 }
 
 function sandboxCrumbs(sandboxRoot, target) {

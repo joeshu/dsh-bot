@@ -34,30 +34,50 @@ private enum ChatTranscriptRow: Identifiable {
     }
 }
 
+private enum ChatActiveSheet: Identifiable {
+    case botProfile
+    case sideChat
+    case groupWorkspace
+    case memory
+    case workspaceFiles
+    case editBot
+    case diagnostics
+    case scheduleManager
+    case jobsManager
+    case referenceChatPicker
+    case history(SessionHistoryPresentation)
+
+    var id: String {
+        switch self {
+        case .botProfile: return "botProfile"
+        case .sideChat: return "sideChat"
+        case .groupWorkspace: return "groupWorkspace"
+        case .memory: return "memory"
+        case .workspaceFiles: return "workspaceFiles"
+        case .editBot: return "editBot"
+        case .diagnostics: return "diagnostics"
+        case .scheduleManager: return "scheduleManager"
+        case .jobsManager: return "jobsManager"
+        case .referenceChatPicker: return "referenceChatPicker"
+        case .history(let presentation): return "history-\(presentation.id)"
+        }
+    }
+}
+
 public struct ChatView: View {
     let bot: BotProfile
     @ObservedObject var host: LocalAgentHost
     private let searchResultMessageID: String?
     @State private var input = ""
     @State private var selectedModel: String
-    @State private var showSideChat = false
-    @State private var showGroupWorkspace = false
     @State private var activeSectionTitle = ""
     @State private var isPrivateUnlocked = false
     @State private var historyError: String?
-    @State private var historyPresentation: SessionHistoryPresentation?
     @State private var restoringOlderHistory = false
     @State private var followsLiveOutput = true
     @State private var showClearConfirm = false
-    @State private var showEditBot = false
-    @State private var showBotProfile = false
-    @State private var showMemory = false
     @State private var showFileImporter = false
-    @State private var showWorkspaceFiles = false
-    @State private var showDiagnostics = false
-    @State private var showScheduleManager = false
-    @State private var showJobsManager = false
-    @State private var showReferenceChatPicker = false
+    @State private var activeSheet: ChatActiveSheet?
     @State private var referencedBot: BotProfile?
     @State private var attachedFile: LocalAgentHost.AttachedWorkspaceFile?
     @StateObject private var speechInput = SpeechInputController()
@@ -83,8 +103,6 @@ public struct ChatView: View {
 
     private func redteamPresetAllowed(for profile: BotProfile) -> Bool {
         !profile.isPrivate && host.redteamModeEnabled && profile.redteamToolsEnabled
-            && profile.redteamWriteEnabled && profile.redteamSensitiveDataEnabled
-            && profile.permissionMode != "readOnly"
     }
 
     private var isLocked: Bool { liveBot.isPrivate && !isPrivateUnlocked }
@@ -149,7 +167,7 @@ public struct ChatView: View {
             if !isLocked {
                 ToolbarItem(placement: .principal) {
                     Button {
-                        showBotProfile = true
+                        activeSheet = .botProfile
                     } label: {
                         VStack(spacing: 1) {
                             HStack(spacing: 4) {
@@ -175,74 +193,9 @@ public struct ChatView: View {
                     .buttonStyle(.plain)
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
-                    if host.sessionDiagnosticsEnabled {
-                        Button {
-                            showDiagnostics = true
-                        } label: {
-                            Image(systemName: "waveform.path.ecg")
-                        }
-                        .help("会话数据诊断")
-                    }
-
-                    // Menu 1: High-frequency session workspace & tasks drawer
+                    // Menu 1: Live Strategy (Mode, Approval Tier, Model, RedTeam Permissions)
                     Menu {
-                        Section("会话工具与工作区") {
-                            Button {
-                                showBotProfile = true
-                            } label: {
-                                Label("智能体档案（5-Tab）", systemImage: "person.text.rectangle")
-                            }
-                            Button {
-                                showWorkspaceFiles = true
-                            } label: {
-                                Label("工作区文件 (files/)", systemImage: "folder.fill")
-                            }
-                            Button {
-                                showSideChat = true
-                            } label: {
-                                Label("侧边对话 (/side)", systemImage: "bubble.left.and.exclamationmark.bubble.right")
-                            }
-                            Button {
-                                showMemory = true
-                            } label: {
-                                Label("当前 Bot 记忆库", systemImage: "brain.head.profile")
-                            }
-                            Button {
-                                Task { await host.sendMessage(sessionId: liveBot.id, text: "/compact", model: selectedModel) }
-                            } label: {
-                                Label("压缩当前上下文 (/compact)", systemImage: "arrow.down.right.and.arrow.up.left")
-                            }
-                            .disabled(host.isStreaming || sessionMessages.isEmpty)
-                        }
-                        Section("任务与协作") {
-                            Button {
-                                showScheduleManager = true
-                            } label: {
-                                Label("定时任务", systemImage: "calendar.badge.clock")
-                            }
-                            if liveBot.agentPreset == "standard" || liveBot.agentPreset == "cordis" {
-                                Button {
-                                    showJobsManager = true
-                                } label: {
-                                    Label("后台 Python 任务", systemImage: "hourglass")
-                                }
-                            }
-                            if liveBot.isGroup {
-                                Button {
-                                    showGroupWorkspace = true
-                                } label: {
-                                    Label("群目标与共享待办 (/goal)", systemImage: "checklist")
-                                }
-                            }
-                        }
-                    } label: {
-                        Image(systemName: "square.stack.3d.up")
-                    }
-                    .help("会话工作抽屉")
-
-                    // Menu 2: Agent preset, model, permissions, export & lifecycle
-                    Menu {
-                        Section("DSH Agent 模式") {
+                        Section("实时模式与审批（热切换）") {
                             Picker(host.agentPresetName(liveBot.agentPreset), selection: Binding(
                                 get: { liveBot.agentPreset },
                                 set: { host.setAgentPreset(sessionId: liveBot.id, presetId: $0) }
@@ -292,30 +245,69 @@ public struct ChatView: View {
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 } else if !host.redteamModeEnabled {
-                                    Text("请先在“探索与设置”启用全局插件工具宿主。")
+                                    Text("请先在“设置 → 插件与红队宿主”启用全局宿主。")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 } else {
-                                    Text("审批档位：\(liveBot.permissionModeLabel)。只读保护拦截红队写入与敏感工具；标准审批逐次确认；沙盒免打扰自动放行已授权的红队工具并记录审计日志。")
+                                    Text("审批档位：\(liveBot.permissionModeLabel)。只读保护拦截写入与敏感工具；标准审批逐次确认；沙盒免打扰自动放行已授权工具并记录审计日志。")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
                             }
                             .disabled(liveBot.isPrivate || !host.redteamModeEnabled || host.isStreaming)
                         }
-                        Section("会话管理与诊断") {
+                        Section {
                             Button {
-                                showEditBot = true
+                                activeSheet = .editBot
                             } label: {
-                                Label("编辑智能体设置", systemImage: "slider.horizontal.3")
+                                Label("编辑智能体人设与高级配置", systemImage: "person.crop.circle.badge.exclamationmark")
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "slider.horizontal.3")
+                    }
+                    .help("模式、模型与审批策略")
+
+                    // Menu 2: Session Quick Actions (non-overlapping with BotProfileSheet)
+                    Menu {
+                        Section("会话快捷操作") {
+                            Button {
+                                activeSheet = .sideChat
+                            } label: {
+                                Label("侧边旁路对话 (/side)", systemImage: "bubble.left.and.exclamationmark.bubble.right")
                             }
                             Button {
-                                showDiagnostics = true
+                                Task { await host.sendMessage(sessionId: liveBot.id, text: "/compact", model: selectedModel) }
+                            } label: {
+                                Label("压缩当前上下文 (/compact)", systemImage: "arrow.down.right.and.arrow.up.left")
+                            }
+                            .disabled(host.isStreaming || sessionMessages.isEmpty)
+                            Button {
+                                activeSheet = .workspaceFiles
+                            } label: {
+                                Label("工作区文件 (files/)", systemImage: "folder.fill")
+                            }
+                            if liveBot.isGroup {
+                                Button {
+                                    activeSheet = .groupWorkspace
+                                } label: {
+                                    Label("群目标与共享待办 (/goal)", systemImage: "checklist")
+                                }
+                            }
+                        }
+                        Section("档案、诊断与记录") {
+                            Button {
+                                activeSheet = .botProfile
+                            } label: {
+                                Label("打开 5-Tab 智能体档案", systemImage: "person.text.rectangle")
+                            }
+                            Button {
+                                activeSheet = .diagnostics
                             } label: {
                                 Label("会话数据诊断", systemImage: "doc.text.magnifyingglass")
                             }
                             Button {
-                                historyPresentation = .export
+                                activeSheet = .history(.export)
                             } label: {
                                 Label("导出会话为 Markdown", systemImage: "square.and.arrow.up")
                             }
@@ -337,108 +329,13 @@ public struct ChatView: View {
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
+                    .help("会话快捷操作")
                 }
             }
         }
-        .sheet(item: $historyPresentation) { presentation in
+        .sheet(item: $activeSheet) { sheet in
             if !isLocked {
-                SessionHistoryDetailView(host: host, bot: liveBot, presentation: presentation)
-            }
-        }
-        .sheet(isPresented: $showSideChat) {
-            if !isLocked {
-                SideChatSheet(host: host, model: selectedModel, botId: liveBot.id,
-                              botName: liveBot.name, isPrivate: liveBot.isPrivate)
-            }
-        }
-        .sheet(isPresented: $showGroupWorkspace) {
-            if !isLocked { GroupWorkspaceSheet(host: host, groupId: bot.id) }
-        }
-        .sheet(isPresented: $showMemory) {
-            if !isLocked { NavigationStack { MemoryVaultView(host: host, botId: liveBot.id) } }
-        }
-        .sheet(isPresented: $showWorkspaceFiles) {
-            if !isLocked {
-                NavigationStack {
-                    WorkspaceFilesView(host: host)
-                        .toolbar {
-                            ToolbarItem(placement: .topBarLeading) {
-                                Button("关闭") { showWorkspaceFiles = false }
-                            }
-                        }
-                }
-            }
-        }
-        .sheet(isPresented: $showEditBot) {
-            if !isLocked { EditBotSheet(bot: liveBot, host: host) }
-        }
-        .sheet(isPresented: $showBotProfile) {
-            if !isLocked {
-                BotProfileSheet(
-                    bot: liveBot,
-                    host: host,
-                    onOpenMemory: { showMemory = true },
-                    onOpenRoutines: { showScheduleManager = true },
-                    onOpenEditSettings: { showEditBot = true },
-                    onOpenDiagnostics: { showDiagnostics = true }
-                )
-            }
-        }
-        .sheet(isPresented: $showDiagnostics) {
-            if !isLocked { SessionDiagnosticsSheet(host: host, bot: liveBot) }
-        }
-        .sheet(isPresented: $showScheduleManager) {
-            if !isLocked {
-                NavigationStack { ScheduleManagerView(host: host, botId: liveBot.id) }
-            }
-        }
-        .sheet(isPresented: $showJobsManager) {
-            if !isLocked {
-                NavigationStack { JobsManagerView(host: host, botId: liveBot.id) }
-            }
-        }
-        .sheet(isPresented: $showReferenceChatPicker) {
-            NavigationStack {
-                List {
-                    let candidates = host.bots.filter { $0.id != liveBot.id && !$0.isPrivate }
-                    if candidates.isEmpty {
-                        DSEmptyStateView(
-                            icon: "quote.bubble",
-                            title: "暂无可引用的其他会话",
-                            subtitle: "非私密的活跃智能体会话将显示在这里。"
-                        )
-                        .listRowBackground(Color.clear)
-                    } else {
-                        ForEach(candidates) { candidate in
-                            Button {
-                                referencedBot = candidate
-                                showReferenceChatPicker = false
-                            } label: {
-                                HStack(spacing: 12) {
-                                    DSBotAvatar(
-                                        initials: candidate.name,
-                                        color: DSTheme.botAvatarColor(candidate),
-                                        isPrivate: false,
-                                        size: 36
-                                    )
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(candidate.name).font(.subheadline.weight(.semibold))
-                                        Text("\(host.messages(for: candidate.id).count) 条消息 · \(candidate.roleLabel)")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                .navigationTitle("引用历史对话")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("取消") { showReferenceChatPicker = false }
-                    }
-                }
+                sheetContent(for: sheet)
             }
         }
         .confirmationDialog("确定清空「\(liveBot.name)」的全部聊天记录？", isPresented: $showClearConfirm, titleVisibility: .visible) {
@@ -469,6 +366,83 @@ public struct ChatView: View {
         }
     }
 
+    @ViewBuilder
+    private func sheetContent(for sheet: ChatActiveSheet) -> some View {
+        switch sheet {
+        case .history(let presentation):
+            SessionHistoryDetailView(host: host, bot: liveBot, presentation: presentation)
+        case .sideChat:
+            SideChatSheet(host: host, model: selectedModel, botId: liveBot.id,
+                          botName: liveBot.name, isPrivate: liveBot.isPrivate)
+        case .groupWorkspace:
+            GroupWorkspaceSheet(host: host, groupId: bot.id)
+        case .memory:
+            NavigationStack { MemoryVaultView(host: host, botId: liveBot.id) }
+        case .workspaceFiles:
+            NavigationStack {
+                WorkspaceFilesView(host: host)
+                    .toolbar {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button("关闭") { activeSheet = nil }
+                        }
+                    }
+            }
+        case .editBot:
+            EditBotSheet(bot: liveBot, host: host)
+        case .botProfile:
+            BotProfileSheet(bot: liveBot, host: host)
+        case .diagnostics:
+            SessionDiagnosticsSheet(host: host, bot: liveBot)
+        case .scheduleManager:
+            NavigationStack { ScheduleManagerView(host: host, botId: liveBot.id) }
+        case .jobsManager:
+            NavigationStack { JobsManagerView(host: host, botId: liveBot.id) }
+        case .referenceChatPicker:
+            NavigationStack {
+                List {
+                    let candidates = host.bots.filter { $0.id != liveBot.id && !$0.isPrivate }
+                    if candidates.isEmpty {
+                        DSEmptyStateView(
+                            icon: "quote.bubble",
+                            title: "暂无可引用的其他会话",
+                            subtitle: "非私密的活跃智能体会话将显示在这里。"
+                        )
+                        .listRowBackground(Color.clear)
+                    } else {
+                        ForEach(candidates) { candidate in
+                            Button {
+                                referencedBot = candidate
+                                activeSheet = nil
+                            } label: {
+                                HStack(spacing: 12) {
+                                    DSBotAvatar(
+                                        initials: candidate.name,
+                                        color: DSTheme.botAvatarColor(candidate),
+                                        isPrivate: false,
+                                        size: 36
+                                    )
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(candidate.name).font(.subheadline.weight(.semibold))
+                                        Text("\(host.messages(for: candidate.id).count) 条消息 · \(candidate.roleLabel)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                .navigationTitle("引用历史对话")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("取消") { activeSheet = nil }
+                    }
+                }
+            }
+        }
+    }
+
     private func loadHistory(older: Bool = false) async {
         guard !isLocked else { return }
         historyError = nil
@@ -488,16 +462,8 @@ public struct ChatView: View {
         isPrivateUnlocked = false
         host.discardSessionHistoryCache(bot.id)
         historyError = nil
-        historyPresentation = nil
-        showSideChat = false
-        showGroupWorkspace = false
-        showScheduleManager = false
-        showJobsManager = false
-        showEditBot = false
-        showBotProfile = false
-        showMemory = false
+        activeSheet = nil
         showFileImporter = false
-        showWorkspaceFiles = false
         attachedFile = nil
         speechInput.stop()
         showClearConfirm = false
@@ -632,7 +598,7 @@ public struct ChatView: View {
                 messageRow(msg).id(msg.id)
             case .tool(let activity):
                 DSHToolActivityCard(activity: activity) {
-                    historyPresentation = .tool(activity)
+                    activeSheet = .history(.tool(activity))
                 }
                 .id(activity.id)
             case .approval(let audit):
@@ -842,7 +808,7 @@ public struct ChatView: View {
 
             if msg.historyPreview == true {
                 Button {
-                    historyPresentation = .message(msg)
+                    activeSheet = .history(.message(msg))
                 } label: {
                     Label("查看完整消息", systemImage: "arrow.up.left.and.arrow.down.right")
                         .font(.caption)
@@ -955,7 +921,7 @@ public struct ChatView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 Button {
-                    showSideChat = true
+                    activeSheet = .sideChat
                 } label: {
                     Label("旁白追问", systemImage: "bubble.left.and.exclamationmark.bubble.right")
                         .font(.caption)
@@ -1036,14 +1002,14 @@ public struct ChatView: View {
                     HStack(spacing: 8) {
                         Button("/side 侧边对话") {
                             input = ""
-                            showSideChat = true
+                            activeSheet = .sideChat
                         }
                         .buttonStyle(.bordered)
                         .font(.caption)
                         if liveBot.isGroup {
                             Button("/goal 群目标") {
                                 input = ""
-                                showGroupWorkspace = true
+                                activeSheet = .groupWorkspace
                             }
                             .buttonStyle(.bordered)
                             .font(.caption)
@@ -1113,11 +1079,11 @@ public struct ChatView: View {
                 Menu {
                     if !liveBot.isPrivate {
                         Button { showFileImporter = true } label: { Label("附加文件到工作区", systemImage: "paperclip") }
-                        Button { showWorkspaceFiles = true } label: { Label("/files 浏览与编辑工作区", systemImage: "folder.fill") }
+                        Button { activeSheet = .workspaceFiles } label: { Label("/files 浏览与编辑工作区", systemImage: "folder.fill") }
                     }
-                    Button { showReferenceChatPicker = true } label: { Label("引用历史对话作为上下文", systemImage: "quote.bubble") }
-                    Button { showSideChat = true } label: { Label("/side 侧边对话", systemImage: "bubble.left.and.exclamationmark.bubble.right") }
-                    if liveBot.isGroup { Button { showGroupWorkspace = true } label: { Label("/goal 群目标与待办", systemImage: "target") } }
+                    Button { activeSheet = .referenceChatPicker } label: { Label("引用历史对话作为上下文", systemImage: "quote.bubble") }
+                    Button { activeSheet = .sideChat } label: { Label("/side 侧边对话", systemImage: "bubble.left.and.exclamationmark.bubble.right") }
+                    if liveBot.isGroup { Button { activeSheet = .groupWorkspace } label: { Label("/goal 群目标与待办", systemImage: "target") } }
                     Button { showClearConfirm = true } label: { Label("/clear 清空当前会话", systemImage: "trash") }
                     Menu {
                         ForEach(host.bots.filter { !$0.isPrivate && !$0.isGroup }) { member in
@@ -1181,22 +1147,22 @@ public struct ChatView: View {
                         guard !text.isEmpty || attachedFile != nil else { return }
                         if text == "/side" {
                             input = ""
-                            showSideChat = true
+                            activeSheet = .sideChat
                             return
                         }
                         if text == "/files", !liveBot.isPrivate {
                             input = ""
-                            showWorkspaceFiles = true
+                            activeSheet = .workspaceFiles
                             return
                         }
                         if text == "/profile" {
                             input = ""
-                            showBotProfile = true
+                            activeSheet = .botProfile
                             return
                         }
                         if text == "/goal", liveBot.isGroup {
                             input = ""
-                            showGroupWorkspace = true
+                            activeSheet = .groupWorkspace
                             return
                         }
                         if text == "/clear" {

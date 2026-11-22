@@ -181,10 +181,10 @@ private struct LoopbackWebView: UIViewRepresentable {
         )
     }
 
-    private static let mobileInjectScript = """
+    private static let mobileStyleInjectScript = """
     (function() {
-      if (window.__dsbotMobileInjected) return;
-      window.__dsbotMobileInjected = true;
+      if (window.__dsbotMobileStyleInjected) return;
+      window.__dsbotMobileStyleInjected = true;
       var style = document.createElement('style');
       style.id = 'dsh-mobile-inject';
       style.textContent = [
@@ -192,10 +192,19 @@ private struct LoopbackWebView: UIViewRepresentable {
         'input, textarea, select { font-size: 16px !important; }',
         'table { display: block; max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }',
         'pre { max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }',
+        'body.dsbot-mobile-mode { padding-bottom: env(safe-area-inset-bottom, 0px); }',
         'body.dsbot-mobile-mode [role="menu"], body.dsbot-mobile-mode [role="listbox"], body.dsbot-mobile-mode [role="dialog"] { max-width: calc(100vw - 16px) !important; box-sizing: border-box; }',
+        '@media (pointer: coarse) { body.dsbot-mobile-mode button, body.dsbot-mobile-mode [role="button"] { min-height: 36px; touch-action: manipulation; } }',
         '@media (hover: none) { *:hover { transition: none; } }'
       ].join('\\n');
       (document.head || document.documentElement).appendChild(style);
+    })();
+    """
+
+    private static let mobileDomAuditScript = """
+    (function() {
+      if (window.__dsbotMobileAuditInjected) return;
+      window.__dsbotMobileAuditInjected = true;
       setTimeout(function() {
         try {
           if (document.body && document.body.classList.contains('dsbot-mobile-mode')
@@ -211,12 +220,16 @@ private struct LoopbackWebView: UIViewRepresentable {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .nonPersistent()
         config.allowsInlineMediaPlayback = true
-        let userScript = WKUserScript(
-            source: Self.mobileInjectScript,
+        config.userContentController.addUserScript(WKUserScript(
+            source: Self.mobileStyleInjectScript,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        ))
+        config.userContentController.addUserScript(WKUserScript(
+            source: Self.mobileDomAuditScript,
             injectionTime: .atDocumentEnd,
             forMainFrameOnly: true
-        )
-        config.userContentController.addUserScript(userScript)
+        ))
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
@@ -255,7 +268,7 @@ private struct LoopbackWebView: UIViewRepresentable {
         webView.loadHTMLString("", baseURL: nil)
     }
 
-    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
         var allowedPort: Int
         var viewportMode: DSHWebViewportMode
         var lastLoadedToken: UUID?
@@ -263,7 +276,9 @@ private struct LoopbackWebView: UIViewRepresentable {
         var onProgress: (Double) -> Void
         var onDisconnect: (String) -> Void
         private var progressObservation: NSKeyValueObservation?
+        private var memoryTrimObserver: NSObjectProtocol?
         private var recentCrashTimestamps: [Date] = []
+        private var activeDownloadDestinations: [ObjectIdentifier: URL] = [:]
 
         init(
             allowedPort: Int,
@@ -285,11 +300,30 @@ private struct LoopbackWebView: UIViewRepresentable {
                     self.onProgress(value)
                 }
             }
+            if let oldObserver = memoryTrimObserver {
+                NotificationCenter.default.removeObserver(oldObserver)
+            }
+            memoryTrimObserver = NotificationCenter.default.addObserver(
+                forName: .dsbotMemoryPressureTrim,
+                object: nil,
+                queue: .main
+            ) { [weak webView] note in
+                let tier = note.object as? String ?? ""
+                guard tier == MemoryPressureTier.urgent.rawValue || tier == MemoryPressureTier.critical.rawValue else { return }
+                webView?.configuration.websiteDataStore.removeData(
+                    ofTypes: [WKWebsiteDataTypeMemoryCache, WKWebsiteDataTypeDiskCache],
+                    modifiedSince: .distantPast
+                ) {}
+            }
         }
 
         func stopObserving() {
             progressObservation?.invalidate()
             progressObservation = nil
+            if let oldObserver = memoryTrimObserver {
+                NotificationCenter.default.removeObserver(oldObserver)
+                memoryTrimObserver = nil
+            }
         }
 
         func applyViewport(to webView: WKWebView) {
@@ -393,6 +427,32 @@ private struct LoopbackWebView: UIViewRepresentable {
 
         func webView(
             _ webView: WKWebView,
+            runJavaScriptTextInputPanelWithPrompt prompt: String,
+            defaultText: String?,
+            initiatedByFrame frame: WKFrameInfo,
+            completionHandler: @escaping (String?) -> Void
+        ) {
+            #if canImport(UIKit)
+            guard let presenter = Self.topViewController() else {
+                completionHandler(nil)
+                return
+            }
+            let alert = UIAlertController(title: "DSH Web 输入", message: prompt, preferredStyle: .alert)
+            alert.addTextField { field in
+                field.text = defaultText
+            }
+            alert.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in completionHandler(nil) })
+            alert.addAction(UIAlertAction(title: "确定", style: .default) { _ in
+                completionHandler(alert.textFields?.first?.text)
+            })
+            presenter.present(alert, animated: true)
+            #else
+            completionHandler(nil)
+            #endif
+        }
+
+        func webView(
+            _ webView: WKWebView,
             decidePolicyFor navigationAction: WKNavigationAction,
             decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
         ) {
@@ -401,7 +461,20 @@ private struct LoopbackWebView: UIViewRepresentable {
                 return
             }
             let scheme = target.scheme?.lowercased() ?? ""
-            if scheme == "about" || scheme == "blob" || scheme == "data" {
+            if navigationAction.shouldPerformDownload {
+                if scheme == "blob" || (scheme == "http" && target.host == "127.0.0.1" && target.port == allowedPort) {
+                    decisionHandler(.download)
+                    return
+                }
+                decisionHandler(.cancel)
+                return
+            }
+            // Allow only safe loopback origin, about:blank, and blob: (for export previews); block data: XSS navigation.
+            if scheme == "about" && target.absoluteString.lowercased().hasPrefix("about:blank") {
+                decisionHandler(.allow)
+                return
+            }
+            if scheme == "blob" {
                 decisionHandler(.allow)
                 return
             }
@@ -415,6 +488,79 @@ private struct LoopbackWebView: UIViewRepresentable {
                 #endif
             }
             decisionHandler(.cancel)
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationResponse: WKNavigationResponse,
+            decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+        ) {
+            if let http = navigationResponse.response as? HTTPURLResponse,
+               let disposition = http.value(forHTTPHeaderField: "Content-Disposition")?.lowercased(),
+               disposition.contains("attachment") {
+                decisionHandler(.download)
+                return
+            }
+            if !navigationResponse.canShowMIMEType {
+                decisionHandler(.download)
+                return
+            }
+            decisionHandler(.allow)
+        }
+
+        func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+            download.delegate = self
+        }
+
+        func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+            download.delegate = self
+        }
+
+        func download(
+            _ download: WKDownload,
+            decideDestinationUsing response: URLResponse,
+            suggestedFilename: String,
+            completionHandler: @escaping (URL?) -> Void
+        ) {
+            let safeName = suggestedFilename
+                .replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: "\\", with: "_")
+                .replacingOccurrences(of: "..", with: "_")
+            let fileName = safeName.isEmpty ? "dsh-export-\(Int(Date().timeIntervalSince1970)).bin" : safeName
+            let dir = FileManager.default.temporaryDirectory.appendingPathComponent("dsh-web-downloads", isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let dest = dir.appendingPathComponent("\(UUID().uuidString.prefix(8))-\(fileName)")
+            activeDownloadDestinations[ObjectIdentifier(download)] = dest
+            completionHandler(dest)
+        }
+
+        func downloadDidFinish(_ download: WKDownload) {
+            let key = ObjectIdentifier(download)
+            guard let fileURL = activeDownloadDestinations.removeValue(forKey: key) else { return }
+            #if canImport(UIKit)
+            DispatchQueue.main.async {
+                guard let presenter = Self.topViewController() else { return }
+                let sheet = UIActivityViewController(activityItems: [fileURL], applicationActivities: nil)
+                sheet.popoverPresentationController?.sourceView = presenter.view
+                sheet.popoverPresentationController?.sourceRect = CGRect(
+                    x: presenter.view.bounds.midX,
+                    y: presenter.view.bounds.maxY - 60,
+                    width: 1,
+                    height: 1
+                )
+                sheet.completionWithItemsHandler = { _, _, _, _ in
+                    try? FileManager.default.removeItem(at: fileURL)
+                }
+                presenter.present(sheet, animated: true)
+            }
+            #endif
+        }
+
+        func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+            let key = ObjectIdentifier(download)
+            if let fileURL = activeDownloadDestinations.removeValue(forKey: key) {
+                try? FileManager.default.removeItem(at: fileURL)
+            }
         }
 
         #if canImport(UIKit)

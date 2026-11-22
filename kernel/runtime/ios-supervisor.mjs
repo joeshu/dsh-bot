@@ -16,7 +16,7 @@ let recoveringRevision = false
 let worker
 let ready = false
 let closed = false
-let safeMode = false
+let safeMode = args.includes('--safe-mode')
 let restart
 let stopTimer
 let startupTimer

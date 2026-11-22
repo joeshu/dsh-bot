@@ -103,11 +103,19 @@ private final class DSMarkdownBlockCache: @unchecked Sendable {
         cache.setObject(NSAttributedString(parsed), forKey: key)
         return parsed
     }
+
+    func removeAll() {
+        cache.removeAllObjects()
+    }
 }
 
 /// Renders Markdown natively with styled fenced code blocks (with one-tap copy confirmation),
 /// Markdown headings, and cached inline `AttributedString(markdown:)` formatting.
 public struct DSMarkdownText: View {
+    public static func clearRenderCache() {
+        DSMarkdownBlockCache.shared.removeAll()
+    }
+
     let raw: String
     @State private var copiedBlockId: Int?
 
