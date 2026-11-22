@@ -630,7 +630,7 @@ public struct BotRosterTabView: View {
 public struct ToolsHubTabView: View {
     @ObservedObject var host: LocalAgentHost
     @ObservedObject private var memoryGovernor = MemoryGovernor.shared
-    @ObservedObject private var budgetGovernor = CostAndBudgetGovernor.shared
+    @ObservedObject private var budgetGovernor = CostBudgetGovernor.shared
 
     public init(host: LocalAgentHost) {
         self.host = host
@@ -674,7 +674,7 @@ public struct ToolsHubTabView: View {
                     let memText = memMB > 0
                         ? String(format: "%.0f MB · %@", memMB, memoryGovernor.tier.displayName)
                         : host.appVersion
-                    let spendText = CostDisplayState.exact(budgetGovernor.todayEstimatedSpendUSD).formattedText
+                    let spendText = CostDisplayState.exact(budgetGovernor.todayEstimatedSpendUSD).formattedLabel
                     WidgetBlueprintCardView(
                         title: "端侧运行态势（实时）",
                         metrics: [

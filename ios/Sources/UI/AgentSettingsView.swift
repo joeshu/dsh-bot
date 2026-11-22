@@ -10,7 +10,7 @@ import UIKit
 public struct SettingsAndExploreTabView: View {
     @ObservedObject var host: LocalAgentHost
     @ObservedObject private var memoryGovernor = MemoryGovernor.shared
-    @ObservedObject private var budgetGovernor = CostAndBudgetGovernor.shared
+    @ObservedObject private var budgetGovernor = CostBudgetGovernor.shared
     @ObservedObject private var safeModeGuard = SafeModeBootGuard.shared
     @State private var keyConfigured = false
 
@@ -77,7 +77,7 @@ public struct SettingsAndExploreTabView: View {
                     NavigationLink {
                         ConnectorsAndUsageView(host: host)
                     } label: {
-                        let spendText = CostDisplayState.exact(budgetGovernor.todayEstimatedSpendUSD).formattedText
+                        let spendText = CostDisplayState.exact(budgetGovernor.todayEstimatedSpendUSD).formattedLabel
                         settingsRow(
                             icon: "chart.bar.xaxis",
                             color: DSTheme.brand,
