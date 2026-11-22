@@ -163,7 +163,7 @@ public struct BotProfileSheet: View {
 
     private var filesTab: some View {
         List {
-            Section("会话涉及的文件变更") {
+            Section {
                 if fileActivities.isEmpty {
                     Text("本会话暂无文件读写记录。").font(.caption).foregroundStyle(.secondary)
                 } else {
@@ -178,13 +178,25 @@ public struct BotProfileSheet: View {
                         }
                     }
                 }
+            } header: {
+                Text("本会话关联文件（仅当前智能体轨迹）")
             }
-            Section("沙盒工作区") {
+
+            Section {
+                if liveBot.isPrivate {
+                    Label("私密会话不会自动写入共享目录；打开下方工作区将浏览全局共享 files/。", systemImage: "lock.shield")
+                        .font(.caption)
+                        .foregroundStyle(DSTheme.warning)
+                }
                 NavigationLink {
                     WorkspaceFilesView(host: host)
                 } label: {
-                    Label("浏览与编辑工作区文件 (files/)", systemImage: "folder.fill")
+                    Label("打开全局共享工作区 (files/)", systemImage: "folder.fill")
                 }
+            } header: {
+                Text("共享工作区全部文件（跨会话共享）")
+            } footer: {
+                Text("files/ 为全局沙盒共享目录，所有非私密智能体均可读写；与上方仅限本会话的变更轨迹作用域不同。")
             }
         }
     }

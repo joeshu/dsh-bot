@@ -461,6 +461,14 @@ public struct RuntimeDiagnosticsAndBackupView: View {
                 }
             }
 
+            Section {
+                Toggle("启用统一导航与多话题架构 (V2)", isOn: $host.unifiedNavigationV2)
+            } header: {
+                Text("页面重构灰度开关 (P2-02)")
+            } footer: {
+                Text("关闭后可安全回滚到经典会话列表视图，不会丢失已创建的话题与聊天记录，且始终保留 SessionAddress 地址校验与隐私边界保护。")
+            }
+
             Section("脱敏诊断与配置备份") {
                 Button {
                     Task {

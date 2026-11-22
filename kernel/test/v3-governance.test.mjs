@@ -382,8 +382,26 @@ test('v3 roadmap: canonical ipc-protocol, main-CI kernel-tests gate, multi-threa
   assert.match(entrySrc, /normalizedDisabledTools/, 'dsh-ios-entry.mjs must enforce per-Bot disabledTools denylist')
 })
 
+test('v3 ui-refactor: SessionAddress, unifiedPendingInbox, idempotent approvals, private snapshot shield, and unifiedNavigationV2 flag', () => {
+  const repoRoot = join(__dirname, '..', '..')
+  const routingSrc = readFileSync(join(repoRoot, 'ios/Sources/Runtime/SessionAddressAndRouting.swift'), 'utf8')
+  const hostSrc = readFileSync(join(repoRoot, 'ios/Sources/Runtime/LocalAgentHost.swift'), 'utf8')
+  const chatSrc = readFileSync(join(repoRoot, 'ios/Sources/UI/ChatView.swift'), 'utf8')
+  const inboxSrc = readFileSync(join(repoRoot, 'ios/Sources/UI/SessionInboxView.swift'), 'utf8')
+  const settingsSrc = readFileSync(join(repoRoot, 'ios/Sources/UI/AgentSettingsView.swift'), 'utf8')
 
-
-
-
-
+  assert.match(routingSrc, /public struct SessionAddress/, 'SessionAddress must be defined')
+  assert.match(routingSrc, /public struct PendingInboxItem/, 'PendingInboxItem must be defined')
+  assert.match(routingSrc, /public enum AppRoute/, 'AppRoute must be defined')
+  assert.match(routingSrc, /public enum AppActionCatalog/, 'AppActionCatalog must be defined')
+  assert.match(hostSrc, /public func resolveAddress\(/, 'LocalAgentHost must validate SessionAddress')
+  assert.match(hostSrc, /public var unifiedPendingInbox:/, 'LocalAgentHost must expose unifiedPendingInbox')
+  assert.match(hostSrc, /inFlightRequestIDs/, 'LocalAgentHost must guard against duplicate approval/question taps')
+  assert.match(hostSrc, /unifiedNavigationV2/, 'LocalAgentHost must expose unifiedNavigationV2 feature flag')
+  assert.match(chatSrc, /private var activeSessionId:/, 'ChatView must bind thread operations to activeSessionId')
+  assert.match(chatSrc, /isPrivateSnapshotShielded/, 'ChatView must shield private conversations on background/inactive')
+  assert.match(chatSrc, /showPrivateExportConfirm/, 'ChatView must confirm cross-space export for private sessions')
+  assert.match(chatSrc, /BotThreadsSheet\(/, 'ChatView must wire BotThreadsSheet for multi-thread switching')
+  assert.match(inboxSrc, /host\.unifiedPendingInbox/, 'SessionInboxView must consume unifiedPendingInbox')
+  assert.match(settingsSrc, /\$host\.unifiedNavigationV2/, 'Settings must expose unifiedNavigationV2 rollback toggle')
+})

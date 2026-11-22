@@ -27,6 +27,7 @@ public enum AppSettings {
         case privateSessionTombstones = "dsbot.privateSessionTombstones"
         case providerProfilesJSON = "dsbot.providerProfiles.v1"
         case botThreadsJSON = "dsbot.botThreads.v1"
+        case unifiedNavigationV2 = "dsbot.nav.unifiedV2"
     }
 
     public static func bool(_ key: Key, default defaultValue: Bool = false) -> Bool {

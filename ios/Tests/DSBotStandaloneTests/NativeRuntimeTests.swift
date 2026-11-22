@@ -212,4 +212,52 @@ final class NativeRuntimeTests: XCTestCase {
         )
         XCTAssertEqual(readBack["output"] as? String, "hello dsh")
     }
+
+    func testSessionAddressParsingLegacyCompatibilityAndMalformedRejection() {
+        let known: Set<String> = ["main", "bot_alpha"]
+
+        // Legacy main thread compatibility
+        let mainDefault = SessionAddress.resolve("main", knownBotIDs: known)
+        XCTAssertEqual(mainDefault?.botID, "main")
+        XCTAssertNil(mainDefault?.threadID)
+        XCTAssertEqual(mainDefault?.canonicalSessionId, "main")
+        XCTAssertEqual(mainDefault?.dshSessionId, "ios:main")
+
+        // Explicit ios: prefix and default thread normalization
+        let prefixedDefault = SessionAddress.resolve("ios:main:default", knownBotIDs: known)
+        XCTAssertEqual(prefixedDefault, mainDefault)
+
+        // Child thread isolation
+        let child = SessionAddress.resolve("bot_alpha:t-42", knownBotIDs: known)
+        XCTAssertEqual(child?.botID, "bot_alpha")
+        XCTAssertEqual(child?.threadID, "t-42")
+        XCTAssertEqual(child?.canonicalSessionId, "bot_alpha:t-42")
+        XCTAssertEqual(child?.dshSessionId, "ios:bot_alpha:t-42")
+        XCTAssertEqual(SessionAddress.resolve("ios:bot_alpha:t-42", knownBotIDs: known), child)
+
+        // Malformed or unknown addresses MUST return nil (never fall back to main)
+        XCTAssertNil(SessionAddress.resolve("", knownBotIDs: known))
+        XCTAssertNil(SessionAddress.resolve("main:", knownBotIDs: known))
+        XCTAssertNil(SessionAddress.resolve("main:a:b", knownBotIDs: known))
+        XCTAssertNil(SessionAddress.resolve("unknown_bot", knownBotIDs: known))
+        XCTAssertNil(SessionAddress.resolve("unknown_bot:t-1", knownBotIDs: known))
+    }
+
+    func testAppActionCatalogAvailabilityAndPrivacyBoundaries() {
+        let clear = AppActionCatalog.descriptor(for: .clearSession)
+        XCTAssertTrue(clear.requiresConfirmation)
+        XCTAssertEqual(clear.scope, .session)
+        XCTAssertFalse(clear.isAvailable(isPrivate: false, isStreaming: true))
+        XCTAssertTrue(clear.isAvailable(isPrivate: false, isStreaming: false))
+
+        let export = AppActionCatalog.descriptor(for: .exportSession)
+        XCTAssertTrue(export.requiresCrossSpaceConfirmationForPrivate)
+        XCTAssertEqual(export.scope, .workspace)
+
+        let save = AppActionCatalog.descriptor(for: .saveToWorkspaceFile)
+        XCTAssertTrue(save.requiresCrossSpaceConfirmationForPrivate)
+
+        let approval = AppActionCatalog.descriptor(for: .resolveApproval)
+        XCTAssertTrue(approval.isAvailable(isPrivate: true, isStreaming: true))
+    }
 }

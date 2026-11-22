@@ -207,10 +207,12 @@ private struct GlobalBotPulseBar: View {
 
 public struct SessionsTabView: View {
     @ObservedObject var host: LocalAgentHost
+    @ObservedObject private var threadStore = BotThreadStore.shared
     @State private var searchText = ""
     @State private var createKind: CreateBotInitialKind?
     @State private var editingBot: BotProfile?
     @State private var profileBot: BotProfile?
+    @State private var threadsBot: BotProfile?
 
     public init(host: LocalAgentHost) {
         self.host = host
@@ -221,7 +223,7 @@ public struct SessionsTabView: View {
     }
 
     private var pendingCount: Int {
-        host.pendingApprovals.count + host.pendingDSHQuestions.count
+        host.unifiedPendingInbox.count
     }
 
     private var botSearchSnapshot: (bots: [BotProfile], messages: [String: ChatMessageItem]) {
@@ -287,14 +289,15 @@ public struct SessionsTabView: View {
                         DSEmptyStateView(
                             icon: "bubble.left.and.bubble.right",
                             title: searchQuery.isEmpty ? "暂无会话" : "没有找到匹配的会话",
-                            subtitle: searchQuery.isEmpty ? "点击右上角新建智能体或协作群聊。" : "尝试更换关键词，或查看上方的历史消息全文检索结果。"
+                            subtitle: searchQuery.isEmpty ? "点击右上角新建话题、智能体或协作群聊。" : "尝试更换关键词，或查看上方的历史消息全文检索结果。"
                         )
                         .listRowBackground(Color.clear)
                     } else {
                         ForEach(searchSnapshot.bots) { bot in
                             let matchedMessage = searchSnapshot.messages[bot.id]
-                            let botPendingCount = host.pendingApprovals.filter { $0.sessionId == bot.id }.count
-                                + host.pendingDSHQuestions.filter { $0.sessionId == bot.id }.count
+                            let botPendingCount = host.unifiedPendingInbox.filter { $0.address.botID == bot.id }.count
+                            let botThreadCount = threadStore.threads(for: bot.id).count
+                            let isBotStreaming = host.isStreaming && host.streamingSessionId.flatMap { host.resolveAddress($0)?.botID } == bot.id
                             NavigationLink {
                                 ChatView(bot: bot, host: host, targetMessageID: matchedMessage?.id)
                             } label: {
@@ -316,6 +319,9 @@ public struct SessionsTabView: View {
                                                 DSStatusBadge("群聊", color: .indigo)
                                             } else if bot.isPrivate {
                                                 DSStatusBadge("私密", color: DSTheme.warning, icon: "lock.fill")
+                                            }
+                                            if host.unifiedNavigationV2 && botThreadCount > 1 && !bot.isPrivate {
+                                                DSStatusBadge("\(botThreadCount) 话题", color: .teal)
                                             }
                                             DSPresetBadge(
                                                 presetId: bot.agentPreset,
@@ -339,7 +345,7 @@ public struct SessionsTabView: View {
                                                 .font(.caption2)
                                                 .foregroundColor(.secondary)
                                         }
-                                        if host.isStreaming && host.streamingSessionId == bot.id {
+                                        if isBotStreaming {
                                             DSStatusBadge("生成中", color: DSTheme.brand)
                                         } else if botPendingCount > 0 {
                                             DSStatusBadge("\(botPendingCount) 待办", color: DSTheme.warning)
@@ -349,6 +355,10 @@ public struct SessionsTabView: View {
                                 .padding(.vertical, 4)
                             }
                             .swipeActions(edge: .trailing) {
+                                if host.unifiedNavigationV2 {
+                                    Button("话题") { threadsBot = bot }
+                                        .tint(.teal)
+                                }
                                 Button("编辑") { editingBot = bot }
                                     .tint(DSTheme.brand)
                                 if !bot.isPrivate {
@@ -382,26 +392,37 @@ public struct SessionsTabView: View {
                     .help("待处理收件箱")
 
                     Menu {
-                        Button {
-                            createKind = .standard
-                        } label: {
-                            Label("新建智能体", systemImage: "person.badge.plus")
+                        if host.unifiedNavigationV2, let defaultBot = host.bots.first(where: \.isMain) ?? host.bots.first {
+                            Section("新话题（不新建 Bot）") {
+                                Button {
+                                    threadsBot = defaultBot
+                                } label: {
+                                    Label("在「\(defaultBot.name)」新建/切换话题", systemImage: "bubble.left.and.bubble.right.fill")
+                                }
+                            }
                         }
-                        Button {
-                            createKind = .group
-                        } label: {
-                            Label("新建协作群聊", systemImage: "person.3.fill")
-                        }
-                        Button {
-                            createKind = .privateSpace
-                        } label: {
-                            Label("新建私密会话 (Face ID)", systemImage: "lock.shield.fill")
+                        Section("新建智能体实体") {
+                            Button {
+                                createKind = .standard
+                            } label: {
+                                Label("新建智能体", systemImage: "person.badge.plus")
+                            }
+                            Button {
+                                createKind = .group
+                            } label: {
+                                Label("新建协作群聊", systemImage: "person.3.fill")
+                            }
+                            Button {
+                                createKind = .privateSpace
+                            } label: {
+                                Label("新建私密会话 (Face ID)", systemImage: "lock.shield.fill")
+                            }
                         }
                     } label: {
                         Image(systemName: "plus.circle.fill")
                             .font(.title3)
                     }
-                    .help("新建智能体或协作群聊")
+                    .help("新建话题或智能体")
                 }
             }
             .sheet(item: $createKind) { kind in
@@ -412,6 +433,18 @@ public struct SessionsTabView: View {
             }
             .sheet(item: $profileBot) { target in
                 BotProfileSheet(bot: target, host: host)
+            }
+            .sheet(item: $threadsBot) { target in
+                BotThreadsSheet(
+                    bot: target,
+                    threadStore: threadStore,
+                    onSelectThread: { thread in
+                        threadStore.selectThread(thread)
+                    },
+                    onDeleteSession: { sessionId in
+                        Task { await host.clearSession(sessionId) }
+                    }
+                )
             }
         }
     }

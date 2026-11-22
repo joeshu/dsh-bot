@@ -96,6 +96,15 @@ public final class BotThreadStore: ObservableObject {
         activeThreadIdByBot[thread.botId] = thread.id
     }
 
+    public func selectAddress(_ address: SessionAddress) {
+        activeThreadIdByBot[address.botID] = address.threadID ?? "default"
+    }
+
+    public func threadTitle(for address: SessionAddress) -> String? {
+        guard let threadID = address.threadID else { return nil }
+        return threads(for: address.botID, includeArchived: true).first(where: { $0.id == threadID })?.title
+    }
+
     public func renameThread(botId: String, threadId: String, title: String) {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }

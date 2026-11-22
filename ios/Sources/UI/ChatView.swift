@@ -43,6 +43,7 @@ private enum ChatTranscriptRow: Identifiable {
 
 private enum ChatActiveSheet: Identifiable {
     case botProfile
+    case threads
     case sideChat
     case groupWorkspace
     case memory
@@ -63,6 +64,7 @@ private enum ChatActiveSheet: Identifiable {
     var id: String {
         switch self {
         case .botProfile: return "botProfile"
+        case .threads: return "threads"
         case .sideChat: return "sideChat"
         case .groupWorkspace: return "groupWorkspace"
         case .memory: return "memory"
@@ -87,7 +89,9 @@ public struct ChatView: View {
     let bot: BotProfile
     @ObservedObject var host: LocalAgentHost
     @ObservedObject private var browserController = AgentBrowserController.shared
+    @ObservedObject private var threadStore = BotThreadStore.shared
     private let searchResultMessageID: String?
+    private let initialAddress: SessionAddress?
     @State private var input = ""
     @State private var selectedModel: String
     @State private var sessionViewMode: ChatSessionViewMode = .dialogue
@@ -99,6 +103,7 @@ public struct ChatView: View {
     @State private var restoringOlderHistory = false
     @State private var followsLiveOutput = true
     @State private var showClearConfirm = false
+    @State private var showPrivateExportConfirm = false
     @State private var showFileImporter = false
     @State private var activeSheet: ChatActiveSheet?
     @State private var referencedBot: BotProfile?
@@ -114,18 +119,35 @@ public struct ChatView: View {
     @Environment(\.scenePhase) private var chatScenePhase
 
     @MainActor
-    public init(bot: BotProfile, host: LocalAgentHost, targetMessageID: String? = nil) {
+    public init(bot: BotProfile, host: LocalAgentHost, targetMessageID: String? = nil, initialAddress: SessionAddress? = nil) {
         self.bot = bot
         self.host = host
         self.searchResultMessageID = targetMessageID
+        self.initialAddress = initialAddress
+        if let initialAddress, initialAddress.botID == bot.id {
+            BotThreadStore.shared.selectAddress(initialAddress)
+        }
+        let initialSessionId = BotThreadStore.shared.activeSessionId(for: bot.id)
         _pendingSearchMessageID = State(initialValue: targetMessageID)
         _selectedModel = State(initialValue: host.modelSelection(bot.model))
-        _input = State(initialValue: bot.isPrivate ? "" : host.draftInput(for: bot.id))
+        _input = State(initialValue: bot.isPrivate ? "" : host.draftInput(for: initialSessionId))
         _expandStreamingReasoning = State(initialValue: !host.collapseThinkingByDefault)
     }
 
     private var liveBot: BotProfile {
         host.bots.first(where: { $0.id == bot.id }) ?? bot
+    }
+
+    private var activeThread: BotThread {
+        threadStore.activeThread(for: liveBot.id)
+    }
+
+    private var activeSessionId: String {
+        activeThread.sessionId
+    }
+
+    private var isPrivateSnapshotShielded: Bool {
+        liveBot.isPrivate && chatScenePhase != .active
     }
 
     private func redteamPresetAllowed(for profile: BotProfile) -> Bool {
@@ -141,14 +163,14 @@ public struct ChatView: View {
     private var isLocked: Bool { liveBot.isPrivate && !isPrivateUnlocked }
 
     private var sessionMessages: [ChatMessageItem] {
-        isLocked ? [] : host.messages(for: liveBot.id)
+        isLocked ? [] : host.messages(for: activeSessionId)
     }
 
     private var transcriptRows: [ChatTranscriptRow] {
         let messages = sessionMessages.map(ChatTranscriptRow.message)
-        let activities = (isLocked ? [] : host.dshToolActivities.filter { $0.sessionId == liveBot.id })
+        let activities = (isLocked ? [] : host.dshToolActivities.filter { $0.sessionId == activeSessionId })
             .map(ChatTranscriptRow.tool)
-        let approvalAudits = (isLocked ? [] : host.dshApprovalAudits.filter { $0.sessionId == liveBot.id })
+        let approvalAudits = (isLocked ? [] : host.dshApprovalAudits.filter { $0.sessionId == activeSessionId })
             .map(ChatTranscriptRow.approval)
         let sorted = (messages + activities + approvalAudits).sorted { left, right in
             if left.timestamp != right.timestamp { return left.timestamp < right.timestamp }
@@ -199,7 +221,24 @@ public struct ChatView: View {
                 conversation
             }
         }
-        .task(id: isLocked) {
+        .overlay {
+            if isPrivateSnapshotShielded && !isLocked {
+                ZStack {
+                    Color(.systemBackground).ignoresSafeArea()
+                    VStack(spacing: 12) {
+                        Image(systemName: "lock.shield.fill")
+                            .font(.system(size: 40))
+                            .foregroundStyle(DSTheme.warning)
+                        Text("私密会话已遮罩保护")
+                            .font(.headline)
+                        Text("返回应用后自动恢复显示")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .task(id: "\(isLocked)-\(activeSessionId)") {
             if !isLocked { await loadHistory() }
         }
         .navigationTitle(liveBot.name)
@@ -207,17 +246,23 @@ public struct ChatView: View {
         .onChange(of: selectedModel) { nextModel in
             host.setBotModel(sessionId: liveBot.id, model: nextModel)
         }
+        .onChange(of: activeSessionId) { nextId in
+            host.visibleChatSessionId = nextId
+            if !liveBot.isPrivate {
+                input = host.draftInput(for: nextId)
+            }
+        }
         .onChange(of: input) { nextText in
             if !isLocked {
-                host.setDraftInput(nextText, for: liveBot.id, isPrivate: liveBot.isPrivate)
+                host.setDraftInput(nextText, for: activeSessionId, isPrivate: liveBot.isPrivate)
             }
         }
         .onChange(of: host.apiBaseURL) { _ in selectedModel = host.modelSelection(liveBot.model) }
         .onAppear {
-            host.visibleChatSessionId = liveBot.id
+            host.visibleChatSessionId = activeSessionId
         }
         .onDisappear {
-            if host.visibleChatSessionId == liveBot.id { host.visibleChatSessionId = nil }
+            if host.visibleChatSessionId == activeSessionId { host.visibleChatSessionId = nil }
             if liveBot.isPrivate { lockPrivateConversation() }
         }
         .onChange(of: chatScenePhase) { phase in
@@ -237,6 +282,12 @@ public struct ChatView: View {
                                     .font(.subheadline.weight(.semibold))
                                     .foregroundStyle(.primary)
                                     .lineLimit(1)
+                                if !activeThread.isDefault {
+                                    Text("· \(activeThread.title)")
+                                        .font(.caption.weight(.medium))
+                                        .foregroundStyle(DSTheme.brand)
+                                        .lineLimit(1)
+                                }
                                 if liveBot.isPrivate {
                                     Image(systemName: "lock.fill")
                                         .font(.caption2)
@@ -354,14 +405,19 @@ public struct ChatView: View {
 
                     // Menu 2: Session Quick Actions (non-overlapping with BotProfileSheet)
                     Menu {
-                        Section("会话快捷操作") {
+                        Section("多话题与会话操作") {
+                            Button {
+                                activeSheet = .threads
+                            } label: {
+                                Label("切换 / 新建话题（当前：\(activeThread.title)）", systemImage: "bubble.left.and.bubble.right")
+                            }
                             Button {
                                 activeSheet = .sideChat
                             } label: {
                                 Label("侧边旁路对话 (/side)", systemImage: "bubble.left.and.exclamationmark.bubble.right")
                             }
                             Button {
-                                Task { await host.sendMessage(sessionId: liveBot.id, text: "/compact", model: selectedModel) }
+                                Task { await host.sendMessage(sessionId: activeSessionId, text: "/compact", model: selectedModel) }
                             } label: {
                                 Label("压缩当前上下文 (/compact)", systemImage: "arrow.down.right.and.arrow.up.left")
                             }
@@ -398,11 +454,15 @@ public struct ChatView: View {
                                 Label("会话数据诊断", systemImage: "doc.text.magnifyingglass")
                             }
                             Button {
-                                activeSheet = .history(.export)
+                                if liveBot.isPrivate {
+                                    showPrivateExportConfirm = true
+                                } else {
+                                    activeSheet = .history(.export)
+                                }
                             } label: {
                                 Label("导出会话为 Markdown", systemImage: "square.and.arrow.up")
                             }
-                            .disabled(host.streamingSessionId == bot.id)
+                            .disabled(host.streamingSessionId == activeSessionId)
                             if liveBot.isPrivate {
                                 Button {
                                     lockPrivateConversation()
@@ -413,7 +473,7 @@ public struct ChatView: View {
                             Button(role: .destructive) {
                                 showClearConfirm = true
                             } label: {
-                                Label("清空当前会话", systemImage: "trash")
+                                Label("清空当前话题（\(activeThread.title)）", systemImage: "trash")
                             }
                             .disabled(host.isStreaming)
                         }
@@ -429,15 +489,25 @@ public struct ChatView: View {
                 sheetContent(for: sheet)
             }
         }
-        .confirmationDialog("确定清空「\(liveBot.name)」的全部聊天记录？", isPresented: $showClearConfirm, titleVisibility: .visible) {
-            Button("清空记录", role: .destructive) {
+        .confirmationDialog("确定清空「\(liveBot.name) · \(activeThread.title)」的全部聊天记录？其他话题不受影响。", isPresented: $showClearConfirm, titleVisibility: .visible) {
+            Button("清空当前话题", role: .destructive) {
                 guard !isLocked, !host.isStreaming else { return }
+                let targetId = activeSessionId
                 Task {
-                    await host.clearSession(bot.id)
+                    await host.clearSession(targetId)
                     DSHaptics.notify(.warning)
                 }
             }
             Button("取消", role: .cancel) {}
+        }
+        .confirmationDialog("私密会话跨空间导出确认", isPresented: $showPrivateExportConfirm, titleVisibility: .visible) {
+            Button("确认导出私密内容", role: .destructive) {
+                guard !isLocked else { return }
+                performSessionMarkdownExport()
+            }
+            Button("取消（不写入任何文件）", role: .cancel) {}
+        } message: {
+            Text("当前为私密会话。继续操作将把本话题内容导出到系统共享表单；点击取消不会写入任何文件。")
         }
         .fileImporter(
             isPresented: $showFileImporter,
@@ -518,6 +588,17 @@ public struct ChatView: View {
         switch sheet {
         case .history(let presentation):
             SessionHistoryDetailView(host: host, bot: liveBot, presentation: presentation)
+        case .threads:
+            BotThreadsSheet(
+                bot: liveBot,
+                threadStore: threadStore,
+                onSelectThread: { thread in
+                    threadStore.selectThread(thread)
+                },
+                onDeleteSession: { sessionId in
+                    Task { await host.clearSession(sessionId) }
+                }
+            )
         case .sideChat:
             SideChatSheet(host: host, model: selectedModel, botId: liveBot.id,
                           botName: liveBot.name, isPrivate: liveBot.isPrivate)
@@ -550,7 +631,8 @@ public struct ChatView: View {
                     input = prompt
                     return
                 }
-                Task { await host.sendMessage(sessionId: bot.id, text: prompt, model: selectedModel) }
+                let targetId = activeSessionId
+                Task { await host.sendMessage(sessionId: targetId, text: prompt, model: selectedModel) }
             }
         case .pluginManager:
             NavigationStack {
@@ -620,12 +702,13 @@ public struct ChatView: View {
 
     private func loadHistory(older: Bool = false) async {
         guard !isLocked else { return }
+        let targetId = activeSessionId
         historyError = nil
         restoringOlderHistory = older
         let previousCount = sessionMessages.count
         defer { if previousCount == sessionMessages.count { restoringOlderHistory = false } }
         do {
-            try await host.loadSessionHistory(bot.id, older: older)
+            try await host.loadSessionHistory(targetId, older: older)
         } catch is CancellationError {
             return
         } catch {
@@ -635,24 +718,29 @@ public struct ChatView: View {
 
     private func lockPrivateConversation() {
         isPrivateUnlocked = false
-        host.discardSessionHistoryCache(bot.id)
+        for thread in threadStore.threads(for: liveBot.id, includeArchived: true) {
+            host.discardSessionHistoryCache(thread.sessionId)
+            if host.streamingSessionId == thread.sessionId {
+                Task { await host.abortActiveTurn() }
+            }
+        }
         historyError = nil
         activeSheet = nil
         showFileImporter = false
         attachedFiles.removeAll()
         speechInput.stop()
         showClearConfirm = false
+        showPrivateExportConfirm = false
         actionStatus = ""
         Task { _ = try? await host.rpc()?.request("device.stopSpeaking") }
-        if host.streamingSessionId == bot.id { Task { await host.abortActiveTurn() } }
     }
 
     private var conversation: some View {
         ScrollViewReader { proxy in
             ZStack(alignment: .top) {
                 VStack(spacing: 0) {
-                    let sessionActivities = host.dshToolActivities.filter { $0.sessionId == bot.id }
-                    let sessionAudits = host.dshApprovalAudits.filter { $0.sessionId == bot.id }
+                    let sessionActivities = host.dshToolActivities.filter { $0.sessionId == activeSessionId }
+                    let sessionAudits = host.dshApprovalAudits.filter { $0.sessionId == activeSessionId }
                     let turnCount = sessionMessages.filter { $0.role == "user" }.count
                     ChatSessionSubTabBar(
                         mode: $sessionViewMode,
@@ -670,11 +758,13 @@ public struct ChatView: View {
                     )
                     if host.isStreaming,
                        let activeId = host.streamingSessionId,
-                       activeId != liveBot.id,
-                       let activeBot = host.bots.first(where: { $0.id == activeId }) {
+                       activeId != activeSessionId,
+                       let activeAddress = host.resolveAddress(activeId),
+                       let activeBot = host.bot(for: activeAddress) {
                         HStack(spacing: 8) {
                             ProgressView().scaleEffect(0.7)
-                            Text("「\(activeBot.name)」正在后台流式生成中")
+                            let threadSuffix = (!activeBot.isPrivate ? threadStore.threadTitle(for: activeAddress).map { " · \($0)" } : nil) ?? ""
+                            Text("「\(activeBot.isPrivate ? "私密会话" : activeBot.name)\(threadSuffix)」正在后台流式生成中")
                                 .font(.caption.weight(.medium))
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
@@ -752,7 +842,7 @@ public struct ChatView: View {
                                     Spacer()
                                 }
                             }
-                            if !followsLiveOutput && (!sessionMessages.isEmpty || (host.isStreaming && host.streamingSessionId == bot.id)) {
+                            if !followsLiveOutput && (!sessionMessages.isEmpty || (host.isStreaming && host.streamingSessionId == activeSessionId)) {
                                 Button {
                                     followsLiveOutput = true
                                     withAnimation(.easeOut(duration: 0.2)) {
@@ -760,14 +850,14 @@ public struct ChatView: View {
                                     }
                                 } label: {
                                     HStack(spacing: 6) {
-                                        if host.isStreaming && host.streamingSessionId == bot.id {
+                                        if host.isStreaming && host.streamingSessionId == activeSessionId {
                                             Circle()
                                                 .fill(DSTheme.brand)
                                                 .frame(width: 7, height: 7)
                                         }
                                         Image(systemName: "arrow.down")
                                             .font(.caption.weight(.bold))
-                                        Text(host.isStreaming && host.streamingSessionId == bot.id ? "回到最新输出" : "回到底部")
+                                        Text(host.isStreaming && host.streamingSessionId == activeSessionId ? "回到最新输出" : "回到底部")
                                             .font(.caption.weight(.semibold))
                                     }
                                     .foregroundStyle(.primary)
@@ -845,7 +935,7 @@ public struct ChatView: View {
     }
 
     private func scrollToBottomIfFollowing(proxy: ScrollViewProxy) {
-        guard followsLiveOutput, host.streamingSessionId == bot.id else { return }
+        guard followsLiveOutput, host.streamingSessionId == activeSessionId else { return }
         let now = Date()
         if now.timeIntervalSince(lastScrollAt) >= 0.12 {
             lastScrollAt = now
@@ -863,7 +953,7 @@ public struct ChatView: View {
             )
         }
 
-        if host.loadingHistoryIDs.contains(bot.id) {
+        if host.loadingHistoryIDs.contains(activeSessionId) {
             HStack {
                 Spacer()
                 ProgressView("正在读取持久记录…")
@@ -878,9 +968,9 @@ public struct ChatView: View {
                 message: historyError,
                 actionTitle: "重试"
             ) {
-                Task { await loadHistory(older: host.hasOlderHistory(bot.id)) }
+                Task { await loadHistory(older: host.hasOlderHistory(activeSessionId)) }
             }
-        } else if host.hasOlderHistory(bot.id) {
+        } else if host.hasOlderHistory(activeSessionId) {
             HStack {
                 Spacer()
                 Button {
@@ -894,8 +984,8 @@ public struct ChatView: View {
             }
         }
 
-        if sessionMessages.isEmpty && !host.hasSessionHistory(bot.id)
-            && !host.loadingHistoryIDs.contains(bot.id) && !host.isStreaming {
+        if sessionMessages.isEmpty && !host.hasSessionHistory(activeSessionId)
+            && !host.loadingHistoryIDs.contains(activeSessionId) && !host.isStreaming {
             emptyWelcomeView
         }
     }
@@ -921,7 +1011,7 @@ public struct ChatView: View {
             }
         }
 
-        if host.isStreaming && host.streamingSessionId == bot.id {
+        if host.isStreaming && host.streamingSessionId == activeSessionId {
             StreamingTurnRow(
                 botName: liveBot.name,
                 liveStream: host.liveStream,
@@ -934,7 +1024,7 @@ public struct ChatView: View {
 
     @ViewBuilder
     private var conversationPendingSection: some View {
-        ForEach(host.pendingApprovals.filter { $0.sessionId == bot.id }) { approval in
+        ForEach(host.pendingApprovals.filter { $0.sessionId == activeSessionId }) { approval in
             DSHPendingApprovalCard(
                 approval: approval,
                 onRespond: { approved in
@@ -946,7 +1036,7 @@ public struct ChatView: View {
             )
         }
 
-        ForEach(host.pendingDSHQuestions.filter { $0.sessionId == bot.id }) { request in
+        ForEach(host.pendingDSHQuestions.filter { $0.sessionId == activeSessionId }) { request in
             DSHUserQuestionCard(request: request) { answers in
                 Task { await host.respondToDSHQuestion(id: request.id, answers: answers) }
             }
@@ -974,20 +1064,20 @@ public struct ChatView: View {
             .padding(.horizontal, 12)
             .padding(.bottom, 6)
         }
-        if host.lastErrorSessionId == bot.id, let errMsg = host.lastStreamError, !host.isStreaming {
+        if host.lastErrorSessionId == activeSessionId, let errMsg = host.lastStreamError, !host.isStreaming {
             DSBannerCard(
                 icon: "exclamationmark.triangle.fill",
                 tint: DSTheme.danger,
                 message: errMsg,
                 actionTitle: "重试"
             ) {
-                Task { await host.regenerateLastReply(sessionId: liveBot.id, model: selectedModel) }
+                Task { await host.regenerateLastReply(sessionId: activeSessionId, model: selectedModel) }
             }
             .padding(.horizontal, 12)
             .padding(.bottom, 6)
         }
 
-        if !host.isStreaming, host.lastCancelledSessionId == bot.id {
+        if !host.isStreaming, host.lastCancelledSessionId == activeSessionId {
             HStack(spacing: 6) {
                 Image(systemName: "stop.circle")
                     .font(.caption2)
@@ -1097,7 +1187,7 @@ public struct ChatView: View {
             VStack(spacing: 8) {
                 ForEach(starterPrompts, id: \.self) { prompt in
                     Button {
-                        Task { await host.sendMessage(sessionId: bot.id, text: prompt, model: selectedModel) }
+                        Task { await host.sendMessage(sessionId: activeSessionId, text: prompt, model: selectedModel) }
                     } label: {
                         HStack {
                             Text(prompt)
@@ -1142,7 +1232,7 @@ public struct ChatView: View {
                         Button {
                             Task {
                                 await host.sendMessage(
-                                    sessionId: bot.id,
+                                    sessionId: activeSessionId,
                                     text: "请从刚才中断的位置继续完成上面的回答，不要重复已输出的内容。",
                                     model: selectedModel
                                 )
@@ -1226,7 +1316,7 @@ public struct ChatView: View {
                     }
                     if !host.isStreaming {
                         Button(role: .destructive) {
-                            host.deleteMessage(sessionId: bot.id, messageId: msg.id)
+                            host.deleteMessage(sessionId: activeSessionId, messageId: msg.id)
                         } label: {
                             Label("删除此条消息", systemImage: "trash")
                         }
@@ -1236,7 +1326,7 @@ public struct ChatView: View {
                             Button {
                                 Task {
                                     await host.sendMessage(
-                                        sessionId: bot.id,
+                                        sessionId: activeSessionId,
                                         text: "请从刚才中断的位置继续完成上面的回答，不要重复已输出的内容。",
                                         model: selectedModel
                                     )
@@ -1246,7 +1336,7 @@ public struct ChatView: View {
                             }
                         }
                         Button {
-                            Task { await host.regenerateLastReply(sessionId: bot.id, model: selectedModel) }
+                            Task { await host.regenerateLastReply(sessionId: activeSessionId, model: selectedModel) }
                         } label: {
                             Label("再次回答", systemImage: "arrow.clockwise")
                         }
@@ -1269,7 +1359,7 @@ public struct ChatView: View {
                     timestamp: msg.timestamp,
                     canRegenerate: !host.isStreaming && msg.id == sessionMessages.last(where: { $0.role != "user" })?.id,
                     onRegenerate: {
-                        Task { await host.regenerateLastReply(sessionId: bot.id, model: selectedModel) }
+                        Task { await host.regenerateLastReply(sessionId: activeSessionId, model: selectedModel) }
                     }
                 )
             }
@@ -1312,7 +1402,7 @@ public struct ChatView: View {
 
                 if sessionMessages.count >= 8 {
                     Button {
-                        Task { await host.sendMessage(sessionId: bot.id, text: "/compact", model: selectedModel) }
+                        Task { await host.sendMessage(sessionId: activeSessionId, text: "/compact", model: selectedModel) }
                     } label: {
                         Label("压缩上下文", systemImage: "arrow.down.right.and.arrow.up.left")
                             .font(.caption)
@@ -1367,8 +1457,16 @@ public struct ChatView: View {
     }
 
     private func exportSessionMarkdown() {
-        guard !liveBot.isPrivate else { return }
-        var lines: [String] = ["# \(liveBot.name) · 会话日志导出", ""]
+        if liveBot.isPrivate {
+            showPrivateExportConfirm = true
+            return
+        }
+        performSessionMarkdownExport()
+    }
+
+    private func performSessionMarkdownExport() {
+        let threadSuffix = activeThread.isDefault ? "" : "（\(activeThread.title)）"
+        var lines: [String] = ["# \(liveBot.name)\(threadSuffix) · 会话日志导出", ""]
         for msg in sessionMessages {
             let roleTitle = msg.role == "user" ? "用户" : liveBot.name
             lines.append("## \(roleTitle)")
@@ -1378,7 +1476,7 @@ public struct ChatView: View {
             lines.append(msg.content)
             lines.append("")
         }
-        let sessionActivities = host.dshToolActivities.filter { $0.sessionId == bot.id }
+        let sessionActivities = host.dshToolActivities.filter { $0.sessionId == activeSessionId }
         if !sessionActivities.isEmpty {
             lines.append("## 执行轨迹（\(sessionActivities.count) 步）")
             for (idx, act) in sessionActivities.enumerated() {
@@ -1405,7 +1503,7 @@ public struct ChatView: View {
     }
 
     private func rewindLastUserTurn() {
-        guard let previous = host.rewindLastTurn(sessionId: bot.id) else {
+        guard let previous = host.rewindLastTurn(sessionId: activeSessionId) else {
             actionStatus = "当前没有可回退的上一轮消息。"
             return
         }
@@ -1454,7 +1552,7 @@ public struct ChatView: View {
                     onCompact: {
                         showCommandPalette = false
                         input = ""
-                        Task { await host.sendMessage(sessionId: bot.id, text: "/compact", model: selectedModel) }
+                        Task { await host.sendMessage(sessionId: activeSessionId, text: "/compact", model: selectedModel) }
                     },
                     onOpenConfig: {
                         showCommandPalette = false
@@ -1656,7 +1754,7 @@ public struct ChatView: View {
                     #endif
                 }
 
-                TextField(host.isStreaming && host.streamingSessionId == bot.id ? "输入插话引导内容（Steer）…" : "给 \(liveBot.name) 发消息…", text: $input, axis: .vertical)
+                TextField(host.isStreaming && host.streamingSessionId == activeSessionId ? "输入插话引导内容（Steer）…" : "给 \(liveBot.name) 发消息…", text: $input, axis: .vertical)
                     .lineLimit(1...4)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
@@ -1686,13 +1784,13 @@ public struct ChatView: View {
                 }
                 .disabled(host.isStreaming)
 
-                if host.isStreaming && host.streamingSessionId == bot.id {
+                if host.isStreaming && host.streamingSessionId == activeSessionId {
                     let steerText = input.trimmingCharacters(in: .whitespacesAndNewlines)
                     if !steerText.isEmpty {
                         Button {
                             let toSend = steerText
                             input = ""
-                            Task { await host.steerActiveTurn(sessionId: bot.id, text: toSend, model: selectedModel) }
+                            Task { await host.steerActiveTurn(sessionId: activeSessionId, text: toSend, model: selectedModel) }
                         } label: {
                             Image(systemName: "arrow.triangle.turn.up.right.circle.fill")
                                 .font(.title2)
@@ -1804,7 +1902,7 @@ public struct ChatView: View {
                         input = ""
                         attachedFiles.removeAll()
                         referencedBot = nil
-                        Task { await host.sendMessage(sessionId: bot.id, text: payload, model: selectedModel) }
+                        Task { await host.sendMessage(sessionId: activeSessionId, text: payload, model: selectedModel) }
                     } label: {
                         Image(systemName: "arrow.up.circle.fill")
                             .font(.title2)
@@ -1818,7 +1916,7 @@ public struct ChatView: View {
             .background(DSTheme.surfacePrimary)
 
             if !liveBot.isPrivate {
-                let sessionActs = host.dshToolActivities.filter { $0.sessionId == bot.id }
+                let sessionActs = host.dshToolActivities.filter { $0.sessionId == activeSessionId }
                 let turns = sessionMessages.filter { $0.role == "user" }.count
                 let steps = sessionActs.count
                 let toolDurationMs = sessionActs.compactMap(\.durationMs).reduce(0, +)
@@ -1833,7 +1931,7 @@ public struct ChatView: View {
                     stepCount: steps,
                     toolDurationMs: toolDurationMs,
                     firstTokenMs: host.streamFirstTokenMs,
-                    liveTelemetry: host.telemetryBySession[bot.id],
+                    liveTelemetry: host.telemetryBySession[activeSessionId],
                     systemPromptTokens: sysTokens,
                     toolSchemaTokens: toolSchemaTokens,
                     messageTokens: msgTokens,
@@ -1847,7 +1945,7 @@ public struct ChatView: View {
                     },
                     onTapCompact: {
                         guard !host.isStreaming else { return }
-                        Task { await host.sendMessage(sessionId: bot.id, text: "/compact", model: selectedModel) }
+                        Task { await host.sendMessage(sessionId: activeSessionId, text: "/compact", model: selectedModel) }
                     }
                 )
                 .background(DSTheme.surfacePrimary)

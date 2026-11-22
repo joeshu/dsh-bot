@@ -113,6 +113,49 @@ public final class LocalAgentHost: ObservableObject {
     @Published public private(set) var dshToolActivities: [DSHToolActivity] = []
     @Published public private(set) var dshApprovalAudits: [DSHApprovalAudit] = []
     @Published public private(set) var telemetryBySession: [String: SessionLiveTelemetry] = [:]
+    @Published public var unifiedNavigationV2: Bool = AppSettings.bool(.unifiedNavigationV2, default: true) {
+        didSet { AppSettings.set(unifiedNavigationV2, for: .unifiedNavigationV2) }
+    }
+    private var inFlightRequestIDs: Set<String> = []
+    private var resolvedRequestIDs: Set<String> = []
+
+    /// Resolves and validates a session address against known bots (P0-01).
+    /// Returns nil for malformed IDs or unknown botIDs so writes never fall back to main.
+    public func resolveAddress(_ rawSessionId: String) -> SessionAddress? {
+        SessionAddress.resolve(rawSessionId, knownBotIDs: Set(bots.map(\.id)))
+    }
+
+    public func bot(for address: SessionAddress) -> BotProfile? {
+        bots.first(where: { $0.id == address.botID })
+    }
+
+    /// Unified pending-action projection shared by Inbox, Chat cards, and status banners (P0-03).
+    public var unifiedPendingInbox: [PendingInboxItem] {
+        var items: [PendingInboxItem] = []
+        for approval in pendingApprovals {
+            guard let addr = resolveAddress(approval.sessionId) else { continue }
+            items.append(PendingInboxItem(
+                id: approval.id,
+                kind: .approval,
+                address: addr,
+                title: "等待审批 · \(approval.toolName)",
+                detail: approval.summary,
+                toolName: approval.toolName
+            ))
+        }
+        for question in pendingDSHQuestions {
+            guard let addr = resolveAddress(question.sessionId) else { continue }
+            items.append(PendingInboxItem(
+                id: question.id,
+                kind: .question,
+                address: addr,
+                title: "DSH 提问等待回复",
+                detail: question.prompts.first?.question ?? "请回答以继续执行",
+                toolName: nil
+            ))
+        }
+        return items
+    }
     @Published public private(set) var dshAgentPresets: [DSHAgentPresetOption] = [
         DSHAgentPresetOption(id: "standard", name: "标准模式", description: "DSH 标准编码工具集。", broken: nil),
         DSHAgentPresetOption(id: "cordis", name: "创造模式", description: "面向 DSH / Cordis 扩展的工具集。", broken: nil),
@@ -390,19 +433,29 @@ public final class LocalAgentHost: ObservableObject {
     /// returning the user's original prompt so it can be edited and resent cleanly (`rewind`).
     @discardableResult
     public func rewindLastTurn(sessionId: String) -> String? {
-        guard !isStreaming, var list = messagesBySession[sessionId], !list.isEmpty else { return nil }
+        guard let address = resolveAddress(sessionId) else {
+            workspaceError = "无效的会话地址，已拒绝撤回操作。"
+            return nil
+        }
+        let targetId = address.canonicalSessionId
+        guard !isStreaming, var list = messagesBySession[targetId], !list.isEmpty else { return nil }
         guard let lastUserIdx = list.lastIndex(where: { $0.role == "user" }) else { return nil }
         let userText = list[lastUserIdx].content
         list.removeSubrange(lastUserIdx..<list.count)
-        messagesBySession[sessionId] = list
+        messagesBySession[targetId] = list
         return userText
     }
 
-    /// Removes a single message from the local session transcript (P1-2).
+    /// Removes a single message from the local session transcript (P1-2, bound to SessionAddress).
     public func deleteMessage(sessionId: String, messageId: String) {
-        guard !isStreaming, var list = messagesBySession[sessionId] else { return }
+        guard let address = resolveAddress(sessionId) else {
+            workspaceError = "无效的会话地址，已拒绝删除消息。"
+            return
+        }
+        let targetId = address.canonicalSessionId
+        guard !isStreaming, var list = messagesBySession[targetId] else { return }
         list.removeAll { $0.id == messageId }
-        messagesBySession[sessionId] = list
+        messagesBySession[targetId] = list
         DSHaptics.impact(.light)
     }
 
@@ -432,6 +485,11 @@ public final class LocalAgentHost: ObservableObject {
     }
 
     public func steerActiveTurn(sessionId: String, text: String, model: String) async {
+        guard let address = resolveAddress(sessionId) else {
+            workspaceError = "无效的会话地址，已拒绝插话引导。"
+            return
+        }
+        let targetId = address.canonicalSessionId
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         pendingSteerNote = trimmed
@@ -443,7 +501,7 @@ public final class LocalAgentHost: ObservableObject {
                 try? await Task.sleep(nanoseconds: 80_000_000)
             }
         }
-        await sendMessage(sessionId: sessionId, text: "[插话引导] \(trimmed)", model: model)
+        await sendMessage(sessionId: targetId, text: "[插话引导] \(trimmed)", model: model)
     }
 
     /// Refreshes session summaries and reloads visible non-private history after closing the DSH Web Workbench.
@@ -452,9 +510,10 @@ public final class LocalAgentHost: ObservableObject {
         await refreshSessionSummaries()
         await refreshPluginState()
         if let visibleId = visibleChatSessionId,
-           bots.first(where: { $0.id == visibleId })?.isPrivate != true {
-            loadedHistoryIDs.remove(visibleId)
-            try? await loadSessionHistory(visibleId)
+           let address = resolveAddress(visibleId),
+           bot(for: address)?.isPrivate != true {
+            loadedHistoryIDs.remove(address.canonicalSessionId)
+            try? await loadSessionHistory(address.canonicalSessionId)
         }
     }
 
@@ -528,7 +587,13 @@ public final class LocalAgentHost: ObservableObject {
         case .allow:
             CostBudgetGovernor.shared.activeBudgetWarning = nil
         }
-        let targetBot = bots.first(where: { $0.id == sessionId })
+        guard let address = resolveAddress(sessionId) else {
+            lastStreamError = "无效的会话地址（\(sessionId)），已拒绝写入。"
+            DSHaptics.notify(.error)
+            return
+        }
+        let targetSessionId = address.canonicalSessionId
+        let targetBot = bot(for: address)
         if let preset = targetBot?.agentPreset, (preset == "ptc-python" || preset == "cordis"),
            !MemoryGovernor.shared.canAdmitHeavyWork() {
             lastStreamError = "系统可用内存不足（< 180 MB），已拦截重型工具执行以避免闪退，请关闭其他应用后重试。"
@@ -542,14 +607,14 @@ public final class LocalAgentHost: ObservableObject {
         }
         lastCancelledSessionId = nil
         let turnId = UUID().uuidString
-        messagesBySession[sessionId, default: []].append(ChatMessageItem(sessionId: sessionId, role: "user", content: trimmed))
+        messagesBySession[targetSessionId, default: []].append(ChatMessageItem(sessionId: targetSessionId, role: "user", content: trimmed))
         persistWorkspace()
         activeTurnId = turnId
-        streamingSessionId = sessionId
+        streamingSessionId = targetSessionId
         sentCancellation = false
         let steerNote = pendingSteerNote
         pendingSteerNote = nil
-        liveStream.begin(sessionId: sessionId, steerNote: steerNote)
+        liveStream.begin(sessionId: targetSessionId, steerNote: steerNote)
         lastDraftSavedAt = .distantPast
         lastDraftSavedLength = 0
         streamStartedAt = Date()
@@ -576,8 +641,8 @@ public final class LocalAgentHost: ObservableObject {
             }
         }
 
-        let bot = bots.first(where: { $0.id == sessionId })
-        let legacyHistory = (legacyMessagesBySession[sessionId] ?? []).suffix(12).map { message in
+        let bot = targetBot
+        let legacyHistory = (legacyMessagesBySession[targetSessionId] ?? []).suffix(12).map { message in
             ["role": message.role, "content": String(message.content.prefix(12_000))]
         }
         if bot?.isGroup == true {
@@ -591,7 +656,7 @@ public final class LocalAgentHost: ObservableObject {
         }
         do {
             _ = try await channel.request("chat.send", params: [
-                "sessionId": sessionId, "turnId": turnId, "model": model, "apiBaseURL": apiBaseURL,
+                "sessionId": targetSessionId, "turnId": turnId, "model": model, "apiBaseURL": apiBaseURL,
                 "systemPrompt": bot?.systemPrompt ?? "", "isGroup": bot?.isGroup ?? false,
                 "agentPreset": bot?.agentPreset ?? "standard", "permissionMode": bot?.permissionMode ?? "ask",
                 "reasoningEffort": bot?.reasoningEffort ?? "medium",
@@ -811,19 +876,28 @@ public final class LocalAgentHost: ObservableObject {
 
     public func regenerateLastReply(sessionId: String, model: String) async {
         guard !isStreaming, state == .ready else { return }
+        guard let address = resolveAddress(sessionId) else {
+            workspaceError = "无效的会话地址，已拒绝重新生成。"
+            return
+        }
+        let targetId = address.canonicalSessionId
         // DSH sessions are append-only event logs. Retrying creates another turn
         // with the same prompt so the visible transcript stays aligned with the
         // durable history after the next app launch.
-        guard let lastUser = messagesBySession[sessionId]?.last(where: { $0.role == "user" }) else { return }
-        await sendMessage(sessionId: sessionId, text: lastUser.content, model: model)
+        guard let lastUser = messagesBySession[targetId]?.last(where: { $0.role == "user" }) else { return }
+        await sendMessage(sessionId: targetId, text: lastUser.content, model: model)
     }
 
     public func exportSessionMarkdown(sessionId: String, botName: String) async throws -> String {
+        guard let address = resolveAddress(sessionId) else {
+            throw NSError(domain: "DSBotSession", code: 400, userInfo: [NSLocalizedDescriptionKey: "无效的会话地址，已拒绝导出。"])
+        }
+        let targetId = address.canonicalSessionId
         guard let rpc = rpc() else { throw IPCFrameError.channelClosed }
-        let payload = try await rpc.request("session.history.markdown", params: ["sessionId": sessionId], timeoutSeconds: 30)
+        let payload = try await rpc.request("session.history.markdown", params: ["sessionId": targetId], timeoutSeconds: 30)
         guard let markdown = payload["markdown"] as? String else { throw IPCFrameError.invalidJSON }
         let formatter = ISO8601DateFormatter()
-        let legacy = (legacyMessagesBySession[sessionId] ?? []).map { message in
+        let legacy = (legacyMessagesBySession[targetId] ?? []).map { message in
             let speaker = message.role == "user" ? "用户" : "助手"
             return "## \(speaker) · \(formatter.string(from: message.timestamp))\n\n\(message.content)\n\n"
         }.joined()
@@ -1244,8 +1318,14 @@ public final class LocalAgentHost: ObservableObject {
     }
 
     public func respondToApproval(id: String, approved: Bool) async {
+        guard !inFlightRequestIDs.contains(id), !resolvedRequestIDs.contains(id) else { return }
         guard let approval = pendingApprovals.first(where: { $0.id == id }),
-              approval.turnId == activeTurnId, !sentCancellation else { return }
+              approval.turnId == activeTurnId, !sentCancellation else {
+            pendingApprovals.removeAll { $0.id == id }
+            return
+        }
+        inFlightRequestIDs.insert(id)
+        defer { inFlightRequestIDs.remove(id) }
         let params: [String: Any] = [
             "approvalId": id, "turnId": approval.turnId, "sessionId": approval.sessionId, "approved": approved
         ]
@@ -1256,18 +1336,32 @@ public final class LocalAgentHost: ObservableObject {
             receipt = try? await workspaceCapabilities.nativeWorkspaceRequest(method: "approval.respond", params: params)
         }
         if receipt?["found"] as? Bool == true {
+            resolvedRequestIDs.insert(id)
             pendingApprovals.removeAll { $0.id == id }
+        } else {
+            pendingApprovals.removeAll { $0.id == id }
+            workspaceError = "该审批请求已失效或已被其他入口处理。"
         }
     }
 
     public func respondToDSHQuestion(id: String, answers: [[String: Any]]) async {
+        guard !inFlightRequestIDs.contains(id), !resolvedRequestIDs.contains(id) else { return }
         guard let question = pendingDSHQuestions.first(where: { $0.id == id }),
-              question.turnId == activeTurnId, !sentCancellation else { return }
+              question.turnId == activeTurnId, !sentCancellation else {
+            pendingDSHQuestions.removeAll { $0.id == id }
+            return
+        }
+        inFlightRequestIDs.insert(id)
+        defer { inFlightRequestIDs.remove(id) }
         let receipt = try? await channel?.request("user-question.respond", params: [
             "questionId": id, "turnId": question.turnId, "sessionId": question.sessionId, "answers": answers
         ])
         if receipt?["found"] as? Bool == true {
+            resolvedRequestIDs.insert(id)
             pendingDSHQuestions.removeAll { $0.id == id }
+        } else {
+            pendingDSHQuestions.removeAll { $0.id == id }
+            workspaceError = "该提问请求已失效或已被其他入口处理。"
         }
     }
 
@@ -1523,14 +1617,19 @@ public final class LocalAgentHost: ObservableObject {
 
     public func clearSession(_ sessionId: String) async {
         guard let channel else { return }
+        guard let address = resolveAddress(sessionId) else {
+            workspaceError = "无效的会话地址（\(sessionId)），已拒绝清空。"
+            return
+        }
+        let target = address.canonicalSessionId
         do {
-            _ = try await channel.request("session.clear", params: ["sessionId": sessionId], timeoutSeconds: 60)
-            messagesBySession[sessionId] = []
-            legacyMessagesBySession[sessionId] = []
-            discardSessionHistoryCache(sessionId)
-            persistedSessionIDs.remove(sessionId)
-            persistedSessionActivityByID.removeValue(forKey: sessionId)
-            persistedSessionPreviewByID.removeValue(forKey: sessionId)
+            _ = try await channel.request("session.clear", params: ["sessionId": target], timeoutSeconds: 60)
+            messagesBySession[target] = []
+            legacyMessagesBySession[target] = []
+            discardSessionHistoryCache(target)
+            persistedSessionIDs.remove(target)
+            persistedSessionActivityByID.removeValue(forKey: target)
+            persistedSessionPreviewByID.removeValue(forKey: target)
             lastStreamError = nil
             persistWorkspace()
         } catch {
@@ -1631,7 +1730,9 @@ public final class LocalAgentHost: ObservableObject {
         dshApprovalAudits.removeAll { $0.sessionId == id }
     }
 
-    public func loadSessionHistory(_ id: String, older: Bool = false) async throws {
+    public func loadSessionHistory(_ rawId: String, older: Bool = false) async throws {
+        guard let address = resolveAddress(rawId) else { return }
+        let id = address.canonicalSessionId
         guard let rpc = rpc(), !loadingHistoryIDs.contains(id),
               older ? historyCursors[id] != nil : !loadedHistoryIDs.contains(id) else { return }
         let epoch = UUID()

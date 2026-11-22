@@ -2,10 +2,19 @@ import SwiftUI
 
 struct SessionInboxView: View {
     @ObservedObject var host: LocalAgentHost
+    @ObservedObject private var threadStore = BotThreadStore.shared
+
+    private var approvalItems: [PendingInboxItem] {
+        host.unifiedPendingInbox.filter { $0.kind == .approval }
+    }
+
+    private var questionItems: [PendingInboxItem] {
+        host.unifiedPendingInbox.filter { $0.kind == .question }
+    }
 
     var body: some View {
         List {
-            if host.pendingApprovals.isEmpty && host.pendingDSHQuestions.isEmpty {
+            if host.unifiedPendingInbox.isEmpty {
                 DSEmptyStateView(
                     icon: "tray",
                     title: "收件箱已清空",
@@ -14,13 +23,15 @@ struct SessionInboxView: View {
                 .listRowBackground(Color.clear)
             }
 
-            if !host.pendingApprovals.isEmpty {
-                Section("待审批工具调用 (\(host.pendingApprovals.count))") {
-                    ForEach(host.pendingApprovals) { approval in
-                        if let bot = host.bots.first(where: { $0.id == approval.sessionId }) {
+            if !approvalItems.isEmpty {
+                Section("待审批工具调用 (\(approvalItems.count))") {
+                    ForEach(approvalItems) { item in
+                        if let bot = host.bot(for: item.address) {
+                            let isHandling = host.inFlightRequestIDs.contains(item.id)
+                            let threadLabel = bot.isPrivate ? nil : threadStore.threadTitle(for: item.address)
                             VStack(alignment: .leading, spacing: 8) {
                                 NavigationLink {
-                                    ChatView(bot: bot, host: host)
+                                    ChatView(bot: bot, host: host, initialAddress: item.address)
                                 } label: {
                                     HStack(spacing: 12) {
                                         DSBotAvatar(
@@ -33,9 +44,15 @@ struct SessionInboxView: View {
                                             HStack(spacing: 6) {
                                                 Text(bot.isPrivate ? "私密会话" : bot.name)
                                                     .font(.subheadline.weight(.semibold))
-                                                DSStatusBadge("待审批", color: DSTheme.warning, icon: "hand.raised.fill")
+                                                if let threadLabel {
+                                                    Text("· \(threadLabel)")
+                                                        .font(.caption)
+                                                        .foregroundStyle(.secondary)
+                                                        .lineLimit(1)
+                                                }
+                                                DSStatusBadge(isHandling ? "处理中" : "待审批", color: DSTheme.warning, icon: "hand.raised.fill")
                                             }
-                                            Text(bot.isPrivate ? "需解锁私密会话后查看并确认工具审批" : "工具：\(approval.tool) · \(approval.summary)")
+                                            Text(bot.isPrivate ? "需解锁私密会话后查看并确认工具审批" : "工具：\(item.toolName ?? item.title) · \(item.detail)")
                                                 .font(.caption)
                                                 .foregroundStyle(.secondary)
                                                 .lineLimit(2)
@@ -46,22 +63,24 @@ struct SessionInboxView: View {
                                 if !bot.isPrivate {
                                     HStack(spacing: 10) {
                                         Button {
-                                            Task { await host.respondToApproval(id: approval.id, approved: true) }
+                                            Task { await host.respondToApproval(id: item.id, approved: true) }
                                         } label: {
-                                            Label("批准执行", systemImage: "checkmark.circle.fill")
+                                            Label(isHandling ? "处理中…" : "批准执行", systemImage: "checkmark.circle.fill")
                                                 .font(.caption.weight(.semibold))
                                         }
                                         .buttonStyle(.borderedProminent)
                                         .controlSize(.small)
+                                        .disabled(isHandling)
 
                                         Button(role: .destructive) {
-                                            Task { await host.respondToApproval(id: approval.id, approved: false) }
+                                            Task { await host.respondToApproval(id: item.id, approved: false) }
                                         } label: {
                                             Label("拒绝", systemImage: "xmark.circle")
                                                 .font(.caption.weight(.semibold))
                                         }
                                         .buttonStyle(.bordered)
                                         .controlSize(.small)
+                                        .disabled(isHandling)
                                     }
                                     .padding(.leading, 50)
                                 }
@@ -72,12 +91,13 @@ struct SessionInboxView: View {
                 }
             }
 
-            if !host.pendingDSHQuestions.isEmpty {
-                Section("待回答智能体提问 (\(host.pendingDSHQuestions.count))") {
-                    ForEach(host.pendingDSHQuestions) { request in
-                        if let bot = host.bots.first(where: { $0.id == request.sessionId }) {
+            if !questionItems.isEmpty {
+                Section("待回答智能体提问 (\(questionItems.count))") {
+                    ForEach(questionItems) { item in
+                        if let bot = host.bot(for: item.address) {
+                            let threadLabel = bot.isPrivate ? nil : threadStore.threadTitle(for: item.address)
                             NavigationLink {
-                                ChatView(bot: bot, host: host)
+                                ChatView(bot: bot, host: host, initialAddress: item.address)
                             } label: {
                                 HStack(spacing: 12) {
                                     DSBotAvatar(
@@ -90,9 +110,15 @@ struct SessionInboxView: View {
                                         HStack(spacing: 6) {
                                             Text(bot.isPrivate ? "私密会话" : bot.name)
                                                 .font(.subheadline.weight(.semibold))
-                                            DSStatusBadge("\(request.questions.count) 项提问", color: DSTheme.brand, icon: "questionmark.circle.fill")
+                                            if let threadLabel {
+                                                Text("· \(threadLabel)")
+                                                    .font(.caption)
+                                                    .foregroundStyle(.secondary)
+                                                    .lineLimit(1)
+                                            }
+                                            DSStatusBadge(item.title, color: DSTheme.brand, icon: "questionmark.circle.fill")
                                         }
-                                        Text(bot.isPrivate ? "需解锁私密会话后回答问题" : (request.questions.first?.question ?? "智能体正在等待你的补充确认"))
+                                        Text(bot.isPrivate ? "需解锁私密会话后回答问题" : item.detail)
                                             .font(.caption)
                                             .foregroundStyle(.secondary)
                                             .lineLimit(2)
