@@ -116,7 +116,7 @@ public final class LocalAgentHost: ObservableObject {
     @Published public var unifiedNavigationV2: Bool = AppSettings.bool(.unifiedNavigationV2, default: true) {
         didSet { AppSettings.set(unifiedNavigationV2, for: .unifiedNavigationV2) }
     }
-    private var inFlightRequestIDs: Set<String> = []
+    @Published public private(set) var inFlightRequestIDs: Set<String> = []
     private var resolvedRequestIDs: Set<String> = []
 
     /// Resolves and validates a session address against known bots (P0-01).
@@ -138,9 +138,9 @@ public final class LocalAgentHost: ObservableObject {
                 id: approval.id,
                 kind: .approval,
                 address: addr,
-                title: "等待审批 · \(approval.toolName)",
+                title: "等待审批 · \(approval.tool)",
                 detail: approval.summary,
-                toolName: approval.toolName
+                toolName: approval.tool
             ))
         }
         for question in pendingDSHQuestions {
@@ -149,8 +149,8 @@ public final class LocalAgentHost: ObservableObject {
                 id: question.id,
                 kind: .question,
                 address: addr,
-                title: "DSH 提问等待回复",
-                detail: question.prompts.first?.question ?? "请回答以继续执行",
+                title: "\(question.questions.count) 项提问",
+                detail: question.questions.first?.question ?? "智能体正在等待你的补充确认",
                 toolName: nil
             ))
         }
