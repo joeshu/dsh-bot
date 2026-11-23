@@ -1199,7 +1199,10 @@ async function boot() {
     if (wsRegistry && typeof wsRegistry.list === 'function' && wsRegistry.list().length === 0) {
       if (typeof wsRegistry.initializeDefault === 'function') {
         await wsRegistry.initializeDefault(async () => WORKSPACE_FILES)
-      } else if (typeof wsRegistry.create === 'function') {
+      }
+      // initializeDefault() intentionally no-ops when native Bot sessions already exist in SQLite;
+      // explicitly register WORKSPACE_FILES so the Web UI always has a ready default workspace.
+      if (wsRegistry.list().length === 0 && typeof wsRegistry.create === 'function') {
         await wsRegistry.create(WORKSPACE_FILES)
       }
     }

@@ -128,16 +128,24 @@ async function apply(ctx) {
   const remoteAccess = ctx.remoteAccess
 
   function actionRoster() {
+    const actions = new Set()
     const descriptors = [
       ...(typeof ctx.typert?.local?.list === 'function' ? ctx.typert.local.list() : []),
       ...(typeof ctx.typert?.remotes?.list === 'function' ? ctx.typert.remotes.list() : []),
     ]
-    return [...new Set(
-      descriptors
-        .filter((item) => item && typeof item.namespace === 'string' && typeof item.method === 'string')
-        .map(({ namespace, method }) => `${namespace}/${method}`)
-        .filter((action) => !isBlockedWebAction(action))
-    )]
+    for (const item of descriptors) {
+      if (item && typeof item.namespace === 'string' && typeof item.method === 'string') {
+        const action = `${item.namespace}/${item.method}`
+        if (!isBlockedWebAction(action)) actions.add(action)
+      }
+    }
+    const gateway = ctx.get?.('typertGateway')
+    if (typeof gateway?.collectSrcClaims === 'function') {
+      for (const action of gateway.collectSrcClaims()) {
+        if (typeof action === 'string' && !isBlockedWebAction(action)) actions.add(action)
+      }
+    }
+    return [...actions]
   }
 
   function bindings() {
@@ -278,6 +286,7 @@ async function apply(ctx) {
       remoteAccess.invalidate(WEB_PRINCIPAL)
     })
   }
+  ctx.on('internal/service', () => remoteAccess.invalidate(WEB_PRINCIPAL))
   ctx.typert?.local?.subscribe?.(() => remoteAccess.invalidate(WEB_PRINCIPAL))
   ctx.typert?.remotes?.subscribe?.(() => remoteAccess.invalidate(WEB_PRINCIPAL))
   ctx.effect(() => () => {

@@ -405,3 +405,13 @@ test('v3 ui-refactor: SessionAddress, unifiedPendingInbox, idempotent approvals,
   assert.match(inboxSrc, /host\.unifiedPendingInbox/, 'SessionInboxView must consume unifiedPendingInbox')
   assert.match(settingsSrc, /\$host\.unifiedNavigationV2/, 'Settings must expose unifiedNavigationV2 rollback toggle')
 })
+
+test('v3 web-workspace: private-session-access collects typertGateway.collectSrcClaims() and dsh-ios-entry registers default files/ workspace even with existing sessions', () => {
+  const privateAccessSrc = readFileSync(join(runtimeDir, 'ios-host-package/private-session-access.mjs'), 'utf8')
+  const entrySrc = readFileSync(join(runtimeDir, 'dsh-ios-entry.mjs'), 'utf8')
+
+  assert.match(privateAccessSrc, /collectSrcClaims\(/, 'private-session-access.mjs must collect live @Remote endpoints from typertGateway.collectSrcClaims()')
+  assert.match(privateAccessSrc, /ctx\.on\('internal\/service'/, 'private-session-access.mjs must invalidate remoteAccess policy when Cordis services mount')
+  assert.match(entrySrc, /wsRegistry\.list\(\)\.length === 0 && typeof wsRegistry\.create === 'function'/, 'dsh-ios-entry.mjs must fall back to wsRegistry.create(WORKSPACE_FILES) when initializeDefault no-ops')
+})
+
