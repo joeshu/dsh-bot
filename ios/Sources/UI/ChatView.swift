@@ -509,50 +509,52 @@ public struct ChatView: View {
         } message: {
             Text("当前为私密会话。继续操作将把本话题内容导出到系统共享表单；点击取消不会写入任何文件。")
         }
-        .fileImporter(
-            isPresented: $showFileImporter,
-            allowedContentTypes: [.item, .data, .content],
-            allowsMultipleSelection: true
-        ) { result in
-            guard !liveBot.isPrivate else { return }
-            switch result {
-            case .success(let urls):
-                var addedCount = 0
-                var lastError: String?
-                for url in urls.prefix(10) {
-                    do {
-                        let imported = try host.importFileToWorkspace(from: url)
-                        if !attachedFiles.contains(where: { $0.relativePath == imported.relativePath }) {
-                            attachedFiles.append(imported)
+        .background(
+            Color.clear
+                .fileImporter(
+                    isPresented: $showFileImporter,
+                    allowedContentTypes: LocalAgentHost.supportedImportContentTypes,
+                    allowsMultipleSelection: true
+                ) { result in
+                    switch result {
+                    case .success(let urls):
+                        var addedCount = 0
+                        var lastError: String?
+                        for url in urls {
+                            do {
+                                let imported = try host.importFileToWorkspace(from: url)
+                                if !attachedFiles.contains(where: { $0.relativePath == imported.relativePath }) {
+                                    attachedFiles.append(imported)
+                                }
+                                addedCount += 1
+                            } catch {
+                                lastError = error.localizedDescription
+                            }
                         }
-                        addedCount += 1
-                    } catch {
-                        lastError = error.localizedDescription
+                        if addedCount > 0 {
+                            actionStatus = addedCount == 1
+                                ? "已附加：files/\(attachedFiles.last?.relativePath ?? "")"
+                                : "已附加 \(addedCount) 个文件到工作区"
+                            DSHaptics.notify(.success)
+                        } else if let lastError {
+                            actionStatus = "附加失败：\(lastError)"
+                            DSHaptics.notify(.error)
+                        }
+                    case .failure(let error):
+                        actionStatus = "附加失败：\(error.localizedDescription)"
+                        DSHaptics.notify(.error)
                     }
                 }
-                if addedCount > 0 {
-                    actionStatus = addedCount == 1
-                        ? "已附加：files/\(attachedFiles.last?.relativePath ?? "")"
-                        : "已附加 \(addedCount) 个文件到工作区"
-                    DSHaptics.notify(.success)
-                } else if let lastError {
-                    actionStatus = "附加失败：\(lastError)"
-                    DSHaptics.notify(.error)
-                }
-            case .failure(let error):
-                actionStatus = "附加失败：\(error.localizedDescription)"
-                DSHaptics.notify(.error)
-            }
-        }
+        )
         #if canImport(PhotosUI)
         .onChange(of: selectedPhotoItems) { items in
-            guard !items.isEmpty, !liveBot.isPrivate else { return }
+            guard !items.isEmpty else { return }
             let picked = items
             selectedPhotoItems = []
             Task {
                 var added = 0
                 var lastError: String?
-                for (idx, item) in picked.prefix(5).enumerated() {
+                for (idx, item) in picked.enumerated() {
                     do {
                         if let rawData = try await item.loadTransferable(type: Data.self) {
                             let stamp = Int(Date().timeIntervalSince1970)
@@ -1732,27 +1734,25 @@ public struct ChatView: View {
                     }
                 }
 
-                if !liveBot.isPrivate {
-                    Button {
-                        showFileImporter = true
-                    } label: {
-                        Image(systemName: "paperclip")
-                            .font(.system(size: 18, weight: .medium))
-                            .foregroundColor(attachedFiles.isEmpty ? .secondary : DSTheme.brand)
-                    }
-                    .disabled(host.isStreaming)
-                    .help("附加任意文件")
-
-                    #if canImport(PhotosUI)
-                    PhotosPicker(selection: $selectedPhotoItems, maxSelectionCount: 5, matching: .images) {
-                        Image(systemName: "photo")
-                            .font(.system(size: 17, weight: .medium))
-                            .foregroundColor(.secondary)
-                    }
-                    .disabled(host.isStreaming)
-                    .help("从相册选择图片")
-                    #endif
+                Button {
+                    showFileImporter = true
+                } label: {
+                    Image(systemName: "paperclip")
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundColor(attachedFiles.isEmpty ? .secondary : DSTheme.brand)
                 }
+                .disabled(host.isStreaming)
+                .help("附加任意本地文件或目录")
+
+                #if canImport(PhotosUI)
+                PhotosPicker(selection: $selectedPhotoItems, matching: .images) {
+                    Image(systemName: "photo")
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundColor(.secondary)
+                }
+                .disabled(host.isStreaming)
+                .help("从相册选择图片")
+                #endif
 
                 TextField(host.isStreaming && host.streamingSessionId == activeSessionId ? "输入插话引导内容（Steer）…" : "给 \(liveBot.name) 发消息…", text: $input, axis: .vertical)
                     .lineLimit(1...4)

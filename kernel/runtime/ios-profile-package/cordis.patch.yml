@@ -196,9 +196,10 @@
 
     - id: session-title
       name: '@deepseek-ai/dsh-session-title'
-
-    - id: agent-tool-presentation
-      name: '@deepseek-ai/dsh-agent-tool-presentation'
+      config:
+        fallbackMaxWords: 8
+        fallbackMaxBytes: 64
+        maxTitleBytes: 120
 
     - id: message-feedback
       name: '@deepseek-ai/dsh-message-feedback'
@@ -524,6 +525,12 @@
 
     - id: workspace-files
       name: '@deepseek-ai/dsh-api-workspace-files'
+
+    - id: config-editor
+      name: '@deepseek-ai/dsh-config-editor'
+
+    - id: settings
+      name: '@deepseek-ai/dsh-settings'
 
     - id: settings-controller
       name: '@deepseek-ai/dsh-api-settings-controller'

@@ -7,9 +7,9 @@ const EXACT_SESSION_BOUND_PATHS = new Set([
   '/api/session.markdown',
   '/api/session/uploadFileBinary',
 ])
-// These Hosts APIs can write the plugin profile or manage global schedules;
-// neither has a public-session-scoped authorization contract in the iOS UI.
-const EXCLUDED_WEB_ACTION = /^(?:pluginManager|plugins|schedule)\//i
+// These Hosts APIs either write the plugin profile / global schedules or spawn
+// desktop-only native apps (`open -t` / Finder) that do not exist on iOS.
+const EXCLUDED_WEB_ACTION = /^(?:(?:pluginManager|plugins|schedule)\/|settings\/openSettingsDocument$|session\/openWorkspacePath$)/i
 const FORWARDED_SESSION_EVENTS = [
   'event:api-session/added',
   'event:api-session/removed',

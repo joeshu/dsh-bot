@@ -406,12 +406,24 @@ test('v3 ui-refactor: SessionAddress, unifiedPendingInbox, idempotent approvals,
   assert.match(settingsSrc, /\$host\.unifiedNavigationV2/, 'Settings must expose unifiedNavigationV2 rollback toggle')
 })
 
-test('v3 web-workspace: private-session-access collects typertGateway.collectSrcClaims() and dsh-ios-entry registers default files/ workspace even with existing sessions', () => {
+test('v3 web-workspace: private-session-access collects typertGateway.collectSrcClaims(), excludes desktop launchers, and cordis.patch.yml activates cleanly with Settings & session-title', () => {
   const privateAccessSrc = readFileSync(join(runtimeDir, 'ios-host-package/private-session-access.mjs'), 'utf8')
   const entrySrc = readFileSync(join(runtimeDir, 'dsh-ios-entry.mjs'), 'utf8')
+  const patchSrc = readFileSync(join(runtimeDir, 'ios-profile-package/cordis.patch.yml'), 'utf8')
 
   assert.match(privateAccessSrc, /collectSrcClaims\(/, 'private-session-access.mjs must collect live @Remote endpoints from typertGateway.collectSrcClaims()')
   assert.match(privateAccessSrc, /ctx\.on\('internal\/service'/, 'private-session-access.mjs must invalidate remoteAccess policy when Cordis services mount')
+  assert.match(privateAccessSrc, /settings\\\/openSettingsDocument/, 'private-session-access.mjs must exclude desktop-only settings/openSettingsDocument')
+  assert.match(privateAccessSrc, /session\\\/openWorkspacePath/, 'private-session-access.mjs must exclude desktop-only session/openWorkspacePath')
   assert.match(entrySrc, /wsRegistry\.list\(\)\.length === 0 && typeof wsRegistry\.create === 'function'/, 'dsh-ios-entry.mjs must fall back to wsRegistry.create(WORKSPACE_FILES) when initializeDefault no-ops')
+  assert.match(patchSrc, /fallbackMaxWords:\s*\d+/, 'cordis.patch.yml must configure dsh-session-title required options')
+  assert.doesNotMatch(patchSrc, /@deepseek-ai\/dsh-agent-tool-presentation/, 'cordis.patch.yml must not mount deprecated duplicate agent-tool-presentation')
+  assert.match(patchSrc, /@deepseek-ai\/dsh-config-editor/, 'cordis.patch.yml must mount dsh-config-editor for Web UI Settings')
+  assert.match(patchSrc, /@deepseek-ai\/dsh-settings/, 'cordis.patch.yml must mount dsh-settings for Web UI Settings')
+  assert.match(entrySrc, /iosPureJsWorkspaceFileSearch/, 'dsh-ios-entry.mjs must patch workspaceFiles.search with pure-JS sandboxed search (no ripgrep subprocess on iOS)')
+  const webUISrc = readFileSync(join(__dirname, '..', '..', 'ios/Sources/UI/DSHWebUIView.swift'), 'utf8')
+  const hostSrc = readFileSync(join(__dirname, '..', '..', 'ios/Sources/Runtime/LocalAgentHost.swift'), 'utf8')
+  assert.match(webUISrc, /window\.__DSH_FILE_UPLOAD__/, 'DSHWebUIView must hook __DSH_FILE_UPLOAD__ to main-thread fetch for iOS WKWebView uploads')
+  assert.match(hostSrc, /supportedImportContentTypes/, 'LocalAgentHost must expose comprehensive supportedImportContentTypes for iOS fileImporter')
 })
 

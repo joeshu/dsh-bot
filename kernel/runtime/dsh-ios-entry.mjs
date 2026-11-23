@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
+import { readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { parentPort, workerData } from 'node:worker_threads'
 import net from 'node:net'
@@ -1208,6 +1209,72 @@ async function boot() {
     }
   } catch (error) {
     ctx?.logger?.warn?.(`Default iOS workspace initialization skipped: ${String(error)}`)
+  }
+  try {
+    const wsFiles = ctx?.get?.('workspaceFiles')
+    if (wsFiles && typeof wsFiles.search === 'function') {
+      const VCS_NAMES = new Set(['.git', '.svn', '.hg', '.bzr', '.jj', '.sl', 'node_modules'])
+      wsFiles.search = async function iosPureJsWorkspaceFileSearch(workspaceFileScope, request, signal) {
+        const query = String(request?.query ?? '').trim()
+        if (!query) throw new Error('query must not be blank')
+        signal?.throwIfAborted?.()
+        const root = resolve(workspaceFileScope?.workspaceRoot || WORKSPACE_FILES)
+        const maxResults = Number.isInteger(request?.maxResults) && request.maxResults > 0 ? Math.min(request.maxResults, 500) : 200
+        const maxEntries = 10_000
+        const includeHidden = request?.includeHidden === true
+        const needle = query.toLowerCase()
+        const byPath = query.includes('/')
+        const entries = new Map()
+        const admit = (relPath, type) => {
+          const name = relPath.slice(relPath.lastIndexOf('/') + 1)
+          if ((byPath ? relPath : name).toLowerCase().includes(needle)) {
+            entries.set(relPath, { path: relPath, type })
+          }
+        }
+        let scanned = 0
+        let incomplete = false
+        const queue = ['']
+        while (queue.length > 0 && scanned < maxEntries) {
+          signal?.throwIfAborted?.()
+          const relDir = queue.shift()
+          const absDir = relDir ? join(root, relDir) : root
+          let dirents
+          try {
+            dirents = await readdir(absDir, { withFileTypes: true })
+          } catch {
+            incomplete = true
+            continue
+          }
+          for (const dirent of dirents) {
+            if (scanned >= maxEntries) {
+              incomplete = true
+              break
+            }
+            const name = dirent.name
+            if (VCS_NAMES.has(name) || dirent.isSymbolicLink()) continue
+            if (!includeHidden && name.startsWith('.')) continue
+            const relPath = relDir ? `${relDir}/${name}` : name
+            if (dirent.isDirectory()) {
+              admit(relPath, 'directory')
+              queue.push(relPath)
+            } else if (dirent.isFile()) {
+              admit(relPath, 'file')
+              scanned += 1
+            }
+          }
+        }
+        const matches = [...entries.values()].sort((a, b) =>
+          a.path.split('/').length - b.path.split('/').length || (a.path < b.path ? -1 : 1)
+        )
+        return {
+          matches: matches.slice(0, maxResults),
+          truncated: matches.length > maxResults,
+          incomplete,
+        }
+      }
+    }
+  } catch (error) {
+    ctx?.logger?.warn?.(`Pure-JS workspaceFiles.search patch skipped: ${String(error)}`)
   }
   createIOSPluginManager({ rpc, runtime, workspace: WORKSPACE, profileDir: PROFILE_DIR, installAnchor: INSTALL_ANCHOR, safeMode, drainAgents: () => ctx.subagents.drainDescendants([...runtime.activeAgents.values()].map(({ agent }) => agent)) })
   await rpc.request('runtime.ready', runtimeInfo(), 30_000)

@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import UniformTypeIdentifiers
 #if canImport(PDFKit)
 import PDFKit
 #endif
@@ -994,13 +995,20 @@ public final class LocalAgentHost: ObservableObject {
             }
             return nil
         }
-        // Read up to inlineLimit bytes for text/code files (or small UTF-8 files of any extension)
+        // Read up to inlineLimit bytes for text/code files (or small text files of any extension)
         if textExtensions.contains(ext) || byteCount <= inlineLimit {
             guard let handle = try? FileHandle(forReadingFrom: dest) else { return nil }
             defer { try? handle.close() }
             let slice = (try? handle.read(upToCount: inlineLimit)) ?? Data()
-            guard !slice.isEmpty, !slice.contains(0) else { return nil }
-            if let decoded = String(data: slice, encoding: .utf8) {
+            guard !slice.isEmpty else { return nil }
+            let gb18030 = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue)))
+            let decoded: String? = {
+                if !slice.contains(0), let utf8 = String(data: slice, encoding: .utf8) { return utf8 }
+                if !slice.contains(0), let gb = String(data: slice, encoding: gb18030) { return gb }
+                if let utf16 = String(data: slice, encoding: .utf16) { return utf16 }
+                return nil
+            }()
+            if let decoded {
                 if byteCount > slice.count {
                     return decoded + "\n...[已截断，完整内容请使用 workspace_read 或 python_exec 查看]"
                 }
@@ -1010,79 +1018,132 @@ public final class LocalAgentHost: ObservableObject {
         return nil
     }
 
+    public static let supportedImportContentTypes: [UTType] = [
+        .item, .data, .content, .directory, .folder, .package,
+        .plainText, .text, .utf8PlainText, .sourceCode, .pdf, .image, .audio, .movie, .archive
+    ]
+
     public func importFileToWorkspace(from sourceURL: URL) throws -> AttachedWorkspaceFile {
         let accessed = sourceURL.startAccessingSecurityScopedResource()
         defer { if accessed { sourceURL.stopAccessingSecurityScopedResource() } }
 
-        let maxImportBytes = 25 * 1024 * 1024
+        let maxInMemoryCopyBytes = 16 * 1024 * 1024
         let maxImageDirectBytes = 4 * 1024 * 1024
-        let filesDir = LocalAgentTransport.defaultWorkspace.appendingPathComponent("files", isDirectory: true)
+        let filesDir = workspace.appendingPathComponent("files", isDirectory: true)
         try FileManager.default.createDirectory(at: filesDir, withIntermediateDirectories: true)
+
+        func performImport(from readableURL: URL) throws -> AttachedWorkspaceFile {
+            let values = try? readableURL.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey, .fileSizeKey])
+            let isDir = values?.isDirectory == true
+            let rawSize = values?.fileSize ?? 0
+
+            let sourceExt = readableURL.pathExtension.lowercased()
+            let isImage = !isDir && Self.imageExtensions.contains(sourceExt)
+            var preferredName = Self.sanitizeAttachmentFilename(
+                readableURL.lastPathComponent.isEmpty ? sourceURL.lastPathComponent : readableURL.lastPathComponent,
+                fallbackExt: isDir ? "" : (sourceExt.isEmpty ? "txt" : sourceExt)
+            )
+            if isDir && preferredName.hasSuffix(".") {
+                preferredName.removeLast()
+            }
+
+            if isDir {
+                let (targetName, dest) = Self.uniqueDestination(in: filesDir, preferredName: preferredName)
+                try FileManager.default.copyItem(at: readableURL, to: dest)
+                let itemCount = (try? FileManager.default.contentsOfDirectory(atPath: dest.path).count) ?? 0
+                return AttachedWorkspaceFile(
+                    relativePath: targetName,
+                    fileName: targetName,
+                    byteCount: rawSize,
+                    inlineText: "[已导入目录：files/\(targetName)（共 \(itemCount) 项，可使用 workspace_list / workspace_read 查看）]"
+                )
+            }
+
+            if isImage && rawSize > maxImageDirectBytes {
+                if let downsampled = MemoryGovernor.downsampleImage(at: readableURL, maxPixelSize: 1568, compressionQuality: 0.82) {
+                    let stem = (preferredName as NSString).deletingPathExtension
+                    preferredName = "\(stem).jpg"
+                    let (targetName, dest) = Self.uniqueDestination(in: filesDir, preferredName: preferredName)
+                    try downsampled.write(to: dest, options: .atomic)
+                    let inlineText = Self.extractInlinePreview(at: dest, byteCount: downsampled.count)
+                    return AttachedWorkspaceFile(relativePath: targetName, fileName: targetName, byteCount: downsampled.count, inlineText: inlineText)
+                }
+            }
+
+            let (targetName, dest) = Self.uniqueDestination(in: filesDir, preferredName: preferredName)
+            // For files <= 16 MB, read & atomically write to avoid Cocoa error 257 on external FileProviders.
+            // For larger files, copyItem streams on disk without spiking iOS Jetsam memory.
+            if rawSize <= maxInMemoryCopyBytes, let data = try? Data(contentsOf: readableURL, options: .mappedIfSafe) {
+                try data.write(to: dest, options: .atomic)
+                let inlineText = Self.extractInlinePreview(at: dest, byteCount: data.count)
+                return AttachedWorkspaceFile(relativePath: targetName, fileName: targetName, byteCount: data.count, inlineText: inlineText)
+            }
+
+            do {
+                try FileManager.default.copyItem(at: readableURL, to: dest)
+            } catch {
+                // Chunked stream copy fallback for large files from restrictive FileProviders
+                guard let input = InputStream(url: readableURL),
+                      let output = OutputStream(url: dest, append: false) else {
+                    throw error
+                }
+                input.open()
+                output.open()
+                defer {
+                    input.close()
+                    output.close()
+                }
+                var buffer = [UInt8](repeating: 0, count: 65_536)
+                while input.hasBytesAvailable {
+                    let readCount = input.read(&buffer, maxLength: buffer.count)
+                    if readCount < 0 { throw input.streamError ?? error }
+                    if readCount == 0 { break }
+                    var written = 0
+                    while written < readCount {
+                        let w = buffer.withUnsafeBytes { ptr -> Int in
+                            guard let base = ptr.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return -1 }
+                            return output.write(base.advanced(by: written), maxLength: readCount - written)
+                        }
+                        if w <= 0 { throw output.streamError ?? error }
+                        written += w
+                    }
+                }
+            }
+            let copiedAttrs = try? FileManager.default.attributesOfItem(atPath: dest.path)
+            let finalSize = (copiedAttrs?[.size] as? Int) ?? rawSize
+            let inlineText = Self.extractInlinePreview(at: dest, byteCount: finalSize)
+            return AttachedWorkspaceFile(relativePath: targetName, fileName: targetName, byteCount: finalSize, inlineText: inlineText)
+        }
 
         var coordinatorError: NSError?
         var importError: Error?
         var importedFile: AttachedWorkspaceFile?
 
+        // Use default options ([]) so iOS materializes iCloud Drive / third-party FileProvider items before reading.
         let coordinator = NSFileCoordinator()
-        coordinator.coordinate(readingItemAt: sourceURL, options: .withoutChanges, error: &coordinatorError) { coordinatedURL in
+        coordinator.coordinate(readingItemAt: sourceURL, options: [], error: &coordinatorError) { coordinatedURL in
             do {
-                let values = try coordinatedURL.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey, .fileSizeKey])
-                if values.isDirectory == true && values.isPackage != true {
-                    throw IPCFrameError.remoteError(code: -32602, message: "暂不支持直接附加文件夹，请选择文件或压缩包。")
-                }
-                let rawSize = values.fileSize ?? 0
-                if rawSize > maxImportBytes {
-                    throw IPCFrameError.remoteError(code: -32602, message: "单个附件不能超过 25 MB。")
-                }
-
-                let sourceExt = coordinatedURL.pathExtension.lowercased()
-                let isImage = Self.imageExtensions.contains(sourceExt)
-                var preferredName = Self.sanitizeAttachmentFilename(coordinatedURL.lastPathComponent)
-
-                if isImage && rawSize > maxImageDirectBytes {
-                    if let downsampled = MemoryGovernor.downsampleImage(at: coordinatedURL, maxPixelSize: 1568, compressionQuality: 0.82),
-                       downsampled.count <= maxImportBytes {
-                        let stem = (preferredName as NSString).deletingPathExtension
-                        preferredName = "\(stem).jpg"
-                        let (targetName, dest) = Self.uniqueDestination(in: filesDir, preferredName: preferredName)
-                        try downsampled.write(to: dest, options: .atomic)
-                        let inlineText = Self.extractInlinePreview(at: dest, byteCount: downsampled.count)
-                        importedFile = AttachedWorkspaceFile(relativePath: targetName, fileName: targetName, byteCount: downsampled.count, inlineText: inlineText)
-                        return
-                    }
-                }
-
-                let (targetName, dest) = Self.uniqueDestination(in: filesDir, preferredName: preferredName)
-                try FileManager.default.copyItem(at: coordinatedURL, to: dest)
-                let copiedAttrs = try? FileManager.default.attributesOfItem(atPath: dest.path)
-                let finalSize = (copiedAttrs?[.size] as? Int) ?? rawSize
-                if finalSize > maxImportBytes {
-                    try? FileManager.default.removeItem(at: dest)
-                    throw IPCFrameError.remoteError(code: -32602, message: "单个附件不能超过 25 MB。")
-                }
-                let inlineText = Self.extractInlinePreview(at: dest, byteCount: finalSize)
-                importedFile = AttachedWorkspaceFile(relativePath: targetName, fileName: targetName, byteCount: finalSize, inlineText: inlineText)
+                importedFile = try performImport(from: coordinatedURL)
             } catch {
                 importError = error
             }
         }
 
-        if let coordinatorError { throw coordinatorError }
-        if let importError { throw importError }
-        guard let importedFile else {
-            throw IPCFrameError.remoteError(code: -32603, message: "无法读取所选文件，请重试。")
+        if let importedFile { return importedFile }
+        // Fallback: some transient Inbox / FileProvider URLs succeed on direct read even if coordination errored.
+        if let direct = try? performImport(from: sourceURL) {
+            return direct
         }
-        return importedFile
+        if let importError { throw importError }
+        if let coordinatorError { throw coordinatorError }
+        throw IPCFrameError.remoteError(code: -32603, message: "无法读取所选文件，请重试。")
     }
 
     public func importRawDataToWorkspace(_ data: Data, suggestedName: String) throws -> AttachedWorkspaceFile {
-        let maxImportBytes = 25 * 1024 * 1024
-        guard data.count <= maxImportBytes else {
-            throw IPCFrameError.remoteError(code: -32602, message: "单个附件不能超过 25 MB。")
-        }
-        let filesDir = LocalAgentTransport.defaultWorkspace.appendingPathComponent("files", isDirectory: true)
+        let filesDir = workspace.appendingPathComponent("files", isDirectory: true)
         try FileManager.default.createDirectory(at: filesDir, withIntermediateDirectories: true)
-        let preferredName = Self.sanitizeAttachmentFilename(suggestedName, fallbackExt: "jpg")
+        let ext = (suggestedName as NSString).pathExtension
+        let preferredName = Self.sanitizeAttachmentFilename(suggestedName, fallbackExt: ext.isEmpty ? "txt" : ext)
         let (targetName, dest) = Self.uniqueDestination(in: filesDir, preferredName: preferredName)
         try data.write(to: dest, options: .atomic)
         let inlineText = Self.extractInlinePreview(at: dest, byteCount: data.count)

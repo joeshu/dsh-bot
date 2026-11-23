@@ -137,18 +137,38 @@ public struct WorkspaceFilesView: View {
                 }
             }
         }
-        .fileImporter(isPresented: $showImporter, allowedContentTypes: [.item]) { result in
-            switch result {
-            case .success(let url):
-                do {
-                    let imported = try host.importFileToWorkspace(from: url)
-                    status = "已导入：files/\(imported.relativePath)"
-                    reload()
-                } catch { status = "导入失败：\(error.localizedDescription)" }
-            case .failure(let error):
-                status = "导入失败：\(error.localizedDescription)"
-            }
-        }
+        .background(
+            Color.clear
+                .fileImporter(
+                    isPresented: $showImporter,
+                    allowedContentTypes: LocalAgentHost.supportedImportContentTypes,
+                    allowsMultipleSelection: true
+                ) { result in
+                    switch result {
+                    case .success(let urls):
+                        var importedNames: [String] = []
+                        var lastError: String?
+                        for url in urls {
+                            do {
+                                let imported = try host.importFileToWorkspace(from: url)
+                                importedNames.append(imported.relativePath)
+                            } catch {
+                                lastError = error.localizedDescription
+                            }
+                        }
+                        if !importedNames.isEmpty {
+                            status = importedNames.count == 1
+                                ? "已导入：files/\(importedNames[0])"
+                                : "已导入 \(importedNames.count) 个文件到 files/"
+                            reload()
+                        } else if let lastError {
+                            status = "导入失败：\(lastError)"
+                        }
+                    case .failure(let error):
+                        status = "导入失败：\(error.localizedDescription)"
+                    }
+                }
+        )
         .sheet(isPresented: Binding(
             get: { selectedPreview != nil },
             set: { if !$0 { selectedPreview = nil; isEditingPreview = false } }

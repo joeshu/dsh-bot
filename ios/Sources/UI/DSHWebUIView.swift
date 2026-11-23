@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 import WebKit
 #if canImport(UIKit)
 import UIKit
@@ -43,6 +44,8 @@ public struct DSHWebUIView: View {
     @State private var webBackgroundColor: Color?
     @State private var webIsDark: Bool?
     @State private var showAgentBrowser = false
+    @State private var showFileImporter = false
+    @State private var importBanner: String?
     @AppStorage("dsbot.web.viewportMode") private var viewportModeRaw: String = DSHWebViewportMode.responsive.rawValue
     @AppStorage("dsbot.web.textScale") private var textScaleRaw: Int = DSHWebTextScale.standard.rawValue
 
@@ -75,6 +78,12 @@ public struct DSHWebUIView: View {
                 // Dedicated top capsule bar area matching the Web UI theme so the floating
                 // `••• | ✕` capsule never overlaps the Web UI's own top-right toolbar icons.
                 HStack {
+                    if let importBanner {
+                        Text(importBanner)
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
                     Spacer()
                     floatingCapsule
                 }
@@ -100,6 +109,40 @@ public struct DSHWebUIView: View {
         .sheet(isPresented: $showAgentBrowser) {
             AgentBrowserSheet(workspace: host.workspace)
         }
+        .background(
+            Color.clear
+                .fileImporter(
+                    isPresented: $showFileImporter,
+                    allowedContentTypes: LocalAgentHost.supportedImportContentTypes,
+                    allowsMultipleSelection: true
+                ) { result in
+                    switch result {
+                    case .success(let urls):
+                        var count = 0
+                        var lastPath = ""
+                        var lastErr: String?
+                        for url in urls {
+                            do {
+                                let imported = try host.importFileToWorkspace(from: url)
+                                count += 1
+                                lastPath = imported.relativePath
+                            } catch {
+                                lastErr = error.localizedDescription
+                            }
+                        }
+                        if count > 0 {
+                            importBanner = count == 1 ? "已导入 files/\(lastPath)" : "已导入 \(count) 个文件到 files/"
+                            DSHaptics.notify(.success)
+                        } else if let lastErr {
+                            importBanner = "导入失败：\(lastErr)"
+                            DSHaptics.notify(.error)
+                        }
+                    case .failure(let error):
+                        importBanner = "导入失败：\(error.localizedDescription)"
+                        DSHaptics.notify(.error)
+                    }
+                }
+        )
         .task(id: host.runtimeGeneration) {
             await loadWebUIInfo()
         }
@@ -122,6 +165,32 @@ public struct DSHWebUIView: View {
 
         return HStack(spacing: 0) {
             Menu {
+                Section("手机文件与文本导入") {
+                    Button {
+                        showFileImporter = true
+                    } label: {
+                        Label("导入手机文件到工作区 (files/)", systemImage: "square.and.arrow.down")
+                    }
+                    #if canImport(UIKit)
+                    Button {
+                        let text = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                        guard !text.isEmpty else {
+                            importBanner = "剪贴板为空"
+                            return
+                        }
+                        do {
+                            let stamp = Int(Date().timeIntervalSince1970)
+                            let imported = try host.importRawDataToWorkspace(Data(text.utf8), suggestedName: "clipboard_\(stamp).txt")
+                            importBanner = "已保存剪贴板文本：files/\(imported.relativePath)"
+                            DSHaptics.notify(.success)
+                        } catch {
+                            importBanner = "保存失败：\(error.localizedDescription)"
+                        }
+                    } label: {
+                        Label("粘贴剪贴板文本存为文件", systemImage: "doc.on.clipboard")
+                    }
+                    #endif
+                }
                 Picker("布局视口", selection: $viewportModeRaw) {
                     ForEach(DSHWebViewportMode.allCases) { mode in
                         Label(
@@ -336,6 +405,16 @@ private struct LoopbackWebView: UIViewRepresentable {
 
     private static let mobileStyleInjectScript = """
     (function() {
+      // Bypass iOS WKWebView Blob Web Worker cookie/XHR restrictions by routing DSH file uploads
+      // through main-thread fetch() with credentials: 'include' before Cordis boots FileUploadRuntime.
+      if (!window.__DSH_FILE_UPLOAD__) {
+        window.__DSH_FILE_UPLOAD__ = {
+          fetch: function(input, init) {
+            var opts = Object.assign({}, init || {}, { credentials: 'include' });
+            return window.fetch(input, opts);
+          }
+        };
+      }
       if (window.__dsbotMobileStyleInjected) return;
       window.__dsbotMobileStyleInjected = true;
       var style = document.createElement('style');
