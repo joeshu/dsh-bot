@@ -13,6 +13,30 @@ public struct WorkspaceFilesView: View {
         let url: URL
         let name: String
         let byteCount: Int
+        let isDirectory: Bool
+
+        var iconName: String {
+            if isDirectory { return "folder.fill" }
+            let ext = url.pathExtension.lowercased()
+            if ["png", "jpg", "jpeg", "heic", "heif", "webp", "gif", "bmp"].contains(ext) { return "photo.fill" }
+            if ext == "pdf" { return "doc.richtext.fill" }
+            if ["zip", "tar", "gz", "tgz", "rar", "7z"].contains(ext) { return "doc.zipper" }
+            if ["mp4", "mov", "m4v", "avi", "mkv"].contains(ext) { return "film.fill" }
+            if ["mp3", "m4a", "wav", "aac", "flac"].contains(ext) { return "waveform" }
+            if ["swift", "py", "js", "mjs", "ts", "tsx", "jsx", "json", "yml", "yaml", "sh", "html", "css", "sql", "go", "rs", "c", "cpp", "h"].contains(ext) {
+                return "chevron.left.forwardslash.chevron.right"
+            }
+            return "doc.text.fill"
+        }
+
+        var iconColor: Color {
+            if isDirectory { return .orange }
+            let ext = url.pathExtension.lowercased()
+            if ["png", "jpg", "jpeg", "heic", "heif", "webp", "gif"].contains(ext) { return .pink }
+            if ext == "pdf" { return .red }
+            if ["zip", "tar", "gz", "tgz", "rar", "7z"].contains(ext) { return .purple }
+            return DSTheme.brand
+        }
     }
 
     @State private var entries: [FileEntry] = []
@@ -31,7 +55,7 @@ public struct WorkspaceFilesView: View {
     }
 
     private var filesRoot: URL {
-        let dir = LocalAgentTransport.defaultWorkspace.appendingPathComponent("files", isDirectory: true)
+        let dir = host.workspace.appendingPathComponent("files", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
@@ -54,10 +78,10 @@ public struct WorkspaceFilesView: View {
                     DSEmptyStateView(
                         icon: "folder.badge.plus",
                         title: entries.isEmpty ? "工作区暂无文件" : "无匹配文件",
-                        subtitle: entries.isEmpty ? "点击右上角新建文本/代码文件，或从系统文件 App 导入文档与图片。" : "尝试更换搜索关键词。",
-                        actionTitle: entries.isEmpty ? "新建文件" : nil
+                        subtitle: entries.isEmpty ? "点击右上角新建文本/代码文件，粘贴剪贴板文本，或从系统文件 App 导入任意本地文件与目录。" : "尝试更换搜索关键词。",
+                        actionTitle: entries.isEmpty ? "导入本地文件" : nil
                     ) {
-                        showNewFile = true
+                        showImporter = true
                     }
                     .listRowBackground(Color.clear)
                 } else {
@@ -66,11 +90,11 @@ public struct WorkspaceFilesView: View {
                             preview(entry)
                         } label: {
                             HStack(spacing: 12) {
-                                Image(systemName: "doc.text.fill")
-                                    .foregroundStyle(DSTheme.brand)
+                                Image(systemName: entry.iconName)
+                                    .foregroundStyle(entry.iconColor)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(entry.name).font(.subheadline.weight(.medium))
-                                    Text(ByteCountFormatter.string(fromByteCount: Int64(entry.byteCount), countStyle: .file))
+                                    Text(entry.isDirectory ? "目录 · 点击查看内容" : ByteCountFormatter.string(fromByteCount: Int64(entry.byteCount), countStyle: .file))
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
                                 }
@@ -78,6 +102,28 @@ public struct WorkspaceFilesView: View {
                                 Image(systemName: "chevron.right")
                                     .font(.caption2)
                                     .foregroundStyle(.tertiary)
+                            }
+                        }
+                        .contextMenu {
+                            #if canImport(UIKit)
+                            Button {
+                                UIPasteboard.general.string = "files/\(entry.name)"
+                                status = "已复制路径：files/\(entry.name)"
+                                DSHaptics.impact(.light)
+                            } label: {
+                                Label("复制工作区路径", systemImage: "doc.on.doc")
+                            }
+                            #endif
+                            if !entry.isDirectory {
+                                ShareLink(item: entry.url) {
+                                    Label("分享 / 导出文件", systemImage: "square.and.arrow.up")
+                                }
+                            }
+                            Button(role: .destructive) {
+                                try? FileManager.default.removeItem(at: entry.url)
+                                reload()
+                            } label: {
+                                Label("删除", systemImage: "trash")
                             }
                         }
                         .swipeActions(edge: .trailing) {
@@ -98,8 +144,31 @@ public struct WorkspaceFilesView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
+                #if canImport(UIKit)
+                Button {
+                    let text = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    guard !text.isEmpty else {
+                        status = "剪贴板为空。"
+                        return
+                    }
+                    do {
+                        let stamp = Int(Date().timeIntervalSince1970)
+                        let imported = try host.importRawDataToWorkspace(Data(text.utf8), suggestedName: "clipboard_\(stamp).txt")
+                        status = "已保存剪贴板文本：files/\(imported.relativePath)"
+                        DSHaptics.notify(.success)
+                        reload()
+                    } catch {
+                        status = "保存失败：\(error.localizedDescription)"
+                    }
+                } label: {
+                    Image(systemName: "doc.on.clipboard")
+                }
+                .help("粘贴剪贴板文本存为文件")
+                #endif
                 Button { showNewFile = true } label: { Image(systemName: "doc.badge.plus") }
+                    .help("新建文本或代码文件")
                 Button { showImporter = true } label: { Image(systemName: "square.and.arrow.down") }
+                    .help("从手机导入任意文件或目录")
             }
         }
         .sheet(isPresented: $showNewFile) {
@@ -234,31 +303,57 @@ public struct WorkspaceFilesView: View {
         let fm = FileManager.default
         guard let urls = try? fm.contentsOfDirectory(
             at: filesRoot,
-            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey],
+            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey],
             options: [.skipsHiddenFiles]
         ) else {
             entries = []
             return
         }
         entries = urls.compactMap { url in
-            let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
-            guard values?.isSymbolicLink != true, values?.isRegularFile == true else { return nil }
-            return FileEntry(id: url.lastPathComponent, url: url, name: url.lastPathComponent, byteCount: values?.fileSize ?? 0)
-        }.sorted { $0.name < $1.name }
+            let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey])
+            guard values?.isSymbolicLink != true else { return nil }
+            let isDir = values?.isDirectory == true
+            guard isDir || values?.isRegularFile == true else { return nil }
+            return FileEntry(id: url.lastPathComponent, url: url, name: url.lastPathComponent, byteCount: values?.fileSize ?? 0, isDirectory: isDir)
+        }.sorted { lhs, rhs in
+            if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }
+            return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
     }
 
     private func preview(_ entry: FileEntry) {
-        guard let data = try? Data(contentsOf: entry.url) else {
+        if entry.isDirectory {
+            let children = (try? FileManager.default.contentsOfDirectory(atPath: entry.url.path))?.sorted() ?? []
+            let body = children.isEmpty
+                ? "空目录（files/\(entry.name)）"
+                : "目录内容（共 \(children.count) 项）：\n\n" + children.prefix(200).map { "• \($0)" }.joined(separator: "\n")
+            selectedPreview = (entry.url, entry.name, body, false)
+            isEditingPreview = false
+            return
+        }
+        // O(1) bounded 64 KB read via FileHandle so large imported files never spike iOS Jetsam memory.
+        let maxPreviewBytes = 65_536
+        guard let handle = try? FileHandle(forReadingFrom: entry.url) else {
             status = "无法读取文件。"
             return
         }
-        let slice = data.prefix(65_536)
-        if let text = String(data: slice, encoding: .utf8) {
-            let truncated = data.count > 65_536
+        defer { try? handle.close() }
+        let slice = (try? handle.read(upToCount: maxPreviewBytes)) ?? Data()
+        let totalBytes = entry.byteCount > 0 ? entry.byteCount : slice.count
+        let gb18030 = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue)))
+        let decoded: String? = {
+            if !slice.contains(0), let utf8 = String(data: slice, encoding: .utf8) { return utf8 }
+            if !slice.contains(0), let gb = String(data: slice, encoding: gb18030) { return gb }
+            if let utf16 = String(data: slice, encoding: .utf16) { return utf16 }
+            return nil
+        }()
+        if let text = decoded {
+            let truncated = totalBytes > maxPreviewBytes
             selectedPreview = (entry.url, entry.name, truncated ? text + "\n…(已截断，仅只读预览)" : text, !truncated)
             isEditingPreview = false
         } else {
-            selectedPreview = (entry.url, entry.name, "二进制文件（\(data.count) 字节），可使用右上角分享导出。", false)
+            let sizeStr = ByteCountFormatter.string(fromByteCount: Int64(totalBytes), countStyle: .file)
+            selectedPreview = (entry.url, entry.name, "二进制文件（\(sizeStr)），可使用右上角分享导出，或让智能体通过 python_exec 分析处理。", false)
             isEditingPreview = false
         }
     }

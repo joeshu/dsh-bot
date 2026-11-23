@@ -1282,13 +1282,15 @@ public final class LocalAgentHost: ObservableObject {
             }
             await refreshPluginState(on: rpc)
             await synchronizeRedteamHost(on: rpc)
-            MemoryGovernor.shared.onPressureTrim = { _ in
-                DSMarkdownText.clearRenderCache()
+            MemoryGovernor.shared.onPressureTrim = { [weak self] _ in
+                Task { @MainActor in
+                    self?.trimMemoryCachesForPressure()
+                }
             }
             MemoryGovernor.shared.onCriticalPressure = { [weak self] in
                 guard let self else { return }
                 Task { @MainActor in
-                    DSMarkdownText.clearRenderCache()
+                    self.trimMemoryCachesForPressure()
                     if self.isStreaming {
                         self.lastStreamError = "系统内存紧张，已安全暂停当前生成以保护进度。"
                         await self.abortActiveTurn()
@@ -1303,6 +1305,23 @@ public final class LocalAgentHost: ObservableObject {
             if let channel { await channel.close() }
             self.channel = nil
             state = .failed(error.localizedDescription)
+        }
+    }
+
+    /// Reclaims SwiftUI render caches, inactive session transcripts, and excess tool/audit records under iOS memory pressure.
+    public func trimMemoryCachesForPressure() {
+        DSMarkdownText.clearRenderCache()
+        let keepIds = Set([visibleChatSessionId, streamingSessionId].compactMap { $0 })
+        for sessionId in Array(messagesBySession.keys) where !keepIds.contains(sessionId) {
+            messagesBySession.removeValue(forKey: sessionId)
+            loadedHistoryIDs.remove(sessionId)
+            historyCursors.removeValue(forKey: sessionId)
+        }
+        if dshToolActivities.count > 120 {
+            dshToolActivities.removeFirst(dshToolActivities.count - 120)
+        }
+        if dshApprovalAudits.count > 100 {
+            dshApprovalAudits.removeFirst(dshApprovalAudits.count - 100)
         }
     }
 

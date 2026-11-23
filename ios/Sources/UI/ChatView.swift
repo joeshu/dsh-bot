@@ -427,6 +427,27 @@ public struct ChatView: View {
                             } label: {
                                 Label("工作区文件 (files/)", systemImage: "folder.fill")
                             }
+                            #if canImport(UIKit)
+                            Button {
+                                let text = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                                guard !text.isEmpty else {
+                                    actionStatus = "剪贴板为空。"
+                                    return
+                                }
+                                do {
+                                    let stamp = Int(Date().timeIntervalSince1970)
+                                    let imported = try host.importRawDataToWorkspace(Data(text.utf8), suggestedName: "clipboard_\(stamp).txt")
+                                    attachedFiles.append(imported)
+                                    actionStatus = "已附加剪贴板文本：files/\(imported.relativePath)"
+                                    DSHaptics.notify(.success)
+                                } catch {
+                                    actionStatus = "附加剪贴板失败：\(error.localizedDescription)"
+                                }
+                            } label: {
+                                Label("粘贴剪贴板文本为附件", systemImage: "doc.on.clipboard")
+                            }
+                            .disabled(host.isStreaming)
+                            #endif
                             if !liveBot.isPrivate {
                                 Button {
                                     activeSheet = .agentBrowser

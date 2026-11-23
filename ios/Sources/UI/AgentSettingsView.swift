@@ -427,8 +427,8 @@ public struct RuntimeDiagnosticsAndBackupView: View {
                 LabeledContent("Web 工作台", value: "Loopback 认证端口（支持 dsh-client-ui-*）")
                 Button {
                     memoryGovernor.refreshSnapshot()
-                    DSMarkdownText.clearRenderCache()
-                    status = "已刷新内存遥测并回收 Markdown 渲染缓存。"
+                    host.trimMemoryCachesForPressure()
+                    status = "已刷新内存遥测，并回收渲染缓存与非活跃会话内存。"
                 } label: {
                     Label("刷新遥测并清理渲染缓存", systemImage: "arrow.clockwise")
                 }
