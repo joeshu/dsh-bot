@@ -177,7 +177,6 @@ public struct UnifiedConversationsTabView: View {
                     await host.refreshSessionSummaries()
                 }
                 .navigationTitle("对话")
-                .searchable(text: $searchText, prompt: "搜索智能体、职责、模型或 Web 会话")
                 .toolbar { toolbarContent }
                 .sheet(item: $activeSheet) { sheet in
                     switch sheet {
@@ -274,12 +273,35 @@ public struct UnifiedConversationsTabView: View {
             }
 
             Section {
-                Picker("筛选对话", selection: $filter) {
-                    ForEach(ConversationFilter.allCases) { item in
-                        Text(item.rawValue).tag(item)
+                VStack(spacing: 10) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "magnifyingglass")
+                            .foregroundStyle(.secondary)
+                        TextField("搜索智能体、职责、模型或 Web 会话", text: $searchText)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        if !searchText.isEmpty {
+                            Button {
+                                searchText = ""
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
                     }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(DSTheme.surfaceSecondary)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                    Picker("筛选对话", selection: $filter) {
+                        ForEach(ConversationFilter.allCases) { item in
+                            Text(item.rawValue).tag(item)
+                        }
+                    }
+                    .pickerStyle(.segmented)
                 }
-                .pickerStyle(.segmented)
             }
             .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
             .listRowBackground(Color.clear)
