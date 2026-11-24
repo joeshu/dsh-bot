@@ -8,23 +8,13 @@ public typealias SessionsTabView = UnifiedConversationsTabView
 public typealias BotRosterTabView = UnifiedConversationsTabView
 
 private enum ConversationFilter: String, CaseIterable, Identifiable {
-    case recent = "最近活跃"
-    case teams = "全部团队"
-    case groups = "协作群聊"
-    case privateSpace = "私密空间"
-    case webSessions = "Web 会话"
+    case recent = "最近"
+    case teams = "团队"
+    case groups = "群聊"
+    case privateSpace = "私密"
+    case webSessions = "Web"
 
     var id: String { rawValue }
-
-    var icon: String {
-        switch self {
-        case .recent: return "clock.fill"
-        case .teams: return "person.2.fill"
-        case .groups: return "person.3.fill"
-        case .privateSpace: return "lock.shield.fill"
-        case .webSessions: return "globe"
-        }
-    }
 }
 
 private struct ConversationNavTarget: Identifiable {
@@ -327,49 +317,15 @@ public struct UnifiedConversationsTabView: View {
     @ViewBuilder
     private var filterChipsSection: some View {
         Section {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(ConversationFilter.allCases) { item in
-                        filterChipButton(item)
-                    }
+            Picker("筛选对话", selection: $filter) {
+                ForEach(ConversationFilter.allCases) { item in
+                    Text(item.rawValue).tag(item)
                 }
-                .padding(.vertical, 2)
             }
+            .pickerStyle(.segmented)
         }
-        .listRowInsets(EdgeInsets(top: 2, leading: 16, bottom: 2, trailing: 16))
+        .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
         .listRowBackground(Color.clear)
-    }
-
-    private func filterChipButton(_ item: ConversationFilter) -> some View {
-        let selected = filter == item
-        let webCount = item == .webSessions ? host.webStandaloneSessions.count : 0
-        return Button {
-            withAnimation(.easeInOut(duration: 0.16)) {
-                filter = item
-            }
-            DSHaptics.impact(.light)
-        } label: {
-            HStack(spacing: 5) {
-                Image(systemName: item.icon)
-                    .font(.caption2.weight(.semibold))
-                Text(item.rawValue)
-                    .font(.caption.weight(selected ? .semibold : .medium))
-                if webCount > 0 {
-                    Text("\(webCount)")
-                        .font(.caption2.monospacedDigit().weight(.bold))
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(selected ? Color.white.opacity(0.22) : Color.secondary.opacity(0.16))
-                        .clipShape(Capsule())
-                }
-            }
-            .padding(.horizontal, 11)
-            .padding(.vertical, 6)
-            .background(selected ? DSTheme.brand : DSTheme.surfaceSecondary)
-            .foregroundStyle(selected ? .white : .primary)
-            .clipShape(Capsule())
-        }
-        .buttonStyle(.plain)
     }
 
     @ToolbarContentBuilder

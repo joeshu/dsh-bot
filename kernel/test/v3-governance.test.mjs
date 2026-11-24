@@ -578,7 +578,7 @@ test('v3 master-refactor (v2.5.0): 3-Tab unified IA, zero .fileImporter, chats.j
   assert.match(standaloneSrc, /host\.resolveAddress\(sid\)/, 'GlobalBotPulseBar must resolve child-thread addresses')
   assert.match(standaloneSrc, /AgentBrowserSheet\(workspace: host\.workspace\)/, 'ToolsHubTabView must provide direct AgentBrowserSheet entry')
   assert.match(unifiedSrc, /public struct UnifiedConversationsTabView/, 'UnifiedConversationsTabView must exist')
-  assert.match(unifiedSrc, /case webSessions = "Web 会话"/, 'UnifiedConversationsTabView must surface standalone Web sessions')
+  assert.match(unifiedSrc, /case webSessions = "Web"/, 'UnifiedConversationsTabView must surface standalone Web sessions')
 
   // 2. Settings deduplication + Editable ProviderProfile
   assert.match(settingsSrc, /private struct EditProviderProfileSheet/, 'ModelServiceSettingsView must allow editing ProviderProfiles')
