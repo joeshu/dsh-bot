@@ -219,7 +219,6 @@ public struct ToolsHubTabView: View {
     @ObservedObject var host: LocalAgentHost
     @ObservedObject private var memoryGovernor = MemoryGovernor.shared
     @ObservedObject private var budgetGovernor = CostBudgetGovernor.shared
-    @ObservedObject private var browserController = AgentBrowserController.shared
     @State private var showAgentBrowser = false
 
     public init(host: LocalAgentHost) {
@@ -275,15 +274,9 @@ public struct ToolsHubTabView: View {
                                     Text("内置受控浏览器")
                                         .font(.headline)
                                         .foregroundStyle(.primary)
-                                    if browserController.needsHumanTakeover {
-                                        DSStatusBadge("需人工接管", color: DSTheme.warning)
-                                    } else {
-                                        DSStatusBadge("browser_*", color: .cyan)
-                                    }
+                                    DSStatusBadge("browser_*", color: .cyan)
                                 }
-                                Text(browserController.currentURL.isEmpty
-                                     ? "独立 WKWebView 沙盒，供智能体检索、填表、截图 OCR 与人工接管登录"
-                                     : browserController.currentURL)
+                                Text("独立 WKWebView 沙盒，供智能体检索、填表、截图 OCR 与人工接管登录")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                     .lineLimit(2)

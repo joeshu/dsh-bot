@@ -47,8 +47,11 @@ public struct UnifiedConversationsTabView: View {
     @State private var profileBot: BotProfile?
     @State private var threadsBot: BotProfile?
     @State private var pendingDeleteBot: BotProfile?
+    @State private var showDeleteConfirm = false
     @State private var navigatedTarget: ConversationNavTarget?
+    @State private var showNavigatedChat = false
     @State private var webSessionToOpen: String?
+    @State private var showWebSession = false
     @State private var importBanner: String?
 
     public init(host: LocalAgentHost) {
@@ -185,10 +188,7 @@ public struct UnifiedConversationsTabView: View {
                     await host.refreshSessionSummaries()
                 }
                 .navigationTitle("对话")
-                .navigationDestination(isPresented: Binding(
-                    get: { navigatedTarget != nil },
-                    set: { if !$0 { navigatedTarget = nil } }
-                )) {
+                .navigationDestination(isPresented: $showNavigatedChat) {
                     if let target = navigatedTarget {
                         ChatView(bot: target.bot, host: host, initialAddress: target.address)
                     }
@@ -213,26 +213,21 @@ public struct UnifiedConversationsTabView: View {
                         onSelectThread: { chosenThread in
                             threadsBot = nil
                             navigatedTarget = ConversationNavTarget(bot: target, address: chosenThread.address)
+                            showNavigatedChat = true
                         },
                         onDeleteSession: { sessionId in
                             Task { await host.clearSession(sessionId) }
                         }
                     )
                 }
-                .fullScreenCover(isPresented: Binding(
-                    get: { webSessionToOpen != nil },
-                    set: { if !$0 { webSessionToOpen = nil } }
-                )) {
+                .fullScreenCover(isPresented: $showWebSession) {
                     if let sid = webSessionToOpen {
                         DSHWebUIView(host: host, initialSessionId: sid)
                     }
                 }
                 .confirmationDialog(
                     "确定删除「\(pendingDeleteBot?.name ?? "")」及其全部聊天记录？",
-                    isPresented: Binding(
-                        get: { pendingDeleteBot != nil },
-                        set: { if !$0 { pendingDeleteBot = nil } }
-                    ),
+                    isPresented: $showDeleteConfirm,
                     titleVisibility: .visible
                 ) {
                     Button("删除", role: .destructive) {
@@ -394,6 +389,7 @@ public struct UnifiedConversationsTabView: View {
                     Button {
                         let thread = threadStore.createThread(for: mainBot.id)
                         navigatedTarget = ConversationNavTarget(bot: mainBot, address: thread.address)
+                        showNavigatedChat = true
                         DSHaptics.impact(.light)
                     } label: {
                         Label("在「\(mainBot.name)」开启新话题", systemImage: "plus.bubble")
@@ -462,6 +458,7 @@ public struct UnifiedConversationsTabView: View {
                 ForEach(filteredWebSessions) { session in
                     Button {
                         webSessionToOpen = session.sessionId
+                        showWebSession = true
                     } label: {
                         HStack(spacing: 12) {
                             ZStack {
@@ -604,6 +601,7 @@ public struct UnifiedConversationsTabView: View {
             Button {
                 let thread = threadStore.createThread(for: bot.id)
                 navigatedTarget = ConversationNavTarget(bot: bot, address: thread.address)
+                showNavigatedChat = true
                 DSHaptics.impact(.light)
             } label: {
                 Label("新话题", systemImage: "plus.bubble")
@@ -614,6 +612,7 @@ public struct UnifiedConversationsTabView: View {
             if !bot.isMain {
                 Button("删除", role: .destructive) {
                     pendingDeleteBot = bot
+                    showDeleteConfirm = true
                 }
             }
             Button("编辑") {
@@ -641,6 +640,7 @@ public struct UnifiedConversationsTabView: View {
             Button {
                 let thread = threadStore.createThread(for: bot.id)
                 navigatedTarget = ConversationNavTarget(bot: bot, address: thread.address)
+                showNavigatedChat = true
             } label: {
                 Label("新建子话题", systemImage: "plus.bubble")
             }
@@ -653,6 +653,7 @@ public struct UnifiedConversationsTabView: View {
                 Divider()
                 Button(role: .destructive) {
                     pendingDeleteBot = bot
+                    showDeleteConfirm = true
                 } label: {
                     Label("删除智能体", systemImage: "trash")
                 }
