@@ -39,7 +39,6 @@ public struct UnifiedConversationsTabView: View {
     @State private var pendingDeleteBot: BotProfile?
     @State private var showDeleteConfirm = false
     @State private var navigatedTarget: ConversationNavTarget?
-    @State private var showNavigatedChat = false
     @State private var webSessionToOpen: String?
     @State private var showWebSession = false
     @State private var importBanner: String?
@@ -173,19 +172,24 @@ public struct UnifiedConversationsTabView: View {
         NavigationStack {
             conversationList
                 .listStyle(.insetGrouped)
-                .searchable(text: $searchText, prompt: "搜索智能体、职责、模型或 Web 会话")
                 .refreshable {
                     await host.refreshSessionSummaries()
                 }
                 .navigationTitle("对话")
-                .navigationDestination(isPresented: $showNavigatedChat) {
-                    if let target = navigatedTarget {
-                        ChatView(bot: target.bot, host: host, initialAddress: target.address)
-                    }
-                }
+                .searchable(text: $searchText, prompt: "搜索智能体、职责、模型或 Web 会话")
                 .toolbar { toolbarContent }
                 .sheet(isPresented: $showInbox) {
                     SessionInboxView(host: host)
+                }
+                .sheet(item: $navigatedTarget) { target in
+                    NavigationStack {
+                        ChatView(bot: target.bot, host: host, initialAddress: target.address)
+                            .toolbar {
+                                ToolbarItem(placement: .topBarLeading) {
+                                    Button("完成") { navigatedTarget = nil }
+                                }
+                            }
+                    }
                 }
                 .sheet(item: $createKind) { kind in
                     CreateBotSheet(host: host, initialKind: kind)
@@ -203,7 +207,6 @@ public struct UnifiedConversationsTabView: View {
                         onSelectThread: { chosenThread in
                             threadsBot = nil
                             navigatedTarget = ConversationNavTarget(bot: target, address: chosenThread.address)
-                            showNavigatedChat = true
                         },
                         onDeleteSession: { sessionId in
                             Task { await host.clearSession(sessionId) }
@@ -330,7 +333,7 @@ public struct UnifiedConversationsTabView: View {
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
-        ToolbarItem(placement: .topBarTrailing) {
+        ToolbarItemGroup(placement: .topBarTrailing) {
             Button {
                 showInbox = true
             } label: {
@@ -338,14 +341,12 @@ public struct UnifiedConversationsTabView: View {
                     .foregroundStyle(pendingCount > 0 ? DSTheme.warning : .primary)
             }
             .accessibilityLabel("待处理收件箱")
-        }
-        ToolbarItem(placement: .topBarTrailing) {
+
             Menu {
                 if let mainBot = host.bots.first(where: \.isMain) ?? host.bots.first {
                     Button {
                         let thread = threadStore.createThread(for: mainBot.id)
                         navigatedTarget = ConversationNavTarget(bot: mainBot, address: thread.address)
-                        showNavigatedChat = true
                         DSHaptics.impact(.light)
                     } label: {
                         Label("在「\(mainBot.name)」开启新话题", systemImage: "plus.bubble")
@@ -557,7 +558,6 @@ public struct UnifiedConversationsTabView: View {
             Button {
                 let thread = threadStore.createThread(for: bot.id)
                 navigatedTarget = ConversationNavTarget(bot: bot, address: thread.address)
-                showNavigatedChat = true
                 DSHaptics.impact(.light)
             } label: {
                 Label("新话题", systemImage: "plus.bubble")
@@ -596,7 +596,6 @@ public struct UnifiedConversationsTabView: View {
             Button {
                 let thread = threadStore.createThread(for: bot.id)
                 navigatedTarget = ConversationNavTarget(bot: bot, address: thread.address)
-                showNavigatedChat = true
             } label: {
                 Label("新建子话题", systemImage: "plus.bubble")
             }
