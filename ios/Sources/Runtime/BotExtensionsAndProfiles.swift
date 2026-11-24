@@ -101,11 +101,14 @@ public final class BotThreadStore: ObservableObject {
     }
 
     public func selectThread(_ thread: BotThread) {
+        guard activeThreadIdByBot[thread.botId] != thread.id else { return }
         activeThreadIdByBot[thread.botId] = thread.id
     }
 
     public func selectAddress(_ address: SessionAddress) {
-        activeThreadIdByBot[address.botID] = address.threadID ?? "default"
+        let target = address.threadID ?? "default"
+        guard activeThreadIdByBot[address.botID] != target else { return }
+        activeThreadIdByBot[address.botID] = target
     }
 
     public func threadTitle(for address: SessionAddress) -> String? {

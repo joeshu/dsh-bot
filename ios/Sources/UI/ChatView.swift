@@ -125,10 +125,12 @@ public struct ChatView: View {
         self.host = host
         self.searchResultMessageID = targetMessageID
         self.initialAddress = initialAddress
+        let initialSessionId: String
         if let initialAddress, initialAddress.botID == bot.id {
-            BotThreadStore.shared.selectAddress(initialAddress)
+            initialSessionId = initialAddress.canonicalSessionId
+        } else {
+            initialSessionId = BotThreadStore.shared.activeSessionId(for: bot.id)
         }
-        let initialSessionId = BotThreadStore.shared.activeSessionId(for: bot.id)
         _pendingSearchMessageID = State(initialValue: targetMessageID)
         _selectedModel = State(initialValue: host.modelSelection(bot.model))
         _input = State(initialValue: bot.isPrivate ? "" : host.draftInput(for: initialSessionId))
@@ -260,6 +262,9 @@ public struct ChatView: View {
         }
         .onChange(of: host.apiBaseURL) { _ in selectedModel = host.modelSelection(liveBot.model) }
         .onAppear {
+            if let initialAddress, initialAddress.botID == bot.id {
+                threadStore.selectAddress(initialAddress)
+            }
             host.visibleChatSessionId = activeSessionId
         }
         .onDisappear {

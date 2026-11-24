@@ -485,7 +485,7 @@ public struct UnifiedConversationsTabView: View {
         let activeTitle = threadStore.threadTitle(for: activeAddr)
 
         NavigationLink {
-            ChatView(bot: bot, host: host, initialAddress: activeAddr)
+            ChatView(bot: bot, host: host)
         } label: {
             HStack(spacing: 12) {
                 ZStack(alignment: .bottomTrailing) {
