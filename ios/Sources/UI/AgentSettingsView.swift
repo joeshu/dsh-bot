@@ -271,8 +271,7 @@ public struct ModelServiceSettingsView: View {
                         id: existing.id,
                         name: existing.name,
                         apiBaseURL: existing.apiBaseURL,
-                        defaultModel: modelId,
-                        createdAt: existing.createdAt
+                        defaultModel: modelId
                     ))
                 }
                 status = "已将「\(modelId)」设为默认模型并同步应用到全部智能体。"
