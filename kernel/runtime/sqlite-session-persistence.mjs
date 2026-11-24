@@ -135,30 +135,30 @@ class SQLiteSessionHandle {
 
   async drainLive() {
     if (this.drainPromise) {
-      await this.drainPromise.catch(() => {})
+      await this.drainPromise
       if (this.liveError) throw this.liveError
       if (this.pendingLive.length) return this.drainLive()
       return
     }
     this.draining = true
-    const current = (async () => {
-      try {
-        while (this.pendingLive.length) {
-          const batch = this.pendingLive.slice()
-          await this.append(batch)
-          this.pendingLive.splice(0, batch.length)
-          this.liveError = undefined
-        }
-      } catch (error) {
-        this.liveError = error
-        throw error
-      } finally {
-        this.draining = false
-        if (this.drainPromise === current) this.drainPromise = null
+    let resolveDone
+    const waiter = new Promise((resolve) => { resolveDone = resolve })
+    this.drainPromise = waiter
+    try {
+      while (this.pendingLive.length) {
+        const batch = this.pendingLive.slice()
+        await this.append(batch)
+        this.pendingLive.splice(0, batch.length)
+        this.liveError = undefined
       }
-    })()
-    this.drainPromise = current
-    return await current
+    } catch (error) {
+      this.liveError = error
+      throw error
+    } finally {
+      this.draining = false
+      if (this.drainPromise === waiter) this.drainPromise = null
+      resolveDone()
+    }
   }
 
   async flush(options = {}) {
