@@ -17,10 +17,22 @@ private enum ConversationFilter: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-private struct ConversationNavTarget: Identifiable {
-    let bot: BotProfile
-    let address: SessionAddress
-    var id: String { address.canonicalSessionId }
+private enum ConversationsActiveSheet: Identifiable {
+    case create(CreateBotInitialKind)
+    case edit(BotProfile)
+    case profile(BotProfile)
+    case threads(BotProfile)
+    case threadChat(BotProfile, SessionAddress)
+
+    var id: String {
+        switch self {
+        case .create(let kind): return "create:\(kind.id)"
+        case .edit(let bot): return "edit:\(bot.id)"
+        case .profile(let bot): return "profile:\(bot.id)"
+        case .threads(let bot): return "threads:\(bot.id)"
+        case .threadChat(_, let addr): return "chat:\(addr.canonicalSessionId)"
+        }
+    }
 }
 
 /// Unified Tab 1 ("对话"): merges recent sessions, team roster, multi-thread management,
@@ -31,16 +43,9 @@ public struct UnifiedConversationsTabView: View {
 
     @State private var filter: ConversationFilter = .recent
     @State private var searchText = ""
-    @State private var showInbox = false
-    @State private var createKind: CreateBotInitialKind?
-    @State private var editingBot: BotProfile?
-    @State private var profileBot: BotProfile?
-    @State private var threadsBot: BotProfile?
+    @State private var activeSheet: ConversationsActiveSheet?
     @State private var pendingDeleteBot: BotProfile?
     @State private var showDeleteConfirm = false
-    @State private var navigatedTarget: ConversationNavTarget?
-    @State private var webSessionToOpen: String?
-    @State private var showWebSession = false
     @State private var importBanner: String?
 
     public init(host: LocalAgentHost) {
@@ -137,10 +142,6 @@ public struct UnifiedConversationsTabView: View {
         }
     }
 
-    private var showRuntimeBanner: Bool {
-        host.state != .ready || host.isDSHRecoveryMode || host.workspaceError != nil
-    }
-
     private func previewText(for bot: BotProfile) -> String {
         if bot.isPrivate { return "私密会话 · 需要 Face ID / 密码解锁" }
         let activeAddr = threadStore.activeAddress(for: bot.id)
@@ -178,44 +179,35 @@ public struct UnifiedConversationsTabView: View {
                 .navigationTitle("对话")
                 .searchable(text: $searchText, prompt: "搜索智能体、职责、模型或 Web 会话")
                 .toolbar { toolbarContent }
-                .sheet(isPresented: $showInbox) {
-                    SessionInboxView(host: host)
-                }
-                .sheet(item: $navigatedTarget) { target in
-                    NavigationStack {
-                        ChatView(bot: target.bot, host: host, initialAddress: target.address)
-                            .toolbar {
-                                ToolbarItem(placement: .topBarLeading) {
-                                    Button("完成") { navigatedTarget = nil }
-                                }
+                .sheet(item: $activeSheet) { sheet in
+                    switch sheet {
+                    case .create(let kind):
+                        CreateBotSheet(host: host, initialKind: kind)
+                    case .edit(let target):
+                        EditBotSheet(bot: target, host: host)
+                    case .profile(let target):
+                        BotProfileSheet(bot: target, host: host)
+                    case .threads(let target):
+                        BotThreadsSheet(
+                            bot: target,
+                            threadStore: threadStore,
+                            onSelectThread: { chosenThread in
+                                threadStore.selectThread(chosenThread)
+                                activeSheet = .threadChat(target, chosenThread.address)
+                            },
+                            onDeleteSession: { sessionId in
+                                Task { await host.clearSession(sessionId) }
                             }
-                    }
-                }
-                .sheet(item: $createKind) { kind in
-                    CreateBotSheet(host: host, initialKind: kind)
-                }
-                .sheet(item: $editingBot) { target in
-                    EditBotSheet(bot: target, host: host)
-                }
-                .sheet(item: $profileBot) { target in
-                    BotProfileSheet(bot: target, host: host)
-                }
-                .sheet(item: $threadsBot) { target in
-                    BotThreadsSheet(
-                        bot: target,
-                        threadStore: threadStore,
-                        onSelectThread: { chosenThread in
-                            threadsBot = nil
-                            navigatedTarget = ConversationNavTarget(bot: target, address: chosenThread.address)
-                        },
-                        onDeleteSession: { sessionId in
-                            Task { await host.clearSession(sessionId) }
+                        )
+                    case .threadChat(let bot, let address):
+                        NavigationStack {
+                            ChatView(bot: bot, host: host, initialAddress: address)
+                                .toolbar {
+                                    ToolbarItem(placement: .topBarLeading) {
+                                        Button("完成") { activeSheet = nil }
+                                    }
+                                }
                         }
-                    )
-                }
-                .fullScreenCover(isPresented: $showWebSession) {
-                    if let sid = webSessionToOpen {
-                        DSHWebUIView(host: host, initialSessionId: sid)
                     }
                 }
                 .confirmationDialog(
@@ -237,13 +229,11 @@ public struct UnifiedConversationsTabView: View {
     @ViewBuilder
     private var conversationList: some View {
         List {
-            if showRuntimeBanner {
-                Section {
-                    DSRuntimeStatusBanner(host: host)
-                }
-                .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
-                .listRowBackground(Color.clear)
+            Section {
+                DSRuntimeStatusBanner(host: host)
             }
+            .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
+            .listRowBackground(Color.clear)
 
             if let importBanner {
                 Section {
@@ -262,8 +252,8 @@ public struct UnifiedConversationsTabView: View {
 
             if pendingCount > 0 {
                 Section {
-                    Button {
-                        showInbox = true
+                    NavigationLink {
+                        SessionInboxView(host: host)
                     } label: {
                         HStack(spacing: 12) {
                             Image(systemName: "bell.badge.fill")
@@ -277,17 +267,22 @@ public struct UnifiedConversationsTabView: View {
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
-                            Spacer()
-                            Image(systemName: "chevron.right")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.tertiary)
                         }
                         .padding(.vertical, 4)
                     }
                 }
             }
 
-            filterChipsSection
+            Section {
+                Picker("筛选对话", selection: $filter) {
+                    ForEach(ConversationFilter.allCases) { item in
+                        Text(item.rawValue).tag(item)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+            .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
+            .listRowBackground(Color.clear)
 
             if filter == .webSessions {
                 webSessionsSection
@@ -304,7 +299,7 @@ public struct UnifiedConversationsTabView: View {
                     }
                 }
             } else {
-                Section(header: Text(sectionHeaderTitle)) {
+                Section(sectionHeaderTitle) {
                     if filteredBots.isEmpty {
                         emptyStateSection
                     } else {
@@ -317,25 +312,11 @@ public struct UnifiedConversationsTabView: View {
         }
     }
 
-    @ViewBuilder
-    private var filterChipsSection: some View {
-        Section {
-            Picker("筛选对话", selection: $filter) {
-                ForEach(ConversationFilter.allCases) { item in
-                    Text(item.rawValue).tag(item)
-                }
-            }
-            .pickerStyle(.segmented)
-        }
-        .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
-        .listRowBackground(Color.clear)
-    }
-
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItemGroup(placement: .topBarTrailing) {
-            Button {
-                showInbox = true
+            NavigationLink {
+                SessionInboxView(host: host)
             } label: {
                 Image(systemName: pendingCount > 0 ? "tray.full.fill" : "tray")
                     .foregroundStyle(pendingCount > 0 ? DSTheme.warning : .primary)
@@ -346,7 +327,7 @@ public struct UnifiedConversationsTabView: View {
                 if let mainBot = host.bots.first(where: \.isMain) ?? host.bots.first {
                     Button {
                         let thread = threadStore.createThread(for: mainBot.id)
-                        navigatedTarget = ConversationNavTarget(bot: mainBot, address: thread.address)
+                        activeSheet = .threadChat(mainBot, thread.address)
                         DSHaptics.impact(.light)
                     } label: {
                         Label("在「\(mainBot.name)」开启新话题", systemImage: "plus.bubble")
@@ -359,17 +340,17 @@ public struct UnifiedConversationsTabView: View {
                 }
                 Divider()
                 Button {
-                    createKind = .standard
+                    activeSheet = .create(.standard)
                 } label: {
                     Label("新建智能体", systemImage: "person.badge.plus")
                 }
                 Button {
-                    createKind = .group
+                    activeSheet = .create(.group)
                 } label: {
                     Label("新建协作群聊", systemImage: "person.3.fill")
                 }
                 Button {
-                    createKind = .privateSpace
+                    activeSheet = .create(.privateSpace)
                 } label: {
                     Label("新建私密会话 (Face ID)", systemImage: "lock.shield.fill")
                 }
@@ -413,9 +394,8 @@ public struct UnifiedConversationsTabView: View {
                 .listRowBackground(Color.clear)
             } else {
                 ForEach(filteredWebSessions) { session in
-                    Button {
-                        webSessionToOpen = session.sessionId
-                        showWebSession = true
+                    NavigationLink {
+                        DSHWebUIView(host: host, initialSessionId: session.sessionId)
                     } label: {
                         HStack(spacing: 12) {
                             ZStack {
@@ -444,7 +424,6 @@ public struct UnifiedConversationsTabView: View {
                         }
                         .padding(.vertical, 3)
                     }
-                    .buttonStyle(.plain)
                 }
             }
         } header: {
@@ -530,7 +509,7 @@ public struct UnifiedConversationsTabView: View {
 
                         if threads.count > 1 || activeTitle != nil {
                             Button {
-                                threadsBot = bot
+                                activeSheet = .threads(bot)
                             } label: {
                                 HStack(spacing: 3) {
                                     Image(systemName: "text.bubble")
@@ -557,7 +536,7 @@ public struct UnifiedConversationsTabView: View {
         .swipeActions(edge: .leading, allowsFullSwipe: true) {
             Button {
                 let thread = threadStore.createThread(for: bot.id)
-                navigatedTarget = ConversationNavTarget(bot: bot, address: thread.address)
+                activeSheet = .threadChat(bot, thread.address)
                 DSHaptics.impact(.light)
             } label: {
                 Label("新话题", systemImage: "plus.bubble")
@@ -572,35 +551,35 @@ public struct UnifiedConversationsTabView: View {
                 }
             }
             Button("编辑") {
-                editingBot = bot
+                activeSheet = .edit(bot)
             }
             .tint(DSTheme.brand)
             Button("话题") {
-                threadsBot = bot
+                activeSheet = .threads(bot)
             }
             .tint(.indigo)
         }
         .contextMenu {
             if !bot.isPrivate {
                 Button {
-                    profileBot = bot
+                    activeSheet = .profile(bot)
                 } label: {
                     Label("查看档案与服务商", systemImage: "person.text.rectangle")
                 }
             }
             Button {
-                threadsBot = bot
+                activeSheet = .threads(bot)
             } label: {
                 Label("管理子话题（\(threads.count)）", systemImage: "text.bubble")
             }
             Button {
                 let thread = threadStore.createThread(for: bot.id)
-                navigatedTarget = ConversationNavTarget(bot: bot, address: thread.address)
+                activeSheet = .threadChat(bot, thread.address)
             } label: {
                 Label("新建子话题", systemImage: "plus.bubble")
             }
             Button {
-                editingBot = bot
+                activeSheet = .edit(bot)
             } label: {
                 Label("编辑智能体", systemImage: "slider.horizontal.3")
             }
