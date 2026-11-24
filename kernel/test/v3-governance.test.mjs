@@ -610,4 +610,17 @@ test('v3 master-refactor (v2.5.0): 3-Tab unified IA, zero .fileImporter, chats.j
   }
 })
 
-
+test('v3 sandbox: every dsh-agent-instructions preset in cordis.patch.yml pins projectRootMarkers to .dsbot-ios-workspace-root', () => {
+  const patchSrc = readFileSync(join(runtimeDir, 'ios-profile-package/cordis.patch.yml'), 'utf8')
+  const blocks = patchSrc.split(/- id: agent-instructions\b/).slice(1)
+  assert.ok(blocks.length >= 5, `expected at least 5 agent-instructions preset blocks, got ${blocks.length}`)
+  for (let i = 0; i < blocks.length; i++) {
+    const nextEntryIdx = blocks[i].indexOf('\n          - id:')
+    const block = nextEntryIdx >= 0 ? blocks[i].slice(0, nextEntryIdx) : blocks[i]
+    assert.match(
+      block,
+      /projectRootMarkers:\s*\n\s*-\s*\.dsbot-ios-workspace-root\b/,
+      `agent-instructions block #${i + 1} in cordis.patch.yml must declare projectRootMarkers: [.dsbot-ios-workspace-root] to prevent walking above $DSH_HOME/files`
+    )
+  }
+})

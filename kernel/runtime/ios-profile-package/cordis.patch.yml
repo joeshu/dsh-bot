@@ -430,6 +430,8 @@
             name: '@deepseek-ai/dsh-agent-instructions'
             config:
               maxBytes: 65536
+              projectRootMarkers:
+                - .dsbot-ios-workspace-root
           - id: time-context
             name: '@deepseek-ai/dsh-time-context'
           - id: tool-fs
@@ -482,6 +484,8 @@
             name: '@deepseek-ai/dsh-agent-instructions'
             config:
               maxBytes: 65536
+              projectRootMarkers:
+                - .dsbot-ios-workspace-root
           - id: time-context
             name: '@deepseek-ai/dsh-time-context'
           - id: tool-fs
