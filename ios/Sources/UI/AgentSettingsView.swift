@@ -244,6 +244,56 @@ public struct ModelServiceSettingsView: View {
         self.host = host
     }
 
+    private var displayedEndpointModels: [String] {
+        let ordered = host.orderedAvailableModels.filter { host.models.contains($0) || !host.usesOfficialModels }
+        let q = modelSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+        return q.isEmpty ? ordered : ordered.filter { $0.localizedCaseInsensitiveContains(q) }
+    }
+
+    @ViewBuilder
+    private func modelRow(modelId: String, isSelected: Bool) -> some View {
+        let isFav = host.isFavoriteModel(modelId)
+        HStack(spacing: 10) {
+            Button {
+                host.toggleFavoriteModel(modelId)
+                DSHaptics.impact(.light)
+            } label: {
+                Image(systemName: isFav ? "star.fill" : "star")
+                    .foregroundStyle(isFav ? .orange : .secondary.opacity(0.6))
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                host.applyModelToAllBots(modelId)
+                let trimmed = host.apiBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let existing = providerStore.profiles.first(where: { $0.apiBaseURL == trimmed }) {
+                    providerStore.upsert(ProviderProfile(
+                        id: existing.id,
+                        name: existing.name,
+                        apiBaseURL: existing.apiBaseURL,
+                        defaultModel: modelId,
+                        createdAt: existing.createdAt
+                    ))
+                }
+                status = "已将「\(modelId)」设为默认模型并同步应用到全部智能体。"
+                DSHaptics.notify(.success)
+            } label: {
+                HStack {
+                    Text(modelId)
+                        .font(.subheadline.monospaced())
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                    Spacer()
+                    if isSelected {
+                        DSStatusBadge("当前默认", color: DSTheme.brand, icon: "checkmark.circle.fill")
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
     public var body: some View {
         Form {
             Section {
@@ -350,51 +400,8 @@ public struct ModelServiceSettingsView: View {
                         }
                     }
                     let currentMainModel = host.bots.first(where: \.isMain)?.model ?? host.bots.first?.model ?? ""
-                    let ordered = host.orderedAvailableModels.filter { host.models.contains($0) || !host.usesOfficialModels }
-                    let q = modelSearch.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let displayed = q.isEmpty ? ordered : ordered.filter { $0.localizedCaseInsensitiveContains(q) }
-                    ForEach(displayed, id: \.self) { modelId in
-                        let isSelected = currentMainModel == modelId
-                        let isFav = host.isFavoriteModel(modelId)
-                        HStack(spacing: 10) {
-                            Button {
-                                host.toggleFavoriteModel(modelId)
-                                DSHaptics.impact(.light)
-                            } label: {
-                                Image(systemName: isFav ? "star.fill" : "star")
-                                    .foregroundStyle(isFav ? .orange : .secondary.opacity(0.6))
-                            }
-                            .buttonStyle(.plain)
-
-                            Button {
-                                host.applyModelToAllBots(modelId)
-                                let trimmed = host.apiBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-                                if let existing = providerStore.profiles.first(where: { $0.apiBaseURL == trimmed }) {
-                                    providerStore.upsert(ProviderProfile(
-                                        id: existing.id,
-                                        name: existing.name,
-                                        apiBaseURL: existing.apiBaseURL,
-                                        defaultModel: modelId,
-                                        createdAt: existing.createdAt
-                                    ))
-                                }
-                                status = "已将「\(modelId)」设为默认模型并同步应用到全部智能体。"
-                                DSHaptics.notify(.success)
-                            } label: {
-                                HStack {
-                                    Text(modelId)
-                                        .font(.subheadline.monospaced())
-                                        .foregroundStyle(.primary)
-                                        .lineLimit(2)
-                                    Spacer()
-                                    if isSelected {
-                                        DSStatusBadge("当前默认", color: DSTheme.brand, icon: "checkmark.circle.fill")
-                                    }
-                                }
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                        }
+                    ForEach(displayedEndpointModels, id: \.self) { (modelId: String) in
+                        modelRow(modelId: modelId, isSelected: currentMainModel == modelId)
                     }
                 } header: {
                     Text("当前端点已拉取模型（\(host.models.count) 个 · 点星标置顶 / 点名称设为默认）")
