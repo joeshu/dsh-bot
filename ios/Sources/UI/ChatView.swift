@@ -1943,6 +1943,13 @@ public struct ChatView: View {
                         }
                         let planPrefix = isPlanMode ? "[计划模式：请先给出清晰的分步执行计划，待我确认后再执行任何修改操作]\n\n" : ""
                         let attachmentPrefix = attachedFiles.map { $0.promptPrefix() }.joined()
+                        let imageExts: Set<String> = ["jpg", "jpeg", "png", "webp", "gif"]
+                        let imagePaths = attachedFiles
+                            .map(\.relativePath)
+                            .filter { path in
+                                let ext = URL(fileURLWithPath: path).pathExtension.lowercased()
+                                return imageExts.contains(ext)
+                            }
                         let prefix = planPrefix + refPrefix + attachmentPrefix
                         let body = text.isEmpty ? "请查看我刚附加的工作区文件。" : text
                         let payload = prefix + body
@@ -1950,7 +1957,7 @@ public struct ChatView: View {
                         input = ""
                         attachedFiles.removeAll()
                         referencedBot = nil
-                        Task { await host.sendMessage(sessionId: activeSessionId, text: payload, model: selectedModel) }
+                        Task { await host.sendMessage(sessionId: activeSessionId, text: payload, model: selectedModel, imagePaths: imagePaths) }
                     } label: {
                         Image(systemName: "arrow.up.circle.fill")
                             .font(.title2)

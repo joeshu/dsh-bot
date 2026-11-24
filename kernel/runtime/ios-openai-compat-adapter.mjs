@@ -370,7 +370,8 @@ export function installCustomEndpointCompatFetch({ getProviderBaseURL, isOfficia
 
   const shouldTryOpenAiFallback = (status, bodyText) => {
     if (status === 404 || status === 405 || status === 501) return true
-    if ((status === 400 || status === 422) && /not found|not implemented|unknown path|invalid url|unsupported|unrecognized|messages/i.test(bodyText)) {
+    if ((status === 400 || status === 422 || status === 502)
+      && /not found|not implemented|unknown path|invalid url|unsupported|unrecognized|messages/i.test(bodyText)) {
       return true
     }
     return false

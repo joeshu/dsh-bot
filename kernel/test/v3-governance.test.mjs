@@ -545,3 +545,20 @@ test('v3 custom-endpoint: ensureAnthropicStreamComplete synthesizes missing cont
   assert.match(text, /"type":"message_stop"/)
 })
 
+test('v3 full-audit (v2.4.0): multi-thread session keys, writable configEditor sandbox override, per-Bot endpoint binding, and multimodal image blocks', () => {
+  const repoRoot = join(__dirname, '..', '..')
+  const entrySrc = readFileSync(join(runtimeDir, 'dsh-ios-entry.mjs'), 'utf8')
+  const hostSrc = readFileSync(join(repoRoot, 'ios/Sources/Runtime/LocalAgentHost.swift'), 'utf8')
+  const modelsSrc = readFileSync(join(repoRoot, 'ios/Sources/Runtime/AgentModels.swift'), 'utf8')
+  const patchSrc = readFileSync(join(runtimeDir, 'ios-profile-package/cordis.patch.yml'), 'utf8')
+
+  assert.match(entrySrc, /function isValidSessionKey\(value\)/, 'dsh-ios-entry.mjs must support botId:threadId multi-thread session keys')
+  assert.match(entrySrc, /function isPrivateBotOrThread\(sessionKey\)/, 'dsh-ios-entry.mjs must enforce root-bot privacy on child threads')
+  assert.match(entrySrc, /function inferCustomModelCapabilities\(id\)/, 'dsh-ios-entry.mjs must infer custom model vision/maxTokens capabilities')
+  assert.match(entrySrc, /web-config-overrides\.json/, 'dsh-ios-entry.mjs must redirect Web UI configEditor edits to writable sandbox JSON')
+  assert.match(entrySrc, /params\.imagePaths/, 'dsh-ios-entry.mjs must attach native multimodal image blocks in startTurn')
+  assert.match(patchSrc, /id:\s*agent-preset-redteam/, 'cordis.patch.yml must declare agent-preset-redteam')
+  assert.match(modelsSrc, /public var providerProfileId: String\?/, 'BotProfile must support optional per-Bot providerProfileId')
+  assert.match(hostSrc, /public func effectiveApiBaseURL\(for bot: BotProfile\?\)/, 'LocalAgentHost must resolve per-Bot endpoint URL')
+})
+

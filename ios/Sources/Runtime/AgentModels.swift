@@ -332,13 +332,14 @@ public struct BotProfile: Identifiable, Codable, Equatable {
     public var redteamToolsEnabled: Bool
     public var redteamWriteEnabled: Bool
     public var redteamSensitiveDataEnabled: Bool
+    public var providerProfileId: String?
 
     enum CodingKeys: String, CodingKey {
         case id, name, roleLabel, model, systemPrompt, isMain, isPrivate, isGroup, section, permissionMode, agentPreset, reasoningEffort, disabledTools
-        case redteamToolsEnabled, redteamWriteEnabled, redteamSensitiveDataEnabled
+        case redteamToolsEnabled, redteamWriteEnabled, redteamSensitiveDataEnabled, providerProfileId
     }
 
-    public init(id: String, name: String, roleLabel: String, model: String = "deepseek-flash", systemPrompt: String = "", isMain: Bool = false, isPrivate: Bool = false, isGroup: Bool = false, section: String = "默认团队", permissionMode: String = "ask", agentPreset: String = "standard", reasoningEffort: String = "medium", disabledTools: [String] = [], redteamToolsEnabled: Bool = false, redteamWriteEnabled: Bool = false, redteamSensitiveDataEnabled: Bool = false) {
+    public init(id: String, name: String, roleLabel: String, model: String = "deepseek-flash", systemPrompt: String = "", isMain: Bool = false, isPrivate: Bool = false, isGroup: Bool = false, section: String = "默认团队", permissionMode: String = "ask", agentPreset: String = "standard", reasoningEffort: String = "medium", disabledTools: [String] = [], redteamToolsEnabled: Bool = false, redteamWriteEnabled: Bool = false, redteamSensitiveDataEnabled: Bool = false, providerProfileId: String? = nil) {
         self.id = id
         self.name = name
         self.roleLabel = roleLabel
@@ -355,6 +356,7 @@ public struct BotProfile: Identifiable, Codable, Equatable {
         self.redteamToolsEnabled = !isPrivate && redteamToolsEnabled
         self.redteamWriteEnabled = !isPrivate && redteamToolsEnabled && redteamWriteEnabled
         self.redteamSensitiveDataEnabled = !isPrivate && redteamToolsEnabled && redteamSensitiveDataEnabled
+        self.providerProfileId = providerProfileId
     }
 
     public init(from decoder: Decoder) throws {
@@ -379,6 +381,7 @@ public struct BotProfile: Identifiable, Codable, Equatable {
         redteamToolsEnabled = !isPrivate && storedRedteamToolsEnabled
         redteamWriteEnabled = !isPrivate && redteamToolsEnabled && storedRedteamWriteEnabled
         redteamSensitiveDataEnabled = !isPrivate && redteamToolsEnabled && storedRedteamSensitiveDataEnabled
+        providerProfileId = try c.decodeIfPresent(String.self, forKey: .providerProfileId)
     }
 
     public var reasoningEffortLabel: String {

@@ -675,7 +675,30 @@ public final class LocalAgentHost: ObservableObject {
         return bot
     }
 
-    public func sendMessage(sessionId: String, text: String, model: String) async {
+    public func effectiveApiBaseURL(for bot: BotProfile?) -> String {
+        if let profileId = bot?.providerProfileId,
+           !profileId.isEmpty,
+           let profile = ProviderProfileStore.shared.profiles.first(where: { $0.id == profileId }),
+           !profile.apiBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return profile.apiBaseURL
+        }
+        return apiBaseURL
+    }
+
+    public func setBotProviderProfile(sessionId: String, profileId: String?) {
+        let rootId = resolveAddress(sessionId)?.botID ?? sessionId
+        guard let idx = bots.firstIndex(where: { $0.id == rootId }) else { return }
+        let normalized = profileId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        bots[idx].providerProfileId = (normalized?.isEmpty == true) ? nil : normalized
+        if let profileId = bots[idx].providerProfileId,
+           let profile = ProviderProfileStore.shared.profiles.first(where: { $0.id == profileId }),
+           !profile.defaultModel.isEmpty {
+            bots[idx].model = profile.defaultModel
+        }
+        persistWorkspace()
+    }
+
+    public func sendMessage(sessionId: String, text: String, model: String, imagePaths: [String] = []) async {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !isStreaming, state == .ready, let channel else { return }
         lastErrorSessionId = sessionId
@@ -748,6 +771,7 @@ public final class LocalAgentHost: ObservableObject {
         }
 
         let bot = targetBot
+        let effectiveURL = effectiveApiBaseURL(for: bot)
         let legacyHistory = (legacyMessagesBySession[targetSessionId] ?? []).suffix(12).map { message in
             ["role": message.role, "content": String(message.content.prefix(12_000))]
         }
@@ -762,7 +786,7 @@ public final class LocalAgentHost: ObservableObject {
         }
         do {
             _ = try await channel.request("chat.send", params: [
-                "sessionId": targetSessionId, "turnId": turnId, "model": model, "apiBaseURL": apiBaseURL,
+                "sessionId": targetSessionId, "turnId": turnId, "model": model, "apiBaseURL": effectiveURL,
                 "systemPrompt": bot?.systemPrompt ?? "", "isGroup": bot?.isGroup ?? false,
                 "agentPreset": bot?.agentPreset ?? "standard", "permissionMode": bot?.permissionMode ?? "ask",
                 "reasoningEffort": bot?.reasoningEffort ?? "medium",
@@ -772,6 +796,7 @@ public final class LocalAgentHost: ObservableObject {
                 "redteamMode": bot?.redteamToolsEnabled ?? false,
                 "redteamWriteEnabled": bot?.redteamWriteEnabled ?? false,
                 "redteamSensitiveDataEnabled": bot?.redteamSensitiveDataEnabled ?? false,
+                "imagePaths": imagePaths,
                 "text": trimmed, "legacyHistory": legacyHistory
             ])
         } catch {
@@ -1556,12 +1581,21 @@ public final class LocalAgentHost: ObservableObject {
         return HostRPC(channel: channel, workspace: workspaceCapabilities)
     }
 
-    /// Only the Keychain key for the address currently selected in Settings is released to Node.
+    /// Only the Keychain key for the global endpoint or an explicitly saved ProviderProfile is released to Node.
     private func configuredCredentialProvider(_ params: [String: Any]) throws -> ModelProvider {
         let configured = try ModelProvider(apiBaseURL)
-        if let requested = params["apiBaseURL"] as? String,
-           try ModelProvider(requested).baseURL != configured.baseURL {
-            throw IPCFrameError.remoteError(code: -32003, message: "凭据只提供给当前设置的服务地址。")
+        if let requestedRaw = params["apiBaseURL"] as? String {
+            let requested = try ModelProvider(requestedRaw)
+            if requested.baseURL == configured.baseURL {
+                return configured
+            }
+            let allowedProfileURLs = ProviderProfileStore.shared.profiles.compactMap {
+                try? ModelProvider($0.apiBaseURL).baseURL
+            }
+            if allowedProfileURLs.contains(requested.baseURL) {
+                return requested
+            }
+            throw IPCFrameError.remoteError(code: -32003, message: "凭据只提供给当前设置或已保存档案的服务地址。")
         }
         return configured
     }

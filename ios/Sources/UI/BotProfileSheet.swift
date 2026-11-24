@@ -248,6 +248,17 @@ public struct BotProfileSheet: View {
                 }
                 .disabled(host.isStreaming)
 
+                Picker("专属模型服务商", selection: Binding(
+                    get: { liveBot.providerProfileId ?? "" },
+                    set: { host.setBotProviderProfile(sessionId: liveBot.id, profileId: $0.isEmpty ? nil : $0) }
+                )) {
+                    Text("跟随全局设置").tag("")
+                    ForEach(ProviderProfileStore.shared.profiles) { profile in
+                        Text(profile.name).tag(profile.id)
+                    }
+                }
+                .disabled(host.isStreaming)
+
                 ModelSelectionView(
                     host: host,
                     model: Binding(

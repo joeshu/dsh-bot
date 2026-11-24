@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
-import { readdir } from 'node:fs/promises'
+import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { parentPort, workerData } from 'node:worker_threads'
 import net from 'node:net'
@@ -479,6 +479,30 @@ async function dshUsageSummary({ dayWindows } = {}) {
   }
 }
 
+function isValidSessionKey(value) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 161) return false
+  const parts = value.split(':')
+  if (parts.length === 1) return /^[A-Za-z0-9_-]{1,80}$/.test(parts[0])
+  if (parts.length === 2) return /^[A-Za-z0-9_-]{1,80}$/.test(parts[0]) && /^[A-Za-z0-9_-]{1,80}$/.test(parts[1])
+  return false
+}
+function rootBotIdOf(value) {
+  return typeof value === 'string' ? value.split(':')[0] : ''
+}
+function isPrivateBotOrThread(sessionKey) {
+  return runtime.privateBotIds.has(rootBotIdOf(sessionKey))
+}
+function inferCustomModelCapabilities(id) {
+  const lower = String(id || '').toLowerCase()
+  const isVision = /(?:vl|vision|4o|claude|gemini|glm-4v|glm-5|deepseek-v4|gpt-5|qwen2\.5-vl|llava|pixtral)/i.test(lower)
+  const isFlagship = /(?:v4|pro|reasoner|r1|thinking|claude|gpt-5|gpt-4|glm-5|o1|o3|qwq)/i.test(lower)
+  return {
+    id,
+    name: id,
+    maxTokens: isFlagship ? 16384 : 8192,
+    inputModalities: isVision ? ['text', 'image'] : ['text'],
+  }
+}
 function dshSessionId(botId) { return `ios:${botId}` }
 function botIdFromSession(id) { return id.startsWith('ios:') ? id.slice(4) : id }
 
@@ -638,7 +662,7 @@ function redteamToolDenial(policy, name) {
   const flags = redteamToolFlags(name)
   if (!flags.known) return `iOS 未审核红队工具 ${name}，默认拒绝。`
   if (!policy.enabled || !runtime.redteamToolsEnabled) return '红队工具宿主或本 Bot 授权已关闭。'
-  if (policy.botId && runtime.privateBotIds.has(policy.botId)) return '私密会话禁止调用 dsh-purge-safe 工具。'
+  if (policy.botId && isPrivateBotOrThread(policy.botId)) return '私密会话禁止调用 dsh-purge-safe 工具。'
   if (flags.sensitive && policy.permissionMode === 'readOnly') {
     return '只读保护模式禁止调用红队敏感工具。'
   }
@@ -1221,6 +1245,48 @@ async function boot() {
   if (!safeMode && redteamStatus().installed) {
     await ensureRedteamPresetRegistered()
   }
+  // Redirect Web UI Settings configEditor writes away from the read-only iOS .app bundle
+  // into $DSH_HOME/web-config-overrides.json with fast in-memory fiber.update() hot-apply.
+  try {
+    const configEditorSvc = ctx?.get?.('configEditor')
+    const overridesPath = join(WORKSPACE, 'web-config-overrides.json')
+    const loadOverrides = () => {
+      try {
+        if (!existsSync(overridesPath)) return {}
+        const parsed = JSON.parse(readFileSync(overridesPath, 'utf8'))
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+      } catch { return {} }
+    }
+    const savedOverrides = loadOverrides()
+    for (const [rowId, cfg] of Object.entries(savedOverrides)) {
+      if (rowId === 'llm-deepseek' || !cfg || typeof cfg !== 'object') continue
+      const fiber = mountedRows.get(rowId)
+      if (fiber && fiber.state === 2) {
+        try { await fiber.update(cfg) } catch {}
+      }
+    }
+    if (configEditorSvc && typeof configEditorSvc.edit === 'function' && !configEditorSvc.__dsbotWritableSandboxPatched) {
+      configEditorSvc.edit = async function iosSandboxConfigEdit(entry, change) {
+        const fiber = entry?.fiber
+        if (!fiber || fiber.state !== 2) throw new Error('Configuration plugin is no longer active')
+        const current = structuredClone(entry.options?.config ?? {})
+        const next = change(current, current)
+        fiber.resolveConfig(next)
+        await fiber.update(next)
+        const entryId = entry?.options?.id
+        if (typeof entryId === 'string' && entryId) {
+          const all = loadOverrides()
+          all[entryId] = next
+          try {
+            writeFileSync(overridesPath, JSON.stringify(all, null, 2), 'utf8')
+          } catch {}
+        }
+      }
+      configEditorSvc.__dsbotWritableSandboxPatched = true
+    }
+  } catch (error) {
+    ctx?.logger?.warn?.(`Writable configEditor sandbox override skipped: ${String(error)}`)
+  }
   try {
     const wsFiles = ctx?.get?.('workspaceFiles')
     if (wsFiles && typeof wsFiles.search === 'function') {
@@ -1339,7 +1405,7 @@ rpc.handle('python.execute', async ({ botId, turnId, code }) => {
   const normalizedBotId = String(botId ?? '')
   const normalizedTurnId = String(turnId ?? '')
   const normalizedCode = typeof code === 'string' ? code : ''
-  if (!/^[A-Za-z0-9_-]{1,80}$/.test(normalizedBotId)
+  if (!isValidSessionKey(normalizedBotId)
       || !/^[A-Za-z0-9_-]{1,128}$/.test(normalizedTurnId)) {
     throw new TypeError('Invalid local Python session or turn.')
   }
@@ -1376,36 +1442,31 @@ async function startTurn(params, preparation) {
   const text = typeof params.text === 'string' ? params.text.trim() : ''
   const model = typeof params.model === 'string' ? params.model.trim() : ''
   const turnId = String(params.turnId ?? '')
-  if (!/^[A-Za-z0-9_-]{1,80}$/.test(botId) || !turnId || !model || !text) throw new TypeError('Invalid chat request')
+  if (!isValidSessionKey(botId) || !turnId || !model || !text) throw new TypeError('Invalid chat request')
   if (Buffer.byteLength(text, 'utf8') > 262_144) throw new RangeError('Message exceeds 256 KB')
   if (runtime.activeTurns.size) throw new Error('Another DSH turn is already running')
   const nextApiBaseURL = typeof params.apiBaseURL === 'string' ? params.apiBaseURL : runtime.apiBaseURL
   const nextProviderBaseURL = routeForApiBase(nextApiBaseURL)
+  runtime.apiBaseURL = nextApiBaseURL
   if (nextProviderBaseURL !== runtime.providerBaseURL) {
     for (const [id, active] of runtime.activeAgents) await drainAndDispose(id, active)
     // Cordis validates the plain config and owns the volatile references.
     // Fiber.update applies this through Cordis' normal update lifecycle.
     const nextConfig = { baseURL: nextProviderBaseURL }
     if (!isOfficialDeepSeekBase(nextApiBaseURL) && Array.isArray(runtime.customCatalogModels) && runtime.customCatalogModels.length > 0) {
-      nextConfig.models = runtime.customCatalogModels.map((id) => ({
-        id,
-        name: id,
-        maxTokens: 8192,
-        inputModalities: ['text', 'image'],
-      }))
+      nextConfig.models = runtime.customCatalogModels.map((id) => inferCustomModelCapabilities(id))
     }
     await runtime.providerFiber.update(nextConfig)
     runtime.providerBaseURL = nextProviderBaseURL
     process.env.DS_BOT_PROVIDER_BASE_URL = nextProviderBaseURL
   }
-  runtime.apiBaseURL = nextApiBaseURL
   const dshModel = model === 'deepseek-flash-thinking' ? 'deepseek-flash' : model
   const reasoningEnabled = model === 'deepseek-flash-thinking' || model === 'deepseek-v4-pro'
   const officialDeepSeek = isOfficialDeepSeekBase(runtime.apiBaseURL)
   const toolsEnabled = officialDeepSeek || params.customTools === true
   const webSearchEnabled = officialDeepSeek && params.webSearchEnabled === true
   const permissionMode = ['ask', 'autoReview', 'readOnly'].includes(params.permissionMode) ? params.permissionMode : 'ask'
-  const redteamMode = params.redteamMode === true && runtime.redteamToolsEnabled && !runtime.privateBotIds.has(botId)
+  const redteamMode = params.redteamMode === true && runtime.redteamToolsEnabled && !isPrivateBotOrThread(botId)
   const redteamWriteEnabled = redteamMode && params.redteamWriteEnabled === true
   const redteamSensitiveDataEnabled = redteamMode && params.redteamSensitiveDataEnabled === true
   const agentPreset = typeof params.agentPreset === 'string' ? params.agentPreset : ctx.agentPresets.defaultId
@@ -1503,7 +1564,35 @@ async function startTurn(params, preparation) {
     rpc.notify('chat.done', { sessionId: botId, turnId, status: 'aborted' })
     return { turnId, status: 'accepted', engine: 'node+dsh' }
   }
-  const userMessage = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })
+  const contentBlocks = [{ type: 'text', text }]
+  if (Array.isArray(params.imagePaths) && params.imagePaths.length > 0 && WORKSPACE_FILES) {
+    const attachmentsSvc = ctx?.get?.('attachments')
+    const filesRoot = resolve(WORKSPACE_FILES)
+    const mimeByExt = {
+      '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+      '.webp': 'image/webp', '.gif': 'image/gif',
+    }
+    for (const rel of params.imagePaths.slice(0, 6)) {
+      if (typeof rel !== 'string' || !rel.trim()) continue
+      const cleanRel = rel.replace(/^files\//, '').replace(/^\/+/, '')
+      const fullPath = resolve(filesRoot, cleanRel)
+      if (!fullPath.startsWith(filesRoot + '/')) continue
+      const extMatch = fullPath.toLowerCase().match(/\.(jpg|jpeg|png|webp|gif)$/)
+      if (!extMatch) continue
+      const mediaType = mimeByExt[`.${extMatch[1]}`]
+      try {
+        const bytes = await readFile(fullPath)
+        if (!bytes || bytes.byteLength === 0 || bytes.byteLength > 4 * 1024 * 1024) continue
+        if (attachmentsSvc && typeof attachmentsSvc.storeImage === 'function') {
+          const stored = await attachmentsSvc.storeImage(bytes, mediaType)
+          if (stored?.ref) {
+            contentBlocks.push({ type: 'image', attachment: stored.ref })
+          }
+        }
+      } catch {}
+    }
+  }
+  const userMessage = createUserMessage({ content: contentBlocks, source: { kind: 'user' } })
   const turn = { turnId, botId, isGroup: params.isGroup === true, webSearchEnabled, toolsEnabled, permissionMode, done: false, startedAt: Date.now() }
   runtime.activeTurns.set(id, turn)
   runtime.redteamTurnPolicies.set(id, {
@@ -1864,7 +1953,7 @@ rpc.handle('session.history', async ({ sessionId }) => {
 
 // Sequence cursors refer to raw events, including events with no visible row.
 function nativeHistorySessionId(sessionId) {
-  if (typeof sessionId !== 'string' || !/^[A-Za-z0-9_-]{1,80}$/.test(sessionId)) {
+  if (!isValidSessionKey(sessionId)) {
     throw new TypeError('Invalid native session identifier')
   }
   return dshSessionId(sessionId)
@@ -1879,7 +1968,7 @@ rpc.handle('session.search', async ({ query, botIds, cursor } = {}) => {
   }
   const allowed = new Set(botIds.map((botId) => {
     const id = nativeHistorySessionId(botId)
-    return runtime.privateBotIds.has(botId) ? undefined : id
+    return isPrivateBotOrThread(botId) ? undefined : id
   }).filter(Boolean))
   if (!allowed.size) return { results: [] }
   const provider = ctx.get('sessionQuery')
@@ -1897,7 +1986,7 @@ rpc.handle('session.search', async ({ query, botIds, cursor } = {}) => {
   const results = []
   for (const { header, bestMatch } of page.items) {
     const botId = botIdFromSession(header.id)
-    if (!allowed.has(header.id) || runtime.privateBotIds.has(botId) || header.parentSession != null) continue
+    if (!allowed.has(header.id) || isPrivateBotOrThread(botId) || header.parentSession != null) continue
     results.push({
       botId, sequence: bestMatch.seq, timestamp: bestMatch.time, snippet: bestMatch.snippet,
     })
@@ -1907,7 +1996,7 @@ rpc.handle('session.search', async ({ query, botIds, cursor } = {}) => {
 
 rpc.handle('session.search.context', async ({ sessionId, sequence } = {}) => {
   const id = nativeHistorySessionId(sessionId)
-  if (!Number.isSafeInteger(sequence) || sequence < 0 || runtime.privateBotIds.has(sessionId)) {
+  if (!Number.isSafeInteger(sequence) || sequence < 0 || isPrivateBotOrThread(sessionId)) {
     throw new Error('Search result is unavailable')
   }
   await runtime.persistence.flushSession(id)
@@ -1921,7 +2010,7 @@ rpc.handle('session.search.context', async ({ sessionId, sequence } = {}) => {
   try {
     const { events } = await handle.read(start, end - start)
     const messages = eventMessages(events, sessionId)
-    if (!messages.some((message) => message.sequence === sequence) || runtime.privateBotIds.has(sessionId)) {
+    if (!messages.some((message) => message.sequence === sequence) || isPrivateBotOrThread(sessionId)) {
       throw new Error('Search result is unavailable')
     }
     return { messages: messages.map(historyMessagePreview) }
@@ -2074,7 +2163,7 @@ rpc.handle('session.history.markdown', async ({ sessionId } = {}) => {
 })
 
 rpc.handle('session.history.page', async ({ sessionId, beforeSeq } = {}) => {
-  if (typeof sessionId !== 'string' || !/^[A-Za-z0-9_-]{1,80}$/.test(sessionId)
+  if (!isValidSessionKey(sessionId)
     || (beforeSeq !== undefined && (!Number.isSafeInteger(beforeSeq) || beforeSeq < 0))) {
     throw new TypeError('Invalid session history cursor')
   }
@@ -2598,12 +2687,7 @@ async function syncProviderModelCatalog({ apiBaseURL, models, defaultModel } = {
 
   const nextConfig = { baseURL: nextProviderBaseURL }
   if (!official && effectiveIds.length > 0) {
-    nextConfig.models = effectiveIds.map((id) => ({
-      id,
-      name: id,
-      maxTokens: 8192,
-      inputModalities: ['text', 'image'],
-    }))
+    nextConfig.models = effectiveIds.map((id) => inferCustomModelCapabilities(id))
   }
   if (nextProviderBaseURL !== runtime.providerBaseURL) {
     for (const [id, active] of runtime.activeAgents) await drainAndDispose(id, active)
