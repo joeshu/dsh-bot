@@ -2618,32 +2618,55 @@ async function syncProviderModelCatalog({ apiBaseURL, models, defaultModel } = {
 
   // Guarantee ctx.llm.listModels('deepseek-official') always includes synced custom models
   // so Web UI selectModel() never rejects a visible custom model with session/model-unavailable.
-  if (ctx?.llm && typeof ctx.llm.listModels === 'function' && !ctx.llm.__dsbotCustomListModelsPatched) {
-    const origListModels = ctx.llm.listModels.bind(ctx.llm)
-    ctx.llm.listModels = async function patchedListModels(providerId) {
-      const listed = await origListModels(providerId)
-      if (providerId === 'deepseek-official'
-        && !isOfficialDeepSeekBase(runtime.apiBaseURL)
-        && Array.isArray(runtime.customCatalogModels)
-        && runtime.customCatalogModels.length > 0) {
-        const listedIds = new Set(listed.map((m) => m.id))
-        const merged = [...listed]
-        for (const id of runtime.customCatalogModels) {
-          if (!listedIds.has(id)) {
-            merged.push({
-              provider: 'deepseek-official',
-              id,
-              name: id,
-              inputModalities: ['text', 'image'],
-            })
+  try {
+    const llmSvc = ctx?.get?.('llm') ?? ctx?.llm
+    if (llmSvc && typeof llmSvc.listModels === 'function' && !llmSvc.__dsbotCustomListModelsPatched) {
+      const origListModels = llmSvc.listModels.bind(llmSvc)
+      llmSvc.listModels = async function patchedListModels(providerId) {
+        const listed = await origListModels(providerId)
+        if (providerId === 'deepseek-official'
+          && !isOfficialDeepSeekBase(runtime.apiBaseURL)
+          && Array.isArray(runtime.customCatalogModels)
+          && runtime.customCatalogModels.length > 0) {
+          const listedIds = new Set(listed.map((m) => m.id))
+          const merged = [...listed]
+          for (const id of runtime.customCatalogModels) {
+            if (!listedIds.has(id)) {
+              merged.push({
+                provider: 'deepseek-official',
+                id,
+                name: id,
+                inputModalities: ['text', 'image'],
+              })
+            }
           }
+          return merged
         }
-        return merged
+        return listed
       }
-      return listed
+      llmSvc.__dsbotCustomListModelsPatched = true
     }
-    ctx.llm.__dsbotCustomListModelsPatched = true
-  }
+  } catch {}
+
+  // Prevent agentDefaultModel.saveSelection() from invoking configEditor against the read-only
+  // iOS .app bundle or triggering a Cordis reload mid-request (which causes WebKit "Load failed").
+  try {
+    const defaultModelSvc = ctx?.get?.('agentDefaultModel') ?? ctx?.agentDefaultModel
+    if (defaultModelSvc && typeof defaultModelSvc.saveSelection === 'function' && !defaultModelSvc.__dsbotInMemorySavePatched) {
+      defaultModelSvc.saveSelection = async function inMemorySaveSelection(next) {
+        if (!runtime.defaultModelFiber || !next?.provider || !next?.model) return
+        const payload = {
+          provider: String(next.provider),
+          model: String(next.model),
+          ...(next.reasoningEffort === undefined ? {} : { reasoningEffort: String(next.reasoningEffort) }),
+        }
+        try {
+          await runtime.defaultModelFiber.update(payload)
+        } catch {}
+      }
+      defaultModelSvc.__dsbotInMemorySavePatched = true
+    }
+  } catch {}
 
   // Keep DSH Web UI's agent-default-model aligned with the active endpoint & chosen default model.
   if (runtime.defaultModelFiber) {

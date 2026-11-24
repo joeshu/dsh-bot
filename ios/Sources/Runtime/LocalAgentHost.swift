@@ -358,6 +358,24 @@ public final class LocalAgentHost: ObservableObject {
         }
         if apiBaseURL == address {
             models = ids
+            if !usesOfficialModels, let firstCustom = ids.first {
+                let officialIds: Set<String> = [
+                    ModelProvider.defaultModel,
+                    ModelProvider.thinkingModel,
+                    "deepseek-v4-pro",
+                    "deepseek-chat",
+                    "deepseek-reasoner"
+                ]
+                var migrated = false
+                for idx in bots.indices {
+                    let cur = bots[idx].model.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if (cur.isEmpty || officialIds.contains(cur)) && !ids.contains(cur) {
+                        bots[idx].model = firstCustom
+                        migrated = true
+                    }
+                }
+                if migrated { persistWorkspace() }
+            }
             await syncProviderModelCatalogToDSH()
         }
         return (result["latencyMs"] as? Int ?? 0, ids.count)

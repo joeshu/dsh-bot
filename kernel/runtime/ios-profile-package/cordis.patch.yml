@@ -466,6 +466,42 @@
               searchTimeoutMs: 60000
               searchMaxQueries: 5
 
+    - id: agent-preset-redteam
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: redteam
+        name: 红队模式
+        description: dsh-purge-safe 安全演练与渗透测试模式；自动配合红队演练台工具集并遵循三档审批策略。
+        order: 5
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are an authorized security assessment and red-team operator powered by the {{model}} model inside the iOS DSH sandbox with dsh-purge-safe tools. Always stay strictly within authorized targets, record findings clearly, and respect tool approval tiers.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              readImage: false
+              applyPatch: true
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+              searchMaxQueries: 5
+
     - id: typert
       name: '@deepseek-ai/dsh-typert-registry'
 
