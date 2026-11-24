@@ -680,7 +680,7 @@ public struct BackendDevToolsInspectorView: View {
     }
 }
 
-private struct AutoReviewDetailView: View {
+struct AutoReviewDetailView: View {
     @ObservedObject var host: LocalAgentHost
 
     var body: some View {
@@ -747,7 +747,7 @@ private struct AutoReviewDetailView: View {
     }
 }
 
-private struct DiagnosticsFeatureDetailView: View {
+struct DiagnosticsFeatureDetailView: View {
     @ObservedObject var host: LocalAgentHost
 
     var body: some View {

@@ -2493,7 +2493,7 @@ public final class LocalAgentHost: ObservableObject {
         let botsSnapshot = bots
         let chatsSnapshot = legacyMessagesBySession
         let root = workspace
-        let writeBlock = { [weak self] in
+        let writeBlock: @Sendable () -> Void = { [weak self] in
             do {
                 try JSONEncoder().encode(botsSnapshot).write(to: root.appendingPathComponent("bots.json"), options: .atomic)
                 try JSONEncoder().encode(chatsSnapshot).write(to: root.appendingPathComponent("chats.json"), options: .atomic)

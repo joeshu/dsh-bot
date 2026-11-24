@@ -27,6 +27,12 @@ private enum ConversationFilter: String, CaseIterable, Identifiable {
     }
 }
 
+private struct ConversationNavTarget: Identifiable {
+    let bot: BotProfile
+    let address: SessionAddress
+    var id: String { address.canonicalSessionId }
+}
+
 /// Unified Tab 1 ("对话"): merges recent sessions, team roster, multi-thread management,
 /// external conversation import, and standalone Web Workbench sessions into a single cohesive hub.
 public struct UnifiedConversationsTabView: View {
@@ -36,12 +42,12 @@ public struct UnifiedConversationsTabView: View {
     @State private var filter: ConversationFilter = .recent
     @State private var searchText = ""
     @State private var showInbox = false
-    @State private var createKind: CreateBotKind?
+    @State private var createKind: CreateBotInitialKind?
     @State private var editingBot: BotProfile?
     @State private var profileBot: BotProfile?
     @State private var threadsBot: BotProfile?
     @State private var pendingDeleteBot: BotProfile?
-    @State private var navigatedTarget: (bot: BotProfile, address: SessionAddress)?
+    @State private var navigatedTarget: ConversationNavTarget?
     @State private var webSessionToOpen: String?
     @State private var importBanner: String?
 
@@ -53,20 +59,42 @@ public struct UnifiedConversationsTabView: View {
         host.pendingApprovals.count + host.pendingDSHQuestions.count
     }
 
+    private func pendingCount(for botId: String) -> Int {
+        let approvalCount = host.pendingApprovals.filter {
+            host.resolveAddress($0.sessionId)?.botID == botId
+        }.count
+        let questionCount = host.pendingDSHQuestions.filter {
+            host.resolveAddress($0.sessionId)?.botID == botId
+        }.count
+        return approvalCount + questionCount
+    }
+
+    private func lastActivityDate(for botId: String) -> Date {
+        let activeId = threadStore.activeSessionId(for: botId)
+        let activeDate = host.sessionActivityDate(for: activeId)
+        let rootDate = host.sessionActivityDate(for: botId)
+        switch (activeDate, rootDate) {
+        case let (a?, b?): return max(a, b)
+        case let (a?, nil): return a
+        case let (nil, b?): return b
+        case (nil, nil): return .distantPast
+        }
+    }
+
     private var filteredBots: [BotProfile] {
         let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let base: [BotProfile]
         switch filter {
         case .recent:
             base = host.bots.sorted { lhs, rhs in
-                let lhsPending = host.pendingCount(for: lhs.id)
-                let rhsPending = host.pendingCount(for: rhs.id)
+                let lhsPending = pendingCount(for: lhs.id)
+                let rhsPending = pendingCount(for: rhs.id)
                 if lhsPending != rhsPending { return lhsPending > rhsPending }
                 let lhsStreaming = host.isBotStreaming(lhs.id)
                 let rhsStreaming = host.isBotStreaming(rhs.id)
                 if lhsStreaming != rhsStreaming { return lhsStreaming }
-                let lhsDate = host.lastActivityDate(for: lhs.id)
-                let rhsDate = host.lastActivityDate(for: rhs.id)
+                let lhsDate = lastActivityDate(for: lhs.id)
+                let rhsDate = lastActivityDate(for: rhs.id)
                 if lhsDate != rhsDate { return lhsDate > rhsDate }
                 if lhs.isMain != rhs.isMain { return lhs.isMain }
                 return lhs.name < rhs.name
@@ -127,10 +155,13 @@ public struct UnifiedConversationsTabView: View {
         if host.isSessionStreaming(activeAddr.canonicalSessionId) || host.isBotStreaming(bot.id) {
             return "正在生成回复…"
         }
-        let last = host.lastMessagePreview(for: activeAddr.canonicalSessionId)
-        if !last.isEmpty { return last }
-        let rootLast = host.lastMessagePreview(for: bot.id)
-        return rootLast.isEmpty ? bot.roleLabel : rootLast
+        if let last = host.sessionPreview(for: activeAddr.canonicalSessionId), !last.isEmpty {
+            return last
+        }
+        if let rootLast = host.sessionPreview(for: bot.id), !rootLast.isEmpty {
+            return rootLast
+        }
+        return bot.roleLabel
     }
 
     private func shortModelLabel(_ model: String) -> String {
@@ -147,242 +178,252 @@ public struct UnifiedConversationsTabView: View {
 
     public var body: some View {
         NavigationStack {
-            List {
-                if showRuntimeBanner {
-                    Section {
-                        DSRuntimeStatusHeader(host: host)
-                    }
-                    .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
-                    .listRowBackground(Color.clear)
+            conversationList
+                .listStyle(.insetGrouped)
+                .searchable(text: $searchText, prompt: "搜索智能体、职责、模型或 Web 会话")
+                .refreshable {
+                    await host.refreshSessionSummaries()
                 }
-
-                if let importBanner {
-                    Section {
-                        DSBannerCard(
-                            icon: "square.and.arrow.down.fill",
-                            tint: DSTheme.brand,
-                            message: importBanner,
-                            actionTitle: "知道了"
-                        ) {
-                            self.importBanner = nil
+                .navigationTitle("对话")
+                .navigationDestination(isPresented: Binding(
+                    get: { navigatedTarget != nil },
+                    set: { if !$0 { navigatedTarget = nil } }
+                )) {
+                    if let target = navigatedTarget {
+                        ChatView(bot: target.bot, host: host, initialAddress: target.address)
+                    }
+                }
+                .toolbar { toolbarContent }
+                .sheet(isPresented: $showInbox) {
+                    SessionInboxView(host: host)
+                }
+                .sheet(item: $createKind) { kind in
+                    CreateBotSheet(host: host, initialKind: kind)
+                }
+                .sheet(item: $editingBot) { target in
+                    EditBotSheet(bot: target, host: host)
+                }
+                .sheet(item: $profileBot) { target in
+                    BotProfileSheet(bot: target, host: host)
+                }
+                .sheet(item: $threadsBot) { target in
+                    BotThreadsSheet(
+                        bot: target,
+                        threadStore: threadStore,
+                        onSelectThread: { chosenThread in
+                            threadsBot = nil
+                            navigatedTarget = ConversationNavTarget(bot: target, address: chosenThread.address)
+                        },
+                        onDeleteSession: { sessionId in
+                            Task { await host.clearSession(sessionId) }
+                        }
+                    )
+                }
+                .fullScreenCover(isPresented: Binding(
+                    get: { webSessionToOpen != nil },
+                    set: { if !$0 { webSessionToOpen = nil } }
+                )) {
+                    if let sid = webSessionToOpen {
+                        DSHWebUIView(host: host, initialSessionId: sid)
+                    }
+                }
+                .confirmationDialog(
+                    "确定删除「\(pendingDeleteBot?.name ?? "")」及其全部聊天记录？",
+                    isPresented: Binding(
+                        get: { pendingDeleteBot != nil },
+                        set: { if !$0 { pendingDeleteBot = nil } }
+                    ),
+                    titleVisibility: .visible
+                ) {
+                    Button("删除", role: .destructive) {
+                        if let target = pendingDeleteBot {
+                            pendingDeleteBot = nil
+                            host.deleteBot(id: target.id)
                         }
                     }
-                    .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
-                    .listRowBackground(Color.clear)
+                    Button("取消", role: .cancel) { pendingDeleteBot = nil }
                 }
+        }
+    }
 
-                if pendingCount > 0 {
-                    Section {
-                        Button {
-                            showInbox = true
-                        } label: {
-                            HStack(spacing: 12) {
-                                Image(systemName: "bell.badge.fill")
-                                    .font(.title3)
-                                    .foregroundStyle(DSTheme.warning)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("有 \(pendingCount) 项待审批或智能体提问")
-                                        .font(.subheadline.weight(.semibold))
-                                        .foregroundStyle(.primary)
-                                    Text("点击集中处理，避免阻塞正在执行的会话")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                Image(systemName: "chevron.right")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.tertiary)
-                            }
-                            .padding(.vertical, 4)
-                        }
-                    }
-                }
-
-                // Filter Chips Bar
+    @ViewBuilder
+    private var conversationList: some View {
+        List {
+            if showRuntimeBanner {
                 Section {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) {
-                            ForEach(ConversationFilter.allCases) { item in
-                                let selected = filter == item
-                                let badgeCount: Int = {
-                                    switch item {
-                                    case .webSessions: return host.webStandaloneSessions.count
-                                    case .groups: return host.bots.filter(\.isGroup).count
-                                    case .privateSpace: return host.bots.filter(\.isPrivate).count
-                                    default: return 0
-                                    }
-                                }()
-                                Button {
-                                    withAnimation(.easeInOut(duration: 0.16)) {
-                                        filter = item
-                                    }
-                                    DSHaptics.impact(.light)
-                                } label: {
-                                    HStack(spacing: 5) {
-                                        Image(systemName: item.icon)
-                                            .font(.caption2.weight(.semibold))
-                                        Text(item.rawValue)
-                                            .font(.caption.weight(selected ? .semibold : .medium))
-                                        if badgeCount > 0 && item == .webSessions {
-                                            Text("\(badgeCount)")
-                                                .font(.caption2.monospacedDigit().weight(.bold))
-                                                .padding(.horizontal, 5)
-                                                .padding(.vertical, 1)
-                                                .background(selected ? Color.white.opacity(0.22) : Color.secondary.opacity(0.16))
-                                                .clipShape(Capsule())
-                                        }
-                                    }
-                                    .padding(.horizontal, 11)
-                                    .padding(.vertical, 6)
-                                    .background(selected ? DSTheme.brand : DSTheme.surfaceSecondary)
-                                    .foregroundStyle(selected ? .white : .primary)
-                                    .clipShape(Capsule())
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                        .padding(.vertical, 2)
+                    DSRuntimeStatusBanner(host: host)
+                }
+                .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
+                .listRowBackground(Color.clear)
+            }
+
+            if let importBanner {
+                Section {
+                    DSBannerCard(
+                        icon: "square.and.arrow.down.fill",
+                        tint: DSTheme.brand,
+                        message: importBanner,
+                        actionTitle: "知道了"
+                    ) {
+                        self.importBanner = nil
                     }
                 }
-                .listRowInsets(EdgeInsets(top: 2, leading: 16, bottom: 2, trailing: 16))
+                .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
                 .listRowBackground(Color.clear)
+            }
 
-                if filter == .webSessions {
-                    webSessionsSection
-                } else if filter == .teams {
-                    if groupedSections.isEmpty {
-                        emptyStateSection
-                    } else {
-                        ForEach(groupedSections, id: \.title) { group in
-                            Section(group.title) {
-                                ForEach(group.bots) { bot in
-                                    botConversationRow(bot)
-                                }
+            if pendingCount > 0 {
+                Section {
+                    Button {
+                        showInbox = true
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "bell.badge.fill")
+                                .font(.title3)
+                                .foregroundStyle(DSTheme.warning)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("有 \(pendingCount) 项待审批或智能体提问")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.primary)
+                                Text("点击集中处理，避免阻塞正在执行的会话")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.tertiary)
                         }
+                        .padding(.vertical, 4)
                     }
+                }
+            }
+
+            filterChipsSection
+
+            if filter == .webSessions {
+                webSessionsSection
+            } else if filter == .teams {
+                if groupedSections.isEmpty {
+                    emptyStateSection
                 } else {
-                    Section(header: Text(sectionHeaderTitle)) {
-                        if filteredBots.isEmpty {
-                            emptyStateSection
-                        } else {
-                            ForEach(filteredBots) { bot in
+                    ForEach(groupedSections, id: \.title) { group in
+                        Section(group.title) {
+                            ForEach(group.bots) { bot in
                                 botConversationRow(bot)
                             }
                         }
                     }
                 }
-            }
-            .listStyle(.insetGrouped)
-            .searchable(text: $searchText, prompt: "搜索智能体、职责、模型或 Web 会话")
-            .refreshable {
-                await host.refreshSessionSummaries()
-            }
-            .navigationTitle("对话")
-            .navigationDestination(isPresented: Binding(
-                get: { navigatedTarget != nil },
-                set: { if !$0 { navigatedTarget = nil } }
-            )) {
-                if let target = navigatedTarget {
-                    ChatView(bot: target.bot, host: host, initialAddress: target.address)
+            } else {
+                Section(header: Text(sectionHeaderTitle)) {
+                    if filteredBots.isEmpty {
+                        emptyStateSection
+                    } else {
+                        ForEach(filteredBots) { bot in
+                            botConversationRow(bot)
+                        }
+                    }
                 }
             }
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+        }
+    }
+
+    @ViewBuilder
+    private var filterChipsSection: some View {
+        Section {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(ConversationFilter.allCases) { item in
+                        filterChipButton(item)
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+        }
+        .listRowInsets(EdgeInsets(top: 2, leading: 16, bottom: 2, trailing: 16))
+        .listRowBackground(Color.clear)
+    }
+
+    private func filterChipButton(_ item: ConversationFilter) -> some View {
+        let selected = filter == item
+        let webCount = item == .webSessions ? host.webStandaloneSessions.count : 0
+        return Button {
+            withAnimation(.easeInOut(duration: 0.16)) {
+                filter = item
+            }
+            DSHaptics.impact(.light)
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: item.icon)
+                    .font(.caption2.weight(.semibold))
+                Text(item.rawValue)
+                    .font(.caption.weight(selected ? .semibold : .medium))
+                if webCount > 0 {
+                    Text("\(webCount)")
+                        .font(.caption2.monospacedDigit().weight(.bold))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(selected ? Color.white.opacity(0.22) : Color.secondary.opacity(0.16))
+                        .clipShape(Capsule())
+                }
+            }
+            .padding(.horizontal, 11)
+            .padding(.vertical, 6)
+            .background(selected ? DSTheme.brand : DSTheme.surfaceSecondary)
+            .foregroundStyle(selected ? .white : .primary)
+            .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        ToolbarItem(placement: .topBarTrailing) {
+            Button {
+                showInbox = true
+            } label: {
+                Image(systemName: pendingCount > 0 ? "tray.full.fill" : "tray")
+                    .foregroundStyle(pendingCount > 0 ? DSTheme.warning : .primary)
+            }
+            .accessibilityLabel("待处理收件箱")
+        }
+        ToolbarItem(placement: .topBarTrailing) {
+            Menu {
+                if let mainBot = host.bots.first(where: \.isMain) ?? host.bots.first {
                     Button {
-                        showInbox = true
+                        let thread = threadStore.createThread(for: mainBot.id)
+                        navigatedTarget = ConversationNavTarget(bot: mainBot, address: thread.address)
+                        DSHaptics.impact(.light)
                     } label: {
-                        Image(systemName: pendingCount > 0 ? "tray.full.fill" : "tray")
-                    }
-                    .accessibilityLabel("待处理收件箱")
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        if let mainBot = host.bots.first(where: \.isMain) ?? host.bots.first {
-                            Button {
-                                let thread = threadStore.createThread(for: mainBot.id)
-                                navigatedTarget = (mainBot, thread.address)
-                                DSHaptics.impact(.light)
-                            } label: {
-                                Label("在「\(mainBot.name)」开启新话题", systemImage: "plus.bubble")
-                            }
-                        }
-                        Button {
-                            presentConversationImporter()
-                        } label: {
-                            Label("导入外部对话 (JSON / Markdown)", systemImage: "square.and.arrow.down")
-                        }
-                        Divider()
-                        Button {
-                            createKind = .standard
-                        } label: {
-                            Label("新建智能体", systemImage: "person.badge.plus")
-                        }
-                        Button {
-                            createKind = .group
-                        } label: {
-                            Label("新建协作群聊", systemImage: "person.3.fill")
-                        }
-                        Button {
-                            createKind = .privateSpace
-                        } label: {
-                            Label("新建私密会话 (Face ID)", systemImage: "lock.shield.fill")
-                        }
-                    } label: {
-                        Image(systemName: "plus.circle.fill")
-                    }
-                    .accessibilityLabel("新建或导入对话")
-                }
-            }
-            .sheet(isPresented: $showInbox) {
-                SessionInboxView(host: host)
-            }
-            .sheet(item: $createKind) { kind in
-                CreateBotSheet(host: host, initialKind: kind)
-            }
-            .sheet(item: $editingBot) { target in
-                EditBotSheet(bot: target, host: host)
-            }
-            .sheet(item: $profileBot) { target in
-                BotProfileSheet(bot: target, host: host)
-            }
-            .sheet(item: $threadsBot) { target in
-                BotThreadsSheet(
-                    bot: target,
-                    threadStore: threadStore,
-                    onSelectThread: { chosenThread in
-                        threadsBot = nil
-                        navigatedTarget = (target, chosenThread.address)
-                    },
-                    onDeleteSession: { sessionId in
-                        Task { await host.clearSession(sessionId) }
-                    }
-                )
-            }
-            .fullScreenCover(isPresented: Binding(
-                get: { webSessionToOpen != nil },
-                set: { if !$0 { webSessionToOpen = nil } }
-            )) {
-                if let sid = webSessionToOpen {
-                    DSHWebUIView(host: host, initialSessionId: sid)
-                }
-            }
-            .confirmationDialog(
-                "确定删除「\(pendingDeleteBot?.name ?? "")」及其全部聊天记录？",
-                isPresented: Binding(
-                    get: { pendingDeleteBot != nil },
-                    set: { if !$0 { pendingDeleteBot = nil } }
-                ),
-                titleVisibility: .visible
-            ) {
-                Button("删除", role: .destructive) {
-                    if let target = pendingDeleteBot {
-                        pendingDeleteBot = nil
-                        host.deleteBot(id: target.id)
+                        Label("在「\(mainBot.name)」开启新话题", systemImage: "plus.bubble")
                     }
                 }
-                Button("取消", role: .cancel) { pendingDeleteBot = nil }
+                Button {
+                    presentConversationImporter()
+                } label: {
+                    Label("导入外部对话 (JSON / Markdown)", systemImage: "square.and.arrow.down")
+                }
+                Divider()
+                Button {
+                    createKind = .standard
+                } label: {
+                    Label("新建智能体", systemImage: "person.badge.plus")
+                }
+                Button {
+                    createKind = .group
+                } label: {
+                    Label("新建协作群聊", systemImage: "person.3.fill")
+                }
+                Button {
+                    createKind = .privateSpace
+                } label: {
+                    Label("新建私密会话 (Face ID)", systemImage: "lock.shield.fill")
+                }
+            } label: {
+                Image(systemName: "plus.circle.fill")
             }
+            .accessibilityLabel("新建或导入对话")
         }
     }
 
@@ -462,7 +503,7 @@ public struct UnifiedConversationsTabView: View {
     @ViewBuilder
     private func botConversationRow(_ bot: BotProfile) -> some View {
         let isBotStreaming = host.isBotStreaming(bot.id)
-        let botPending = host.pendingCount(for: bot.id)
+        let botPending = pendingCount(for: bot.id)
         let threads = threadStore.threads(for: bot.id)
         let activeAddr = threadStore.activeAddress(for: bot.id)
         let activeTitle = threadStore.threadTitle(for: activeAddr)
@@ -498,7 +539,7 @@ public struct UnifiedConversationsTabView: View {
                         } else if isBotStreaming {
                             DSStatusBadge("运行中", color: DSTheme.brand)
                         } else if !bot.isPrivate {
-                            let lastDate = host.lastActivityDate(for: bot.id)
+                            let lastDate = lastActivityDate(for: bot.id)
                             if lastDate > .distantPast {
                                 Text(lastDate, style: .relative)
                                     .font(.caption2)
@@ -562,7 +603,7 @@ public struct UnifiedConversationsTabView: View {
         .swipeActions(edge: .leading, allowsFullSwipe: true) {
             Button {
                 let thread = threadStore.createThread(for: bot.id)
-                navigatedTarget = (bot, thread.address)
+                navigatedTarget = ConversationNavTarget(bot: bot, address: thread.address)
                 DSHaptics.impact(.light)
             } label: {
                 Label("新话题", systemImage: "plus.bubble")
@@ -599,7 +640,7 @@ public struct UnifiedConversationsTabView: View {
             }
             Button {
                 let thread = threadStore.createThread(for: bot.id)
-                navigatedTarget = (bot, thread.address)
+                navigatedTarget = ConversationNavTarget(bot: bot, address: thread.address)
             } label: {
                 Label("新建子话题", systemImage: "plus.bubble")
             }

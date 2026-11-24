@@ -19,6 +19,10 @@ public struct BotThread: Identifiable, Codable, Equatable, Sendable {
         isDefault ? botId : "\(botId):\(id)"
     }
 
+    public var address: SessionAddress {
+        SessionAddress(botID: botId, threadID: isDefault ? nil : id)
+    }
+
     public init(
         id: String = "t-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(4).lowercased())",
         botId: String,
