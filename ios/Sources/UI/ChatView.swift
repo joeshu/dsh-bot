@@ -57,6 +57,7 @@ private enum ChatActiveSheet: Identifiable {
     case pluginManager
     case webWorkbench
     case sessionConfig
+    case modelPicker
     case rulesEditor
     case skillsManager
     case history(SessionHistoryPresentation)
@@ -78,6 +79,7 @@ private enum ChatActiveSheet: Identifiable {
         case .pluginManager: return "pluginManager"
         case .webWorkbench: return "webWorkbench"
         case .sessionConfig: return "sessionConfig"
+        case .modelPicker: return "modelPicker"
         case .rulesEditor: return "rulesEditor"
         case .skillsManager: return "skillsManager"
         case .history(let presentation): return "history-\(presentation.id)"
@@ -356,9 +358,13 @@ public struct ChatView: View {
                             }
                             .disabled(host.isStreaming)
                         }
-                        if host.usesOfficialModels || !host.models.isEmpty {
-                            ModelSelectionView(host: host, model: $selectedModel, allowsTyping: false)
+                        ModelSelectionView(host: host, model: $selectedModel, allowsTyping: false)
+                        Button {
+                            activeSheet = .modelPicker
+                        } label: {
+                            Label("搜索 / 刷新全部模型…", systemImage: "magnifyingglass")
                         }
+                        .disabled(host.isStreaming)
                         if host.redteamStatus.installed {
                             Section("dsh-purge-safe 会话授权") {
                                 Toggle("允许本 Bot 调用红队工具", isOn: Binding(
@@ -670,6 +676,14 @@ public struct ChatView: View {
             DSHWebUIView(host: host)
         case .sessionConfig:
             ChatSessionConfigSheet(host: host, bot: liveBot, selectedModel: $selectedModel)
+        case .modelPicker:
+            ModelPickerSheet(
+                host: host,
+                model: $selectedModel,
+                title: "切换当前对话模型"
+            ) { chosen in
+                host.applyModelToAllBots(chosen)
+            }
         case .rulesEditor:
             SessionRulesEditorSheet(workspace: host.workspace)
         case .skillsManager:

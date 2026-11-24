@@ -182,11 +182,85 @@ public final class LocalAgentHost: ObservableObject {
     @Published public var useBubbleLayout: Bool = (UserDefaults.standard.object(forKey: "dsbot.useBubbleLayout") as? Bool) ?? true {
         didSet { UserDefaults.standard.set(useBubbleLayout, forKey: "dsbot.useBubbleLayout") }
     }
+    private static let cachedModelsKey = "dsbot.cachedModelsByEndpoint"
+    private static let favoriteModelsKey = "dsbot.favoriteModels"
+
+    private static func loadCachedModels(for endpoint: String) -> [String] {
+        let map = UserDefaults.standard.dictionary(forKey: cachedModelsKey) as? [String: [String]] ?? [:]
+        return map[endpoint] ?? []
+    }
+
+    private static func saveCachedModels(_ ids: [String], for endpoint: String) {
+        var map = UserDefaults.standard.dictionary(forKey: cachedModelsKey) as? [String: [String]] ?? [:]
+        map[endpoint] = ids
+        UserDefaults.standard.set(map, forKey: cachedModelsKey)
+    }
+
+    @Published public var favoriteModels: [String] = UserDefaults.standard.stringArray(forKey: "dsbot.favoriteModels") ?? [] {
+        didSet { UserDefaults.standard.set(favoriteModels, forKey: Self.favoriteModelsKey) }
+    }
+
+    public func isFavoriteModel(_ modelId: String) -> Bool {
+        favoriteModels.contains(modelId)
+    }
+
+    public func toggleFavoriteModel(_ modelId: String) {
+        let trimmed = modelId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if let idx = favoriteModels.firstIndex(of: trimmed) {
+            favoriteModels.remove(at: idx)
+        } else {
+            favoriteModels.insert(trimmed, at: 0)
+        }
+    }
+
+    public var orderedAvailableModels: [String] {
+        var base: [String] = []
+        if usesOfficialModels {
+            base = [ModelProvider.defaultModel, ModelProvider.thinkingModel, "deepseek-v4-pro"]
+            for id in models where !base.contains(id) {
+                base.append(id)
+            }
+        } else {
+            base = models
+        }
+        let favSet = Set(favoriteModels)
+        let pinned = favoriteModels.filter { base.contains($0) }
+        let rest = base.filter { !favSet.contains($0) }
+        return pinned + rest
+    }
+
     @Published public var apiBaseURL: String = UserDefaults.standard.string(forKey: "dsbot.apiBaseURL") ?? ModelProvider.defaultAddress {
         didSet {
             UserDefaults.standard.set(apiBaseURL, forKey: "dsbot.apiBaseURL")
-            models = []
+            models = Self.loadCachedModels(for: apiBaseURL)
+            Task { @MainActor [weak self] in
+                await self?.syncProviderModelCatalogToDSH()
+            }
         }
+    }
+
+    public func syncProviderModelCatalogToDSH(on rpc: IPCChannel? = nil) async {
+        guard let target = rpc ?? channel else { return }
+        let address = apiBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentModels = usesOfficialModels ? [] : models
+        _ = try? await target.request(
+            "models.catalog.sync",
+            params: [
+                "apiBaseURL": address,
+                "models": currentModels
+            ],
+            timeoutSeconds: 15
+        )
+    }
+
+    public func applyModelToAllBots(_ modelId: String) {
+        let trimmed = modelId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        for index in bots.indices {
+            bots[index].model = trimmed
+        }
+        persistWorkspace()
     }
 
     var usesOfficialModels: Bool { (try? ModelProvider(apiBaseURL).isDeepSeek) == true }
@@ -273,7 +347,13 @@ public final class LocalAgentHost: ObservableObject {
         let address = apiBaseURL
         let result = try await workspaceCapabilities.nativeWorkspaceRequest(method: "models.test", params: ["apiBaseURL": address])
         let ids = result["models"] as? [String] ?? []
-        if apiBaseURL == address { models = ids }
+        if !ids.isEmpty {
+            Self.saveCachedModels(ids, for: address)
+        }
+        if apiBaseURL == address {
+            models = ids
+            await syncProviderModelCatalogToDSH()
+        }
         return (result["latencyMs"] as? Int ?? 0, ids.count)
     }
 
@@ -323,6 +403,7 @@ public final class LocalAgentHost: ObservableObject {
             keychain: keychainBridge,
             migrateOfficialKey: migrationAllowed
         )
+        models = Self.loadCachedModels(for: apiBaseURL)
         workspaceCapabilities.setNativeNotificationHandler { [weak self] method, params in
             Task { @MainActor [weak self] in
                 self?.handleNativeApprovalNotification(method: method, params: params)
@@ -799,6 +880,7 @@ public final class LocalAgentHost: ObservableObject {
             throw IPCFrameError.remoteError(code: -32000, message: "DSH 未确认应用全部运行时设置。")
         }
         workspaceError = nil
+        await syncProviderModelCatalogToDSH(on: rpc)
     }
 
     public func updateBot(id: String, name: String, roleLabel: String, model: String, systemPrompt: String = "", permissionMode: String? = nil, agentPreset: String? = nil, reasoningEffort: String? = nil, redteamToolsEnabled: Bool? = nil, redteamWriteEnabled: Bool? = nil, redteamSensitiveDataEnabled: Bool? = nil) {

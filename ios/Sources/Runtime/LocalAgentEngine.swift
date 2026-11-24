@@ -1076,12 +1076,70 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
         let provider = try ModelProvider(params["apiBaseURL"] as? String ?? "")
         let key = try await modelKey(provider)
         let start = Date()
-        let (data, response) = try await session.data(for: makeRequest(provider.endpoint("models"), key: key))
-        try checkHTTP(response)
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let models = json["data"] as? [[String: Any]] else { throw ModelProviderError.invalidResponse }
-        let ids = models.compactMap { $0["id"] as? String }
-        return ["ok": true, "models": ids, "modelCount": ids.count, "latencyMs": Int(Date().timeIntervalSince(start) * 1000)]
+        var candidates: [URL] = [provider.endpoint("models")]
+        let normalizedPath = provider.baseURL.path.lowercased()
+        if !provider.isDeepSeek && !normalizedPath.hasSuffix("/v1") && !normalizedPath.hasSuffix("/v1/") {
+            candidates.append(provider.endpoint("v1/models"))
+        }
+
+        var lastError: Error = ModelProviderError.invalidResponse
+        for url in candidates {
+            do {
+                let (data, response) = try await session.data(for: makeModelsRequest(url, key: key))
+                try checkHTTP(response)
+                let ids = Self.parseModelIdentifiers(from: data)
+                guard !ids.isEmpty else {
+                    lastError = ModelProviderError.invalidResponse
+                    continue
+                }
+                return [
+                    "ok": true,
+                    "models": ids,
+                    "modelCount": ids.count,
+                    "latencyMs": Int(Date().timeIntervalSince(start) * 1000)
+                ]
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError
+    }
+
+    private static func parseModelIdentifiers(from data: Data) -> [String] {
+        guard let root = try? JSONSerialization.jsonObject(with: data) else { return [] }
+        var rawIds: [String] = []
+        if let dict = root as? [String: Any] {
+            if let list = dict["data"] as? [[String: Any]] {
+                rawIds.append(contentsOf: list.compactMap { ($0["id"] as? String) ?? ($0["name"] as? String) })
+            }
+            if rawIds.isEmpty, let list = dict["models"] as? [[String: Any]] {
+                rawIds.append(contentsOf: list.compactMap { ($0["id"] as? String) ?? ($0["name"] as? String) })
+            }
+            if rawIds.isEmpty, let list = dict["models"] as? [String] {
+                rawIds.append(contentsOf: list)
+            }
+        } else if let list = root as? [[String: Any]] {
+            rawIds.append(contentsOf: list.compactMap { ($0["id"] as? String) ?? ($0["name"] as? String) })
+        } else if let list = root as? [String] {
+            rawIds.append(contentsOf: list)
+        }
+        var seen = Set<String>()
+        var unique: [String] = []
+        for raw in rawIds {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, seen.insert(trimmed).inserted else { continue }
+            unique.append(trimmed)
+        }
+        return unique.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    private func makeModelsRequest(_ url: URL, key: String) -> URLRequest {
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        request.setValue(key, forHTTPHeaderField: "x-api-key")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        return request
     }
 
     private func checkHTTP(_ response: URLResponse) throws {

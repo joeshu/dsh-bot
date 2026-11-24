@@ -20,6 +20,7 @@ import { mountIOSScheduleTools, iosSchedulePublicTask, iosScheduleTaskVisible } 
 import { SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { IPCRpcEndpoint } from './ipc-protocol.mjs'
+import { installCustomEndpointCompatFetch } from './ios-openai-compat-adapter.mjs'
 
 const IPC_FD = Number(process.argv.find((arg) => arg.startsWith('--ipc-fd='))?.slice('--ipc-fd='.length))
 const WORKSPACE = process.argv.find((arg) => arg.startsWith('--workspace='))?.slice('--workspace='.length)
@@ -125,8 +126,8 @@ function guardIOSBackgroundFollowups(agent) {
 
 function routeForApiBase(value) {
   const url = new URL(value)
-  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) {
-    throw new Error('DSH requires an HTTPS API address without credentials, query, or fragment')
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+    throw new Error('DSH requires an HTTP(S) API address without credentials, query, or fragment')
   }
   url.pathname = url.pathname.replace(/\/+$/, '')
   if (isOfficialDeepSeekBase(url)) {
@@ -1088,6 +1089,12 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
 async function boot() {
   runtime.providerBaseURL = routeForApiBase(runtime.apiBaseURL)
   process.env.DS_BOT_PROVIDER_BASE_URL = runtime.providerBaseURL
+  installCustomEndpointCompatFetch({
+    getProviderBaseURL: () => runtime.providerBaseURL,
+    isOfficialBase: (base) => {
+      try { return isOfficialDeepSeekBase(base) } catch { return false }
+    },
+  })
   initProfile(PROFILE_DIR, [PROFILE_BUNDLE])
   if (workerData?.safeMode || workerData?.recoveringRevision) await settlePluginRevision(PROFILE_DIR, true)
   const safeMode = workerData?.safeMode === true
@@ -1374,7 +1381,16 @@ async function startTurn(params, preparation) {
     for (const [id, active] of runtime.activeAgents) await drainAndDispose(id, active)
     // Cordis validates the plain config and owns the volatile references.
     // Fiber.update applies this through Cordis' normal update lifecycle.
-    await runtime.providerFiber.update({ baseURL: nextProviderBaseURL })
+    const nextConfig = { baseURL: nextProviderBaseURL }
+    if (!isOfficialDeepSeekBase(nextApiBaseURL) && Array.isArray(runtime.customCatalogModels) && runtime.customCatalogModels.length > 0) {
+      nextConfig.models = runtime.customCatalogModels.map((id) => ({
+        id,
+        name: id,
+        maxTokens: 8192,
+        inputModalities: ['text', 'image'],
+      }))
+    }
+    await runtime.providerFiber.update(nextConfig)
     runtime.providerBaseURL = nextProviderBaseURL
     process.env.DS_BOT_PROVIDER_BASE_URL = nextProviderBaseURL
   }
@@ -2259,10 +2275,49 @@ rpc.handle('session.clear', async ({ sessionId }) => {
 // Swift directly to its native workspace and are intentionally not reachable through this process.
 
 let redteamToolsFork = null
+let redteamPresetDisposer = null
 let redteamMountInFlight = null
 let redteamMountError = ''
 let redteamMountDurationMs = 0
 let redteamSkillsCache = { dir: '', mtimeMs: 0, count: 0 }
+
+async function ensureRedteamPresetRegistered() {
+  if (!ctx?.agentPresets || typeof ctx.agentPresets.register !== 'function') return
+  try {
+    const existing = await ctx.agentPresets.list()
+    if (existing.some((p) => p.id === 'redteam')) return
+    redteamPresetDisposer = await ctx.agentPresets.register({
+      id: 'redteam',
+      name: '红队模式',
+      description: 'dsh-purge-safe 安全演练与渗透测试模式；自动挂载红队演练台工具集并遵循三档审批策略。',
+      order: 5,
+      plugins: [
+        {
+          id: 'persona',
+          name: '@deepseek-ai/dsh-persona',
+          config: {
+            prefix: 'You are an authorized security assessment and red-team operator working inside the iOS DSH sandbox with dsh-purge-safe tools. Always stay strictly within authorized targets, record findings clearly, and respect tool approval tiers.',
+          },
+        },
+        { id: 'agent-instructions', name: '@deepseek-ai/dsh-agent-instructions', config: { maxBytes: 65536 } },
+        { id: 'time-context', name: '@deepseek-ai/dsh-time-context' },
+        { id: 'tool-fs', name: '@deepseek-ai/dsh-tool-fs', config: { read: true, write: true, edit: true, applyPatch: true, glob: true, grep: true } },
+        { id: 'tool-ask-user', name: '@deepseek-ai/dsh-tool-ask-user' },
+        { id: 'tool-todo', name: '@deepseek-ai/dsh-tool-todo', config: { allowParallelInProgress: true } },
+        { id: 'tool-web', name: '@deepseek-ai/dsh-tool-web', config: { fetch: true, searchTimeoutMs: 60000, searchMaxQueries: 5 } },
+      ],
+    })
+  } catch (err) {
+    ctx?.logger?.warn?.(`RedTeam preset registration skipped: ${String(err)}`)
+  }
+}
+
+function disposeRedteamPreset() {
+  if (typeof redteamPresetDisposer === 'function') {
+    try { redteamPresetDisposer() } catch { /* ignore */ }
+  }
+  redteamPresetDisposer = null
+}
 
 function redteamToolsModulePath() {
   const candidate = join(PROFILE_DIR, 'node_modules', 'dsh-purge-safe', 'lib', 'redteam', 'tools.js')
@@ -2297,6 +2352,7 @@ async function performSetRedteamToolsMounted(enabled) {
     redteamMountDurationMs = 0
     runtime.redteamApprovalGrants.clear()
     for (const policy of runtime.redteamTurnPolicies.values()) policy.enabled = false
+    disposeRedteamPreset()
     if (redteamToolsFork) {
       try { await redteamToolsFork.dispose() } catch { /* ignore */ }
       redteamToolsFork = null
@@ -2337,6 +2393,9 @@ async function performSetRedteamToolsMounted(enabled) {
       redteamMountDurationMs = 0
       redteamMountError = err instanceof Error ? err.message : String(err)
     }
+  }
+  if (redteamToolsFork && !redteamMountError) {
+    await ensureRedteamPresetRegistered()
   }
   return redteamStatus()
 }
@@ -2484,6 +2543,58 @@ rpc.handle('runtime.config.update', async (params = {}) => {
   Object.assign(liveConfig, next)
   runtime.webSearchConfigSynced = Boolean(runtime.webSearchFiber)
   return { ok: true, config: { ...liveConfig } }
+})
+
+async function syncProviderModelCatalog({ apiBaseURL, models } = {}) {
+  if (!runtime.providerFiber) {
+    return { ok: false, syncedCount: 0, baseURL: runtime.providerBaseURL ?? '' }
+  }
+  const nextApiBaseURL = typeof apiBaseURL === 'string' && apiBaseURL.trim()
+    ? apiBaseURL.trim()
+    : runtime.apiBaseURL
+  const nextProviderBaseURL = routeForApiBase(nextApiBaseURL)
+  const official = isOfficialDeepSeekBase(nextApiBaseURL)
+  const seen = new Set()
+  const uniqueIds = []
+  if (Array.isArray(models)) {
+    for (const entry of models) {
+      const id = typeof entry === 'string' ? entry.trim() : ''
+      if (!id || seen.has(id)) continue
+      seen.add(id)
+      uniqueIds.push(id)
+      if (uniqueIds.length >= 200) break
+    }
+  }
+  const nextConfig = { baseURL: nextProviderBaseURL }
+  if (!official && uniqueIds.length > 0) {
+    nextConfig.models = uniqueIds.map((id) => ({
+      id,
+      name: id,
+      maxTokens: 8192,
+      inputModalities: ['text', 'image'],
+    }))
+  }
+  if (nextProviderBaseURL !== runtime.providerBaseURL) {
+    for (const [id, active] of runtime.activeAgents) await drainAndDispose(id, active)
+  }
+  await runtime.providerFiber.update(nextConfig)
+  runtime.apiBaseURL = nextApiBaseURL
+  runtime.providerBaseURL = nextProviderBaseURL
+  runtime.customCatalogModels = !official ? uniqueIds : []
+  process.env.DS_BOT_PROVIDER_BASE_URL = nextProviderBaseURL
+  try {
+    ctx.emit('llm/models-updated', 'deepseek-official')
+  } catch {}
+  return {
+    ok: true,
+    baseURL: nextProviderBaseURL,
+    official,
+    syncedCount: !official ? uniqueIds.length : 0,
+  }
+}
+
+rpc.handle('models.catalog.sync', async (params = {}) => {
+  return await syncProviderModelCatalog(params)
 })
 
 rpc.handle('usage.summary', (params) => dshUsageSummary(params))

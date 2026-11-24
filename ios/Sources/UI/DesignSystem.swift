@@ -912,6 +912,7 @@ public struct ModelSelectionView: View {
     @ObservedObject var host: LocalAgentHost
     @Binding var model: String
     var allowsTyping: Bool
+    @State private var showPickerSheet = false
 
     public init(host: LocalAgentHost, model: Binding<String>, allowsTyping: Bool = true) {
         self.host = host
@@ -919,26 +920,196 @@ public struct ModelSelectionView: View {
         self.allowsTyping = allowsTyping
     }
 
+    private func displayName(for id: String) -> String {
+        let base: String
+        switch id {
+        case ModelProvider.defaultModel: base = host.usesOfficialModels ? "DeepSeek Flash" : id
+        case ModelProvider.thinkingModel: base = host.usesOfficialModels ? "DeepSeek Flash · 思考" : id
+        case "deepseek-v4-pro": base = host.usesOfficialModels ? "DeepSeek V4 Pro" : id
+        default: base = id
+        }
+        return host.isFavoriteModel(id) ? "★ \(base)" : base
+    }
+
     public var body: some View {
-        if host.usesOfficialModels {
-            Picker("模型", selection: $model) {
-                Text("DeepSeek Flash").tag(ModelProvider.defaultModel)
-                Text("DeepSeek Flash · 思考").tag(ModelProvider.thinkingModel)
-                Text("DeepSeek V4 Pro").tag("deepseek-v4-pro")
-                if ![ModelProvider.defaultModel, ModelProvider.thinkingModel, "deepseek-v4-pro"].contains(model) {
-                    Text(model).tag(model)
+        let options = host.orderedAvailableModels
+        if !options.isEmpty {
+            Picker("模型：\(model.isEmpty ? "未选择" : displayName(for: model))", selection: $model) {
+                if !model.isEmpty && !options.contains(model) {
+                    Text("\(model)（当前）").tag(model)
+                }
+                ForEach(options, id: \.self) { id in
+                    Text(displayName(for: id)).tag(id)
                 }
             }
-        } else {
-            if allowsTyping {
-                TextField("服务商模型 ID", text: $model)
+        } else if !allowsTyping {
+            Text("当前模型：\(model.isEmpty ? "未设置" : model)（可在设置中拉取列表）")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        if allowsTyping {
+            HStack(spacing: 8) {
+                TextField("手动输入或搜索模型 ID", text: $model)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
+                Button {
+                    showPickerSheet = true
+                } label: {
+                    Label(options.isEmpty ? "拉取" : "浏览(\(options.count))", systemImage: "magnifyingglass")
+                        .font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
-            if !host.models.isEmpty {
-                Menu("选择服务商模型") {
-                    ForEach(host.models, id: \.self) { id in
-                        Button(id) { model = id }
+            .sheet(isPresented: $showPickerSheet) {
+                ModelPickerSheet(host: host, model: $model)
+            }
+        }
+    }
+}
+
+/// Searchable full-list model picker with favorite pinning, live refresh, and manual ID entry.
+public struct ModelPickerSheet: View {
+    @ObservedObject var host: LocalAgentHost
+    @Binding var model: String
+    var title: String
+    var onApplyAll: ((String) -> Void)?
+    @Environment(\.dismiss) private var dismiss
+    @State private var searchText = ""
+    @State private var isRefreshing = false
+    @State private var refreshMessage = ""
+
+    public init(
+        host: LocalAgentHost,
+        model: Binding<String>,
+        title: String = "选择模型",
+        onApplyAll: ((String) -> Void)? = nil
+    ) {
+        self.host = host
+        self._model = model
+        self.title = title
+        self.onApplyAll = onApplyAll
+    }
+
+    private var filteredModels: [String] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let all = host.orderedAvailableModels
+        guard !query.isEmpty else { return all }
+        return all.filter { $0.localizedCaseInsensitiveContains(query) }
+    }
+
+    public var body: some View {
+        NavigationStack {
+            List {
+                if !refreshMessage.isEmpty {
+                    Section {
+                        Text(refreshMessage)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                let trimmedQuery = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmedQuery.isEmpty && !host.orderedAvailableModels.contains(trimmedQuery) {
+                    Section("使用自定义模型 ID") {
+                        Button {
+                            model = trimmedQuery
+                            DSHaptics.notify(.success)
+                            dismiss()
+                        } label: {
+                            Label("使用「\(trimmedQuery)」", systemImage: "plus.circle.fill")
+                                .font(.subheadline.monospaced())
+                        }
+                    }
+                }
+
+                Section {
+                    if filteredModels.isEmpty {
+                        Text(host.orderedAvailableModels.isEmpty
+                             ? "当前端点尚未拉取模型列表，点击右上角刷新或直接在搜索框输入模型 ID。"
+                             : "未找到匹配「\(searchText)」的模型。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(filteredModels, id: \.self) { id in
+                            let selected = model == id
+                            let fav = host.isFavoriteModel(id)
+                            HStack(spacing: 10) {
+                                Button {
+                                    host.toggleFavoriteModel(id)
+                                    DSHaptics.impact(.light)
+                                } label: {
+                                    Image(systemName: fav ? "star.fill" : "star")
+                                        .foregroundStyle(fav ? .orange : .secondary.opacity(0.6))
+                                }
+                                .buttonStyle(.plain)
+
+                                Button {
+                                    model = id
+                                    DSHaptics.notify(.success)
+                                    dismiss()
+                                } label: {
+                                    HStack {
+                                        Text(id)
+                                            .font(.subheadline.monospaced())
+                                            .foregroundStyle(.primary)
+                                            .lineLimit(2)
+                                        Spacer()
+                                        if selected {
+                                            Image(systemName: "checkmark.circle.fill")
+                                                .foregroundStyle(DSTheme.brand)
+                                        }
+                                    }
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            .swipeActions(edge: .trailing) {
+                                if let onApplyAll {
+                                    Button("应用全部") {
+                                        model = id
+                                        onApplyAll(id)
+                                        DSHaptics.notify(.success)
+                                        dismiss()
+                                    }
+                                    .tint(DSTheme.brand)
+                                }
+                            }
+                        }
+                    }
+                } header: {
+                    Text("可用模型（\(filteredModels.count) 个 · 星标置顶）")
+                }
+            }
+            .searchable(text: $searchText, prompt: "搜索或输入模型 ID")
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("关闭") { dismiss() }
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        guard !isRefreshing else { return }
+                        isRefreshing = true
+                        refreshMessage = "正在拉取当前端点模型列表…"
+                        Task {
+                            defer { isRefreshing = false }
+                            do {
+                                let res = try await host.refreshModels()
+                                refreshMessage = "已刷新：共 \(res.count) 个模型（\(res.latency) ms），并已同步至 Web 工作台。"
+                                DSHaptics.notify(.success)
+                            } catch {
+                                refreshMessage = "拉取失败：\(error.localizedDescription)"
+                                DSHaptics.notify(.warning)
+                            }
+                        }
+                    } label: {
+                        if isRefreshing {
+                            ProgressView()
+                        } else {
+                            Label("刷新", systemImage: "arrow.clockwise")
+                        }
                     }
                 }
             }

@@ -238,6 +238,7 @@ public struct ModelServiceSettingsView: View {
     @State private var apiKey = ""
     @State private var status = ""
     @State private var keyConfigured = false
+    @State private var modelSearch = ""
 
     public init(host: LocalAgentHost) {
         self.host = host
@@ -261,7 +262,7 @@ public struct ModelServiceSettingsView: View {
                     }
                     .padding(.vertical, 2)
                 }
-                TextField("HTTPS Base URL", text: $host.apiBaseURL)
+                TextField("API Base URL（支持 HTTP / HTTPS）", text: $host.apiBaseURL)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .keyboardType(.URL)
@@ -288,7 +289,10 @@ public struct ModelServiceSettingsView: View {
                             apiKey = ""
                             status = "已为当前服务地址安全保存密钥至 iOS Keychain。"
                             DSHaptics.notify(.success)
-                            Task { keyConfigured = await host.hasSavedAPIKey() }
+                            Task {
+                                keyConfigured = await host.hasSavedAPIKey()
+                                await host.syncProviderModelCatalogToDSH()
+                            }
                         } catch {
                             status = error.localizedDescription
                             DSHaptics.notify(.error)
@@ -325,20 +329,106 @@ public struct ModelServiceSettingsView: View {
                 }
             }
 
+            if !host.models.isEmpty {
+                Section {
+                    if host.models.count > 5 {
+                        HStack(spacing: 8) {
+                            Image(systemName: "magnifyingglass")
+                                .foregroundStyle(.secondary)
+                            TextField("筛选模型 ID…", text: $modelSearch)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                            if !modelSearch.isEmpty {
+                                Button {
+                                    modelSearch = ""
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .foregroundStyle(.secondary)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                    let currentMainModel = host.bots.first(where: \.isMain)?.model ?? host.bots.first?.model ?? ""
+                    let ordered = host.orderedAvailableModels.filter { host.models.contains($0) || !host.usesOfficialModels }
+                    let q = modelSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let displayed = q.isEmpty ? ordered : ordered.filter { $0.localizedCaseInsensitiveContains(q) }
+                    ForEach(displayed, id: \.self) { modelId in
+                        let isSelected = currentMainModel == modelId
+                        let isFav = host.isFavoriteModel(modelId)
+                        HStack(spacing: 10) {
+                            Button {
+                                host.toggleFavoriteModel(modelId)
+                                DSHaptics.impact(.light)
+                            } label: {
+                                Image(systemName: isFav ? "star.fill" : "star")
+                                    .foregroundStyle(isFav ? .orange : .secondary.opacity(0.6))
+                            }
+                            .buttonStyle(.plain)
+
+                            Button {
+                                host.applyModelToAllBots(modelId)
+                                let trimmed = host.apiBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+                                if let existing = providerStore.profiles.first(where: { $0.apiBaseURL == trimmed }) {
+                                    providerStore.upsert(ProviderProfile(
+                                        id: existing.id,
+                                        name: existing.name,
+                                        apiBaseURL: existing.apiBaseURL,
+                                        defaultModel: modelId,
+                                        createdAt: existing.createdAt
+                                    ))
+                                }
+                                status = "已将「\(modelId)」设为默认模型并同步应用到全部智能体。"
+                                DSHaptics.notify(.success)
+                            } label: {
+                                HStack {
+                                    Text(modelId)
+                                        .font(.subheadline.monospaced())
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(2)
+                                    Spacer()
+                                    if isSelected {
+                                        DSStatusBadge("当前默认", color: DSTheme.brand, icon: "checkmark.circle.fill")
+                                    }
+                                }
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                } header: {
+                    Text("当前端点已拉取模型（\(host.models.count) 个 · 点星标置顶 / 点名称设为默认）")
+                } footer: {
+                    Text("拉取到的模型列表会按服务地址自动缓存并同步至 DSH Web 工作台，重启 App 后在对话顶部与智能体设置中均可直接选择。")
+                }
+            }
+
             Section("已保存的多端点档案（按域名隔离 Keychain）") {
                 ForEach(providerStore.profiles) { profile in
                     let active = host.apiBaseURL == profile.apiBaseURL
                     Button {
                         host.apiBaseURL = profile.apiBaseURL
                         DSHaptics.impact(.light)
-                        status = "已切换至档案「\(profile.name)」"
+                        if !profile.defaultModel.isEmpty {
+                            host.applyModelToAllBots(profile.defaultModel)
+                            status = "已切换至档案「\(profile.name)」，默认模型：\(profile.defaultModel)"
+                        } else {
+                            status = "已切换至档案「\(profile.name)」"
+                        }
+                        if host.models.isEmpty {
+                            Task {
+                                if let res = try? await host.refreshModels() {
+                                    status = "已切换至「\(profile.name)」，自动拉取到 \(res.count) 个模型并同步至 Web 工作台。"
+                                }
+                            }
+                        }
                     } label: {
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(profile.name)
                                     .font(.subheadline.weight(.medium))
                                     .foregroundStyle(.primary)
-                                Text(profile.apiBaseURL)
+                                Text(profile.defaultModel.isEmpty ? profile.apiBaseURL : "\(profile.apiBaseURL) · 默认：\(profile.defaultModel)")
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)

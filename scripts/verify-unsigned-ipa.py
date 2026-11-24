@@ -97,6 +97,7 @@ def verify_runtime(archive, prefix, names):
     supervisor_path = prefix + "DSHRuntime/ios-supervisor.mjs"
     entry_path = prefix + "DSHRuntime/dsh-ios-entry.mjs"
     plugin_manager_path = prefix + "DSHRuntime/ios-plugin-manager.mjs"
+    compat_adapter_path = prefix + "DSHRuntime/ios-openai-compat-adapter.mjs"
     persistence_path = prefix + "DSHRuntime/sqlite-session-persistence.mjs"
     protocol_path = prefix + "DSHRuntime/ipc-protocol.mjs"
     profile_boot_entry = prefix + "DSHRuntime/vendor/dsh-profile-boot/lib/profile-boot.js"
@@ -114,7 +115,7 @@ def verify_runtime(archive, prefix, names):
     framework_root = prefix + "Frameworks/NodeMobile.framework/"
     framework_binary_path = framework_root + "NodeMobile"
     for required in [runtime_path, package_path, lock_path, notices_path, supervisor_path, entry_path, plugin_manager_path,
-                     persistence_path, protocol_path, profile_boot_entry, profile_boot_impl, profile_boot_license,
+                     compat_adapter_path, persistence_path, protocol_path, profile_boot_entry, profile_boot_impl, profile_boot_license,
                      app_boot_path, ios_profile_package, ios_profile_patch, ios_host_package, framework_binary_path,
                      framework_root + "Info.plist", prefix + "NodeMobile-LICENSE.txt"]:
         require(required in names and archive.getinfo(required).file_size > 0, f"Missing embedded runtime component: {required}")

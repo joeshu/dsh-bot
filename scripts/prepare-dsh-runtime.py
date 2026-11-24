@@ -15,6 +15,7 @@ FILES = {
     "ios-supervisor.mjs": SOURCE / "ios-supervisor.mjs",
     "dsh-ios-entry.mjs": SOURCE / "dsh-ios-entry.mjs",
     "ios-plugin-manager.mjs": SOURCE / "ios-plugin-manager.mjs",
+    "ios-openai-compat-adapter.mjs": SOURCE / "ios-openai-compat-adapter.mjs",
     "sqlite-session-persistence.mjs": SOURCE / "sqlite-session-persistence.mjs",
     "ipc-protocol.mjs": ROOT / "kernel" / "runtime" / "ipc-protocol.mjs",
 }

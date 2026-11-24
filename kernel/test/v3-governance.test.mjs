@@ -425,5 +425,104 @@ test('v3 web-workspace: private-session-access collects typertGateway.collectSrc
   const hostSrc = readFileSync(join(__dirname, '..', '..', 'ios/Sources/Runtime/LocalAgentHost.swift'), 'utf8')
   assert.match(webUISrc, /window\.__DSH_FILE_UPLOAD__/, 'DSHWebUIView must hook __DSH_FILE_UPLOAD__ to main-thread fetch for iOS WKWebView uploads')
   assert.match(hostSrc, /supportedImportContentTypes/, 'LocalAgentHost must expose comprehensive supportedImportContentTypes for iOS fileImporter')
+  assert.match(hostSrc, /cachedModelsKey/, 'LocalAgentHost must cache discovered models per endpoint URL')
+  assert.match(hostSrc, /favoriteModelsKey/, 'LocalAgentHost must persist favorite pinned models')
+  assert.match(hostSrc, /syncProviderModelCatalogToDSH/, 'LocalAgentHost must sync custom endpoint model catalog to DSH Web UI')
+  assert.match(hostSrc, /applyModelToAllBots/, 'LocalAgentHost must support applying selected model to all Bots')
+  assert.match(entrySrc, /ensureRedteamPresetRegistered/, 'dsh-ios-entry.mjs must register redteam preset on ctx.agentPresets so Web UI shows 红队模式')
+  assert.match(entrySrc, /rpc\.handle\('models\.catalog\.sync'/, 'dsh-ios-entry.mjs must handle models.catalog.sync to expose custom endpoint models in Web UI')
+  const engineSrc = readFileSync(join(__dirname, '..', '..', 'ios/Sources/Runtime/LocalAgentEngine.swift'), 'utf8')
+  assert.match(engineSrc, /parseModelIdentifiers/, 'LocalAgentEngine must parse OpenAI/Anthropic/Ollama model list responses')
+  assert.match(engineSrc, /v1\/models/, 'LocalAgentEngine must retry v1/models when baseURL omits /v1')
+  const dsSrc = readFileSync(join(__dirname, '..', '..', 'ios/Sources/UI/DesignSystem.swift'), 'utf8')
+  assert.match(dsSrc, /public struct ModelPickerSheet/, 'DesignSystem must provide searchable ModelPickerSheet with favorites and refresh')
+})
+
+test('v3 custom-endpoint: HTTP /v1 OpenAI-only fallback translates Anthropic /messages to /chat/completions with dual auth and SSE streaming', async () => {
+  const http = await import('node:http')
+  const { installCustomEndpointCompatFetch } = await import(join(runtimeDir, 'ios-openai-compat-adapter.mjs'))
+
+  const seenPaths = []
+  let seenAuth = ''
+  const server = http.createServer((req, res) => {
+    seenPaths.push(req.url)
+    seenAuth = req.headers.authorization || ''
+    if (req.url === '/v1/messages') {
+      res.writeHead(404, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: { message: 'Not Found' } }))
+      return
+    }
+    if (req.url === '/v1/chat/completions') {
+      let body = ''
+      req.on('data', (chunk) => { body += chunk })
+      req.on('end', () => {
+        const parsed = JSON.parse(body)
+        assert.equal(parsed.model, 'custom-gpt')
+        assert.equal(parsed.messages[0].role, 'system')
+        assert.equal(parsed.messages[1].role, 'user')
+        res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' })
+        res.write(`data: ${JSON.stringify({ model: 'custom-gpt', choices: [{ delta: { reasoning_content: 'think-1' } }] })}\n\n`)
+        res.write(`data: ${JSON.stringify({ model: 'custom-gpt', choices: [{ delta: { content: 'hello-oai' } }] })}\n\n`)
+        res.write(`data: ${JSON.stringify({ model: 'custom-gpt', choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', function: { name: 'ping', arguments: '{"ok":true}' } }] }, finish_reason: 'tool_calls' }], usage: { prompt_tokens: 12, completion_tokens: 7 } })}\n\n`)
+        res.write('data: [DONE]\n\n')
+        res.end()
+      })
+      return
+    }
+    res.writeHead(404)
+    res.end()
+  })
+
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const { port } = server.address()
+  const base = `http://127.0.0.1:${port}/v1`
+  const origFetch = globalThis.fetch
+  const prevFlag = globalThis.__DSBOT_COMPAT_FETCH_INSTALLED__
+  globalThis.__DSBOT_COMPAT_FETCH_INSTALLED__ = false
+
+  try {
+    installCustomEndpointCompatFetch({
+      getProviderBaseURL: () => base,
+      isOfficialBase: () => false,
+    })
+
+    const reqBody = JSON.stringify({
+      model: 'custom-gpt',
+      system: 'be concise',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      stream: true,
+    })
+
+    const r1 = await globalThis.fetch(`${base}/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'test-key-123' },
+      body: reqBody,
+    })
+    assert.equal(r1.status, 200)
+    const sse1 = await r1.text()
+    assert.equal(seenAuth, 'Bearer test-key-123')
+    assert.deepEqual(seenPaths, ['/v1/messages', '/v1/chat/completions'])
+    assert.match(sse1, /event: message_start/)
+    assert.match(sse1, /"type":"thinking_delta","thinking":"think-1"/)
+    assert.match(sse1, /"type":"text_delta","text":"hello-oai"/)
+    assert.match(sse1, /"type":"tool_use","id":"call_1","name":"ping"/)
+    assert.match(sse1, /"stop_reason":"tool_use"/)
+    assert.match(sse1, /event: message_stop/)
+
+    // Second request must hit /v1/chat/completions directly without retrying /v1/messages
+    seenPaths.length = 0
+    const r2 = await globalThis.fetch(`${base}/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'test-key-123' },
+      body: reqBody,
+    })
+    assert.equal(r2.status, 200)
+    await r2.text()
+    assert.deepEqual(seenPaths, ['/v1/chat/completions'])
+  } finally {
+    globalThis.fetch = origFetch
+    globalThis.__DSBOT_COMPAT_FETCH_INSTALLED__ = prevFlag
+    await new Promise((resolve) => server.close(resolve))
+  }
 })
 

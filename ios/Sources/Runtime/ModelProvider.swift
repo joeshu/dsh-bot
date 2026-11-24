@@ -13,7 +13,7 @@ enum ModelProviderError: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .invalidAddress: return "请输入有效的 HTTPS 服务地址。"
+        case .invalidAddress: return "请输入有效的 HTTP 或 HTTPS 服务地址。"
         case .missingKey: return "请在设置中为当前服务地址保存 API Key。"
         case .missingModel: return "请为当前服务输入模型 ID。"
         case .invalidResponse: return "模型服务返回了无效响应。"
@@ -37,16 +37,32 @@ struct ModelProvider {
 
     init(_ raw: String) throws {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        var parts = try Self.httpsComponents(trimmed.isEmpty ? Self.defaultAddress : trimmed)
+        var parts = try Self.endpointComponents(trimmed.isEmpty ? Self.defaultAddress : trimmed)
         guard parts.query == nil else { throw ModelProviderError.invalidAddress }
         while parts.percentEncodedPath.last == "/" {
             parts.percentEncodedPath.removeLast()
         }
-        isDeepSeek = parts.host == "api.deepseek.com" && parts.port == nil
+        isDeepSeek = parts.scheme == "https" && parts.host == "api.deepseek.com" && parts.port == nil
             && ["", "/v1"].contains(parts.percentEncodedPath)
         if isDeepSeek { parts.path = "" }
         guard let url = parts.url else { throw ModelProviderError.invalidAddress }
         baseURL = url
+    }
+
+    static func endpointComponents(_ raw: String) throws -> URLComponents {
+        guard var parts = URLComponents(string: raw),
+              let scheme = parts.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              let host = parts.host?.lowercased(), !host.isEmpty,
+              parts.user == nil, parts.password == nil, parts.fragment == nil else {
+            throw ModelProviderError.invalidAddress
+        }
+        parts.scheme = scheme
+        parts.host = host
+        if (scheme == "https" && parts.port == 443) || (scheme == "http" && parts.port == 80) {
+            parts.port = nil
+        }
+        return parts
     }
 
     static func httpsComponents(_ raw: String) throws -> URLComponents {

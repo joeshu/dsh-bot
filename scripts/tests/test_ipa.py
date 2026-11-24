@@ -213,6 +213,7 @@ class IPARegressionTests(unittest.TestCase):
             archive.writestr(base + "DSHRuntime/dsh-ios-entry.mjs",
                              b"import { mountIOSPythonJobTool } from '@dsbot/dsh-ios-host/ios-python-jobs'; mountIOSPythonJobTool(ctx)")
             archive.writestr(base + "DSHRuntime/ios-plugin-manager.mjs", b"// plugin manager")
+            archive.writestr(base + "DSHRuntime/ios-openai-compat-adapter.mjs", b"// compat adapter")
             archive.writestr(base + "DSHRuntime/sqlite-session-persistence.mjs", b"// persistence")
             archive.writestr(base + "DSHRuntime/ipc-protocol.mjs", b"// protocol")
             archive.writestr(base + "DSHRuntime/vendor/dsh-profile-boot/lib/profile-boot.js", profile_boot_entry_bytes)

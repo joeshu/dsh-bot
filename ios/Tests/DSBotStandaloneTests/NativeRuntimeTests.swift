@@ -24,8 +24,12 @@ final class NativeRuntimeTests: XCTestCase {
         XCTAssertEqual(try official.modelFields("deepseek-reasoner")["thinking"] as? [String: String], ["type": "enabled"])
         XCTAssertEqual(try custom.modelFields("deepseek-reasoner")["model"] as? String, "deepseek-reasoner")
         XCTAssertEqual(custom.endpoint("models").absoluteString, "https://example.test/gateway/v1/models")
+        let httpCustom = try ModelProvider("http://85.189.66.232:17187/v1/")
+        XCTAssertEqual(httpCustom.endpoint("models").absoluteString, "http://85.189.66.232:17187/v1/models")
+        XCTAssertFalse(httpCustom.isDeepSeek)
         XCTAssertThrowsError(try ModelProvider("https://user:pass@example.test"))
-        XCTAssertThrowsError(try ModelProvider("http://example.test/v1"))
+        XCTAssertThrowsError(try ModelProvider("ftp://example.test/v1"))
+        XCTAssertThrowsError(try ModelProvider.httpsComponents("http://example.test/v1"))
     }
 
     @MainActor
