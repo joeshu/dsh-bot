@@ -141,7 +141,7 @@ class SQLiteSessionHandle {
       return
     }
     this.draining = true
-    this.drainPromise = (async () => {
+    const current = (async () => {
       try {
         while (this.pendingLive.length) {
           const batch = this.pendingLive.slice()
@@ -154,10 +154,11 @@ class SQLiteSessionHandle {
         throw error
       } finally {
         this.draining = false
-        this.drainPromise = null
+        if (this.drainPromise === current) this.drainPromise = null
       }
     })()
-    return this.drainPromise
+    this.drainPromise = current
+    return await current
   }
 
   async flush(options = {}) {
