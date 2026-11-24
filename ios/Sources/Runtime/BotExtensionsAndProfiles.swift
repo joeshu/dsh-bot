@@ -20,7 +20,7 @@ public struct BotThread: Identifiable, Codable, Equatable, Sendable {
     }
 
     public var address: SessionAddress {
-        SessionAddress(botID: botId, threadID: isDefault ? nil : id)
+        SessionAddress(botID: botId, threadID: isDefault ? nil : id) ?? SessionAddress(botID: "main")!
     }
 
     public init(
