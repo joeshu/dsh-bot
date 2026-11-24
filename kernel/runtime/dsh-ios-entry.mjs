@@ -1420,8 +1420,16 @@ rpc.handle('python.cancel', async ({ botId, turnId }) => ({
   cancelled: cancelIOSPythonExecution({ botId: String(botId ?? ''), turnId: String(turnId ?? '') }),
 }))
 
+const MAX_CONCURRENT_TURNS = 2
+
 rpc.handle('chat.send', async (params) => {
-  if (runtime.preparingTurn || runtime.activeTurns.size) throw new Error('Another DSH turn is already running')
+  const targetId = dshSessionId(String(params.sessionId ?? ''))
+  if (runtime.preparingTurn && runtime.preparingTurn.botId === String(params.sessionId ?? '')) {
+    throw new Error('Another DSH turn is already preparing for this session')
+  }
+  if (runtime.activeTurns.has(targetId) || runtime.activeTurns.size >= MAX_CONCURRENT_TURNS) {
+    throw new Error('Another DSH turn is already running')
+  }
   if (runtime.pluginMutationInProgress || runtime.profileRestartRequired) throw new Error('The DSH profile is changing')
   const preparation = {
     turnId: String(params.turnId ?? ''),
@@ -1430,7 +1438,7 @@ rpc.handle('chat.send', async (params) => {
   }
   runtime.preparingTurn = preparation
   preparation.finished = startTurn(params, preparation).finally(() => {
-    runtime.preparingTurn = undefined
+    if (runtime.preparingTurn === preparation) runtime.preparingTurn = undefined
   })
   return await preparation.finished
 })
@@ -1444,7 +1452,9 @@ async function startTurn(params, preparation) {
   const turnId = String(params.turnId ?? '')
   if (!isValidSessionKey(botId) || !turnId || !model || !text) throw new TypeError('Invalid chat request')
   if (Buffer.byteLength(text, 'utf8') > 262_144) throw new RangeError('Message exceeds 256 KB')
-  if (runtime.activeTurns.size) throw new Error('Another DSH turn is already running')
+  if (runtime.activeTurns.has(dshSessionId(botId)) || runtime.activeTurns.size >= MAX_CONCURRENT_TURNS) {
+    throw new Error('Another DSH turn is already running')
+  }
   const nextApiBaseURL = typeof params.apiBaseURL === 'string' ? params.apiBaseURL : runtime.apiBaseURL
   const nextProviderBaseURL = routeForApiBase(nextApiBaseURL)
   runtime.apiBaseURL = nextApiBaseURL

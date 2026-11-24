@@ -48,9 +48,11 @@ public struct DSHWebUIView: View {
     @State private var importBanner: String?
     @AppStorage("dsbot.web.viewportMode") private var viewportModeRaw: String = DSHWebViewportMode.responsive.rawValue
     @AppStorage("dsbot.web.textScale") private var textScaleRaw: Int = DSHWebTextScale.standard.rawValue
+    private let initialSessionId: String?
 
-    public init(host: LocalAgentHost) {
+    public init(host: LocalAgentHost, initialSessionId: String? = nil) {
         self.host = host
+        self.initialSessionId = initialSessionId
     }
 
     private var viewportMode: DSHWebViewportMode {
@@ -170,20 +172,21 @@ public struct DSHWebUIView: View {
                         #if canImport(UIKit)
                         NativeDocumentPicker.present(allowsMultipleSelection: true) { urls in
                             guard !urls.isEmpty else { return }
-                            var count = 0
-                            var lastPath = ""
+                            var importedPaths: [String] = []
                             var lastErr: String?
                             for url in urls {
                                 do {
                                     let imported = try host.importFileToWorkspace(from: url)
-                                    count += 1
-                                    lastPath = imported.relativePath
+                                    importedPaths.append("files/\(imported.relativePath)")
                                 } catch {
                                     lastErr = error.localizedDescription
                                 }
                             }
-                            if count > 0 {
-                                importBanner = count == 1 ? "已导入 files/\(lastPath)" : "已导入 \(count) 个文件到 files/"
+                            if !importedPaths.isEmpty {
+                                UIPasteboard.general.string = importedPaths.joined(separator: "\n")
+                                importBanner = importedPaths.count == 1
+                                    ? "已导入 \(importedPaths[0])（路径已复制，可直接粘贴）"
+                                    : "已导入 \(importedPaths.count) 个文件（路径已复制）"
                                 DSHaptics.notify(.success)
                             } else if let lastErr {
                                 importBanner = "导入失败：\(lastErr)"
@@ -388,7 +391,15 @@ public struct DSHWebUIView: View {
             }
             errorMessage = nil
             allowedPort = port
-            launchURL = parsed
+            if let targetSession = initialSessionId?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !targetSession.isEmpty,
+               var comps = URLComponents(url: parsed, resolvingAgainstBaseURL: false) {
+                let encoded = targetSession.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? targetSession
+                comps.path = "/session/\(encoded)"
+                launchURL = comps.url ?? parsed
+            } else {
+                launchURL = parsed
+            }
         } catch {
             guard !Task.isCancelled, generation == host.runtimeGeneration else { return }
             launchURL = nil

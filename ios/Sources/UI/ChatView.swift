@@ -686,7 +686,7 @@ public struct ChatView: View {
                     }
             }
         case .webWorkbench:
-            DSHWebUIView(host: host)
+            DSHWebUIView(host: host, initialSessionId: liveBot.isPrivate ? nil : "ios:\(activeSessionId)")
         case .sessionConfig:
             ChatSessionConfigSheet(host: host, bot: liveBot, selectedModel: $selectedModel)
         case .modelPicker:
