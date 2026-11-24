@@ -43,6 +43,7 @@ public struct UnifiedConversationsTabView: View {
 
     @State private var filter: ConversationFilter = .recent
     @State private var searchText = ""
+    @State private var showSearch = false
     @State private var activeSheet: ConversationsActiveSheet?
     @State private var pendingDeleteBot: BotProfile?
     @State private var showDeleteConfirm = false
@@ -272,8 +273,8 @@ public struct UnifiedConversationsTabView: View {
                 }
             }
 
-            Section {
-                VStack(spacing: 10) {
+            if showSearch {
+                Section {
                     HStack(spacing: 8) {
                         Image(systemName: "magnifyingglass")
                             .foregroundStyle(.secondary)
@@ -290,21 +291,8 @@ public struct UnifiedConversationsTabView: View {
                             .buttonStyle(.plain)
                         }
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
-                    .background(DSTheme.surfaceSecondary)
-                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-
-                    Picker("筛选对话", selection: $filter) {
-                        ForEach(ConversationFilter.allCases) { item in
-                            Text(item.rawValue).tag(item)
-                        }
-                    }
-                    .pickerStyle(.segmented)
                 }
             }
-            .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
-            .listRowBackground(Color.clear)
 
             if filter == .webSessions {
                 webSessionsSection
@@ -336,7 +324,40 @@ public struct UnifiedConversationsTabView: View {
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
+        ToolbarItem(placement: .topBarLeading) {
+            Menu {
+                ForEach(ConversationFilter.allCases) { item in
+                    Button {
+                        filter = item
+                        DSHaptics.impact(.light)
+                    } label: {
+                        if filter == item {
+                            Label(item.rawValue, systemImage: "checkmark")
+                        } else {
+                            Text(item.rawValue)
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(filter.rawValue)
+                        .font(.subheadline.weight(.semibold))
+                    Image(systemName: "chevron.down")
+                        .font(.caption2.weight(.bold))
+                }
+            }
+            .accessibilityLabel("切换对话筛选视图")
+        }
+
         ToolbarItemGroup(placement: .topBarTrailing) {
+            Button {
+                showSearch.toggle()
+                if !showSearch { searchText = "" }
+            } label: {
+                Image(systemName: showSearch ? "magnifyingglass.circle.fill" : "magnifyingglass")
+            }
+            .accessibilityLabel("搜索对话")
+
             NavigationLink {
                 SessionInboxView(host: host)
             } label: {
@@ -434,7 +455,7 @@ public struct UnifiedConversationsTabView: View {
                                         .foregroundStyle(.primary)
                                         .lineLimit(1)
                                     Spacer()
-                                    Text(session.lastActivityAt, style: .relative)
+                                    Text(session.lastActivityAt.formatted(date: .omitted, time: .shortened))
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
                                 }
@@ -496,7 +517,7 @@ public struct UnifiedConversationsTabView: View {
                         } else if !bot.isPrivate {
                             let lastDate = lastActivityDate(for: bot.id)
                             if lastDate > .distantPast {
-                                Text(lastDate, style: .relative)
+                                Text(lastDate.formatted(date: .omitted, time: .shortened))
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
                             }
