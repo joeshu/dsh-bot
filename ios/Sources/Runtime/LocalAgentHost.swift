@@ -244,11 +244,14 @@ public final class LocalAgentHost: ObservableObject {
         guard let target = rpc ?? channel else { return }
         let address = apiBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let currentModels = usesOfficialModels ? [] : models
+        let activeDefaultModel = (bots.first(where: \.isMain)?.model ?? bots.first?.model ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         _ = try? await target.request(
             "models.catalog.sync",
             params: [
                 "apiBaseURL": address,
-                "models": currentModels
+                "models": currentModels,
+                "defaultModel": activeDefaultModel
             ],
             timeoutSeconds: 15
         )
@@ -261,6 +264,9 @@ public final class LocalAgentHost: ObservableObject {
             bots[index].model = trimmed
         }
         persistWorkspace()
+        Task { @MainActor [weak self] in
+            await self?.syncProviderModelCatalogToDSH()
+        }
     }
 
     var usesOfficialModels: Bool { (try? ModelProvider(apiBaseURL).isDeepSeek) == true }

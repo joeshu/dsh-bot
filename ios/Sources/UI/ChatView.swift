@@ -275,10 +275,10 @@ public struct ChatView: View {
         .toolbar {
             if !isLocked {
                 ToolbarItem(placement: .principal) {
-                    Button {
-                        activeSheet = .botProfile
-                    } label: {
-                        VStack(spacing: 1) {
+                    VStack(spacing: 1) {
+                        Button {
+                            activeSheet = .botProfile
+                        } label: {
                             HStack(spacing: 4) {
                                 Text(liveBot.name)
                                     .font(.subheadline.weight(.semibold))
@@ -299,13 +299,26 @@ public struct ChatView: View {
                                     .font(.system(size: 9, weight: .semibold))
                                     .foregroundStyle(.tertiary)
                             }
-                            Text("\(host.agentPresetName(liveBot.agentPreset)) · \(selectedModel) · \(liveBot.permissionModeLabel)")
-                                .font(.system(size: 10.5, weight: .medium))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
                         }
+                        .buttonStyle(.plain)
+
+                        Button {
+                            if !host.isStreaming {
+                                activeSheet = .modelPicker
+                            }
+                        } label: {
+                            HStack(spacing: 3) {
+                                Text("\(host.agentPresetName(liveBot.agentPreset)) · \(selectedModel) · \(liveBot.permissionModeLabel)")
+                                    .font(.system(size: 10.5, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                Image(systemName: "chevron.down")
+                                    .font(.system(size: 8, weight: .semibold))
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     // Menu 1: Live Strategy (Mode, Approval Tier, Model, RedTeam Permissions)

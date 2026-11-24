@@ -1176,6 +1176,7 @@ async function boot() {
     .filter((id) => typeof id === 'string')
     .sort()
   runtime.providerFiber = mountedRows.get('llm-deepseek')
+  runtime.defaultModelFiber = mountedRows.get('agent-default-model')
   runtime.subagentFiber = mountedRows.get('ios-subagent')
   runtime.toolSubagentFiber = mountedRows.get('ios-tool-subagent')
   runtime.webSearchFiber = mountedRows.get('ios-web-search')
@@ -2567,7 +2568,7 @@ rpc.handle('runtime.config.update', async (params = {}) => {
   return { ok: true, config: { ...liveConfig } }
 })
 
-async function syncProviderModelCatalog({ apiBaseURL, models } = {}) {
+async function syncProviderModelCatalog({ apiBaseURL, models, defaultModel } = {}) {
   if (!runtime.providerFiber) {
     return { ok: false, syncedCount: 0, baseURL: runtime.providerBaseURL ?? '' }
   }
@@ -2604,6 +2605,36 @@ async function syncProviderModelCatalog({ apiBaseURL, models } = {}) {
   runtime.providerBaseURL = nextProviderBaseURL
   runtime.customCatalogModels = !official ? uniqueIds : []
   process.env.DS_BOT_PROVIDER_BASE_URL = nextProviderBaseURL
+
+  // Keep DSH Web UI's agent-default-model aligned with the active endpoint & chosen default model.
+  if (runtime.defaultModelFiber) {
+    const requestedDefault = typeof defaultModel === 'string' ? defaultModel.trim() : ''
+    let targetModel = ''
+    if (official) {
+      targetModel = requestedDefault === 'deepseek-flash-thinking' ? 'deepseek-flash' : (requestedDefault || 'deepseek-flash')
+      const reasoningEffort = (requestedDefault === 'deepseek-flash-thinking' || requestedDefault === 'deepseek-v4-pro') ? 'high' : 'off'
+      try {
+        await runtime.defaultModelFiber.update({
+          provider: 'deepseek-official',
+          model: targetModel,
+          reasoningEffort,
+        })
+      } catch {}
+    } else {
+      targetModel = (requestedDefault && (uniqueIds.length === 0 || uniqueIds.includes(requestedDefault)))
+        ? requestedDefault
+        : (uniqueIds[0] || requestedDefault)
+      if (targetModel) {
+        try {
+          await runtime.defaultModelFiber.update({
+            provider: 'deepseek-official',
+            model: targetModel,
+          })
+        } catch {}
+      }
+    }
+  }
+
   try {
     ctx.emit('llm/models-updated', 'deepseek-official')
   } catch {}
