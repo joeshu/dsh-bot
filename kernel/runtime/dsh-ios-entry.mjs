@@ -1217,6 +1217,9 @@ async function boot() {
   } catch (error) {
     ctx?.logger?.warn?.(`Default iOS workspace initialization skipped: ${String(error)}`)
   }
+  if (!safeMode && redteamStatus().installed) {
+    await ensureRedteamPresetRegistered()
+  }
   try {
     const wsFiles = ctx?.get?.('workspaceFiles')
     if (wsFiles && typeof wsFiles.search === 'function') {
@@ -1424,11 +1427,14 @@ async function startTurn(params, preparation) {
     await drainAndDispose(id, active)
     active = undefined
   }
-  const requestedEffort = ['low', 'medium', 'high'].includes(params.reasoningEffort) ? params.reasoningEffort : 'medium'
+  const rawEffort = typeof params.reasoningEffort === 'string' ? params.reasoningEffort : 'medium'
+  const requestedEffort = ['low', 'medium', 'high'].includes(rawEffort) ? rawEffort : 'medium'
+  const dshReasoningEffort = rawEffort === 'low' ? 'low' : (rawEffort === 'max' ? 'max' : 'high')
   const disabledTools = Array.isArray(params.disabledTools) ? params.disabledTools.map(String).filter(Boolean) : []
   const options = {
-    provider: 'deepseek-official', model: dshModel,
-    reasoningEffort: reasoningEnabled ? requestedEffort : 'off',
+    provider: 'deepseek-official',
+    model: dshModel,
+    ...(officialDeepSeek ? { reasoningEffort: reasoningEnabled ? dshReasoningEffort : 'off' } : {}),
   }
   if (!active) {
     const composition = setupAgent({
@@ -2285,27 +2291,43 @@ async function ensureRedteamPresetRegistered() {
   if (!ctx?.agentPresets || typeof ctx.agentPresets.register !== 'function') return
   try {
     const existing = await ctx.agentPresets.list()
-    if (existing.some((p) => p.id === 'redteam')) return
-    redteamPresetDisposer = await ctx.agentPresets.register({
+    const current = existing.find((p) => p.id === 'redteam')
+    if (current && !current.broken) return
+    if (current && current.broken) disposeRedteamPreset()
+
+    const stdRecord = ctx.agentPresets.definitions?.get?.('standard')
+    const regCtx = stdRecord?.context ?? ctx
+    const basePlugins = Array.isArray(stdRecord?.config?.plugins)
+      ? stdRecord.config.plugins.map((entry) => {
+          if (entry && entry.id === 'persona' && entry.name === '@deepseek-ai/dsh-persona') {
+            return {
+              ...entry,
+              config: {
+                ...(entry.config || {}),
+                prefix: 'You are an authorized security assessment and red-team operator powered by the {{model}} model inside the iOS DSH sandbox with dsh-purge-safe tools. Always stay strictly within authorized targets, record findings clearly, and respect tool approval tiers.',
+              },
+            }
+          }
+          return entry
+        })
+      : [
+          {
+            id: 'persona',
+            name: '@deepseek-ai/dsh-persona',
+            config: {
+              prefix: 'You are an authorized security assessment and red-team operator powered by the {{model}} model inside the iOS DSH sandbox with dsh-purge-safe tools.',
+            },
+          },
+          { id: 'time-context', name: '@deepseek-ai/dsh-time-context' },
+          { id: 'tool-fs', name: '@deepseek-ai/dsh-tool-fs', config: { readImage: false, applyPatch: true } },
+        ]
+
+    redteamPresetDisposer = await regCtx.agentPresets.register({
       id: 'redteam',
       name: '红队模式',
       description: 'dsh-purge-safe 安全演练与渗透测试模式；自动挂载红队演练台工具集并遵循三档审批策略。',
       order: 5,
-      plugins: [
-        {
-          id: 'persona',
-          name: '@deepseek-ai/dsh-persona',
-          config: {
-            prefix: 'You are an authorized security assessment and red-team operator working inside the iOS DSH sandbox with dsh-purge-safe tools. Always stay strictly within authorized targets, record findings clearly, and respect tool approval tiers.',
-          },
-        },
-        { id: 'agent-instructions', name: '@deepseek-ai/dsh-agent-instructions', config: { maxBytes: 65536 } },
-        { id: 'time-context', name: '@deepseek-ai/dsh-time-context' },
-        { id: 'tool-fs', name: '@deepseek-ai/dsh-tool-fs', config: { read: true, write: true, edit: true, applyPatch: true, glob: true, grep: true } },
-        { id: 'tool-ask-user', name: '@deepseek-ai/dsh-tool-ask-user' },
-        { id: 'tool-todo', name: '@deepseek-ai/dsh-tool-todo', config: { allowParallelInProgress: true } },
-        { id: 'tool-web', name: '@deepseek-ai/dsh-tool-web', config: { fetch: true, searchTimeoutMs: 60000, searchMaxQueries: 5 } },
-      ],
+      plugins: basePlugins,
     })
   } catch (err) {
     ctx?.logger?.warn?.(`RedTeam preset registration skipped: ${String(err)}`)

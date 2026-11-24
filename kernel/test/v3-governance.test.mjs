@@ -378,7 +378,7 @@ test('v3 roadmap: canonical ipc-protocol, main-CI kernel-tests gate, multi-threa
   assert.match(ciWorkflow, /kernel-tests:/, 'ios-ipa-build.yml must include kernel-tests job')
   assert.match(ciWorkflow, /needs:\s*\[kernel-tests,/, 'candidate job must depend on kernel-tests')
   assert.match(privateAccessSrc, /hasPrivateRootPrefix/, 'private-session-access.mjs must isolate multi-thread ios:<botId>:<threadId> children')
-  assert.match(entrySrc, /reasoningEffort:\s*reasoningEnabled\s*\?\s*requestedEffort\s*:\s*'off'/, 'dsh-ios-entry.mjs must pass real reasoningEffort to DSH agentOptions')
+  assert.match(entrySrc, /reasoningEffort:\s*reasoningEnabled\s*\?\s*dshReasoningEffort\s*:\s*'off'/, 'dsh-ios-entry.mjs must map reasoningEffort to DSH-supported values (low/high/max/off)')
   assert.match(entrySrc, /normalizedDisabledTools/, 'dsh-ios-entry.mjs must enforce per-Bot disabledTools denylist')
 })
 

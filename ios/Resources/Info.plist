@@ -37,8 +37,6 @@
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
-		<key>NSAllowsLocalNetworking</key>
-		<true/>
 	</dict>
 	<key>NSFaceIDUsageDescription</key>
 	<string>DS Bot uses device authentication to unlock private conversations and older memories.</string>
