@@ -78,6 +78,10 @@ public final class BotThreadStore: ObservableObject {
         activeThread(for: botId).sessionId
     }
 
+    public func activeAddress(for botId: String) -> SessionAddress {
+        activeThread(for: botId).address
+    }
+
     @discardableResult
     public func createThread(for botId: String, title: String = "") -> BotThread {
         var list = threadsByBot[botId] ?? [BotThread(id: "default", botId: botId, title: "主会话", isDefault: true)]
@@ -248,19 +252,36 @@ public struct ProviderProfile: Identifiable, Codable, Equatable, Sendable {
     public var apiBaseURL: String
     public var defaultModel: String
     public var protocolKind: String // "anthropic" | "openai-compat"
+    public var supportsTools: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, apiBaseURL, defaultModel, protocolKind, supportsTools
+    }
 
     public init(
         id: String = UUID().uuidString,
         name: String,
         apiBaseURL: String,
         defaultModel: String,
-        protocolKind: String = "anthropic"
+        protocolKind: String = "anthropic",
+        supportsTools: Bool = true
     ) {
         self.id = id
         self.name = name
         self.apiBaseURL = apiBaseURL
         self.defaultModel = defaultModel
         self.protocolKind = protocolKind
+        self.supportsTools = supportsTools
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        apiBaseURL = try c.decode(String.self, forKey: .apiBaseURL)
+        defaultModel = try c.decodeIfPresent(String.self, forKey: .defaultModel) ?? ModelProvider.defaultModel
+        protocolKind = try c.decodeIfPresent(String.self, forKey: .protocolKind) ?? "anthropic"
+        supportsTools = try c.decodeIfPresent(Bool.self, forKey: .supportsTools) ?? true
     }
 }
 

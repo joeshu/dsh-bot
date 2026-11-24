@@ -90,6 +90,7 @@ public final class LocalAgentHost: ObservableObject {
     public let buildNumber = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
     @Published public var bots: [BotProfile] = []
     @Published public private(set) var messagesBySession: [String: [ChatMessageItem]] = [:]
+    @Published public private(set) var webStandaloneSessions: [WebSessionSummary] = []
     @Published private var persistedSessionIDs: Set<String> = []
     @Published private var historyCursors: [String: Int] = [:]
     private var persistedSessionActivityByID: [String: Date] = [:]
@@ -100,6 +101,7 @@ public final class LocalAgentHost: ObservableObject {
     private var historyEpochs: [String: UUID] = [:]
     private var legacyMessagesBySession: [String: [ChatMessageItem]] = [:]
     @Published public private(set) var streamingSessionId: String?
+    @Published public private(set) var activeStreamingSessionIds: [String] = []
     @Published public var visibleChatSessionId: String?
     public let liveStream = StreamingTurnState()
     public var streamingReasoning: String { liveStream.reasoning }
@@ -112,6 +114,64 @@ public final class LocalAgentHost: ObservableObject {
     @Published public private(set) var pendingApprovals: [PendingApproval] = []
     @Published public private(set) var pendingDSHQuestions: [PendingDSHQuestion] = []
     @Published public private(set) var dshToolActivities: [DSHToolActivity] = []
+
+    @MainActor
+    private final class ActiveTurnContext {
+        let sessionId: String
+        let turnId: String
+        let streamState: StreamingTurnState
+        var pendingReasoningBuffer = ""
+        var pendingContentBuffer = ""
+        var flushScheduled = false
+        var startedAt = Date()
+        var lastActivityAt = Date()
+        var firstTokenMs: Int?
+        var lastDraftSavedAt: Date = .distantPast
+        var lastDraftSavedLength: Int = 0
+        var sentCancellation = false
+        var stallWatchdogTask: Task<Void, Never>?
+        var groupLeaseWatchdogTask: Task<Void, Never>?
+
+        init(sessionId: String, turnId: String, steerNote: String?) {
+            self.sessionId = sessionId
+            self.turnId = turnId
+            self.streamState = StreamingTurnState()
+            self.streamState.begin(sessionId: sessionId, steerNote: steerNote)
+        }
+    }
+
+    private static let maxConcurrentNativeTurns = 2
+    private var activeTurnsBySession: [String: ActiveTurnContext] = [:]
+
+    public func isSessionStreaming(_ sessionId: String) -> Bool {
+        activeTurnsBySession[sessionId] != nil
+    }
+
+    public func isBotStreaming(_ botId: String) -> Bool {
+        activeTurnsBySession.keys.contains { resolveAddress($0)?.botID == botId }
+    }
+
+    public func liveStream(for sessionId: String) -> StreamingTurnState {
+        activeTurnsBySession[sessionId]?.streamState ?? liveStream
+    }
+
+    private func syncActiveStreamMirrors() {
+        let ordered = activeTurnsBySession.values
+            .sorted { $0.startedAt < $1.startedAt }
+            .map(\.sessionId)
+        activeStreamingSessionIds = ordered
+        isStreaming = !ordered.isEmpty
+        if let visible = visibleChatSessionId, let ctx = activeTurnsBySession[visible] {
+            streamingSessionId = ctx.sessionId
+            activeTurnId = ctx.turnId
+        } else if let firstId = ordered.first, let ctx = activeTurnsBySession[firstId] {
+            streamingSessionId = ctx.sessionId
+            activeTurnId = ctx.turnId
+        } else {
+            streamingSessionId = nil
+            activeTurnId = nil
+        }
+    }
     @Published public private(set) var dshApprovalAudits: [DSHApprovalAudit] = []
     @Published public private(set) var telemetryBySession: [String: SessionLiveTelemetry] = [:]
     @Published public var unifiedNavigationV2: Bool = AppSettings.bool(.unifiedNavigationV2, default: true) {
@@ -178,7 +238,6 @@ public final class LocalAgentHost: ObservableObject {
     private var pluginCatalogRequest = UUID()
     private var pluginCatalogQuery = ""
     @Published public private(set) var activeTurnId: String?
-    private var groupLeaseWatchdogTask: Task<Void, Never>?
     @Published public var useBubbleLayout: Bool = (UserDefaults.standard.object(forKey: "dsbot.useBubbleLayout") as? Bool) ?? true {
         didSet { UserDefaults.standard.set(useBubbleLayout, forKey: "dsbot.useBubbleLayout") }
     }
@@ -214,20 +273,38 @@ public final class LocalAgentHost: ObservableObject {
         }
     }
 
-    public var orderedAvailableModels: [String] {
+    @Published public private(set) var modelsCatalogRevision = UUID()
+
+    public func isOfficialEndpoint(_ endpointURL: String?) -> Bool {
+        let target = (endpointURL ?? apiBaseURL).trimmingCharacters(in: .whitespacesAndNewlines)
+        let effective = target.isEmpty ? apiBaseURL : target
+        return (try? ModelProvider(effective).isDeepSeek) == true
+    }
+
+    public func orderedAvailableModels(for endpointURL: String? = nil) -> [String] {
+        let target = (endpointURL ?? apiBaseURL).trimmingCharacters(in: .whitespacesAndNewlines)
+        let effective = target.isEmpty ? apiBaseURL : target
+        let official = (try? ModelProvider(effective).isDeepSeek) == true
+        let endpointModels: [String] = (effective == apiBaseURL)
+            ? models
+            : Self.loadCachedModels(for: effective)
         var base: [String] = []
-        if usesOfficialModels {
+        if official {
             base = [ModelProvider.defaultModel, ModelProvider.thinkingModel, "deepseek-v4-pro"]
-            for id in models where !base.contains(id) {
+            for id in endpointModels where !base.contains(id) {
                 base.append(id)
             }
         } else {
-            base = models
+            base = endpointModels
         }
         let favSet = Set(favoriteModels)
         let pinned = favoriteModels.filter { base.contains($0) }
         let rest = base.filter { !favSet.contains($0) }
         return pinned + rest
+    }
+
+    public var orderedAvailableModels: [String] {
+        orderedAvailableModels(for: nil)
     }
 
     @Published public var apiBaseURL: String = UserDefaults.standard.string(forKey: "dsbot.apiBaseURL") ?? ModelProvider.defaultAddress {
@@ -348,13 +425,15 @@ public final class LocalAgentHost: ObservableObject {
         return res?["refreshed"] as? Bool == true
     }
 
-    func refreshModels() async throws -> (latency: Int, count: Int) {
+    func refreshModels(for endpointURL: String? = nil) async throws -> (latency: Int, count: Int) {
         guard channel != nil else { throw IPCFrameError.channelClosed }
-        let address = apiBaseURL
+        let requested = (endpointURL ?? apiBaseURL).trimmingCharacters(in: .whitespacesAndNewlines)
+        let address = requested.isEmpty ? apiBaseURL : requested
         let result = try await workspaceCapabilities.nativeWorkspaceRequest(method: "models.test", params: ["apiBaseURL": address])
         let ids = result["models"] as? [String] ?? []
         if !ids.isEmpty {
             Self.saveCachedModels(ids, for: address)
+            modelsCatalogRevision = UUID()
         }
         if apiBaseURL == address {
             models = ids
@@ -367,7 +446,7 @@ public final class LocalAgentHost: ObservableObject {
                     "deepseek-reasoner"
                 ]
                 var migrated = false
-                for idx in bots.indices {
+                for idx in bots.indices where (bots[idx].providerProfileId ?? "").isEmpty {
                     let cur = bots[idx].model.trimmingCharacters(in: .whitespacesAndNewlines)
                     if (cur.isEmpty || officialIds.contains(cur)) && !ids.contains(cur) {
                         bots[idx].model = firstCustom
@@ -392,18 +471,10 @@ public final class LocalAgentHost: ObservableObject {
     private let workspaceCapabilities: LocalAgentTransport
     public let workspace: URL
     private let persistQueue = DispatchQueue(label: "io.github.dsbot.workspace.persist", qos: .utility)
+    private var persistDebounceWorkItem: DispatchWorkItem?
     private var workspaceReadable = true
     private var uiNotifContinuation: AsyncStream<(String, [String: Any])>.Continuation?
-    private var pendingReasoningBuffer = ""
-    private var pendingContentBuffer = ""
-    private var flushScheduled = false
-    private var streamStartedAt: Date?
-    private var lastStreamActivityAt: Date?
-    private var lastDraftSavedAt: Date = .distantPast
-    private var lastDraftSavedLength: Int = 0
-    private var pendingSteerNote: String?
-    private var streamStallWatchdogTask: Task<Void, Never>?
-    private var sentCancellation = false
+    private var pendingSteerNoteBySession: [String: String] = [:]
 
     public init() {
         let workspaceURL = LocalAgentTransport.defaultWorkspace
@@ -598,12 +669,12 @@ public final class LocalAgentHost: ObservableObject {
         let targetId = address.canonicalSessionId
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        pendingSteerNote = trimmed
-        liveStream.recentSteerNote = trimmed
-        if isStreaming {
-            await abortActiveTurn()
+        pendingSteerNoteBySession[targetId] = trimmed
+        activeTurnsBySession[targetId]?.streamState.recentSteerNote = trimmed
+        if isSessionStreaming(targetId) {
+            await abortActiveTurn(sessionId: targetId)
             for _ in 0..<25 {
-                if !isStreaming { break }
+                if !isSessionStreaming(targetId) { break }
                 try? await Task.sleep(nanoseconds: 80_000_000)
             }
         }
@@ -700,7 +771,7 @@ public final class LocalAgentHost: ObservableObject {
 
     public func sendMessage(sessionId: String, text: String, model: String, imagePaths: [String] = []) async {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !isStreaming, state == .ready, let channel else { return }
+        guard !trimmed.isEmpty, state == .ready, let channel else { return }
         lastErrorSessionId = sessionId
         guard trimmed.utf8.count <= 262_144 else {
             lastStreamError = "消息超过 256 KB。"
@@ -722,6 +793,12 @@ public final class LocalAgentHost: ObservableObject {
             return
         }
         let targetSessionId = address.canonicalSessionId
+        guard activeTurnsBySession[targetSessionId] == nil else { return }
+        guard activeTurnsBySession.count < Self.maxConcurrentNativeTurns else {
+            lastStreamError = "当前已有 \(Self.maxConcurrentNativeTurns) 个会话正在并发生成，请等待其中一个完成或停止后再发。"
+            DSHaptics.notify(.warning)
+            return
+        }
         let targetBot = bot(for: address)
         if let preset = targetBot?.agentPreset, (preset == "ptc-python" || preset == "cordis"),
            !MemoryGovernor.shared.canAdmitHeavyWork() {
@@ -734,37 +811,32 @@ public final class LocalAgentHost: ObservableObject {
             lastStreamError = "私密会话 Web API 隔离尚未同步；请稍后重试。"
             return
         }
-        lastCancelledSessionId = nil
+        if lastCancelledSessionId == targetSessionId { lastCancelledSessionId = nil }
         let turnId = UUID().uuidString
         messagesBySession[targetSessionId, default: []].append(ChatMessageItem(sessionId: targetSessionId, role: "user", content: trimmed))
         persistWorkspace()
-        activeTurnId = turnId
-        streamingSessionId = targetSessionId
-        sentCancellation = false
-        let steerNote = pendingSteerNote
-        pendingSteerNote = nil
-        liveStream.begin(sessionId: targetSessionId, steerNote: steerNote)
-        lastDraftSavedAt = .distantPast
-        lastDraftSavedLength = 0
-        streamStartedAt = Date()
-        lastStreamActivityAt = Date()
+        let steerNote = pendingSteerNoteBySession.removeValue(forKey: targetSessionId)
+        let ctx = ActiveTurnContext(sessionId: targetSessionId, turnId: turnId, steerNote: steerNote)
+        activeTurnsBySession[targetSessionId] = ctx
         streamFirstTokenMs = nil
         lastStreamError = nil
-        isStreaming = true
+        syncActiveStreamMirrors()
         DSHaptics.impact(.light)
 
-        streamStallWatchdogTask?.cancel()
-        streamStallWatchdogTask = Task { @MainActor [weak self] in
+        ctx.stallWatchdogTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 15_000_000_000)
-                guard let self, self.activeTurnId == turnId, self.isStreaming else { return }
-                guard self.pendingApprovals.isEmpty, self.pendingDSHQuestions.isEmpty else {
-                    self.lastStreamActivityAt = Date()
+                guard let self, let active = self.activeTurnsBySession[targetSessionId], active.turnId == turnId else { return }
+                let hasPending = self.pendingApprovals.contains { $0.sessionId == targetSessionId }
+                    || self.pendingDSHQuestions.contains { $0.sessionId == targetSessionId }
+                if hasPending {
+                    active.lastActivityAt = Date()
                     continue
                 }
-                if let last = self.lastStreamActivityAt, Date().timeIntervalSince(last) >= 120 {
+                if Date().timeIntervalSince(active.lastActivityAt) >= 120 {
+                    self.lastErrorSessionId = targetSessionId
                     self.lastStreamError = "流式响应超过 120 秒无新数据（网络可能已断开），已安全停止，可点击重试。"
-                    await self.abortActiveTurn()
+                    await self.abortActiveTurn(sessionId: targetSessionId)
                     return
                 }
             }
@@ -776,12 +848,12 @@ public final class LocalAgentHost: ObservableObject {
             ["role": message.role, "content": String(message.content.prefix(12_000))]
         }
         if bot?.isGroup == true {
-            groupLeaseWatchdogTask?.cancel()
-            groupLeaseWatchdogTask = Task { @MainActor [weak self] in
+            ctx.groupLeaseWatchdogTask = Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 90_000_000_000)
-                guard let self, self.activeTurnId == turnId, self.isStreaming else { return }
+                guard let self, let active = self.activeTurnsBySession[targetSessionId], active.turnId == turnId else { return }
+                self.lastErrorSessionId = targetSessionId
                 self.lastStreamError = "群聊编排超过 90 秒租约（interrupted），已安全中止等待。"
-                await self.abortActiveTurn()
+                await self.abortActiveTurn(sessionId: targetSessionId)
             }
         }
         do {
@@ -800,9 +872,10 @@ public final class LocalAgentHost: ObservableObject {
                 "text": trimmed, "legacyHistory": legacyHistory
             ])
         } catch {
-            guard activeTurnId == turnId else { return }
+            guard activeTurnsBySession[targetSessionId]?.turnId == turnId else { return }
+            lastErrorSessionId = targetSessionId
             lastStreamError = error.localizedDescription
-            finishTurn()
+            finishTurn(for: targetSessionId)
         }
     }
 
@@ -1371,9 +1444,11 @@ public final class LocalAgentHost: ObservableObject {
                     self.effectiveWebSearchSendOriginalQuestion = false
                     self.resolveRuntimeReadiness(.channelClosed)
                     guard self.state == .ready else { return }
-                    if let turnId = self.activeTurnId, let sessionId = self.streamingSessionId {
+                    for ctx in self.activeTurnsBySession.values {
+                        let sId = ctx.sessionId
+                        let tId = ctx.turnId
                         Task {
-                            await self.workspaceCapabilities.cancelNativeTool(botId: sessionId, turnId: turnId) { botId, turnId in
+                            await self.workspaceCapabilities.cancelNativeTool(botId: sId, turnId: tId) { botId, turnId in
                                 _ = try? await rpc.request("python.cancel", params: ["botId": botId, "turnId": turnId], timeoutSeconds: 5)
                             }
                         }
@@ -1381,9 +1456,11 @@ public final class LocalAgentHost: ObservableObject {
                     self.pendingApprovals.removeAll()
                     self.pendingDSHQuestions.removeAll()
                     let message = "内嵌 DSH 运行时已退出，请重新启动应用。"
-                    if self.isStreaming {
+                    if !self.activeTurnsBySession.isEmpty {
                         self.lastStreamError = message
-                        self.finishTurn(["status": "error"])
+                        for sId in Array(self.activeTurnsBySession.keys) {
+                            self.finishTurn(for: sId, params: ["status": "error"])
+                        }
                     }
                     self.state = .failed(message)
                 }
@@ -1422,9 +1499,11 @@ public final class LocalAgentHost: ObservableObject {
                 guard let self else { return }
                 Task { @MainActor in
                     self.trimMemoryCachesForPressure()
-                    if self.isStreaming {
+                    if !self.activeTurnsBySession.isEmpty {
                         self.lastStreamError = "系统内存紧张，已安全暂停当前生成以保护进度。"
-                        await self.abortActiveTurn()
+                        for sId in Array(self.activeTurnsBySession.keys) {
+                            await self.abortActiveTurn(sessionId: sId)
+                        }
                     }
                 }
             }
@@ -1442,7 +1521,8 @@ public final class LocalAgentHost: ObservableObject {
     /// Reclaims SwiftUI render caches, inactive session transcripts, and excess tool/audit records under iOS memory pressure.
     public func trimMemoryCachesForPressure() {
         DSMarkdownText.clearRenderCache()
-        let keepIds = Set([visibleChatSessionId, streamingSessionId].compactMap { $0 })
+        var keepIds = Set(activeTurnsBySession.keys)
+        if let visibleChatSessionId { keepIds.insert(visibleChatSessionId) }
         for sessionId in Array(messagesBySession.keys) where !keepIds.contains(sessionId) {
             messagesBySession.removeValue(forKey: sessionId)
             loadedHistoryIDs.remove(sessionId)
@@ -1457,20 +1537,22 @@ public final class LocalAgentHost: ObservableObject {
     }
 
     public func suspendForBackground() async {
+        persistWorkspace(immediate: true)
         guard let channel else { return }
-        let suspendedTurnId = activeTurnId
-        let suspendedSessionId = streamingSessionId
-        if suspendedTurnId != nil {
-            sentCancellation = true
+        let suspendedSnapshots = activeTurnsBySession.map { ($0.key, $0.value.turnId) }
+        if !suspendedSnapshots.isEmpty {
+            for ctx in activeTurnsBySession.values {
+                ctx.sentCancellation = true
+            }
             pendingApprovals.removeAll()
             pendingDSHQuestions.removeAll()
         }
         _ = try? await channel.request("agent.suspend", timeoutSeconds: 3)
-        if let suspendedTurnId, activeTurnId == suspendedTurnId {
-            if let suspendedSessionId {
-                lastCancelledSessionId = suspendedSessionId
+        for (sId, tId) in suspendedSnapshots {
+            if activeTurnsBySession[sId]?.turnId == tId {
+                lastCancelledSessionId = sId
+                finishTurn(for: sId, params: ["status": "aborted"])
             }
-            finishTurn(["status": "aborted"])
         }
     }
 
@@ -1484,20 +1566,22 @@ public final class LocalAgentHost: ObservableObject {
             let webPort = health["webPort"] as? Int ?? 0
             let webAlive = webPort == 0 || (health["webServerAlive"] as? Bool ?? true)
             let activeTurns = health["activeTurns"] as? Int ?? 0
-            if isStreaming && (sentCancellation || activeTurns == 0) {
-                let stuckSessionId = streamingSessionId
-                finishTurn(["status": "aborted"])
-                if let stuckSessionId {
-                    loadedHistoryIDs.remove(stuckSessionId)
-                    try? await loadSessionHistory(stuckSessionId)
+            if !activeTurnsBySession.isEmpty && (activeTurns == 0 || activeTurnsBySession.values.allSatisfy(\.sentCancellation)) {
+                let stuckIds = Array(activeTurnsBySession.keys)
+                for sId in stuckIds {
+                    finishTurn(for: sId, params: ["status": "aborted"])
+                    loadedHistoryIDs.remove(sId)
+                    try? await loadSessionHistory(sId)
                 }
             }
             if (!isHealthy || !webAlive), state == .ready, !isStreaming {
                 _ = await restartRuntime()
             }
         } catch {
-            if isStreaming {
-                finishTurn(["status": "aborted"])
+            if !activeTurnsBySession.isEmpty {
+                for sId in Array(activeTurnsBySession.keys) {
+                    finishTurn(for: sId, params: ["status": "aborted"])
+                }
             }
             if state == .ready, !isStreaming {
                 _ = await restartRuntime()
@@ -1505,25 +1589,30 @@ public final class LocalAgentHost: ObservableObject {
         }
     }
 
-    public func abortActiveTurn() async {
-        guard let turnId = activeTurnId else { return }
-        if sentCancellation {
+    public func abortActiveTurn(sessionId: String? = nil) async {
+        let targetSessionId = sessionId ?? streamingSessionId
+        guard let targetSessionId, let ctx = activeTurnsBySession[targetSessionId] else { return }
+        let turnId = ctx.turnId
+        if ctx.sentCancellation {
             // Second tap on Stop or already-cancelled turn: force-unblock UI and preserve partial text.
-            if let sessionId = streamingSessionId { lastCancelledSessionId = sessionId }
-            finishTurn(["status": "aborted"])
+            lastCancelledSessionId = targetSessionId
+            finishTurn(for: targetSessionId, params: ["status": "aborted"])
             return
         }
-        sentCancellation = true
-        liveStream.phase = .cancelling
+        ctx.sentCancellation = true
+        ctx.streamState.phase = .cancelling
         pendingApprovals.removeAll { $0.turnId == turnId }
         pendingDSHQuestions.removeAll { $0.turnId == turnId }
         do {
             let response = try await channel?.request("chat.abort", params: ["turnId": turnId], timeoutSeconds: 5)
-            if response?["aborted"] as? Bool != true, activeTurnId == turnId { finishTurn(["status": "aborted"]) }
+            if response?["aborted"] as? Bool != true, activeTurnsBySession[targetSessionId]?.turnId == turnId {
+                finishTurn(for: targetSessionId, params: ["status": "aborted"])
+            }
         } catch {
-            if activeTurnId == turnId {
+            if activeTurnsBySession[targetSessionId]?.turnId == turnId {
+                lastErrorSessionId = targetSessionId
                 lastStreamError = error.localizedDescription
-                finishTurn(["status": "aborted"])
+                finishTurn(for: targetSessionId, params: ["status": "aborted"])
             }
         }
     }
@@ -1531,7 +1620,8 @@ public final class LocalAgentHost: ObservableObject {
     public func respondToApproval(id: String, approved: Bool) async {
         guard !inFlightRequestIDs.contains(id), !resolvedRequestIDs.contains(id) else { return }
         guard let approval = pendingApprovals.first(where: { $0.id == id }),
-              approval.turnId == activeTurnId, !sentCancellation else {
+              let ctx = activeTurnsBySession[approval.sessionId],
+              approval.turnId == ctx.turnId, !ctx.sentCancellation else {
             pendingApprovals.removeAll { $0.id == id }
             return
         }
@@ -1558,7 +1648,8 @@ public final class LocalAgentHost: ObservableObject {
     public func respondToDSHQuestion(id: String, answers: [[String: Any]]) async {
         guard !inFlightRequestIDs.contains(id), !resolvedRequestIDs.contains(id) else { return }
         guard let question = pendingDSHQuestions.first(where: { $0.id == id }),
-              question.turnId == activeTurnId, !sentCancellation else {
+              let ctx = activeTurnsBySession[question.sessionId],
+              question.turnId == ctx.turnId, !ctx.sentCancellation else {
             pendingDSHQuestions.removeAll { $0.id == id }
             return
         }
@@ -1922,6 +2013,22 @@ public final class LocalAgentHost: ObservableObject {
             }
             persistedSessionActivityByID = activityByID
             persistedSessionPreviewByID = previewByID
+            if let webListing = try? await rpc.request("web.sessions.list", timeoutSeconds: 15),
+               generation == runtimeGeneration {
+                let rawWeb = webListing["sessions"] as? [[String: Any]] ?? []
+                webStandaloneSessions = rawWeb.compactMap { record -> WebSessionSummary? in
+                    guard let id = record["sessionId"] as? String, !id.isEmpty else { return nil }
+                    let ts = Self.sessionDate(record["lastActivityAt"] ?? record["createdAt"])
+                    let preview = (record["lastMessagePreview"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    let count = record["eventCount"] as? Int ?? 0
+                    return WebSessionSummary(
+                        sessionId: id,
+                        lastActivityAt: ts,
+                        lastMessagePreview: preview,
+                        eventCount: count
+                    )
+                }
+            }
         } catch is CancellationError {
             return
         } catch {
@@ -2238,9 +2345,11 @@ public final class LocalAgentHost: ObservableObject {
             if safeMode || shouldResyncSettings {
                 await MainActor.run { self?.effectiveWebSearchSendOriginalQuestion = false }
             }
-            await self?.updatePluginRecovery(params["safeMode"] as? Bool == true)
-            await MainActor.run { self?.runtimeGeneration = UUID() }
-            await self?.resolveRuntimeReadiness()
+            await MainActor.run {
+                self?.updatePluginRecovery(safeMode)
+                self?.runtimeGeneration = UUID()
+                self?.resolveRuntimeReadiness()
+            }
             if shouldResyncSettings && !safeMode {
                 Task { @MainActor [weak self] in
                     guard let self else { return }
@@ -2296,9 +2405,13 @@ public final class LocalAgentHost: ObservableObject {
             guard let self, let name = params["name"] as? String else { throw IPCFrameError.invalidJSON }
             var arguments = params["args"] as? [String: Any] ?? [:]
             if name == "web_search" {
-                guard self.webSearchEnabled, self.usesOfficialModels, !self.sentCancellation,
-                      let turnId = params["turnId"] as? String, turnId == self.activeTurnId,
-                      let botId = params["botId"] as? String, botId == self.streamingSessionId else {
+                let botId = params["botId"] as? String ?? ""
+                let turnId = params["turnId"] as? String ?? ""
+                let targetBot = self.resolveAddress(botId).flatMap { self.bot(for: $0) }
+                let botUsesOfficial = (try? ModelProvider(self.effectiveApiBaseURL(for: targetBot)).isDeepSeek) == true
+                guard self.webSearchEnabled, botUsesOfficial,
+                      let ctx = self.activeTurnsBySession[botId],
+                      ctx.turnId == turnId, !ctx.sentCancellation else {
                     throw IPCFrameError.remoteError(code: -32000, message: "当前会话不能发起网页搜索。")
                 }
                 arguments.removeValue(forKey: "originalQuestion")
@@ -2364,21 +2477,23 @@ public final class LocalAgentHost: ObservableObject {
             bots = try load("bots.json", fallback: Self.defaultBots)
             if bots.isEmpty { bots = Self.defaultBots }
             messagesBySession = try load("chats.json", fallback: [:])
-            restoreInterruptedStreamingDraftIfNeeded()
             legacyMessagesBySession = messagesBySession
             workspaceReadable = true
+            restoreInterruptedStreamingDraftIfNeeded()
         } catch {
             workspaceReadable = false
             throw IPCFrameError.remoteError(code: -32000, message: "无法读取本机工作区。原有文件已保留。")
         }
     }
 
-    private func persistWorkspace() {
+    private func persistWorkspace(immediate: Bool = false) {
         guard workspaceReadable else { return }
+        persistDebounceWorkItem?.cancel()
+        persistDebounceWorkItem = nil
         let botsSnapshot = bots
         let chatsSnapshot = legacyMessagesBySession
         let root = workspace
-        persistQueue.async { [weak self] in
+        let writeBlock = { [weak self] in
             do {
                 try JSONEncoder().encode(botsSnapshot).write(to: root.appendingPathComponent("bots.json"), options: .atomic)
                 try JSONEncoder().encode(chatsSnapshot).write(to: root.appendingPathComponent("chats.json"), options: .atomic)
@@ -2387,6 +2502,13 @@ public final class LocalAgentHost: ObservableObject {
                 Task { @MainActor in self?.workspaceError = "保存本机工作区失败。请检查存储空间后重试。" }
             }
         }
+        if immediate {
+            persistQueue.async(execute: writeBlock)
+            return
+        }
+        let item = DispatchWorkItem(block: writeBlock)
+        persistDebounceWorkItem = item
+        persistQueue.asyncAfter(deadline: .now() + .milliseconds(250), execute: item)
     }
 
     private func streamingDraftURL() -> URL {
@@ -2412,22 +2534,22 @@ public final class LocalAgentHost: ObservableObject {
         )
         recovered.incomplete = true
         messagesBySession[draft.sessionId, default: []].append(recovered)
-        persistWorkspace()
+        legacyMessagesBySession[draft.sessionId, default: []].append(recovered)
+        persistWorkspace(immediate: true)
     }
 
-    private func checkpointStreamingDraftIfNeeded() {
-        guard let sessionId = streamingSessionId else { return }
-        let totalLen = liveStream.content.count + liveStream.reasoning.count
+    private func checkpointStreamingDraftIfNeeded(for ctx: ActiveTurnContext) {
+        let totalLen = ctx.streamState.content.count + ctx.streamState.reasoning.count
         guard totalLen > 0 else { return }
         let now = Date()
-        let deltaChars = totalLen - lastDraftSavedLength
-        guard deltaChars >= 512 || (deltaChars > 0 && now.timeIntervalSince(lastDraftSavedAt) >= 4.0) else { return }
-        lastDraftSavedAt = now
-        lastDraftSavedLength = totalLen
+        let deltaChars = totalLen - ctx.lastDraftSavedLength
+        guard deltaChars >= 512 || (deltaChars > 0 && now.timeIntervalSince(ctx.lastDraftSavedAt) >= 4.0) else { return }
+        ctx.lastDraftSavedAt = now
+        ctx.lastDraftSavedLength = totalLen
         let draft = StreamingDraftRecord(
-            sessionId: sessionId,
-            content: liveStream.content,
-            reasoning: liveStream.reasoning,
+            sessionId: ctx.sessionId,
+            content: ctx.streamState.content,
+            reasoning: ctx.streamState.reasoning,
             updatedAt: now
         )
         let url = streamingDraftURL()
@@ -2445,99 +2567,104 @@ public final class LocalAgentHost: ObservableObject {
         }
     }
 
-    private func flushPendingStreamBuffers() {
-        flushScheduled = false
+    private func flushPendingStreamBuffers(for sessionId: String) {
+        guard let ctx = activeTurnsBySession[sessionId] else { return }
+        ctx.flushScheduled = false
         var grew = false
-        if !pendingReasoningBuffer.isEmpty {
-            liveStream.reasoning += pendingReasoningBuffer
-            pendingReasoningBuffer = ""
-            if liveStream.content.isEmpty && !sentCancellation {
-                liveStream.phase = .thinking
+        if !ctx.pendingReasoningBuffer.isEmpty {
+            ctx.streamState.reasoning += ctx.pendingReasoningBuffer
+            ctx.pendingReasoningBuffer = ""
+            if ctx.streamState.content.isEmpty && !ctx.sentCancellation {
+                ctx.streamState.phase = .thinking
             }
             grew = true
         }
-        if !pendingContentBuffer.isEmpty {
-            liveStream.appendContent(pendingContentBuffer)
-            pendingContentBuffer = ""
-            if !sentCancellation {
-                liveStream.phase = .generating
+        if !ctx.pendingContentBuffer.isEmpty {
+            ctx.streamState.appendContent(ctx.pendingContentBuffer)
+            ctx.pendingContentBuffer = ""
+            if !ctx.sentCancellation {
+                ctx.streamState.phase = .generating
             }
             grew = true
         }
-        if grew, let start = streamStartedAt {
-            let elapsed = max(0.25, Date().timeIntervalSince(start))
-            liveStream.elapsedSeconds = Int(elapsed)
-            let totalChars = liveStream.content.count + liveStream.reasoning.count
-            liveStream.charsPerSecond = max(1, Int(Double(totalChars) / elapsed))
-            checkpointStreamingDraftIfNeeded()
+        if grew {
+            let elapsed = max(0.25, Date().timeIntervalSince(ctx.startedAt))
+            ctx.streamState.elapsedSeconds = Int(elapsed)
+            let totalChars = ctx.streamState.content.count + ctx.streamState.reasoning.count
+            ctx.streamState.charsPerSecond = max(1, Int(Double(totalChars) / elapsed))
+            checkpointStreamingDraftIfNeeded(for: ctx)
         }
     }
 
-    private func scheduleStreamFlushIfNeeded() {
-        guard !flushScheduled else { return }
-        flushScheduled = true
+    private func scheduleStreamFlushIfNeeded(for sessionId: String) {
+        guard let ctx = activeTurnsBySession[sessionId], !ctx.flushScheduled else { return }
+        ctx.flushScheduled = true
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 33_000_000) // ~30 FPS coalescing
-            self?.flushPendingStreamBuffers()
+            self?.flushPendingStreamBuffers(for: sessionId)
         }
     }
 
-    private func finishTurn(_ params: [String: Any] = [:]) {
-        flushPendingStreamBuffers()
-        clearStreamingDraft()
-        if let sessionId = streamingSessionId, let turnId = activeTurnId {
-            for index in dshToolActivities.indices where dshToolActivities[index].sessionId == sessionId
-                && dshToolActivities[index].turnId == turnId && dshToolActivities[index].phase == "started" {
-                let wasAborted = params["status"] as? String == "aborted"
-                dshToolActivities[index].phase = wasAborted ? "cancelled" : "failed"
-                if dshToolActivities[index].result.isEmpty {
-                    dshToolActivities[index].result = wasAborted ? "会话已取消，工具执行已中止。" : "工具未返回完成结果。"
-                }
+    private func finishTurn(for sessionId: String? = nil, params: [String: Any] = [:]) {
+        let targetSessionId = sessionId ?? streamingSessionId
+        guard let targetSessionId, let ctx = activeTurnsBySession[targetSessionId] else {
+            syncActiveStreamMirrors()
+            return
+        }
+        flushPendingStreamBuffers(for: targetSessionId)
+        if activeTurnsBySession.count <= 1 {
+            clearStreamingDraft()
+        }
+        let turnId = ctx.turnId
+        for index in dshToolActivities.indices where dshToolActivities[index].sessionId == targetSessionId
+            && dshToolActivities[index].turnId == turnId && dshToolActivities[index].phase == "started" {
+            let wasAborted = params["status"] as? String == "aborted"
+            dshToolActivities[index].phase = wasAborted ? "cancelled" : "failed"
+            if dshToolActivities[index].result.isEmpty {
+                dshToolActivities[index].result = wasAborted ? "会话已取消，工具执行已中止。" : "工具未返回完成结果。"
             }
         }
-        if let sessionId = streamingSessionId {
-            var telemetry = telemetryBySession[sessionId] ?? SessionLiveTelemetry()
-            if let usage = params["usage"] as? [String: Any] {
-                telemetry.inputTokens += usage["inputTokens"] as? Int ?? 0
-                telemetry.cacheReadTokens += usage["cacheReadTokens"] as? Int ?? 0
-                telemetry.outputTokens += usage["outputTokens"] as? Int ?? 0
-            }
-            if let dur = params["durationMs"] as? Int, dur > 0 {
-                telemetry.modelDurationMs += dur
-            } else if let start = streamStartedAt {
-                telemetry.modelDurationMs += max(1, Int(Date().timeIntervalSince(start) * 1_000))
-            }
-            if let ttft = streamFirstTokenMs, ttft > 0 {
-                telemetry.ttftSumMs += ttft
-                telemetry.ttftSamples += 1
-            }
-            telemetryBySession[sessionId] = telemetry
+        var telemetry = telemetryBySession[targetSessionId] ?? SessionLiveTelemetry()
+        if let usage = params["usage"] as? [String: Any] {
+            telemetry.inputTokens += usage["inputTokens"] as? Int ?? 0
+            telemetry.cacheReadTokens += usage["cacheReadTokens"] as? Int ?? 0
+            telemetry.outputTokens += usage["outputTokens"] as? Int ?? 0
+        }
+        if let dur = params["durationMs"] as? Int, dur > 0 {
+            telemetry.modelDurationMs += dur
+        } else {
+            telemetry.modelDurationMs += max(1, Int(Date().timeIntervalSince(ctx.startedAt) * 1_000))
+        }
+        if let ttft = ctx.firstTokenMs, ttft > 0 {
+            telemetry.ttftSumMs += ttft
+            telemetry.ttftSamples += 1
+        }
+        telemetryBySession[targetSessionId] = telemetry
 
-            let authoritativeContent = (params["finalContent"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            let authoritativeReasoning = (params["finalReasoning"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            let finalText: String
-            if !authoritativeContent.isEmpty && (liveStream.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || authoritativeContent.count > liveStream.content.count) {
-                finalText = authoritativeContent
-            } else {
-                finalText = liveStream.content
+        let authoritativeContent = (params["finalContent"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let authoritativeReasoning = (params["finalReasoning"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let finalText: String
+        if !authoritativeContent.isEmpty && (ctx.streamState.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || authoritativeContent.count > ctx.streamState.content.count) {
+            finalText = authoritativeContent
+        } else {
+            finalText = ctx.streamState.content
+        }
+        let finalThink: String
+        if !authoritativeReasoning.isEmpty && (ctx.streamState.reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || authoritativeReasoning.count > ctx.streamState.reasoning.count) {
+            finalThink = authoritativeReasoning
+        } else {
+            finalThink = ctx.streamState.reasoning
+        }
+        if !finalText.isEmpty || !finalThink.isEmpty {
+            var item = ChatMessageItem(sessionId: targetSessionId, role: "assistant", content: finalText, reasoning: finalThink)
+            item.incomplete = params["status"] as? String != "completed"
+            if let transcript = params["transcript"],
+               let bytes = try? JSONSerialization.data(withJSONObject: transcript) {
+                item.transcript = try? JSONDecoder().decode([ProviderMessage].self, from: bytes)
+                item.providerProfile = params["profile"] as? String
             }
-            let finalThink: String
-            if !authoritativeReasoning.isEmpty && (liveStream.reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || authoritativeReasoning.count > liveStream.reasoning.count) {
-                finalThink = authoritativeReasoning
-            } else {
-                finalThink = liveStream.reasoning
-            }
-            if !finalText.isEmpty || !finalThink.isEmpty {
-                var item = ChatMessageItem(sessionId: sessionId, role: "assistant", content: finalText, reasoning: finalThink)
-                item.incomplete = params["status"] as? String != "completed"
-                if let transcript = params["transcript"],
-                   let bytes = try? JSONSerialization.data(withJSONObject: transcript) {
-                    item.transcript = try? JSONDecoder().decode([ProviderMessage].self, from: bytes)
-                    item.providerProfile = params["profile"] as? String
-                }
-                messagesBySession[sessionId, default: []].append(item)
-                persistWorkspace()
-            }
+            messagesBySession[targetSessionId, default: []].append(item)
+            persistWorkspace()
         }
         if let usage = params["usage"] as? [String: Any] {
             let model = usage["model"] as? String ?? ModelProvider.defaultModel
@@ -2551,20 +2678,15 @@ public final class LocalAgentHost: ObservableObject {
                 outputTokens: outputTokens
             )
         }
-        groupLeaseWatchdogTask?.cancel()
-        groupLeaseWatchdogTask = nil
-        streamStallWatchdogTask?.cancel()
-        streamStallWatchdogTask = nil
-        lastStreamActivityAt = nil
-        lastDraftSavedAt = .distantPast
-        lastDraftSavedLength = 0
-        sentCancellation = false
-        liveStream.reset()
-        streamingSessionId = nil
-        pendingApprovals.removeAll()
-        pendingDSHQuestions.removeAll()
-        isStreaming = false
-        activeTurnId = nil
+        ctx.groupLeaseWatchdogTask?.cancel()
+        ctx.groupLeaseWatchdogTask = nil
+        ctx.stallWatchdogTask?.cancel()
+        ctx.stallWatchdogTask = nil
+        ctx.streamState.reset()
+        activeTurnsBySession.removeValue(forKey: targetSessionId)
+        pendingApprovals.removeAll { $0.turnId == turnId }
+        pendingDSHQuestions.removeAll { $0.turnId == turnId }
+        syncActiveStreamMirrors()
     }
 
     private func registerUINotifications(on rpc: IPCChannel) async {
@@ -2591,43 +2713,57 @@ public final class LocalAgentHost: ObservableObject {
                     continue
                 }
                 if method.hasPrefix("approval.") {
-                    self.lastStreamActivityAt = Date()
+                    if let sId = params["sessionId"] as? String {
+                        self.activeTurnsBySession[sId]?.lastActivityAt = Date()
+                    }
                     self.handleNativeApprovalNotification(method: method, params: params)
                     continue
                 }
                 if method.hasPrefix("user-question.") {
-                    self.lastStreamActivityAt = Date()
+                    if let sId = params["sessionId"] as? String {
+                        self.activeTurnsBySession[sId]?.lastActivityAt = Date()
+                    }
                     self.handleDSHQuestionNotification(method: method, params: params)
                     continue
                 }
                 if method == "dsh.tool.event" {
-                    self.lastStreamActivityAt = Date()
+                    if let sId = params["sessionId"] as? String {
+                        self.activeTurnsBySession[sId]?.lastActivityAt = Date()
+                    }
                     self.handleDSHToolNotification(params)
                     continue
                 }
                 if method == "dsh.approval.event" {
-                    self.lastStreamActivityAt = Date()
+                    if let sId = params["sessionId"] as? String {
+                        self.activeTurnsBySession[sId]?.lastActivityAt = Date()
+                    }
                     self.handleDSHApprovalAuditNotification(params)
                     continue
                 }
-                guard let turnId = params["turnId"] as? String, self.activeTurnId == turnId,
-                      let sessionId = params["sessionId"] as? String, sessionId == self.streamingSessionId else { continue }
+                guard let sessionId = params["sessionId"] as? String,
+                      let turnId = params["turnId"] as? String,
+                      let ctx = self.activeTurnsBySession[sessionId],
+                      ctx.turnId == turnId else { continue }
                 switch method {
                 case "chat.delta":
-                    guard !self.sentCancellation else { continue }
-                    self.lastStreamActivityAt = Date()
-                    if self.streamFirstTokenMs == nil, let start = self.streamStartedAt {
-                        let ttft = max(1, Int(Date().timeIntervalSince(start) * 1_000))
+                    guard !ctx.sentCancellation else { continue }
+                    ctx.lastActivityAt = Date()
+                    if ctx.firstTokenMs == nil {
+                        let ttft = max(1, Int(Date().timeIntervalSince(ctx.startedAt) * 1_000))
+                        ctx.firstTokenMs = ttft
                         self.streamFirstTokenMs = ttft
-                        self.liveStream.firstTokenMs = ttft
+                        ctx.streamState.firstTokenMs = ttft
                     }
-                    self.pendingReasoningBuffer += params["reasoning"] as? String ?? ""
-                    self.pendingContentBuffer += params["content"] as? String ?? ""
-                    self.scheduleStreamFlushIfNeeded()
+                    ctx.pendingReasoningBuffer += params["reasoning"] as? String ?? ""
+                    ctx.pendingContentBuffer += params["content"] as? String ?? ""
+                    self.scheduleStreamFlushIfNeeded(for: sessionId)
                 case "chat.done":
-                    self.lastStreamError = params["error"] as? String
+                    if let err = params["error"] as? String {
+                        self.lastErrorSessionId = sessionId
+                        self.lastStreamError = err
+                    }
                     if params["status"] as? String == "aborted" { self.lastCancelledSessionId = sessionId }
-                    self.finishTurn(params)
+                    self.finishTurn(for: sessionId, params: params)
                 default: break
                 }
             }
@@ -2640,14 +2776,16 @@ public final class LocalAgentHost: ObservableObject {
             return
         }
         guard method == "approval.request",
-              !sentCancellation,
-              let turnId = params["turnId"] as? String, activeTurnId == turnId,
-              let sessionId = params["sessionId"] as? String, sessionId == streamingSessionId,
+              let sessionId = params["sessionId"] as? String,
+              let turnId = params["turnId"] as? String,
+              let ctx = activeTurnsBySession[sessionId],
+              ctx.turnId == turnId, !ctx.sentCancellation,
               let id = params["approvalId"] as? String,
               let tool = params["tool"] as? String,
               let summary = params["summary"] as? String else { return }
 
-        let botMode = bots.first(where: { $0.id == sessionId })?.permissionMode ?? "ask"
+        let rootBotId = resolveAddress(sessionId)?.botID ?? sessionId
+        let botMode = bots.first(where: { $0.id == rootBotId })?.permissionMode ?? "ask"
         let lowerTool = tool.lowercased()
         let isWriteOrMutate = lowerTool.contains("write") || lowerTool.contains("edit") || lowerTool.contains("patch")
             || lowerTool.contains("delete") || lowerTool.contains("memory") || lowerTool == "terminal_exec"
@@ -2656,7 +2794,7 @@ public final class LocalAgentHost: ObservableObject {
 
         let approval = PendingApproval(id: id, sessionId: sessionId, turnId: turnId, tool: tool, summary: summary, isDSH: params["source"] as? String == "dsh")
         pendingApprovals.append(approval)
-        liveStream.phase = .awaitingApproval(tool)
+        ctx.streamState.phase = .awaitingApproval(tool)
 
         if botMode == "readOnly" && isWriteOrMutate {
             autoReviewLog.insert("[\(Date().formatted(date: .omitted, time: .shortened))] 只读保护拦截：\(tool)", at: 0)
@@ -2674,10 +2812,12 @@ public final class LocalAgentHost: ObservableObject {
     }
 
     public func approveAndSwitchToAutoReview(id: String) async {
-        if let approval = pendingApprovals.first(where: { $0.id == id }),
-           let index = bots.firstIndex(where: { $0.id == approval.sessionId }) {
-            bots[index].permissionMode = "autoReview"
-            persistWorkspace()
+        if let approval = pendingApprovals.first(where: { $0.id == id }) {
+            let rootBotId = resolveAddress(approval.sessionId)?.botID ?? approval.sessionId
+            if let index = bots.firstIndex(where: { $0.id == rootBotId }) {
+                bots[index].permissionMode = "autoReview"
+                persistWorkspace()
+            }
         }
         await respondToApproval(id: id, approved: true)
     }
@@ -2688,9 +2828,10 @@ public final class LocalAgentHost: ObservableObject {
             return
         }
         guard method == "user-question.request",
-              !sentCancellation,
-              let turnId = params["turnId"] as? String, activeTurnId == turnId,
-              let sessionId = params["sessionId"] as? String, sessionId == streamingSessionId,
+              let sessionId = params["sessionId"] as? String,
+              let turnId = params["turnId"] as? String,
+              let ctx = activeTurnsBySession[sessionId],
+              ctx.turnId == turnId, !ctx.sentCancellation,
               let questionId = params["questionId"] as? String,
               let rawQuestions = params["questions"] as? [[String: Any]] else { return }
         let questions = rawQuestions.compactMap { raw -> DSHQuestionItem? in
@@ -2714,15 +2855,15 @@ public final class LocalAgentHost: ObservableObject {
     }
 
     private func handleDSHToolNotification(_ params: [String: Any]) {
-        guard !sentCancellation,
-              let sessionId = params["sessionId"] as? String,
+        guard let sessionId = params["sessionId"] as? String,
               let turnId = params["turnId"] as? String,
-              activeTurnId == turnId, streamingSessionId == sessionId,
+              let ctx = activeTurnsBySession[sessionId],
+              ctx.turnId == turnId, !ctx.sentCancellation,
               let callId = params["callId"] as? String, !callId.isEmpty else { return }
         let phase = params["phase"] as? String ?? "started"
         let toolName = params["toolName"] as? String ?? "DSH tool"
         if phase == "started" {
-            liveStream.phase = .toolRunning(toolName)
+            ctx.streamState.phase = .toolRunning(toolName)
         }
         let redactedArgs = (params["arguments"] as? String).map { SecretRedactor.redactCommonTokens($0) }
         let redactedResult = (params["result"] as? String).map { SecretRedactor.redactCommonTokens($0) }
@@ -2766,8 +2907,9 @@ public final class LocalAgentHost: ObservableObject {
 
     private func handleDSHApprovalAuditNotification(_ params: [String: Any]) {
         guard let sessionId = params["sessionId"] as? String,
-              sessionId == streamingSessionId,
-              let turnId = params["turnId"] as? String, turnId == activeTurnId,
+              let turnId = params["turnId"] as? String,
+              let ctx = activeTurnsBySession[sessionId],
+              ctx.turnId == turnId,
               let auditId = params["id"] as? String, !auditId.isEmpty,
               let outcome = params["outcome"] as? String else { return }
         let toolName = params["toolName"] as? String ?? "DSH 工具"

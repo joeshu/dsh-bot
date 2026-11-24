@@ -28,7 +28,6 @@ public struct PluginManagerView: View {
     @State private var searchText = ""
     @State private var newSourceURL = ""
     @State private var githubRepoURL = ""
-    @State private var showFolderPicker = false
     @State private var isInstalling = false
     @State private var pendingInstall: PendingPluginInstall?
     @State private var pendingRemoval: DSHInstalledPlugin?
@@ -157,18 +156,6 @@ public struct PluginManagerView: View {
                host.pluginCatalog.isEmpty,
                !host.isLoadingPlugins {
                 Task { await host.discoverPlugins(query: searchText) }
-            }
-        }
-        .fileImporter(
-            isPresented: $showFolderPicker,
-            allowedContentTypes: localPluginContentTypes,
-            allowsMultipleSelection: false
-        ) { result in
-            switch result {
-            case .success(let urls):
-                if let url = urls.first { pendingInstall = .local(url) }
-            case .failure(let error):
-                host.setPluginStatus(error.localizedDescription)
             }
         }
         .alert(item: $pendingInstall) { target in
@@ -397,7 +384,11 @@ public struct PluginManagerView: View {
                 }
             }
             Button {
-                showFolderPicker = true
+                #if canImport(UIKit)
+                NativeDocumentPicker.present(contentTypes: localPluginContentTypes, allowsMultipleSelection: false) { urls in
+                    if let url = urls.first { pendingInstall = .local(url) }
+                }
+                #endif
             } label: {
                 Label("从本地文件夹或 .tgz 离线包导入", systemImage: "folder")
             }

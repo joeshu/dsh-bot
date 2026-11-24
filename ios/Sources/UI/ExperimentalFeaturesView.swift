@@ -6,7 +6,6 @@ import UIKit
 
 public struct ExperimentalFeaturesView: View {
     @ObservedObject var host: LocalAgentHost
-    @State private var showImporter = false
     @State private var importStatus = ""
 
     public var body: some View {
@@ -39,7 +38,17 @@ public struct ExperimentalFeaturesView: View {
                 }
 
                 Button {
-                    showImporter = true
+                    #if canImport(UIKit)
+                    NativeDocumentPicker.present(contentTypes: [.json, .plainText, .text], allowsMultipleSelection: false) { urls in
+                        guard let url = urls.first else { return }
+                        do {
+                            let bot = try host.importConversation(from: url)
+                            importStatus = "已导入会话「\(bot.name)」，可在「对话」页打开继续对话。"
+                        } catch {
+                            importStatus = "导入失败：\(error.localizedDescription)"
+                        }
+                    }
+                    #endif
                 } label: {
                     featureRow(
                         icon: "square.and.arrow.down.fill",
@@ -119,24 +128,6 @@ public struct ExperimentalFeaturesView: View {
         }
         .navigationTitle("实验性插件")
         .navigationBarTitleDisplayMode(.inline)
-        .fileImporter(
-            isPresented: $showImporter,
-            allowedContentTypes: [.json, .plainText, .text],
-            allowsMultipleSelection: false
-        ) { result in
-            switch result {
-            case .success(let urls):
-                guard let url = urls.first else { return }
-                do {
-                    let bot = try host.importConversation(from: url)
-                    importStatus = "已导入会话「\(bot.name)」，可在「会话」或「Bot」页打开继续对话。"
-                } catch {
-                    importStatus = "导入失败：\(error.localizedDescription)"
-                }
-            case .failure(let error):
-                importStatus = "选择文件失败：\(error.localizedDescription)"
-            }
-        }
     }
 
     private func featureRow(icon: String, color: Color, title: String, subtitle: String, badge: String?, status: String) -> some View {

@@ -107,9 +107,9 @@ struct ModelProvider {
     }
 }
 
-struct ProviderMessage: Codable, Equatable {
-    struct ToolCall: Codable, Equatable {
-        struct Function: Codable, Equatable {
+struct ProviderMessage: Codable, Equatable, Sendable {
+    struct ToolCall: Codable, Equatable, Sendable {
+        struct Function: Codable, Equatable, Sendable {
             var name = ""
             var arguments = ""
         }

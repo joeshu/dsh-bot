@@ -928,7 +928,7 @@ public struct EditBotSheet: View {
                 Section("智能体信息") {
                     TextField("名称", text: $name)
                     TextField("职责描述", text: $roleLabel)
-                    ModelSelectionView(host: host, model: $model)
+                    ModelSelectionView(host: host, model: $model, endpointURL: host.effectiveApiBaseURL(for: bot))
                     Picker("推理等级", selection: $reasoningEffort) {
                         Text("低（快速）").tag("low")
                         Text("中（均衡）").tag("medium")
@@ -945,7 +945,7 @@ public struct EditBotSheet: View {
                             Text(host.agentPresetName(agentPreset)).tag(agentPreset)
                         }
                     }
-                    .disabled(host.isStreaming)
+                    .disabled(host.isBotStreaming(bot.id))
                     Text("支持随时无损切换模式（保留全部聊天历史，下轮发送自动热切换 DSH 工具与引擎配置）。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -977,7 +977,7 @@ public struct EditBotSheet: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
-                    .disabled(bot.isPrivate || !host.redteamModeEnabled || host.streamingSessionId == bot.id)
+                    .disabled(bot.isPrivate || !host.redteamModeEnabled || host.isBotStreaming(bot.id))
                 }
                 Section("系统提示词（人设与指令）") {
                     TextEditor(text: $systemPrompt)

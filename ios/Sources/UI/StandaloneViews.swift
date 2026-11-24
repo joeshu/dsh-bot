@@ -4,19 +4,24 @@ import UIKit
 #endif
 
 private enum AppTab: Hashable {
-    case sessions
-    case agents
+    case conversations
     case workbench
     case settings
 }
 
-/// Native 4-Tab Agent Navigation (会话 / 智能体 / 工作台 / 设置)
+private struct PulseOpenTarget: Identifiable {
+    let bot: BotProfile
+    let address: SessionAddress
+    var id: String { address.canonicalSessionId }
+}
+
+/// Native 3-Tab Agent Navigation (对话 / 工作台 / 设置)
 /// with iPadOS adaptive sidebar (iOS 18+) and iOS 26 Liquid Glass progressive enhancement.
 public struct MainTabView: View {
     @ObservedObject var host: LocalAgentHost
-    @State private var selectedTab: AppTab = .sessions
+    @State private var selectedTab: AppTab = .conversations
     @State private var dismissedPulseTurnId: String?
-    @State private var pulseTargetBot: BotProfile?
+    @State private var pulseOpenTarget: PulseOpenTarget?
 
     public init(host: LocalAgentHost) {
         self.host = host
@@ -30,9 +35,11 @@ public struct MainTabView: View {
         host.streamingSessionId ?? host.pendingApprovals.first?.sessionId
     }
 
-    private var activePulseBot: BotProfile? {
-        guard let sid = pulseSessionId else { return nil }
-        return host.bots.first(where: { $0.id == sid })
+    private var activePulseTarget: PulseOpenTarget? {
+        guard let sid = pulseSessionId,
+              let address = host.resolveAddress(sid),
+              let bot = host.bot(for: address) else { return nil }
+        return PulseOpenTarget(bot: bot, address: address)
     }
 
     private var showPulseBar: Bool {
@@ -47,14 +54,10 @@ public struct MainTabView: View {
     @ViewBuilder
     private var rootTabView: some View {
         let base = TabView(selection: $selectedTab) {
-            SessionsTabView(host: host)
-                .tabItem { Label("会话", systemImage: "bubble.left.and.bubble.right.fill") }
+            UnifiedConversationsTabView(host: host)
+                .tabItem { Label("对话", systemImage: "bubble.left.and.bubble.right.fill") }
                 .badge(pendingInboxCount > 0 ? pendingInboxCount : 0)
-                .tag(AppTab.sessions)
-
-            BotRosterTabView(host: host)
-                .tabItem { Label("智能体", systemImage: "person.2.crop.square.stack.fill") }
-                .tag(AppTab.agents)
+                .tag(AppTab.conversations)
 
             ToolsHubTabView(host: host)
                 .tabItem { Label("工作台", systemImage: "square.grid.2x2.fill") }
@@ -83,8 +86,8 @@ public struct MainTabView: View {
                 GlobalBotPulseBar(
                     host: host,
                     onTapOpen: {
-                        if let bot = activePulseBot {
-                            pulseTargetBot = bot
+                        if let target = activePulseTarget {
+                            pulseOpenTarget = target
                         }
                     },
                     onDismiss: {
@@ -100,12 +103,12 @@ public struct MainTabView: View {
         .onChange(of: host.activeTurnId) { _ in
             dismissedPulseTurnId = nil
         }
-        .sheet(item: $pulseTargetBot) { target in
+        .sheet(item: $pulseOpenTarget) { target in
             NavigationStack {
-                ChatView(bot: target, host: host)
+                ChatView(bot: target.bot, host: host, initialAddress: target.address)
                     .toolbar {
                         ToolbarItem(placement: .topBarLeading) {
-                            Button("完成") { pulseTargetBot = nil }
+                            Button("完成") { pulseOpenTarget = nil }
                         }
                     }
             }
@@ -118,19 +121,26 @@ private struct GlobalBotPulseBar: View {
     let onTapOpen: () -> Void
     let onDismiss: () -> Void
 
+    private var primarySessionId: String? {
+        host.streamingSessionId ?? host.pendingApprovals.first?.sessionId
+    }
+
     private var activeBotName: String {
-        if let sid = host.streamingSessionId ?? host.pendingApprovals.first?.sessionId,
-           let bot = host.bots.first(where: { $0.id == sid }) {
-            return bot.name
-        }
-        return "智能体"
+        guard let sid = primarySessionId,
+              let address = host.resolveAddress(sid),
+              let bot = host.bot(for: address) else { return "智能体" }
+        let baseName = bot.isPrivate ? "私密会话" : bot.name
+        let threadSuffix = (!bot.isPrivate ? BotThreadStore.shared.threadTitle(for: address).map { " · \($0)" } : nil) ?? ""
+        let extra = host.activeStreamingSessionIds.count > 1 ? " (+\(host.activeStreamingSessionIds.count - 1))" : ""
+        return baseName + threadSuffix + extra
     }
 
     private var statusSubtitle: String {
         if let approval = host.pendingApprovals.first {
             return "待审批：\(approval.tool)"
         }
-        if let activeTool = host.dshToolActivities.last(where: { $0.phase == "started" }) {
+        if let sid = primarySessionId,
+           let activeTool = host.dshToolActivities.last(where: { $0.sessionId == sid && $0.phase == "started" }) {
             return "正在执行：\(activeTool.toolName)"
         }
         return "正在生成回复…"
@@ -167,7 +177,7 @@ private struct GlobalBotPulseBar: View {
             }
             if host.isStreaming {
                 Button("停止") {
-                    Task { await host.abortActiveTurn() }
+                    Task { await host.abortActiveTurn(sessionId: primarySessionId) }
                 }
                 .font(.caption.weight(.semibold))
                 .buttonStyle(.bordered)
@@ -198,472 +208,19 @@ private struct GlobalBotPulseBar: View {
             barContent
                 .background(.regularMaterial, in: Capsule())
                 .overlay(Capsule().stroke(Color.secondary.opacity(0.22), lineWidth: 0.75))
-                .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+                .shadow(color: .black.opacity(0.10), radius: 8, y: 3)
         }
     }
 }
 
-// MARK: - Tab 1: 会话 (Sessions)
-
-public struct SessionsTabView: View {
-    @ObservedObject var host: LocalAgentHost
-    @ObservedObject private var threadStore = BotThreadStore.shared
-    @State private var searchText = ""
-    @State private var createKind: CreateBotInitialKind?
-    @State private var editingBot: BotProfile?
-    @State private var profileBot: BotProfile?
-    @State private var threadsBot: BotProfile?
-
-    public init(host: LocalAgentHost) {
-        self.host = host
-    }
-
-    private var searchQuery: String {
-        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private var pendingCount: Int {
-        host.unifiedPendingInbox.count
-    }
-
-    private var botSearchSnapshot: (bots: [BotProfile], messages: [String: ChatMessageItem]) {
-        let query = searchQuery
-        guard !query.isEmpty else { return (host.recentlyActiveBots, [:]) }
-        var matches: [String: ChatMessageItem] = [:]
-        let matchingBots = host.bots.filter { bot in
-            let matchesIdentity = bot.name.localizedCaseInsensitiveContains(query)
-                || bot.roleLabel.localizedCaseInsensitiveContains(query)
-            if !bot.isPrivate, let message = host.matchingImportedMessage(botId: bot.id, query: query) {
-                matches[bot.id] = message
-            }
-            return matchesIdentity || matches[bot.id] != nil
-        }
-        return (host.sortBySessionActivity(matchingBots), matches)
-    }
-
-    public var body: some View {
-        let searchSnapshot = botSearchSnapshot
-        NavigationStack {
-            List {
-                Section {
-                    DSRuntimeStatusBanner(host: host)
-                }
-                .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
-                .listRowBackground(Color.clear)
-
-                if pendingCount > 0 {
-                    Section {
-                        NavigationLink {
-                            SessionInboxView(host: host)
-                        } label: {
-                            HStack(spacing: 12) {
-                                ZStack {
-                                    Circle()
-                                        .fill(DSTheme.warning.opacity(0.18))
-                                        .frame(width: 36, height: 36)
-                                    Image(systemName: "bell.badge.fill")
-                                        .foregroundStyle(DSTheme.warning)
-                                }
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("有 \(pendingCount) 项待处理的审批或提问")
-                                        .font(.subheadline.weight(.semibold))
-                                    Text("点击进入收件箱，立即批准工具操作或回答智能体追问")
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                DSStatusBadge("\(pendingCount)", color: DSTheme.warning)
-                            }
-                            .padding(.vertical, 4)
-                        }
-                    }
-                }
-
-                if !searchQuery.isEmpty {
-                    SessionSearchResults(host: host, query: searchQuery)
-                        .id(searchQuery)
-                }
-
-                Section(searchQuery.isEmpty ? "活跃会话 (\(searchSnapshot.bots.count))" : "匹配的智能体会话") {
-                    if searchSnapshot.bots.isEmpty {
-                        DSEmptyStateView(
-                            icon: "bubble.left.and.bubble.right",
-                            title: searchQuery.isEmpty ? "暂无会话" : "没有找到匹配的会话",
-                            subtitle: searchQuery.isEmpty ? "点击右上角新建话题、智能体或协作群聊。" : "尝试更换关键词，或查看上方的历史消息全文检索结果。"
-                        )
-                        .listRowBackground(Color.clear)
-                    } else {
-                        ForEach(searchSnapshot.bots) { bot in
-                            let matchedMessage = searchSnapshot.messages[bot.id]
-                            let botPendingCount = host.unifiedPendingInbox.filter { $0.address.botID == bot.id }.count
-                            let botThreadCount = threadStore.threads(for: bot.id).count
-                            let isBotStreaming = host.isStreaming && host.streamingSessionId.flatMap { host.resolveAddress($0)?.botID } == bot.id
-                            NavigationLink {
-                                ChatView(bot: bot, host: host, targetMessageID: matchedMessage?.id)
-                            } label: {
-                                HStack(spacing: 12) {
-                                    DSBotAvatar(
-                                        initials: bot.name,
-                                        color: DSTheme.botAvatarColor(bot),
-                                        isPrivate: bot.isPrivate,
-                                        size: 44
-                                    )
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        HStack(spacing: 5) {
-                                            Text(bot.name)
-                                                .font(.headline)
-                                                .lineLimit(1)
-                                            if bot.isMain {
-                                                DSStatusBadge("Main", color: DSTheme.brand)
-                                            } else if bot.isGroup {
-                                                DSStatusBadge("群聊", color: .indigo)
-                                            } else if bot.isPrivate {
-                                                DSStatusBadge("私密", color: DSTheme.warning, icon: "lock.fill")
-                                            }
-                                            if host.unifiedNavigationV2 && botThreadCount > 1 && !bot.isPrivate {
-                                                DSStatusBadge("\(botThreadCount) 话题", color: .teal)
-                                            }
-                                            DSPresetBadge(
-                                                presetId: bot.agentPreset,
-                                                label: host.agentPresetName(bot.agentPreset)
-                                            )
-                                            if bot.permissionMode == "autoReview" {
-                                                DSStatusBadge("免打扰", color: DSTheme.success)
-                                            } else if bot.permissionMode == "readOnly" {
-                                                DSStatusBadge("只读", color: .secondary)
-                                            }
-                                        }
-                                        Text(lastPreview(for: bot, matching: matchedMessage))
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                            .lineLimit(2)
-                                    }
-                                    Spacer(minLength: 4)
-                                    VStack(alignment: .trailing, spacing: 5) {
-                                        if !bot.isPrivate, let timestamp = host.sessionActivityDate(for: bot.id) {
-                                            Text(timestamp.formatted(date: .omitted, time: .shortened))
-                                                .font(.caption2)
-                                                .foregroundColor(.secondary)
-                                        }
-                                        if isBotStreaming {
-                                            DSStatusBadge("生成中", color: DSTheme.brand)
-                                        } else if botPendingCount > 0 {
-                                            DSStatusBadge("\(botPendingCount) 待办", color: DSTheme.warning)
-                                        }
-                                    }
-                                }
-                                .padding(.vertical, 4)
-                            }
-                            .swipeActions(edge: .trailing) {
-                                if host.unifiedNavigationV2 {
-                                    Button("话题") { threadsBot = bot }
-                                        .tint(.teal)
-                                }
-                                Button("编辑") { editingBot = bot }
-                                    .tint(DSTheme.brand)
-                                if !bot.isPrivate {
-                                    Button("档案") { profileBot = bot }
-                                        .tint(.indigo)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            .listStyle(.insetGrouped)
-            .refreshable { await host.refreshSessionSummaries() }
-            .navigationTitle("会话")
-            .searchable(text: $searchText, prompt: "搜索会话与公开历史消息")
-            .toolbar {
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    NavigationLink {
-                        DSHWebUIView(host: host)
-                    } label: {
-                        Image(systemName: "macwindow.on.rectangle")
-                    }
-                    .help("打开 DSH Web 工作台")
-
-                    NavigationLink {
-                        SessionInboxView(host: host)
-                    } label: {
-                        Image(systemName: pendingCount > 0 ? "tray.full.fill" : "tray")
-                            .foregroundStyle(pendingCount > 0 ? DSTheme.warning : .primary)
-                    }
-                    .help("待处理收件箱")
-
-                    Menu {
-                        if host.unifiedNavigationV2, let defaultBot = host.bots.first(where: \.isMain) ?? host.bots.first {
-                            Section("新话题（不新建 Bot）") {
-                                Button {
-                                    threadsBot = defaultBot
-                                } label: {
-                                    Label("在「\(defaultBot.name)」新建/切换话题", systemImage: "bubble.left.and.bubble.right.fill")
-                                }
-                            }
-                        }
-                        Section("新建智能体实体") {
-                            Button {
-                                createKind = .standard
-                            } label: {
-                                Label("新建智能体", systemImage: "person.badge.plus")
-                            }
-                            Button {
-                                createKind = .group
-                            } label: {
-                                Label("新建协作群聊", systemImage: "person.3.fill")
-                            }
-                            Button {
-                                createKind = .privateSpace
-                            } label: {
-                                Label("新建私密会话 (Face ID)", systemImage: "lock.shield.fill")
-                            }
-                        }
-                    } label: {
-                        Image(systemName: "plus.circle.fill")
-                            .font(.title3)
-                    }
-                    .help("新建话题或智能体")
-                }
-            }
-            .sheet(item: $createKind) { kind in
-                CreateBotSheet(host: host, initialKind: kind)
-            }
-            .sheet(item: $editingBot) { target in
-                EditBotSheet(bot: target, host: host)
-            }
-            .sheet(item: $profileBot) { target in
-                BotProfileSheet(bot: target, host: host)
-            }
-            .sheet(item: $threadsBot) { target in
-                BotThreadsSheet(
-                    bot: target,
-                    threadStore: threadStore,
-                    onSelectThread: { thread in
-                        threadStore.selectThread(thread)
-                    },
-                    onDeleteSession: { sessionId in
-                        Task { await host.clearSession(sessionId) }
-                    }
-                )
-            }
-        }
-    }
-
-    private func lastPreview(for bot: BotProfile, matching message: ChatMessageItem? = nil) -> String {
-        if bot.isPrivate { return "私密会话 · 需验证面容或锁屏密码后查看" }
-        if let message {
-            let sender = message.role == "user" ? "你" : bot.name
-            return "\(sender)：\(message.content)"
-        }
-        if let last = host.messages(for: bot.id).last {
-            return last.content
-        }
-        if let persistedPreview = host.sessionPreview(for: bot.id) {
-            return persistedPreview
-        }
-        return bot.roleLabel
-    }
-}
-
-// MARK: - Tab 2: 智能体 (Agents & Groups Team Roster)
-
-private enum RosterFilter: String, CaseIterable, Identifiable {
-    case all = "全部"
-    case core = "核心团队"
-    case group = "协作群聊"
-    case privateSpace = "私密空间"
-    var id: String { rawValue }
-}
-
-public struct BotRosterTabView: View {
-    @ObservedObject var host: LocalAgentHost
-    @State private var filter: RosterFilter = .all
-    @State private var searchText = ""
-    @State private var createKind: CreateBotInitialKind?
-    @State private var editingBot: BotProfile?
-    @State private var profileBot: BotProfile?
-    @State private var pendingDeleteBot: BotProfile?
-
-    public init(host: LocalAgentHost) {
-        self.host = host
-    }
-
-    private var filteredBots: [BotProfile] {
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        return host.bots.filter { bot in
-            let matchesFilter: Bool
-            switch filter {
-            case .all: matchesFilter = true
-            case .core: matchesFilter = !bot.isGroup && !bot.isPrivate
-            case .group: matchesFilter = bot.isGroup
-            case .privateSpace: matchesFilter = bot.isPrivate
-            }
-            let matchesQuery = query.isEmpty
-                || bot.name.localizedCaseInsensitiveContains(query)
-                || bot.roleLabel.localizedCaseInsensitiveContains(query)
-                || bot.model.localizedCaseInsensitiveContains(query)
-            return matchesFilter && matchesQuery
-        }
-    }
-
-    private var sections: [String] {
-        Array(NSOrderedSet(array: filteredBots.map(\.section))) as? [String] ?? []
-    }
-
-    public var body: some View {
-        NavigationStack {
-            List {
-                Section {
-                    Picker("分类", selection: $filter) {
-                        ForEach(RosterFilter.allCases) { item in
-                            Text(item.rawValue).tag(item)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                }
-                .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
-                .listRowBackground(Color.clear)
-
-                if sections.isEmpty {
-                    Section {
-                        DSEmptyStateView(
-                            icon: "person.2.slash",
-                            title: "此分类下暂无智能体",
-                            subtitle: "你可以点击右上角新建自定义智能体、协作群聊或私密会话。",
-                            actionTitle: "新建智能体"
-                        ) {
-                            createKind = filter == .group ? .group : (filter == .privateSpace ? .privateSpace : .standard)
-                        }
-                    }
-                    .listRowBackground(Color.clear)
-                } else {
-                    ForEach(sections, id: \.self) { sec in
-                        Section(sec) {
-                            ForEach(filteredBots.filter { $0.section == sec }) { bot in
-                                NavigationLink {
-                                    ChatView(bot: bot, host: host)
-                                } label: {
-                                    HStack(spacing: 12) {
-                                        DSBotAvatar(
-                                            initials: bot.name,
-                                            color: DSTheme.botAvatarColor(bot),
-                                            isPrivate: bot.isPrivate,
-                                            size: 42
-                                        )
-                                        VStack(alignment: .leading, spacing: 4) {
-                                            HStack(spacing: 6) {
-                                                Text(bot.name)
-                                                    .font(.headline)
-                                                if bot.isMain {
-                                                    DSStatusBadge("Main", color: DSTheme.brand)
-                                                }
-                                                if bot.redteamToolsEnabled && !bot.isPrivate {
-                                                    DSStatusBadge("RedTeam", color: DSTheme.danger, icon: "shield.lefthalf.filled")
-                                                }
-                                            }
-                                            Text(bot.roleLabel)
-                                                .font(.caption)
-                                                .foregroundColor(.secondary)
-                                                .lineLimit(1)
-                                            HStack(spacing: 6) {
-                                                DSPresetBadge(
-                                                    presetId: bot.agentPreset,
-                                                    label: host.agentPresetName(bot.agentPreset)
-                                                )
-                                                DSStatusBadge(bot.permissionModeLabel, color: .secondary)
-                                                Text(host.modelSelection(bot.model))
-                                                    .font(.caption2.monospaced())
-                                                    .foregroundStyle(.secondary)
-                                                    .lineLimit(1)
-                                            }
-                                        }
-                                        Spacer(minLength: 4)
-                                    }
-                                    .padding(.vertical, 3)
-                                }
-                                .swipeActions(edge: .trailing) {
-                                    if !bot.isMain {
-                                        Button("删除", role: .destructive) {
-                                            pendingDeleteBot = bot
-                                        }
-                                    }
-                                    Button("编辑") {
-                                        editingBot = bot
-                                    }
-                                    .tint(DSTheme.brand)
-                                    if !bot.isPrivate {
-                                        Button("档案") {
-                                            profileBot = bot
-                                        }
-                                        .tint(.indigo)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            .listStyle(.insetGrouped)
-            .searchable(text: $searchText, prompt: "按名称、职责或模型筛选")
-            .navigationTitle("智能体团队")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        Button {
-                            createKind = .standard
-                        } label: {
-                            Label("新建智能体", systemImage: "person.badge.plus")
-                        }
-                        Button {
-                            createKind = .group
-                        } label: {
-                            Label("新建协作群聊", systemImage: "person.3.fill")
-                        }
-                        Button {
-                            createKind = .privateSpace
-                        } label: {
-                            Label("新建私密会话 (Face ID)", systemImage: "lock.shield.fill")
-                        }
-                    } label: {
-                        Label("新建", systemImage: "plus.circle.fill")
-                    }
-                }
-            }
-            .sheet(item: $createKind) { kind in
-                CreateBotSheet(host: host, initialKind: kind)
-            }
-            .sheet(item: $editingBot) { target in
-                EditBotSheet(bot: target, host: host)
-            }
-            .sheet(item: $profileBot) { target in
-                BotProfileSheet(bot: target, host: host)
-            }
-            .confirmationDialog(
-                "确定删除「\(pendingDeleteBot?.name ?? "")」及其全部聊天记录？",
-                isPresented: Binding(
-                    get: { pendingDeleteBot != nil },
-                    set: { if !$0 { pendingDeleteBot = nil } }
-                ),
-                titleVisibility: .visible
-            ) {
-                Button("删除", role: .destructive) {
-                    if let target = pendingDeleteBot {
-                        pendingDeleteBot = nil
-                        host.deleteBot(id: target.id)
-                    }
-                }
-                Button("取消", role: .cancel) { pendingDeleteBot = nil }
-            }
-        }
-    }
-}
-
-// MARK: - Tab 3: 工作台 (Workbench & Sandboxed Tools Hub)
+// MARK: - Tab 2: 工作台 (Workbench & Sandboxed Tools Hub)
 
 public struct ToolsHubTabView: View {
     @ObservedObject var host: LocalAgentHost
     @ObservedObject private var memoryGovernor = MemoryGovernor.shared
     @ObservedObject private var budgetGovernor = CostBudgetGovernor.shared
+    @ObservedObject private var browserController = AgentBrowserController.shared
+    @State private var showAgentBrowser = false
 
     public init(host: LocalAgentHost) {
         self.host = host
@@ -672,7 +229,7 @@ public struct ToolsHubTabView: View {
     public var body: some View {
         NavigationStack {
             List {
-                // Hero Section: Embedded DSH Web Workbench + Real-time Metrics
+                // Hero Section: Embedded DSH Web Workbench + Built-in Agent Browser
                 Section {
                     NavigationLink {
                         DSHWebUIView(host: host)
@@ -700,6 +257,45 @@ public struct ToolsHubTabView: View {
                         }
                         .padding(.vertical, 6)
                     }
+
+                    Button {
+                        showAgentBrowser = true
+                    } label: {
+                        HStack(spacing: 14) {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                    .fill(Color.cyan.gradient)
+                                    .frame(width: 48, height: 48)
+                                Image(systemName: "safari.fill")
+                                    .font(.title3.weight(.semibold))
+                                    .foregroundStyle(.white)
+                            }
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 6) {
+                                    Text("内置受控浏览器")
+                                        .font(.headline)
+                                        .foregroundStyle(.primary)
+                                    if browserController.needsHumanTakeover {
+                                        DSStatusBadge("需人工接管", color: DSTheme.warning)
+                                    } else {
+                                        DSStatusBadge("browser_*", color: .cyan)
+                                    }
+                                }
+                                Text(browserController.currentURL.isEmpty
+                                     ? "独立 WKWebView 沙盒，供智能体检索、填表、截图 OCR 与人工接管登录"
+                                     : browserController.currentURL)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                            Spacer(minLength: 4)
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.tertiary)
+                        }
+                        .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.plain)
                 }
 
                 Section {
@@ -741,17 +337,6 @@ public struct ToolsHubTabView: View {
                             color: .indigo,
                             title: "Git 工作树与 PR 追踪",
                             subtitle: "查看本地变更 Diff、快照提交与 GitHub Pull Requests"
-                        )
-                    }
-
-                    NavigationLink {
-                        BackendDevToolsInspectorView(host: host)
-                    } label: {
-                        toolRow(
-                            icon: "wrench.and.screwdriver.fill",
-                            color: .blue,
-                            title: "后端 DevTools 与 Jetsam 遥测",
-                            subtitle: "查看 Node/V8/Jetsam 内存水位、Cordis Fiber 树与 REPL 控制台"
                         )
                     }
                 }
@@ -826,7 +411,7 @@ public struct ToolsHubTabView: View {
                     }
                 }
 
-                Section("连接器生态与用量观测") {
+                Section("外部连接器生态") {
                     NavigationLink {
                         ConnectorMarketplaceView(host: host)
                     } label: {
@@ -835,17 +420,6 @@ public struct ToolsHubTabView: View {
                             color: .indigo,
                             title: "Remote MCP 连接器市场",
                             subtitle: "38 个官方 MCP 目录（GitHub / Notion / Exa 等）与自定义接入"
-                        )
-                    }
-
-                    NavigationLink {
-                        ConnectorsAndUsageView(host: host)
-                    } label: {
-                        toolRow(
-                            icon: "chart.bar.xaxis",
-                            color: DSTheme.brand,
-                            title: "多维 Token 用量与缓存看板",
-                            subtitle: "按 7 天、按 Bot、按模型统计 DSH 真实调用与缓存命中"
                         )
                     }
                 }
@@ -860,6 +434,9 @@ public struct ToolsHubTabView: View {
             }
             .listStyle(.insetGrouped)
             .navigationTitle("工作台")
+            .sheet(isPresented: $showAgentBrowser) {
+                AgentBrowserSheet(workspace: host.workspace)
+            }
         }
     }
 

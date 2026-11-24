@@ -913,27 +913,34 @@ public struct ModelSelectionView: View {
     @ObservedObject var host: LocalAgentHost
     @Binding var model: String
     var allowsTyping: Bool
+    var endpointURL: String?
     @State private var showPickerSheet = false
 
-    public init(host: LocalAgentHost, model: Binding<String>, allowsTyping: Bool = true) {
+    public init(host: LocalAgentHost, model: Binding<String>, allowsTyping: Bool = true, endpointURL: String? = nil) {
         self.host = host
         self._model = model
         self.allowsTyping = allowsTyping
+        self.endpointURL = endpointURL
+    }
+
+    private var isOfficial: Bool {
+        host.isOfficialEndpoint(endpointURL)
     }
 
     private func displayName(for id: String) -> String {
         let base: String
         switch id {
-        case ModelProvider.defaultModel: base = host.usesOfficialModels ? "DeepSeek Flash" : id
-        case ModelProvider.thinkingModel: base = host.usesOfficialModels ? "DeepSeek Flash · 思考" : id
-        case "deepseek-v4-pro": base = host.usesOfficialModels ? "DeepSeek V4 Pro" : id
+        case ModelProvider.defaultModel: base = isOfficial ? "DeepSeek Flash" : id
+        case ModelProvider.thinkingModel: base = isOfficial ? "DeepSeek Flash · 思考" : id
+        case "deepseek-v4-pro": base = isOfficial ? "DeepSeek V4 Pro" : id
         default: base = id
         }
         return host.isFavoriteModel(id) ? "★ \(base)" : base
     }
 
     public var body: some View {
-        let options = host.orderedAvailableModels
+        let _ = host.modelsCatalogRevision
+        let options = host.orderedAvailableModels(for: endpointURL)
         if !options.isEmpty {
             Picker("模型：\(model.isEmpty ? "未选择" : displayName(for: model))", selection: $model) {
                 if !model.isEmpty && !options.contains(model) {
@@ -963,7 +970,7 @@ public struct ModelSelectionView: View {
                 .controlSize(.small)
             }
             .sheet(isPresented: $showPickerSheet) {
-                ModelPickerSheet(host: host, model: $model)
+                ModelPickerSheet(host: host, model: $model, endpointURL: endpointURL)
             }
         }
     }
@@ -974,6 +981,7 @@ public struct ModelPickerSheet: View {
     @ObservedObject var host: LocalAgentHost
     @Binding var model: String
     var title: String
+    var endpointURL: String?
     var onApplyAll: ((String) -> Void)?
     @Environment(\.dismiss) private var dismiss
     @State private var searchText = ""
@@ -984,17 +992,24 @@ public struct ModelPickerSheet: View {
         host: LocalAgentHost,
         model: Binding<String>,
         title: String = "选择模型",
+        endpointURL: String? = nil,
         onApplyAll: ((String) -> Void)? = nil
     ) {
         self.host = host
         self._model = model
         self.title = title
+        self.endpointURL = endpointURL
         self.onApplyAll = onApplyAll
+    }
+
+    private var availableForEndpoint: [String] {
+        _ = host.modelsCatalogRevision
+        return host.orderedAvailableModels(for: endpointURL)
     }
 
     private var filteredModels: [String] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let all = host.orderedAvailableModels
+        let all = availableForEndpoint
         guard !query.isEmpty else { return all }
         return all.filter { $0.localizedCaseInsensitiveContains(query) }
     }
@@ -1002,6 +1017,14 @@ public struct ModelPickerSheet: View {
     public var body: some View {
         NavigationStack {
             List {
+                if let ep = endpointURL, !ep.isEmpty, ep != host.apiBaseURL {
+                    Section {
+                        Label(ep, systemImage: "server.rack")
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 if !refreshMessage.isEmpty {
                     Section {
                         Text(refreshMessage)
@@ -1011,7 +1034,7 @@ public struct ModelPickerSheet: View {
                 }
 
                 let trimmedQuery = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmedQuery.isEmpty && !host.orderedAvailableModels.contains(trimmedQuery) {
+                if !trimmedQuery.isEmpty && !availableForEndpoint.contains(trimmedQuery) {
                     Section("使用自定义模型 ID") {
                         Button {
                             model = trimmedQuery
@@ -1026,7 +1049,7 @@ public struct ModelPickerSheet: View {
 
                 Section {
                     if filteredModels.isEmpty {
-                        Text(host.orderedAvailableModels.isEmpty
+                        Text(availableForEndpoint.isEmpty
                              ? "当前端点尚未拉取模型列表，点击右上角刷新或直接在搜索框输入模型 ID。"
                              : "未找到匹配「\(searchText)」的模型。")
                             .font(.caption)
@@ -1097,8 +1120,8 @@ public struct ModelPickerSheet: View {
                         Task {
                             defer { isRefreshing = false }
                             do {
-                                let res = try await host.refreshModels()
-                                refreshMessage = "已刷新：共 \(res.count) 个模型（\(res.latency) ms），并已同步至 Web 工作台。"
+                                let res = try await host.refreshModels(for: endpointURL)
+                                refreshMessage = "已刷新：共 \(res.count) 个模型（\(res.latency) ms）。"
                                 DSHaptics.notify(.success)
                             } catch {
                                 refreshMessage = "拉取失败：\(error.localizedDescription)"
@@ -1131,6 +1154,7 @@ public final class NativeDocumentPicker: NSObject, UIDocumentPickerDelegate {
     }
 
     public static func present(
+        contentTypes: [UTType] = [.item],
         allowsMultipleSelection: Bool = true,
         onComplete: @escaping ([URL]) -> Void
     ) {
@@ -1138,7 +1162,13 @@ public final class NativeDocumentPicker: NSObject, UIDocumentPickerDelegate {
             onComplete([])
             return
         }
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: true)
+        let includesDirectory = contentTypes.contains(.folder) || contentTypes.contains(.directory)
+        let picker: UIDocumentPickerViewController
+        if includesDirectory {
+            picker = UIDocumentPickerViewController(forOpeningContentTypes: contentTypes)
+        } else {
+            picker = UIDocumentPickerViewController(forOpeningContentTypes: contentTypes, asCopy: true)
+        }
         picker.allowsMultipleSelection = allowsMultipleSelection
         let coordinator = NativeDocumentPicker(onComplete: onComplete)
         picker.delegate = coordinator

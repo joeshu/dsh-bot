@@ -419,7 +419,7 @@ private struct ConnectorSetupSheet: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .keyboardType(.URL)
-                    SecureField(item?.auth == .none ? "Token（此服务免认证，可留空）" : "Bearer Token / API Key（存入 Keychain）", text: $token)
+                    SecureField(item?.auth == ConnectorCatalogItem.AuthKind.none ? "Token（此服务免认证，可留空）" : "Bearer Token / API Key（存入 Keychain）", text: $token)
                 }
 
                 if item == nil {

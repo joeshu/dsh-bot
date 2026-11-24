@@ -127,33 +127,37 @@ class SQLiteSessionHandle {
   enqueueLive(event) {
     if (this.closed || this.access !== 'write') return
     this.pendingLive.push(event)
-    if (!this.draining) void this.drainLive().catch((error) => {
+    if (!this.drainPromise) void this.drainLive().catch((error) => {
       this.liveError = error
       this.owner.ctx.logger.warn(`DSH SQLite persistence buffered a live event for ${this.id}: ${String(error)}`)
     })
   }
 
   async drainLive() {
-    if (this.draining) {
-      while (this.draining) await new Promise((resolve) => setTimeout(resolve, 0))
+    if (this.drainPromise) {
+      await this.drainPromise.catch(() => {})
       if (this.liveError) throw this.liveError
       if (this.pendingLive.length) return this.drainLive()
       return
     }
     this.draining = true
-    try {
-      while (this.pendingLive.length) {
-        const batch = this.pendingLive.slice()
-        await this.append(batch)
-        this.pendingLive.splice(0, batch.length)
-        this.liveError = undefined
+    this.drainPromise = (async () => {
+      try {
+        while (this.pendingLive.length) {
+          const batch = this.pendingLive.slice()
+          await this.append(batch)
+          this.pendingLive.splice(0, batch.length)
+          this.liveError = undefined
+        }
+      } catch (error) {
+        this.liveError = error
+        throw error
+      } finally {
+        this.draining = false
+        this.drainPromise = null
       }
-    } catch (error) {
-      this.liveError = error
-      throw error
-    } finally {
-      this.draining = false
-    }
+    })()
+    return this.drainPromise
   }
 
   async flush(options = {}) {

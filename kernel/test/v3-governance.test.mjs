@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
@@ -561,4 +561,53 @@ test('v3 full-audit (v2.4.0): multi-thread session keys, writable configEditor s
   assert.match(modelsSrc, /public var providerProfileId: String\?/, 'BotProfile must support optional per-Bot providerProfileId')
   assert.match(hostSrc, /public func effectiveApiBaseURL\(for bot: BotProfile\?\)/, 'LocalAgentHost must resolve per-Bot endpoint URL')
 })
+
+test('v3 master-refactor (v2.5.0): 3-Tab unified IA, zero .fileImporter, chats.json safety, AuthKind.none, web.sessions.list, non-busy-wait SQLite, and multi-session concurrency', () => {
+  const repoRoot = join(__dirname, '..', '..')
+  const standaloneSrc = readFileSync(join(repoRoot, 'ios/Sources/UI/StandaloneViews.swift'), 'utf8')
+  const unifiedSrc = readFileSync(join(repoRoot, 'ios/Sources/UI/UnifiedConversationsTabView.swift'), 'utf8')
+  const settingsSrc = readFileSync(join(repoRoot, 'ios/Sources/UI/AgentSettingsView.swift'), 'utf8')
+  const connectorSrc = readFileSync(join(repoRoot, 'ios/Sources/UI/ConnectorMarketplaceView.swift'), 'utf8')
+  const hostSrc = readFileSync(join(repoRoot, 'ios/Sources/Runtime/LocalAgentHost.swift'), 'utf8')
+  const entrySrc = readFileSync(join(runtimeDir, 'dsh-ios-entry.mjs'), 'utf8')
+  const sqliteSrc = readFileSync(join(runtimeDir, 'sqlite-session-persistence.mjs'), 'utf8')
+
+  // 1. 3-Tab IA + GlobalBotPulseBar child-thread resolution + AgentBrowserSheet hero entry
+  assert.match(standaloneSrc, /case conversations/, 'MainTabView must use 3-Tab conversations case')
+  assert.doesNotMatch(standaloneSrc, /case agents\b/, 'MainTabView must not have redundant agents tab')
+  assert.match(standaloneSrc, /host\.resolveAddress\(sid\)/, 'GlobalBotPulseBar must resolve child-thread addresses')
+  assert.match(standaloneSrc, /AgentBrowserSheet\(workspace: host\.workspace\)/, 'ToolsHubTabView must provide direct AgentBrowserSheet entry')
+  assert.match(unifiedSrc, /public struct UnifiedConversationsTabView/, 'UnifiedConversationsTabView must exist')
+  assert.match(unifiedSrc, /case webSessions = "Web 会话"/, 'UnifiedConversationsTabView must surface standalone Web sessions')
+
+  // 2. Settings deduplication + Editable ProviderProfile
+  assert.match(settingsSrc, /private struct EditProviderProfileSheet/, 'ModelServiceSettingsView must allow editing ProviderProfiles')
+  assert.match(settingsSrc, /BackendDevToolsInspectorView\(host: host\)/, 'RuntimeDiagnosticsAndBackupView must host BackendDevToolsInspectorView')
+  assert.doesNotMatch(settingsSrc, /ExperimentalFeaturesView\(host: host\)/, 'SettingsAndExploreTabView must not link to retired ExperimentalFeaturesView')
+
+  // 3. Critical data safety & compiler warning fixes
+  assert.match(connectorSrc, /ConnectorCatalogItem\.AuthKind\.none/, 'ConnectorMarketplaceView must qualify AuthKind.none')
+  assert.match(
+    hostSrc,
+    /legacyMessagesBySession = messagesBySession[\s\S]{0,120}restoreInterruptedStreamingDraftIfNeeded\(\)/,
+    'loadPersistedWorkspace must initialize legacyMessagesBySession before restoring interrupted draft'
+  )
+  assert.match(hostSrc, /private func persistWorkspace\(immediate: Bool = false\)/, 'persistWorkspace must support debounced and immediate flushes')
+  assert.match(hostSrc, /private var activeTurnsBySession: \[String: ActiveTurnContext\]/, 'LocalAgentHost must support concurrent multi-session turns')
+  assert.match(hostSrc, /public func orderedAvailableModels\(for endpointURL: String\? = nil\)/, 'LocalAgentHost must expose per-endpoint orderedAvailableModels')
+
+  // 4. Kernel web.sessions.list & non-busy-wait SQLite drainLive
+  assert.match(entrySrc, /rpc\.handle\('web\.sessions\.list'/, 'dsh-ios-entry.mjs must expose web.sessions.list')
+  assert.doesNotMatch(sqliteSrc, /while \(this\.draining\) await new Promise/, 'sqlite-session-persistence.mjs must not busy-wait spin with setTimeout(0)')
+  assert.match(sqliteSrc, /this\.drainPromise/, 'sqlite-session-persistence.mjs must use single-flight drainPromise')
+
+  // 5. Zero remaining SwiftUI .fileImporter( across ios/Sources/UI/
+  const uiDir = join(repoRoot, 'ios/Sources/UI')
+  for (const name of readdirSync(uiDir)) {
+    if (!name.endsWith('.swift')) continue
+    const content = readFileSync(join(uiDir, name), 'utf8')
+    assert.doesNotMatch(content, /\.fileImporter\s*\(/, `${name} must use NativeDocumentPicker instead of .fileImporter`)
+  }
+})
+
 

@@ -291,7 +291,7 @@ public struct DSHInstalledPlugin: Identifiable, Decodable, Equatable {
     }
 }
 
-public struct ChatMessageItem: Identifiable, Codable, Equatable {
+public struct ChatMessageItem: Identifiable, Codable, Equatable, Sendable {
     public let id: String
     public let sessionId: String
     public let role: String // "user" | "assistant"
@@ -315,7 +315,7 @@ public struct ChatMessageItem: Identifiable, Codable, Equatable {
     }
 }
 
-public struct BotProfile: Identifiable, Codable, Equatable {
+public struct BotProfile: Identifiable, Codable, Equatable, Sendable {
     public let id: String
     public var name: String
     public var roleLabel: String
@@ -558,3 +558,19 @@ public struct RuntimePluginTool: Identifiable, Codable, Equatable, Sendable {
     public let name: String
     public let description: String
 }
+
+public struct WebSessionSummary: Identifiable, Equatable, Sendable {
+    public let sessionId: String
+    public let lastActivityAt: Date
+    public let lastMessagePreview: String
+    public let eventCount: Int
+    public var id: String { sessionId }
+
+    public init(sessionId: String, lastActivityAt: Date, lastMessagePreview: String, eventCount: Int) {
+        self.sessionId = sessionId
+        self.lastActivityAt = lastActivityAt
+        self.lastMessagePreview = lastMessagePreview
+        self.eventCount = eventCount
+    }
+}
+

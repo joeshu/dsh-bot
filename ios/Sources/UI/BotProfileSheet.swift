@@ -257,7 +257,7 @@ public struct BotProfileSheet: View {
                         Text(profile.name).tag(profile.id)
                     }
                 }
-                .disabled(host.isStreaming)
+                .disabled(host.isBotStreaming(liveBot.id))
 
                 ModelSelectionView(
                     host: host,
@@ -265,9 +265,10 @@ public struct BotProfileSheet: View {
                         get: { host.modelSelection(liveBot.model) },
                         set: { host.setBotModel(sessionId: liveBot.id, model: $0) }
                     ),
-                    allowsTyping: false
+                    allowsTyping: false,
+                    endpointURL: host.effectiveApiBaseURL(for: liveBot)
                 )
-                .disabled(host.isStreaming)
+                .disabled(host.isBotStreaming(liveBot.id))
             }
             Section("档案与安全配置") {
                 LabeledContent("私密空间", value: liveBot.isPrivate ? "已开启（Face ID）" : "未开启")

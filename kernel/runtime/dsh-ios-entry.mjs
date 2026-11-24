@@ -1941,12 +1941,28 @@ rpc.handle('session.list', async () => {
         sessionId: botId,
         createdAt: item.header.createdAt,
         eventCount: item.eventCount,
-        ...(!runtime.privateBotIds.has(botId) ? {
+        ...(!isPrivateBotOrThread(botId) ? {
           lastActivityAt: item.lastActivityAt,
           lastMessagePreview: item.lastMessagePreview,
         } : {}),
       }
     })
+  return { sessions }
+})
+
+rpc.handle('web.sessions.list', async () => {
+  const sessions = (await runtime.persistence.list())
+    .filter((item) => !item.header.id.startsWith('ios:') && (item.eventCount ?? 0) > 0)
+    .filter((item) => !isPrivateBotOrThread(item.header.id))
+    .map((item) => ({
+      sessionId: item.header.id,
+      createdAt: item.header.createdAt,
+      eventCount: item.eventCount,
+      lastActivityAt: item.lastActivityAt ?? item.header.createdAt,
+      lastMessagePreview: item.lastMessagePreview ?? '',
+    }))
+    .sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0))
+    .slice(0, 80)
   return { sessions }
 })
 

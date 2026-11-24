@@ -89,22 +89,9 @@ public struct SettingsAndExploreTabView: View {
                             badgeColor: DSTheme.danger
                         )
                     }
-
-                    NavigationLink {
-                        MemoryVaultView(host: host, botId: "main", allowsSwitchingBot: true)
-                    } label: {
-                        settingsRow(
-                            icon: "brain.head.profile",
-                            color: .purple,
-                            title: "智能体长期记忆与隐私门禁",
-                            subtitle: "管理常驻/本机记忆、可逆撤销日志与写前 PII 拦截",
-                            badge: nil,
-                            badgeColor: .secondary
-                        )
-                    }
                 }
 
-                Section("智能体全局能力") {
+                Section("智能体全局能力与策略") {
                     NavigationLink {
                         SubagentSettingsView(host: host)
                     } label: {
@@ -140,6 +127,30 @@ public struct SettingsAndExploreTabView: View {
                             enabled: host.smartActionCardsEnabled
                         )
                     }
+
+                    NavigationLink {
+                        AutoReviewDetailView(host: host)
+                    } label: {
+                        capabilityRow(
+                            icon: "checkmark.shield.fill",
+                            color: .teal,
+                            title: "自动授权审查",
+                            subtitle: "低风险工具调用自动放行并记录审计日志",
+                            enabled: host.autoReviewEnabled
+                        )
+                    }
+
+                    NavigationLink {
+                        DiagnosticsFeatureDetailView(host: host)
+                    } label: {
+                        capabilityRow(
+                            icon: "doc.text.magnifyingglass",
+                            color: .purple,
+                            title: "会话数据诊断与统计",
+                            subtitle: "在对话顶部开启消息分布、估算 Token 与首字延迟面板",
+                            enabled: host.sessionDiagnosticsEnabled
+                        )
+                    }
                 }
 
                 Section("阅读与交互偏好") {
@@ -147,20 +158,7 @@ public struct SettingsAndExploreTabView: View {
                     Toggle("推理模型深度思考默认折叠", isOn: $host.collapseThinkingByDefault)
                 }
 
-                Section("更多设置与系统诊断") {
-                    NavigationLink {
-                        ExperimentalFeaturesView(host: host)
-                    } label: {
-                        settingsRow(
-                            icon: "flask.fill",
-                            color: .indigo,
-                            title: "实验性功能与外部会话导入",
-                            subtitle: "自动授权审查、沙盒终端、Git 追踪、DeepSeek 对话导入",
-                            badge: nil,
-                            badgeColor: .secondary
-                        )
-                    }
-
+                Section("系统诊断、DevTools 与备份") {
                     NavigationLink {
                         RuntimeDiagnosticsAndBackupView(host: host)
                     } label: {
@@ -239,6 +237,7 @@ public struct ModelServiceSettingsView: View {
     @State private var status = ""
     @State private var keyConfigured = false
     @State private var modelSearch = ""
+    @State private var editingProfile: ProviderProfile?
 
     public init(host: LocalAgentHost) {
         self.host = host
@@ -454,17 +453,26 @@ public struct ModelServiceSettingsView: View {
                                 Label("删除", systemImage: "trash")
                             }
                         }
+                        Button {
+                            editingProfile = profile
+                        } label: {
+                            Label("编辑", systemImage: "pencil")
+                        }
+                        .tint(DSTheme.brand)
                     }
                 }
                 Button {
                     let trimmed = host.apiBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
                     let hostName = URL(string: trimmed)?.host ?? "自定义端点"
-                    providerStore.upsert(ProviderProfile(
+                    let newProfile = ProviderProfile(
                         name: hostName,
                         apiBaseURL: trimmed,
-                        defaultModel: host.models.first ?? ModelProvider.defaultModel
-                    ))
-                    status = "已将 \(hostName) 保存到端点档案列表。"
+                        defaultModel: host.models.first ?? ModelProvider.defaultModel,
+                        supportsTools: host.customTools
+                    )
+                    providerStore.upsert(newProfile)
+                    editingProfile = newProfile
+                    status = "已将 \(hostName) 保存到端点档案列表，可继续自定义名称与默认模型。"
                     DSHaptics.notify(.success)
                 } label: {
                     Label("保存当前地址为新档案", systemImage: "plus.circle")
@@ -477,6 +485,13 @@ public struct ModelServiceSettingsView: View {
         .navigationTitle("模型服务与凭据")
         .navigationBarTitleDisplayMode(.inline)
         .task { keyConfigured = await host.hasSavedAPIKey() }
+        .sheet(item: $editingProfile) { target in
+            EditProviderProfileSheet(profile: target, host: host) { updated in
+                providerStore.upsert(updated)
+                status = "已更新档案「\(updated.name)」。"
+                DSHaptics.notify(.success)
+            }
+        }
     }
 
     private func providerPresetButton(_ title: String, url: String) -> some View {
@@ -494,6 +509,68 @@ public struct ModelServiceSettingsView: View {
                 .clipShape(Capsule())
         }
         .buttonStyle(.plain)
+    }
+}
+
+private struct EditProviderProfileSheet: View {
+    let profile: ProviderProfile
+    @ObservedObject var host: LocalAgentHost
+    let onSave: (ProviderProfile) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var name: String
+    @State private var apiBaseURL: String
+    @State private var defaultModel: String
+    @State private var supportsTools: Bool
+
+    init(profile: ProviderProfile, host: LocalAgentHost, onSave: @escaping (ProviderProfile) -> Void) {
+        self.profile = profile
+        self.host = host
+        self.onSave = onSave
+        _name = State(initialValue: profile.name)
+        _apiBaseURL = State(initialValue: profile.apiBaseURL)
+        _defaultModel = State(initialValue: profile.defaultModel)
+        _supportsTools = State(initialValue: profile.supportsTools)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("端点档案信息") {
+                    TextField("档案名称（如 香港自建 V4 网关）", text: $name)
+                    TextField("API Base URL", text: $apiBaseURL)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+                        .disabled(profile.id == "deepseek-official")
+                    ModelSelectionView(host: host, model: $defaultModel, endpointURL: apiBaseURL)
+                    Toggle("支持工具调用 (Tool Calling)", isOn: $supportsTools)
+                }
+            }
+            .navigationTitle("编辑端点档案")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("保存") {
+                        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let cleanURL = apiBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !cleanName.isEmpty, !cleanURL.isEmpty else { return }
+                        onSave(ProviderProfile(
+                            id: profile.id,
+                            name: cleanName,
+                            apiBaseURL: cleanURL,
+                            defaultModel: defaultModel.trimmingCharacters(in: .whitespacesAndNewlines),
+                            protocolKind: profile.protocolKind,
+                            supportsTools: supportsTools
+                        ))
+                        dismiss()
+                    }
+                    .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || apiBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
     }
 }
 
@@ -527,6 +604,12 @@ public struct RuntimeDiagnosticsAndBackupView: View {
                     status = "已刷新内存遥测，并回收渲染缓存与非活跃会话内存。"
                 } label: {
                     Label("刷新遥测并清理渲染缓存", systemImage: "arrow.clockwise")
+                }
+
+                NavigationLink {
+                    BackendDevToolsInspectorView(host: host)
+                } label: {
+                    Label("打开后端 DevTools 与 Cordis 调试器", systemImage: "ladybug.fill")
                 }
             }
 

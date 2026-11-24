@@ -106,7 +106,6 @@ public struct ChatView: View {
     @State private var followsLiveOutput = true
     @State private var showClearConfirm = false
     @State private var showPrivateExportConfirm = false
-    @State private var showFileImporter = false
     @State private var activeSheet: ChatActiveSheet?
     @State private var referencedBot: BotProfile?
     @State private var attachedFiles: [LocalAgentHost.AttachedWorkspaceFile] = []
@@ -369,15 +368,20 @@ public struct ChatView: View {
                                 Text("标准审批").tag("ask")
                                 Text("沙盒免打扰").tag("autoReview")
                             }
-                            .disabled(host.isStreaming)
+                            .disabled(host.isSessionStreaming(activeSessionId))
                         }
-                        ModelSelectionView(host: host, model: $selectedModel, allowsTyping: false)
+                        ModelSelectionView(
+                            host: host,
+                            model: $selectedModel,
+                            allowsTyping: false,
+                            endpointURL: host.effectiveApiBaseURL(for: liveBot)
+                        )
                         Button {
                             activeSheet = .modelPicker
                         } label: {
                             Label("搜索 / 刷新全部模型…", systemImage: "magnifyingglass")
                         }
-                        .disabled(host.isStreaming)
+                        .disabled(host.isSessionStreaming(activeSessionId))
                         if host.redteamStatus.installed {
                             Section("dsh-purge-safe 会话授权") {
                                 Toggle("允许本 Bot 调用红队工具", isOn: Binding(
@@ -549,43 +553,6 @@ public struct ChatView: View {
         } message: {
             Text("当前为私密会话。继续操作将把本话题内容导出到系统共享表单；点击取消不会写入任何文件。")
         }
-        .background(
-            Color.clear
-                .fileImporter(
-                    isPresented: $showFileImporter,
-                    allowedContentTypes: LocalAgentHost.supportedImportContentTypes,
-                    allowsMultipleSelection: true
-                ) { result in
-                    switch result {
-                    case .success(let urls):
-                        var addedCount = 0
-                        var lastError: String?
-                        for url in urls {
-                            do {
-                                let imported = try host.importFileToWorkspace(from: url)
-                                if !attachedFiles.contains(where: { $0.relativePath == imported.relativePath }) {
-                                    attachedFiles.append(imported)
-                                }
-                                addedCount += 1
-                            } catch {
-                                lastError = error.localizedDescription
-                            }
-                        }
-                        if addedCount > 0 {
-                            actionStatus = addedCount == 1
-                                ? "已附加：files/\(attachedFiles.last?.relativePath ?? "")"
-                                : "已附加 \(addedCount) 个文件到工作区"
-                            DSHaptics.notify(.success)
-                        } else if let lastError {
-                            actionStatus = "附加失败：\(lastError)"
-                            DSHaptics.notify(.error)
-                        }
-                    case .failure(let error):
-                        actionStatus = "附加失败：\(error.localizedDescription)"
-                        DSHaptics.notify(.error)
-                    }
-                }
-        )
         #if canImport(PhotosUI)
         .onChange(of: selectedPhotoItems) { items in
             guard !items.isEmpty else { return }
@@ -693,7 +660,8 @@ public struct ChatView: View {
             ModelPickerSheet(
                 host: host,
                 model: $selectedModel,
-                title: "切换当前对话模型"
+                title: "切换当前对话模型",
+                endpointURL: host.effectiveApiBaseURL(for: liveBot)
             ) { chosen in
                 host.applyModelToAllBots(chosen)
             }
@@ -770,13 +738,12 @@ public struct ChatView: View {
         isPrivateUnlocked = false
         for thread in threadStore.threads(for: liveBot.id, includeArchived: true) {
             host.discardSessionHistoryCache(thread.sessionId)
-            if host.streamingSessionId == thread.sessionId {
-                Task { await host.abortActiveTurn() }
+            if host.isSessionStreaming(thread.sessionId) {
+                Task { await host.abortActiveTurn(sessionId: thread.sessionId) }
             }
         }
         historyError = nil
         activeSheet = nil
-        showFileImporter = false
         attachedFiles.removeAll()
         speechInput.stop()
         showClearConfirm = false
@@ -806,15 +773,13 @@ public struct ChatView: View {
                             input = snippet
                         }
                     )
-                    if host.isStreaming,
-                       let activeId = host.streamingSessionId,
-                       activeId != activeSessionId,
+                    if let activeId = host.activeStreamingSessionIds.first(where: { $0 != activeSessionId }),
                        let activeAddress = host.resolveAddress(activeId),
                        let activeBot = host.bot(for: activeAddress) {
                         HStack(spacing: 8) {
                             ProgressView().scaleEffect(0.7)
                             let threadSuffix = (!activeBot.isPrivate ? threadStore.threadTitle(for: activeAddress).map { " · \($0)" } : nil) ?? ""
-                            Text("「\(activeBot.isPrivate ? "私密会话" : activeBot.name)\(threadSuffix)」正在后台流式生成中")
+                            Text("「\(activeBot.isPrivate ? "私密会话" : activeBot.name)\(threadSuffix)」正在后台流式生成中（当前会话可并发发送）")
                                 .font(.caption.weight(.medium))
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
@@ -892,7 +857,7 @@ public struct ChatView: View {
                                     Spacer()
                                 }
                             }
-                            if !followsLiveOutput && (!sessionMessages.isEmpty || (host.isStreaming && host.streamingSessionId == activeSessionId)) {
+                            if !followsLiveOutput && (!sessionMessages.isEmpty || host.isSessionStreaming(activeSessionId)) {
                                 Button {
                                     followsLiveOutput = true
                                     withAnimation(.easeOut(duration: 0.2)) {
@@ -900,14 +865,14 @@ public struct ChatView: View {
                                     }
                                 } label: {
                                     HStack(spacing: 6) {
-                                        if host.isStreaming && host.streamingSessionId == activeSessionId {
+                                        if host.isSessionStreaming(activeSessionId) {
                                             Circle()
                                                 .fill(DSTheme.brand)
                                                 .frame(width: 7, height: 7)
                                         }
                                         Image(systemName: "arrow.down")
                                             .font(.caption.weight(.bold))
-                                        Text(host.isStreaming && host.streamingSessionId == activeSessionId ? "回到最新输出" : "回到底部")
+                                        Text(host.isSessionStreaming(activeSessionId) ? "回到最新输出" : "回到底部")
                                             .font(.caption.weight(.semibold))
                                     }
                                     .foregroundStyle(.primary)
@@ -985,7 +950,7 @@ public struct ChatView: View {
     }
 
     private func scrollToBottomIfFollowing(proxy: ScrollViewProxy) {
-        guard followsLiveOutput, host.streamingSessionId == activeSessionId else { return }
+        guard followsLiveOutput, host.isSessionStreaming(activeSessionId) else { return }
         let now = Date()
         if now.timeIntervalSince(lastScrollAt) >= 0.12 {
             lastScrollAt = now
@@ -1035,7 +1000,7 @@ public struct ChatView: View {
         }
 
         if sessionMessages.isEmpty && !host.hasSessionHistory(activeSessionId)
-            && !host.loadingHistoryIDs.contains(activeSessionId) && !host.isStreaming {
+            && !host.loadingHistoryIDs.contains(activeSessionId) && !host.isSessionStreaming(activeSessionId) {
             emptyWelcomeView
         }
     }
@@ -1061,10 +1026,10 @@ public struct ChatView: View {
             }
         }
 
-        if host.isStreaming && host.streamingSessionId == activeSessionId {
+        if host.isSessionStreaming(activeSessionId) {
             StreamingTurnRow(
                 botName: liveBot.name,
-                liveStream: host.liveStream,
+                liveStream: host.liveStream(for: activeSessionId),
                 collapseThinkingByDefault: host.collapseThinkingByDefault
             ) {
                 scrollToBottomIfFollowing(proxy: proxy)
@@ -1789,7 +1754,7 @@ public struct ChatView: View {
                         .font(.system(size: 18, weight: .medium))
                         .foregroundColor(attachedFiles.isEmpty ? .secondary : DSTheme.brand)
                 }
-                .disabled(host.isStreaming)
+                .disabled(host.isSessionStreaming(activeSessionId))
                 .help("附加任意本地文件或目录")
 
                 #if canImport(PhotosUI)
@@ -1798,11 +1763,11 @@ public struct ChatView: View {
                         .font(.system(size: 17, weight: .medium))
                         .foregroundColor(.secondary)
                 }
-                .disabled(host.isStreaming)
+                .disabled(host.isSessionStreaming(activeSessionId))
                 .help("从相册选择图片")
                 #endif
 
-                TextField(host.isStreaming && host.streamingSessionId == activeSessionId ? "输入插话引导内容（Steer）…" : "给 \(liveBot.name) 发消息…", text: $input, axis: .vertical)
+                TextField(host.isSessionStreaming(activeSessionId) ? "输入插话引导内容（Steer）…" : "给 \(liveBot.name) 发消息…", text: $input, axis: .vertical)
                     .lineLimit(1...4)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
@@ -1830,9 +1795,9 @@ public struct ChatView: View {
                         .font(.title3)
                         .foregroundColor(speechInput.isRecording ? DSTheme.danger : .secondary)
                 }
-                .disabled(host.isStreaming)
+                .disabled(host.isSessionStreaming(activeSessionId))
 
-                if host.isStreaming && host.streamingSessionId == activeSessionId {
+                if host.isSessionStreaming(activeSessionId) {
                     let steerText = input.trimmingCharacters(in: .whitespacesAndNewlines)
                     if !steerText.isEmpty {
                         Button {
@@ -1847,7 +1812,7 @@ public struct ChatView: View {
                         .help("插话引导（Steer）")
                     }
                     Button {
-                        Task { await host.abortActiveTurn() }
+                        Task { await host.abortActiveTurn(sessionId: activeSessionId) }
                     } label: {
                         Image(systemName: "stop.circle.fill")
                             .font(.title2)

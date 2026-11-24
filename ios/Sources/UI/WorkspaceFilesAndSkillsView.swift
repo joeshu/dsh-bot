@@ -44,7 +44,6 @@ public struct WorkspaceFilesView: View {
     @State private var selectedPreview: (url: URL, name: String, content: String, isEditable: Bool)?
     @State private var editedPreviewContent = ""
     @State private var isEditingPreview = false
-    @State private var showImporter = false
     @State private var showNewFile = false
     @State private var newFileName = ""
     @State private var newFileContent = ""
@@ -81,7 +80,7 @@ public struct WorkspaceFilesView: View {
                         subtitle: entries.isEmpty ? "点击右上角新建文本/代码文件，粘贴剪贴板文本，或从系统文件 App 导入任意本地文件与目录。" : "尝试更换搜索关键词。",
                         actionTitle: entries.isEmpty ? "导入本地文件" : nil
                     ) {
-                        showImporter = true
+                        presentWorkspaceImporter()
                     }
                     .listRowBackground(Color.clear)
                 } else {
@@ -167,7 +166,7 @@ public struct WorkspaceFilesView: View {
                 #endif
                 Button { showNewFile = true } label: { Image(systemName: "doc.badge.plus") }
                     .help("新建文本或代码文件")
-                Button { showImporter = true } label: { Image(systemName: "square.and.arrow.down") }
+                Button { presentWorkspaceImporter() } label: { Image(systemName: "square.and.arrow.down") }
                     .help("从手机导入任意文件或目录")
             }
         }
@@ -206,38 +205,6 @@ public struct WorkspaceFilesView: View {
                 }
             }
         }
-        .background(
-            Color.clear
-                .fileImporter(
-                    isPresented: $showImporter,
-                    allowedContentTypes: LocalAgentHost.supportedImportContentTypes,
-                    allowsMultipleSelection: true
-                ) { result in
-                    switch result {
-                    case .success(let urls):
-                        var importedNames: [String] = []
-                        var lastError: String?
-                        for url in urls {
-                            do {
-                                let imported = try host.importFileToWorkspace(from: url)
-                                importedNames.append(imported.relativePath)
-                            } catch {
-                                lastError = error.localizedDescription
-                            }
-                        }
-                        if !importedNames.isEmpty {
-                            status = importedNames.count == 1
-                                ? "已导入：files/\(importedNames[0])"
-                                : "已导入 \(importedNames.count) 个文件到 files/"
-                            reload()
-                        } else if let lastError {
-                            status = "导入失败：\(lastError)"
-                        }
-                    case .failure(let error):
-                        status = "导入失败：\(error.localizedDescription)"
-                    }
-                }
-        )
         .sheet(isPresented: Binding(
             get: { selectedPreview != nil },
             set: { if !$0 { selectedPreview = nil; isEditingPreview = false } }
@@ -297,6 +264,34 @@ public struct WorkspaceFilesView: View {
             }
         }
         .onAppear { reload() }
+    }
+
+    private func presentWorkspaceImporter() {
+        #if canImport(UIKit)
+        NativeDocumentPicker.present(allowsMultipleSelection: true) { urls in
+            guard !urls.isEmpty else { return }
+            var importedNames: [String] = []
+            var lastError: String?
+            for url in urls {
+                do {
+                    let imported = try host.importFileToWorkspace(from: url)
+                    importedNames.append(imported.relativePath)
+                } catch {
+                    lastError = error.localizedDescription
+                }
+            }
+            if !importedNames.isEmpty {
+                status = importedNames.count == 1
+                    ? "已导入：files/\(importedNames[0])"
+                    : "已导入 \(importedNames.count) 个文件到 files/"
+                DSHaptics.notify(.success)
+                reload()
+            } else if let lastError {
+                status = "导入失败：\(lastError)"
+                DSHaptics.notify(.error)
+            }
+        }
+        #endif
     }
 
     private func reload() {
