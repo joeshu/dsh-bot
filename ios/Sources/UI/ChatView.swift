@@ -1575,7 +1575,7 @@ public struct ChatView: View {
                     onPickFile: {
                         showCommandPalette = false
                         if input.hasPrefix("/") { input = "" }
-                        showFileImporter = true
+                        presentAttachmentPicker()
                     },
                     onOpenGoal: {
                         showCommandPalette = false
@@ -1783,7 +1783,7 @@ public struct ChatView: View {
                 }
 
                 Button {
-                    showFileImporter = true
+                    presentAttachmentPicker()
                 } label: {
                     Image(systemName: "paperclip")
                         .font(.system(size: 18, weight: .medium))
@@ -2017,5 +2017,37 @@ public struct ChatView: View {
         default:
             return "paperclip"
         }
+    }
+
+    private func presentAttachmentPicker() {
+        #if canImport(UIKit)
+        NativeDocumentPicker.present(allowsMultipleSelection: true) { urls in
+            guard !urls.isEmpty else { return }
+            var addedCount = 0
+            var lastError: String?
+            for url in urls {
+                do {
+                    let imported = try host.importFileToWorkspace(from: url)
+                    if !attachedFiles.contains(where: { $0.relativePath == imported.relativePath }) {
+                        attachedFiles.append(imported)
+                    }
+                    addedCount += 1
+                } catch {
+                    lastError = error.localizedDescription
+                }
+            }
+            if addedCount > 0 {
+                actionStatus = addedCount == 1
+                    ? "已附加：files/\(attachedFiles.last?.relativePath ?? "")"
+                    : "已附加 \(addedCount) 个文件到工作区"
+                DSHaptics.notify(.success)
+            } else if let lastError {
+                actionStatus = "附加失败：\(lastError)"
+                DSHaptics.notify(.error)
+            }
+        }
+        #else
+        showFileImporter = true
+        #endif
     }
 }

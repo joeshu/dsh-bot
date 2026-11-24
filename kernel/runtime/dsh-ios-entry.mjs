@@ -2588,9 +2588,17 @@ async function syncProviderModelCatalog({ apiBaseURL, models, defaultModel } = {
       if (uniqueIds.length >= 200) break
     }
   }
+  const effectiveIds = !official
+    ? (uniqueIds.length > 0
+        ? uniqueIds
+        : (nextProviderBaseURL === runtime.providerBaseURL && Array.isArray(runtime.customCatalogModels)
+            ? runtime.customCatalogModels
+            : []))
+    : []
+
   const nextConfig = { baseURL: nextProviderBaseURL }
-  if (!official && uniqueIds.length > 0) {
-    nextConfig.models = uniqueIds.map((id) => ({
+  if (!official && effectiveIds.length > 0) {
+    nextConfig.models = effectiveIds.map((id) => ({
       id,
       name: id,
       maxTokens: 8192,
@@ -2600,11 +2608,42 @@ async function syncProviderModelCatalog({ apiBaseURL, models, defaultModel } = {
   if (nextProviderBaseURL !== runtime.providerBaseURL) {
     for (const [id, active] of runtime.activeAgents) await drainAndDispose(id, active)
   }
-  await runtime.providerFiber.update(nextConfig)
+  // Update runtime.apiBaseURL BEFORE providerFiber.update so any volatile-update listener
+  // resolving Keychain credentials immediately queries the new endpoint.
   runtime.apiBaseURL = nextApiBaseURL
   runtime.providerBaseURL = nextProviderBaseURL
-  runtime.customCatalogModels = !official ? uniqueIds : []
+  runtime.customCatalogModels = effectiveIds
   process.env.DS_BOT_PROVIDER_BASE_URL = nextProviderBaseURL
+  await runtime.providerFiber.update(nextConfig)
+
+  // Guarantee ctx.llm.listModels('deepseek-official') always includes synced custom models
+  // so Web UI selectModel() never rejects a visible custom model with session/model-unavailable.
+  if (ctx?.llm && typeof ctx.llm.listModels === 'function' && !ctx.llm.__dsbotCustomListModelsPatched) {
+    const origListModels = ctx.llm.listModels.bind(ctx.llm)
+    ctx.llm.listModels = async function patchedListModels(providerId) {
+      const listed = await origListModels(providerId)
+      if (providerId === 'deepseek-official'
+        && !isOfficialDeepSeekBase(runtime.apiBaseURL)
+        && Array.isArray(runtime.customCatalogModels)
+        && runtime.customCatalogModels.length > 0) {
+        const listedIds = new Set(listed.map((m) => m.id))
+        const merged = [...listed]
+        for (const id of runtime.customCatalogModels) {
+          if (!listedIds.has(id)) {
+            merged.push({
+              provider: 'deepseek-official',
+              id,
+              name: id,
+              inputModalities: ['text', 'image'],
+            })
+          }
+        }
+        return merged
+      }
+      return listed
+    }
+    ctx.llm.__dsbotCustomListModelsPatched = true
+  }
 
   // Keep DSH Web UI's agent-default-model aligned with the active endpoint & chosen default model.
   if (runtime.defaultModelFiber) {
@@ -2621,9 +2660,9 @@ async function syncProviderModelCatalog({ apiBaseURL, models, defaultModel } = {
         })
       } catch {}
     } else {
-      targetModel = (requestedDefault && (uniqueIds.length === 0 || uniqueIds.includes(requestedDefault)))
+      targetModel = (requestedDefault && (effectiveIds.length === 0 || effectiveIds.includes(requestedDefault)))
         ? requestedDefault
-        : (uniqueIds[0] || requestedDefault)
+        : (effectiveIds[0] || requestedDefault)
       if (targetModel) {
         try {
           await runtime.defaultModelFiber.update({
@@ -2642,7 +2681,7 @@ async function syncProviderModelCatalog({ apiBaseURL, models, defaultModel } = {
     ok: true,
     baseURL: nextProviderBaseURL,
     official,
-    syncedCount: !official ? uniqueIds.length : 0,
+    syncedCount: effectiveIds.length,
   }
 }
 

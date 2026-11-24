@@ -2,6 +2,7 @@ import LocalAuthentication
 import SwiftUI
 #if canImport(UIKit)
 import UIKit
+import UniformTypeIdentifiers
 #endif
 
 /// Unified visual design system for DS-Bot iOS Standalone (DesignSystem 2.0).
@@ -1116,3 +1117,55 @@ public struct ModelPickerSheet: View {
         }
     }
 }
+
+#if canImport(UIKit)
+/// Reliable UIKit document picker presenter that never conflicts with SwiftUI sheets/alerts
+/// and uses `asCopy: true` with `[.item]` so iOS copies any selected file cleanly into the sandbox.
+@MainActor
+public final class NativeDocumentPicker: NSObject, UIDocumentPickerDelegate {
+    private static var activePresenter: NativeDocumentPicker?
+    private let onComplete: ([URL]) -> Void
+
+    private init(onComplete: @escaping ([URL]) -> Void) {
+        self.onComplete = onComplete
+    }
+
+    public static func present(
+        allowsMultipleSelection: Bool = true,
+        onComplete: @escaping ([URL]) -> Void
+    ) {
+        guard let root = topViewController() else {
+            onComplete([])
+            return
+        }
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: true)
+        picker.allowsMultipleSelection = allowsMultipleSelection
+        let coordinator = NativeDocumentPicker(onComplete: onComplete)
+        picker.delegate = coordinator
+        activePresenter = coordinator
+        root.present(picker, animated: true)
+    }
+
+    public func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+        let cb = onComplete
+        Self.activePresenter = nil
+        cb(urls)
+    }
+
+    public func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+        let cb = onComplete
+        Self.activePresenter = nil
+        cb([])
+    }
+
+    private static func topViewController() -> UIViewController? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let window = scenes.flatMap(\.windows).first(where: \.isKeyWindow) ?? scenes.flatMap(\.windows).first
+        var top = window?.rootViewController
+        while let presented = top?.presentedViewController {
+            top = presented
+        }
+        return top
+    }
+}
+#endif

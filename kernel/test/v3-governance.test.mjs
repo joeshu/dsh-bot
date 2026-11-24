@@ -526,3 +526,22 @@ test('v3 custom-endpoint: HTTP /v1 OpenAI-only fallback translates Anthropic /me
   }
 })
 
+test('v3 custom-endpoint: ensureAnthropicStreamComplete synthesizes missing content_block_stop, message_delta, and message_stop', async () => {
+  const { ensureAnthropicStreamComplete } = await import(join(runtimeDir, 'ios-openai-compat-adapter.mjs'))
+  const truncated = [
+    'event: message_start\ndata: {"type":"message_start","message":{"id":"m1","role":"assistant","content":[]}}\n\n',
+    'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n',
+  ].join('')
+  const rawResp = new Response(truncated, {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+  })
+  const repaired = ensureAnthropicStreamComplete(rawResp)
+  const text = await repaired.text()
+  assert.match(text, /"type":"text_delta","text":"hi"/)
+  assert.match(text, /"type":"content_block_stop","index":0/)
+  assert.match(text, /"type":"message_delta"/)
+  assert.match(text, /"type":"message_stop"/)
+})
+

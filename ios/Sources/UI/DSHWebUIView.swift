@@ -167,7 +167,32 @@ public struct DSHWebUIView: View {
             Menu {
                 Section("手机文件与文本导入") {
                     Button {
+                        #if canImport(UIKit)
+                        NativeDocumentPicker.present(allowsMultipleSelection: true) { urls in
+                            guard !urls.isEmpty else { return }
+                            var count = 0
+                            var lastPath = ""
+                            var lastErr: String?
+                            for url in urls {
+                                do {
+                                    let imported = try host.importFileToWorkspace(from: url)
+                                    count += 1
+                                    lastPath = imported.relativePath
+                                } catch {
+                                    lastErr = error.localizedDescription
+                                }
+                            }
+                            if count > 0 {
+                                importBanner = count == 1 ? "已导入 files/\(lastPath)" : "已导入 \(count) 个文件到 files/"
+                                DSHaptics.notify(.success)
+                            } else if let lastErr {
+                                importBanner = "导入失败：\(lastErr)"
+                                DSHaptics.notify(.error)
+                            }
+                        }
+                        #else
                         showFileImporter = true
+                        #endif
                     } label: {
                         Label("导入手机文件到工作区 (files/)", systemImage: "square.and.arrow.down")
                     }

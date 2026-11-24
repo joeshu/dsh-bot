@@ -453,7 +453,14 @@ export function installCustomEndpointCompatFetch({ getProviderBaseURL, isOfficia
     }
 
     const primaryResp = await baseFetch(input, { ...init, headers })
-    if (primaryResp.ok || !bodyText) {
+    if (primaryResp.ok) {
+      const ct = (primaryResp.headers.get('content-type') || '').toLowerCase()
+      if (ct.includes('text/event-stream') && primaryResp.body) {
+        return ensureAnthropicStreamComplete(primaryResp)
+      }
+      return primaryResp
+    }
+    if (!bodyText) {
       return primaryResp
     }
 
@@ -474,4 +481,81 @@ export function installCustomEndpointCompatFetch({ getProviderBaseURL, isOfficia
   wrappedFetch.__original = baseFetch
   globalThis.fetch = wrappedFetch
   globalThis.__DSBOT_COMPAT_FETCH_INSTALLED__ = true
+}
+
+/**
+ * Pass-through SSE transformer for custom Anthropic-compatible endpoints.
+ * Forwards every chunk immediately, and if the upstream closes cleanly after
+ * emitting `message_start` without a trailing `message_stop`, synthesizes the
+ * missing closing events so DSH does not abort with "stream ended before message_stop".
+ */
+export function ensureAnthropicStreamComplete(response) {
+  const decoder = new TextDecoder()
+  const encoder = new TextEncoder()
+  let seenMessageStart = false
+  let seenMessageDelta = false
+  let seenMessageStop = false
+  let openBlockIndex = null
+  let tail = ''
+
+  const scanText = (chunkText) => {
+    const combined = tail + chunkText
+    const lines = combined.split('\n')
+    tail = lines.pop() ?? ''
+    for (const rawLine of lines) {
+      const line = rawLine.trim()
+      if (!line.startsWith('data:')) continue
+      const payload = line.slice(5).trim()
+      if (!payload || payload === '[DONE]') continue
+      try {
+        const evt = JSON.parse(payload)
+        if (evt.type === 'message_start') seenMessageStart = true
+        else if (evt.type === 'content_block_start' && typeof evt.index === 'number') openBlockIndex = evt.index
+        else if (evt.type === 'content_block_stop' && evt.index === openBlockIndex) openBlockIndex = null
+        else if (evt.type === 'message_delta') seenMessageDelta = true
+        else if (evt.type === 'message_stop') seenMessageStop = true
+      } catch {}
+    }
+  }
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const reader = response.body.getReader()
+      try {
+        while (true) {
+          const { value, done } = await reader.read()
+          if (done) break
+          if (value && value.byteLength > 0) {
+            scanText(decoder.decode(value, { stream: true }))
+            controller.enqueue(value)
+          }
+        }
+        if (tail.trim()) scanText('\n')
+        if (seenMessageStart && !seenMessageStop) {
+          let suffix = '\n\n'
+          if (openBlockIndex !== null) {
+            suffix += formatSse('content_block_stop', { type: 'content_block_stop', index: openBlockIndex })
+          }
+          if (!seenMessageDelta) {
+            suffix += formatSse('message_delta', {
+              type: 'message_delta',
+              delta: { stop_reason: 'end_turn', stop_sequence: null },
+              usage: { output_tokens: 0 },
+            })
+          }
+          suffix += formatSse('message_stop', { type: 'message_stop' })
+          controller.enqueue(encoder.encode(suffix))
+        }
+        controller.close()
+      } catch (err) {
+        controller.error(err)
+      }
+    },
+  })
+
+  return new Response(stream, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  })
 }
