@@ -1,14 +1,13 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { Context } from '../runtime/node_modules/@deepseek-ai/cordis/lib/index.js'
-import { IOSAttachmentStore, probeImagePureJS } from '../runtime/ios-host-package/ios-attachment-store.mjs'
 
 const REPO_ROOT = fileURLToPath(new URL('../..', import.meta.url))
 const readRepo = (rel) => readFileSync(join(REPO_ROOT, rel), 'utf8')
+const HAS_RUNTIME_NODE_MODULES = existsSync(join(REPO_ROOT, 'kernel/runtime/node_modules/@deepseek-ai/dsh-attachment/lib/index.js'))
 
 // Minimal valid 1x1 PNG (67 bytes)
 const TINY_PNG = Buffer.from(
@@ -19,7 +18,14 @@ const TINY_PNG = Buffer.from(
 // Minimal valid 1x1 GIF89a
 const TINY_GIF = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64')
 
-test('session-arch (stage 2): probeImagePureJS & IOSAttachmentStore save/read/project images and files without sharp', async () => {
+test('session-arch (stage 2): probeImagePureJS & IOSAttachmentStore save/read/project images and files without sharp', async (t) => {
+  if (!HAS_RUNTIME_NODE_MODULES) {
+    t.skip('kernel/runtime/node_modules not installed in lightweight kernel-tests job')
+    return
+  }
+  const { Context } = await import('../runtime/node_modules/@deepseek-ai/cordis/lib/index.js')
+  const { IOSAttachmentStore, probeImagePureJS } = await import('../runtime/ios-host-package/ios-attachment-store.mjs')
+
   const pngMeta = probeImagePureJS(TINY_PNG)
   assert.deepEqual(pngMeta, { mediaType: 'image/png', width: 1, height: 1, hasAlpha: true })
 
