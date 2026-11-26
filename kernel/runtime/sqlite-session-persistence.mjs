@@ -1,3 +1,4 @@
+import { realpathSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 import {
   SessionAlreadyExistsError,
@@ -18,6 +19,14 @@ import {
 const databasePath = process.argv.find((arg) => arg.startsWith('--database='))?.slice('--database='.length)
 if (!databasePath) throw new Error('Missing --database argument for DSH SQLite persistence')
 
+const IOS_CONTAINER_FILES_RE = /^(\/private)?\/var\/mobile\/Containers\/Data\/Application\/[^/]+\/Documents\/dsh-home\/files(\/.*)?$/
+
+function resolveCanonicalWorkspaceFiles() {
+  const raw = process.env.DSH_AGENTS_HOME
+  if (!raw) return undefined
+  try { return realpathSync(raw) } catch { return raw }
+}
+
 function abortIfRequested(signal) {
   if (signal?.aborted) throw signal.reason ?? new Error('Operation aborted')
 }
@@ -31,6 +40,7 @@ function snapshot(row) {
     eventCount: row.next_seq,
     lastActivityAt: Number.isSafeInteger(row.last_activity_at) ? row.last_activity_at : undefined,
     lastMessagePreview: typeof row.last_message_preview === 'string' ? row.last_message_preview : undefined,
+    title: typeof row.title === 'string' && row.title.trim() ? row.title.trim() : undefined,
     sizeBytes: undefined,
     location: { kind: 'sqlite', path: databasePath },
   }
@@ -119,13 +129,19 @@ class SQLiteSessionHandle {
         .run(current.next_seq + batch.length, this.id)
       const lastActivityAt = batch.at(-1)?.time
       let preview
-      for (let index = batch.length - 1; index >= 0 && preview === undefined; index -= 1) {
-        preview = lastMessagePreview(batch[index])
+      let title
+      for (let index = batch.length - 1; index >= 0 && (preview === undefined || title === undefined); index -= 1) {
+        if (preview === undefined) preview = lastMessagePreview(batch[index])
+        if (title === undefined && batch[index]?.type === 'session/title' && typeof batch[index]?.data?.title === 'string') {
+          const trimmed = batch[index].data.title.trim()
+          if (trimmed) title = trimmed
+        }
       }
       this.owner.stmt(`UPDATE sessions
         SET last_activity_at = COALESCE(?, last_activity_at),
-            last_message_preview = COALESCE(?, last_message_preview)
-        WHERE id = ?`).run(Number.isSafeInteger(lastActivityAt) ? lastActivityAt : null, preview ?? null, this.id)
+            last_message_preview = COALESCE(?, last_message_preview),
+            title = COALESCE(?, title)
+        WHERE id = ?`).run(Number.isSafeInteger(lastActivityAt) ? lastActivityAt : null, preview ?? null, title ?? null, this.id)
       this.owner.db.exec('COMMIT')
     } catch (error) {
       try { this.owner.db.exec('ROLLBACK') } catch {}
@@ -263,8 +279,11 @@ export class SQLiteSessionPersistence extends SessionPersistence {
       const sessionColumns = new Set(db.prepare('PRAGMA table_info(sessions)').all().map((row) => row.name))
       if (!sessionColumns.has('last_activity_at')) db.exec('ALTER TABLE sessions ADD COLUMN last_activity_at INTEGER')
       if (!sessionColumns.has('last_message_preview')) db.exec('ALTER TABLE sessions ADD COLUMN last_message_preview TEXT')
+      if (!sessionColumns.has('title')) db.exec('ALTER TABLE sessions ADD COLUMN title TEXT')
       this.backfillSessionSummaries()
+      this.backfillSessionTitles()
       this.backfillSessionAttachments()
+      this.migrateContainerCwds()
     }
     return db
   }
@@ -331,6 +350,67 @@ export class SQLiteSessionPersistence extends SessionPersistence {
     }
   }
 
+  backfillSessionTitles() {
+    const done = this.db.prepare("SELECT value FROM schema_meta WHERE key = 'titles_backfilled'").get()
+    if (done?.value === '1') return
+    const rows = this.db.prepare(`SELECT session_id, event_json FROM session_events
+      WHERE json_extract(event_json, '$.type') = 'session/title'
+      ORDER BY session_id, seq DESC`).all()
+    const seen = new Set()
+    const update = this.db.prepare('UPDATE sessions SET title = ? WHERE id = ? AND (title IS NULL OR title = \'\')')
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      for (const row of rows) {
+        if (seen.has(row.session_id)) continue
+        seen.add(row.session_id)
+        try {
+          const event = JSON.parse(row.event_json)
+          const title = typeof event?.data?.title === 'string' ? event.data.title.trim() : ''
+          if (title) update.run(title, row.session_id)
+        } catch { /* ignore malformed row */ }
+      }
+      this.db.prepare("INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('titles_backfilled', '1')").run()
+      this.db.exec('COMMIT')
+    } catch (error) {
+      try { this.db.exec('ROLLBACK') } catch {}
+      throw error
+    }
+  }
+
+  migrateContainerCwds() {
+    const canonicalRoot = resolveCanonicalWorkspaceFiles()
+    if (!canonicalRoot) return
+    const rows = this.db.prepare(`SELECT id, header_json FROM sessions
+      WHERE header_json LIKE '%/Containers/Data/Application/%/Documents/dsh-home/files%'`).all()
+    if (rows.length === 0) return
+    const update = this.db.prepare('UPDATE sessions SET header_json = ? WHERE id = ?')
+    let migrated = 0
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      for (const row of rows) {
+        try {
+          const header = JSON.parse(row.header_json)
+          if (typeof header?.cwd !== 'string') continue
+          const match = header.cwd.match(IOS_CONTAINER_FILES_RE)
+          if (!match) continue
+          const suffix = match[2] ?? ''
+          const nextCwd = `${canonicalRoot}${suffix}`
+          if (nextCwd === header.cwd) continue
+          header.cwd = nextCwd
+          update.run(JSON.stringify(header), row.id)
+          migrated += 1
+        } catch { /* ignore malformed header */ }
+      }
+      this.db.exec('COMMIT')
+      if (migrated > 0) {
+        this.ctx?.logger?.info?.(`Migrated ${migrated} iOS session header cwd(s) to current container path`)
+      }
+    } catch (error) {
+      try { this.db.exec('ROLLBACK') } catch {}
+      throw error
+    }
+  }
+
   async flushHandleLive(handle) {
     if (handle.access === 'write') return handle.drainLive()
     await this.writeOwners.get(handle.id)?.drainLive()
@@ -382,13 +462,13 @@ export class SQLiteSessionPersistence extends SessionPersistence {
   async stat(id, options = {}) {
     abortIfRequested(options.signal)
     return snapshot(this.db.prepare(`SELECT id, header_json, next_seq, revision,
-      last_activity_at, last_message_preview FROM sessions WHERE id = ?`).get(id))
+      last_activity_at, last_message_preview, title FROM sessions WHERE id = ?`).get(id))
   }
 
   async list(options = {}) {
     abortIfRequested(options.signal)
     return this.db.prepare(`SELECT id, header_json, next_seq, revision,
-      last_activity_at, last_message_preview FROM sessions ORDER BY created_at DESC, id`).all()
+      last_activity_at, last_message_preview, title FROM sessions ORDER BY created_at DESC, id`).all()
       .map((row) => snapshot(row))
   }
 

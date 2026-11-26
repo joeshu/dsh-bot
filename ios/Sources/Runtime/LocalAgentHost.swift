@@ -2174,11 +2174,27 @@ public final class LocalAgentHost: ObservableObject {
         let ids = Self.privateSessionIDs(bots: bots, tombstones: tombstones)
         do {
             _ = try await rpc.request("session.private.update", params: ["botIds": ids], timeoutSeconds: 15)
+            await syncBotPolicies(on: rpc)
             return true
         } catch {
             workspaceError = "私密会话 Web API 隔离同步失败：\(error.localizedDescription)"
             return false
         }
+    }
+
+    private func syncBotPolicies(on rpc: IPCChannel) async {
+        let payload: [[String: Any]] = bots.map { bot in
+            [
+                "id": bot.id,
+                "name": bot.isPrivate ? "" : bot.name,
+                "systemPrompt": bot.isPrivate ? "" : bot.systemPrompt,
+                "permissionMode": bot.permissionMode,
+                "agentPreset": bot.agentPreset,
+                "disabledTools": bot.disabledTools,
+                "isGroup": bot.isGroup,
+            ]
+        }
+        _ = try? await rpc.request("bots.policy.sync", params: ["bots": payload], timeoutSeconds: 15)
     }
 
     private static func privateSessionIDs(bots: [BotProfile], tombstones: [String]) -> [String] {

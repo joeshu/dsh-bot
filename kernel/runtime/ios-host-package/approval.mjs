@@ -63,6 +63,15 @@ function apply(ctx) {
       if (active.permissionMode === 'autoReview') {
         return next()
       }
+    } else {
+      const sid = String(exec?.agent?.session?.id ?? '')
+      if (sid.startsWith('ios:')) {
+        const rootBotId = sid.slice(4).split(':')[0]
+        const botPolicy = runtime.botPolicies?.get(rootBotId)
+        if (botPolicy?.permissionMode === 'readOnly') {
+          throw new Error(`只读保护模式已拦截 ${operation}（files/${path}）`)
+        }
+      }
     }
     const outcome = await ctx.approval.request({
       agent: exec.agent,

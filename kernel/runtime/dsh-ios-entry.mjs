@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { parentPort, workerData } from 'node:worker_threads'
@@ -7,6 +7,7 @@ import net from 'node:net'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { configureIOSHost } from '@dsbot/dsh-ios-host'
 import { auditStartupEntries, initProfile, loadLayeredEnv, loadProfileDirectory, readProfileManifest, resolveProfileDir, writeProfileBundles } from '@deepseek-ai/dsh-app-boot'
+import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import { runProfile } from './vendor/dsh-profile-boot/lib/profile-boot.js'
 import { cleanupPendingPluginRemovals, createIOSPluginManager, ensurePurgeSafeIOSCompatibility, settlePluginRevision } from './ios-plugin-manager.mjs'
 import {
@@ -117,6 +118,8 @@ const runtime = {
   profileShutdown: undefined,
   pluginManager: undefined,
   activeAgents: new Map(),
+  allAgentHandles: new Map(),
+  botPolicies: new Map(),
   activeTurns: new Map(),
   pendingDshApprovals: new Map(),
   redteamApprovalGrants: new Map(),
@@ -782,6 +785,7 @@ function setupAgent({ botId, systemPrompt, pinnedMemories = '', legacyHistory, a
   let redteamPolicy = { botId, enabled: false, write: false, sensitive: false, permissionMode: 'ask' }
   const setup = async (agentCtx) => {
     agentCtx.__dsbotToolsMounted = true
+    installModelSelection(agentCtx)
     if (agentPreset !== 'minimal') {
       if (agentPreset !== 'ptc-python') mountIOSPythonTool(agentCtx)
       if (agentPreset === 'standard' || agentPreset === 'cordis' || agentPreset === 'redteam') mountIOSPythonJobTool(agentCtx)
@@ -1303,8 +1307,56 @@ async function boot() {
   if (!safeMode) await settlePluginRevision(PROFILE_DIR, false)
   await cleanupPendingPluginRemovals(PROFILE_DIR)
   try {
+    const IOS_CONTAINER_WS_RE = /^(\/private)?\/var\/mobile\/Containers\/Data\/Application\/[^/]+\/Documents\/dsh-home\/files(\/.*)?$/
     const wsRegistry = ctx?.get?.('workspaceRegistry')
     const wsController = ctx?.get?.('workspaceController')
+    const filterVisibleWorkspaceSessions = (sessionIds = []) => {
+      if (!Array.isArray(sessionIds)) return []
+      return sessionIds.filter((sid) => {
+        if (typeof sid !== 'string' || !sid) return false
+        if (sid.startsWith('ios:') && isPrivateBotOrThread(botIdFromSession(sid))) return false
+        return true
+      })
+    }
+    if (wsRegistry && typeof wsRegistry.list === 'function') {
+      const existingList = wsRegistry.list()
+      const staleWorkspaces = []
+      for (const ws of existingList) {
+        const wsPath = String(ws?.path ?? '')
+        if (!wsPath || wsPath === WORKSPACE_FILES) continue
+        let isMissing = false
+        try {
+          if (typeof ws.status === 'function') {
+            isMissing = (await ws.status()) === 'missing-dir'
+          }
+        } catch {}
+        if (IOS_CONTAINER_WS_RE.test(wsPath) && (isMissing || !existsSync(wsPath))) {
+          staleWorkspaces.push(ws)
+        }
+      }
+      if (staleWorkspaces.length > 0 && typeof wsRegistry.create === 'function') {
+        let currentWs = wsRegistry.list().find((ws) => ws.path === WORKSPACE_FILES)
+        if (!currentWs) {
+          const created = await wsRegistry.create(WORKSPACE_FILES)
+          currentWs = created?.workspace ?? created
+        }
+        if (currentWs) {
+          for (const stale of staleWorkspaces) {
+            const ids = Array.isArray(stale.sessionIds) ? stale.sessionIds : []
+            for (const sid of ids) {
+              if (typeof currentWs.attachSession === 'function') {
+                await currentWs.attachSession(sid).catch(() => {})
+              }
+            }
+            const staleId = stale.id ?? stale.workspaceId
+            if (staleId && typeof wsRegistry.delete === 'function') {
+              await wsRegistry.delete(staleId).catch(() => {})
+            }
+          }
+          ctx?.logger?.info?.(`Migrated ${staleWorkspaces.length} stale iOS container workspace(s) to ${WORKSPACE_FILES}`)
+        }
+      }
+    }
     if (wsController && wsRegistry && !wsController.__dsbotDefaultWorkspacePatched) {
       wsController.initializeDefault = async function iosInitializeDefaultWorkspace() {
         let workspace = await wsRegistry.initializeDefault(async () => WORKSPACE_FILES)
@@ -1312,14 +1364,14 @@ async function boot() {
           const created = await wsRegistry.create(WORKSPACE_FILES)
           workspace = created?.workspace ?? created
         }
-        workspace ??= wsRegistry.list()[0]
+        workspace ??= wsRegistry.list().find((ws) => ws.path === WORKSPACE_FILES) ?? wsRegistry.list()[0]
         if (!workspace) return undefined
         return {
           workspace: {
             workspaceId: workspace.id ?? workspace.workspaceId,
             path: workspace.path,
             title: workspace.title,
-            sessionIds: workspace.sessionIds ?? [],
+            sessionIds: filterVisibleWorkspaceSessions(workspace.sessionIds ?? []),
             createdAt: workspace.createdAt,
             updatedAt: workspace.updatedAt,
           },
@@ -1349,6 +1401,56 @@ async function boot() {
   } catch (error) {
     ctx?.logger?.warn?.(`Default iOS workspace initialization skipped: ${String(error)}`)
   }
+  // Track every live AgentHandle (Native, Web ApiSessionAgentController, Subagent) in one coordinator map
+  // so cross-surface handoff and background suspend cleanly dispose agents without leaving zombie sessions.
+  try {
+    const agentsSvc = ctx?.get?.('agents')
+    if (agentsSvc && !agentsSvc.__dsbotHandleTrackerInstalled) {
+      const origCreate = typeof agentsSvc.create === 'function' ? agentsSvc.create.bind(agentsSvc) : undefined
+      const origResume = typeof agentsSvc.resume === 'function' ? agentsSvc.resume.bind(agentsSvc) : undefined
+      if (origCreate) {
+        agentsSvc.create = async function iosTrackedCreate(options) {
+          const handle = await origCreate(options)
+          if (handle?.agent?.id) runtime.allAgentHandles.set(handle.agent.id, handle)
+          return handle
+        }
+      }
+      if (origResume) {
+        agentsSvc.resume = async function iosTrackedResume(options) {
+          const handle = await origResume(options)
+          if (handle?.agent?.id) runtime.allAgentHandles.set(handle.agent.id, handle)
+          return handle
+        }
+      }
+      agentsSvc.__dsbotHandleTrackerInstalled = true
+    }
+    ctx.on('agent/disposed', ({ agent } = {}) => {
+      const id = agent?.id ?? agent?.session?.id
+      if (typeof id === 'string' && id) {
+        const tracked = runtime.allAgentHandles.get(id)
+        if (!tracked || tracked.agent === agent) runtime.allAgentHandles.delete(id)
+      }
+    }, { global: true })
+  } catch (error) {
+    ctx?.logger?.warn?.(`Unified AgentHandle tracker install skipped: ${String(error)}`)
+  }
+  // Push lightweight revision change notifications to Swift whenever an ios:* session is mutated
+  // outside an active Native chat.send turn (e.g. from Web Workbench, schedule, or background jobs).
+  const SESSION_CHANGE_EVENT_TYPES = new Set(['user/message', 'assistant/message', 'turn/end', 'compaction/end', 'session/title'])
+  ctx.on('session/event', (event) => {
+    const sid = String(event?.sessionId ?? event?.session?.id ?? '')
+    if (!sid.startsWith('ios:') || !SESSION_CHANGE_EVENT_TYPES.has(event?.type)) return
+    if (runtime.activeTurns.has(sid)) return
+    const botSessionId = botIdFromSession(sid)
+    if (isPrivateBotOrThread(botSessionId)) return
+    rpc.notify('session.changed', {
+      sessionId: botSessionId,
+      dshSessionId: sid,
+      eventType: event.type,
+      seq: Number.isSafeInteger(event.seq) ? event.seq : undefined,
+      time: Number.isSafeInteger(event.time) ? event.time : Date.now(),
+    })
+  }, { global: true })
   if (!safeMode && redteamStatus().installed) {
     await ensureRedteamPresetRegistered()
   }
@@ -1488,6 +1590,37 @@ async function boot() {
       }
       try { mountIOSScheduleTools(agentCtx) } catch {}
     }
+    // Enforce synced Bot persona, pinned memories, readOnly protection, and disabledTools
+    // even when an ios:* session is cold-resumed from the Web Workbench.
+    if (sid.startsWith('ios:')) {
+      const botKey = botIdFromSession(sid)
+      const rootBotId = rootBotIdOf(botKey)
+      const policy = runtime.botPolicies.get(rootBotId)
+      if (policy) {
+        if (policy.systemPrompt && typeof agentCtx.systemPrompt?.section === 'function') {
+          try {
+            agentCtx.systemPrompt.section({ name: 'dsbot-ios-persona', order: 850, text: policy.systemPrompt })
+          } catch {}
+        }
+        if (policy.pinnedMemories && typeof agentCtx.systemPrompt?.section === 'function') {
+          try {
+            agentCtx.systemPrompt.section({ name: 'dsbot-ios-pinned-memories', order: 855, text: policy.pinnedMemories })
+          } catch {}
+        }
+        const blockedTools = new Set(Array.isArray(policy.disabledTools) ? policy.disabledTools : [])
+        if (!policy.isGroup) blockedTools.add('group_todo_add')
+        if (policy.permissionMode === 'readOnly') {
+          for (const writeTool of ['write', 'edit', 'delete', 'terminal_exec', 'python_exec', 'python_job_start', 'schedule_create', 'schedule_edit', 'schedule_delete']) {
+            blockedTools.add(writeTool)
+          }
+        }
+        if (blockedTools.size > 0 && typeof agentCtx.tools?.restrict === 'function') {
+          try {
+            agentCtx.tools.restrict((tool) => !blockedTools.has(tool.name))
+          } catch {}
+        }
+      }
+    }
   }, { global: true })
   createIOSPluginManager({ rpc, runtime, workspace: WORKSPACE, profileDir: PROFILE_DIR, installAnchor: INSTALL_ANCHOR, safeMode, drainAgents: () => ctx.subagents.drainDescendants([...runtime.activeAgents.values()].map(({ agent }) => agent)) })
   await rpc.request('runtime.ready', runtimeInfo(), 30_000)
@@ -1565,6 +1698,9 @@ rpc.handle('chat.send', async (params) => {
   }
   if (runtime.activeTurns.has(targetId) || runtime.activeTurns.size >= MAX_CONCURRENT_TURNS) {
     throw new Error('Another DSH turn is already running')
+  }
+  if (ctx?.agents?.get?.(targetId)?.status === 'running') {
+    throw new Error('该会话正在 Web 工作台运行中，请等待完成或停止后再发送。')
   }
   if (runtime.pluginMutationInProgress || runtime.profileRestartRequired) throw new Error('The DSH profile is changing')
   const preparation = {
@@ -1648,13 +1784,14 @@ async function startTurn(params, preparation) {
     ...(officialDeepSeek ? { reasoningEffort: reasoningEnabled ? dshReasoningEffort : 'off' } : {}),
   }
   if (!active) {
-    const existingWebAgent = typeof ctx.agents?.get === 'function' ? ctx.agents.get(id) : undefined
-    if (existingWebAgent) {
-      try {
-        await existingWebAgent.whenIdle?.()
-        await existingWebAgent.session?.handle?.close?.()
-        await existingWebAgent.dispose?.()
-      } catch {}
+    try {
+      const wsRegistry = ctx?.get?.('workspaceRegistry')
+      if (wsRegistry?.archivedSessionIds?.includes(id) && typeof wsRegistry.unarchiveSession === 'function') {
+        await wsRegistry.unarchiveSession(id)
+      }
+    } catch {}
+    if (ctx?.agents?.get?.(id) || runtime.allAgentHandles.has(id)) {
+      await releaseSessionAgent(id)
     }
     const composition = setupAgent({
       botId, systemPrompt: params.systemPrompt, pinnedMemories: params.pinnedMemories,
@@ -1673,9 +1810,8 @@ async function startTurn(params, preparation) {
       if (error instanceof SessionPersistenceNotFoundError) {
         handle = await ctx.agents.create({ sessionId: id, meta: { cwd: WORKSPACE_FILES }, agentOptions: options, setup: composition.setup })
       } else if (String(error?.name || '').includes('SessionAlreadyOwned') || String(error?.message || '').includes('already owned')) {
-        const owner = runtime.persistence?.writeOwners?.get(id)
-        if (owner && !runtime.activeTurns.has(id)) {
-          await owner.close?.().catch(() => {})
+        if (!runtime.activeTurns.has(id) && ctx?.agents?.get?.(id)?.status !== 'running') {
+          await releaseSessionAgent(id)
           handle = await ctx.agents.resume({ resumeSessionId: id, agentOptions: options, setup: composition.setup })
         } else {
           throw new Error('该会话当前正被 Web 工作台占用，请返回或关闭 Web 工作台页面后重试。')
@@ -1885,6 +2021,34 @@ async function drainAndDispose(id, active) {
   await ctx.sessions.flush(active.agent.session)
   await active.handle.dispose()
   runtime.activeAgents.delete(id)
+  runtime.allAgentHandles.delete(id)
+}
+
+async function releaseSessionAgent(id, { forceCancel = false } = {}) {
+  const active = runtime.activeAgents.get(id)
+  if (active) {
+    if (forceCancel && active.agent?.status === 'running') {
+      try { active.agent.cancel({ kind: 'user' }) } catch {}
+    }
+    await drainAndDispose(id, active)
+    return true
+  }
+  const tracked = runtime.allAgentHandles.get(id)
+  if (tracked) {
+    const agent = tracked.agent
+    if (forceCancel && agent?.status === 'running') {
+      try { agent.cancel({ kind: 'user' }) } catch {}
+    }
+    if (agent) {
+      await ctx.subagents?.drainDescendants?.([agent]).catch(() => {})
+      await agent.whenIdle?.().catch(() => {})
+      if (agent.session) await ctx.sessions?.flush?.(agent.session).catch(() => {})
+    }
+    await tracked.dispose?.().catch(() => {})
+    runtime.allAgentHandles.delete(id)
+    return true
+  }
+  return false
 }
 
 const MAX_ACTIVE_AGENTS = 3
@@ -2055,6 +2219,24 @@ rpc.handle('agent.suspend', async () => {
       return { suspended: false }
     }
   }
+  // Also release any Web-owned or detached live agents so no SQLite write handles remain open on suspend.
+  for (const [id] of [...runtime.allAgentHandles.entries()]) {
+    if (runtime.activeAgents.has(id)) continue
+    await releaseSessionAgent(id, { forceCancel: true }).catch(() => {})
+    if (runtime.suspendGeneration !== suspendGeneration || !runtime.suspended) {
+      return { suspended: false }
+    }
+  }
+  // Close session-query.sqlite handle lazily so it reopens on next search without holding locks in background.
+  try {
+    const sq = ctx?.get?.('sessionQuery')
+    if (sq && sq._db) {
+      await sq._tail?.catch(() => {})
+      try { sq._db.close() } catch {}
+      sq._db = undefined
+      sq._ready = undefined
+    }
+  } catch {}
   let sqliteClosed = false
   if (typeof runtime.persistence?.suspendDatabase === 'function') {
     const res = await runtime.persistence.suspendDatabase()
@@ -2113,11 +2295,26 @@ rpc.handle('session.list', async () => {
 })
 
 rpc.handle('web.sessions.list', async () => {
-  const sessions = (await runtime.persistence.list())
+  const all = await runtime.persistence.list()
+  const byId = new Map(all.map((item) => [item.header.id, item]))
+  const hasPrivateAncestor = (sessionId) => {
+    let cursor = sessionId
+    const seen = new Set()
+    for (let depth = 0; cursor && depth < 32 && !seen.has(cursor); depth += 1) {
+      seen.add(cursor)
+      if (cursor.startsWith('ios:') && isPrivateBotOrThread(botIdFromSession(cursor))) return true
+      if (isPrivateBotOrThread(cursor)) return true
+      cursor = byId.get(cursor)?.header?.parentSession ?? ''
+    }
+    return false
+  }
+  const sessions = all
     .filter((item) => !item.header.id.startsWith('ios:') && (item.eventCount ?? 0) > 0)
-    .filter((item) => !isPrivateBotOrThread(item.header.id))
+    .filter((item) => !item.header.parentSession && item.header.origin !== 'subagent')
+    .filter((item) => !hasPrivateAncestor(item.header.id))
     .map((item) => ({
       sessionId: item.header.id,
+      title: item.title ?? '',
       createdAt: item.header.createdAt,
       eventCount: item.eventCount,
       lastActivityAt: item.lastActivityAt ?? item.header.createdAt,
@@ -2553,6 +2750,30 @@ rpc.handle('session.private.update', async ({ botIds }) => {
   return { updated: runtime.privateBotIds.size }
 })
 
+rpc.handle('bots.policy.sync', async ({ bots } = {}) => {
+  if (!Array.isArray(bots) || bots.length > 2_000) {
+    throw new TypeError('Invalid bots policy list')
+  }
+  const next = new Map()
+  for (const entry of bots) {
+    const id = typeof entry?.id === 'string' ? rootBotIdOf(entry.id) : ''
+    if (!id || !isValidSessionKey(id)) continue
+    const permissionMode = ['ask', 'autoReview', 'readOnly'].includes(entry.permissionMode) ? entry.permissionMode : 'ask'
+    next.set(id, {
+      id,
+      name: typeof entry.name === 'string' ? entry.name.slice(0, 120) : '',
+      systemPrompt: typeof entry.systemPrompt === 'string' ? entry.systemPrompt.slice(0, 32_768) : '',
+      pinnedMemories: typeof entry.pinnedMemories === 'string' ? entry.pinnedMemories.slice(0, 16_384) : '',
+      permissionMode,
+      agentPreset: typeof entry.agentPreset === 'string' ? entry.agentPreset : 'standard',
+      disabledTools: Array.isArray(entry.disabledTools) ? entry.disabledTools.map(String).filter(Boolean).slice(0, 200) : [],
+      isGroup: entry.isGroup === true,
+    })
+  }
+  runtime.botPolicies = next
+  return { synced: next.size }
+})
+
 rpc.handle('session.clear', async ({ sessionId }) => {
   const id = resolveAnyHistorySessionId(sessionId)
   const active = runtime.activeAgents.get(id)
@@ -2832,13 +3053,13 @@ rpc.handle('runtime.config.update', async (params = {}) => {
     }],
     [runtime.webSearchFiber, {
       searchBaseURL: 'https://api.deepseek.com/v1/tools',
-      searchApiKeyEnv: 'DEEPSEEK_API_KEY',
+      searchApiKeyEnv: 'DEEPSEEK_SEARCH_API_KEY',
       searchBilling: 'api-key',
       sendOriginalQuestion: next.webSearchSendOriginalQuestion,
       count: next.webSearchCount,
     }, {
       searchBaseURL: 'https://api.deepseek.com/v1/tools',
-      searchApiKeyEnv: 'DEEPSEEK_API_KEY',
+      searchApiKeyEnv: 'DEEPSEEK_SEARCH_API_KEY',
       searchBilling: 'api-key',
       sendOriginalQuestion: previous.webSearchSendOriginalQuestion,
       count: previous.webSearchCount,

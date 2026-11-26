@@ -148,6 +148,7 @@
       config:
         path: !!js process.env.DSH_HOME + '/session-query.sqlite'
         openAt: first-search
+        journalMode: truncate
 
     - id: sandbox-policy
       name: '@deepseek-ai/dsh-sandbox-policy'
