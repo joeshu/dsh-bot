@@ -582,6 +582,21 @@ export async function settlePluginRevision(profileDir, rollback) {
     if (error.code === 'ENOENT') return false
     throw error
   }
+  const backupInfo = revision.backup && typeof revision.backup.path === 'string' && typeof revision.backup.target === 'string'
+    ? revision.backup : undefined
+  if (backupInfo) {
+    const backupPath = resolve(backupInfo.path)
+    const targetPath = resolve(backupInfo.target)
+    assertInside(profileDir, backupPath)
+    assertInside(resolve(profileDir, 'node_modules'), targetPath)
+    if (rollback) {
+      // Restore the previous plugin version instead of leaving the crashed upgrade in place.
+      await rm(targetPath, { recursive: true, force: true })
+      await rename(backupPath, targetPath).catch((error) => { if (error?.code !== 'ENOENT') throw error })
+    } else {
+      await rm(backupPath, { recursive: true, force: true }).catch(() => {})
+    }
+  }
   if (rollback) {
     await writeManifest(profileDir, revision.previous)
     if (packageName(revision.added)) {
@@ -1080,7 +1095,10 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
         if (backup) await rename(backup, target).catch(() => {})
         throw error
       }
-      if (backup) await rm(backup, { recursive: true, force: true }).catch(() => {})
+      if (backup) {
+        // Keep the old version until the new runtime boots successfully (settled in settlePluginRevision).
+        await writeRevision(profileDir, { previous, added: alreadyInstalled ? undefined : manifest.name, backup: { path: backup, target } })
+      }
       return {
         name: manifest.name,
         version: manifest.version,
@@ -1428,7 +1446,21 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
       }
     }
     rpc.notify?.('plugins.progress', { stage: 'stage', detail: '正在校验并导入本地插件目录…' })
-    return await installDirectory(resolved)
+    const localStaging = join(profileDir, `.ios-plugin-staging-${randomUUID()}`)
+    await mkdir(localStaging)
+    try {
+      for (const item of await packageItems(resolved)) {
+        const output = resolve(localStaging, relative(resolved, item.path))
+        assertInside(localStaging, output)
+        if (item.directory) await mkdir(output, { recursive: true })
+        else { await mkdir(dirname(output), { recursive: true }); await copyFile(item.path, output) }
+      }
+      rpc.notify?.('plugins.progress', { stage: 'deps', detail: '正在解析纯 JS 依赖树…' })
+      await resolvePureJsDependencies(localStaging)
+      return await installDirectory(localStaging)
+    } finally {
+      await rm(localStaging, { recursive: true, force: true })
+    }
   }
 
   rpc.handle('plugins.installed.list', async () => ({ plugins: await installedPlugins() }))

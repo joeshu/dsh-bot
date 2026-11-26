@@ -683,3 +683,10 @@ test('v3 governance: phase 3/4 hardening (abortable python, bounded gunzip, cach
   assert.match(entry, /function splitTerminalSegments/)
   assert.match(entry, /Avoid reading every file into memory/)
 })
+
+test('v3 governance: plugin upgrade keeps backup until boot settles; local dirs resolve pure-JS deps', () => {
+  const pm = readFileSync(join(runtimeDir, 'ios-plugin-manager.mjs'), 'utf8')
+  assert.match(pm, /backup: \{ path: backup, target \}/)
+  assert.match(pm, /revision\.backup/)
+  assert.match(pm, /localStaging/)
+})
