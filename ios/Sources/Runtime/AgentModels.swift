@@ -153,11 +153,12 @@ public struct SessionLiveTelemetry: Equatable, Sendable {
     public var ttftSumMs: Int = 0
     public var ttftSamples: Int = 0
 
-    public var totalTokens: Int { inputTokens + outputTokens }
-    public var uncachedInputTokens: Int { max(0, inputTokens - cacheReadTokens) }
+    public var totalTokens: Int { inputTokens + cacheReadTokens + outputTokens }
+    public var uncachedInputTokens: Int { inputTokens }
     public var cacheHitPercent: Int {
-        guard inputTokens > 0 else { return 0 }
-        return min(100, Int((Double(cacheReadTokens) / Double(inputTokens) * 100.0).rounded()))
+        let totalInput = inputTokens + cacheReadTokens
+        guard totalInput > 0 else { return 0 }
+        return min(100, Int((Double(cacheReadTokens) / Double(totalInput) * 100.0).rounded()))
     }
     public var averageTtftMs: Int? {
         guard ttftSamples > 0 else { return nil }

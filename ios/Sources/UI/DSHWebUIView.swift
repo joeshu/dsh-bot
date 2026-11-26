@@ -115,7 +115,10 @@ public struct DSHWebUIView: View {
         }
         .onChange(of: scenePhase) { newPhase in
             if newPhase == .active, host.state == .ready {
-                Task { await loadWebUIInfo(preserveIfSamePort: true) }
+                Task {
+                    try? await Task.sleep(nanoseconds: 350_000_000)
+                    await loadWebUIInfo(preserveIfSamePort: true)
+                }
             }
         }
         .onDisappear {

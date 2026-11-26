@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events'
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
 import { readdir, readFile } from 'node:fs/promises'
-import { basename, join, resolve } from 'node:path'
+import { join } from 'node:path'
 import { parentPort, workerData } from 'node:worker_threads'
 import net from 'node:net'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -2263,8 +2263,24 @@ rpc.handle('chat.abort', async ({ turnId }) => {
   const active = runtime.activeAgents.get(id)
   active?.agent.cancel({ kind: 'user' })
   void rpc.request('native.tool.cancel', { botId: activeTurn.botId, sessionId: activeTurn.botId, turnId }, 5_000).catch(() => {})
-  if (active) await drainAndDispose(id, active)
+  if (active) {
+    await active.agent.whenIdle().catch(() => {})
+    await ctx.sessions.flush(active.agent.session).catch(() => {})
+  }
   return { aborted: true, sessionId: activeTurn.botId }
+})
+
+rpc.handle('chat.steer', async ({ sessionId, text } = {}) => {
+  const botId = String(sessionId ?? '').trim()
+  const cleanText = typeof text === 'string' ? text.trim() : ''
+  if (!isValidSessionKey(botId) || !cleanText) throw new TypeError('Invalid chat.steer request')
+  const id = dshSessionId(botId)
+  if (!runtime.activeTurns.has(id)) return { steered: false }
+  const active = runtime.activeAgents.get(id)
+  if (!active?.agent || typeof active.agent.steer !== 'function') return { steered: false }
+  const userMessage = createUserMessage({ content: [{ type: 'text', text: cleanText }], source: { kind: 'user' } })
+  active.agent.steer(userMessage)
+  return { steered: true }
 })
 
 rpc.handle('agent.suspend', async () => {
@@ -2672,11 +2688,21 @@ rpc.handle('session.history.page', async ({ sessionId, beforeSeq } = {}) => {
   await runtime.persistence.flushSession(id)
   const summary = await runtime.persistence.stat(id)
   const end = Math.min(beforeSeq ?? Infinity, summary?.eventCount ?? 0)
-  const start = Math.max(0, end - 50)
-  if (!summary || end === start) return { messages: [], toolActivities: [], hasMore: false }
+  if (!summary || end <= 0) return { messages: [], toolActivities: [], hasMore: false }
   const handle = await runtime.persistence.open(id, 'read')
   try {
-    const { events } = await handle.read(start, end - start)
+    let start = end
+    let events = []
+    let visibleMessages = []
+    const minVisible = 15
+    const maxScan = 500
+    while (start > 0 && visibleMessages.length < minVisible && (end - start) < maxScan) {
+      const nextStart = Math.max(0, start - 50)
+      const chunk = await handle.read(nextStart, start - nextStart)
+      events = [...chunk.events, ...events]
+      start = nextStart
+      visibleMessages = eventMessages(events, sessionId)
+    }
     const activityEvents = [...events]
     const approvals = await approvalEventsForHistoryPage(handle, events, start, end, summary.eventCount)
     const pageCalls = new Set(events
@@ -2694,7 +2720,7 @@ rpc.handle('session.history.page', async ({ sessionId, beforeSeq } = {}) => {
       }
     }
     return {
-      messages: eventMessages(events, sessionId).map(historyMessagePreview),
+      messages: visibleMessages.map(historyMessagePreview),
       toolActivities: eventToolActivities(activityEvents, sessionId, end, 50).map((row) => ({
         ...row, arguments: excerpt(row.arguments, 600), result: excerpt(row.result, 600),
       })),

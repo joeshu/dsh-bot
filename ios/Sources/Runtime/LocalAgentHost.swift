@@ -731,6 +731,12 @@ public final class LocalAgentHost: ObservableObject {
         pendingSteerNoteBySession[targetId] = trimmed
         activeTurnsBySession[targetId]?.streamState.recentSteerNote = trimmed
         if isSessionStreaming(targetId) {
+            if let channel,
+               let res = try? await channel.request("chat.steer", params: ["sessionId": targetId, "text": trimmed], timeoutSeconds: 10),
+               res["steered"] as? Bool == true {
+                DSHaptics.impact(.light)
+                return
+            }
             await abortActiveTurn(sessionId: targetId)
             for _ in 0..<50 {
                 if !isSessionStreaming(targetId) { break }
@@ -1804,10 +1810,14 @@ public final class LocalAgentHost: ObservableObject {
             historyCursors.removeValue(forKey: sessionId)
         }
         if dshToolActivities.count > 120 {
-            dshToolActivities.removeFirst(dshToolActivities.count - 120)
+            let protected = dshToolActivities.filter { keepIds.contains($0.sessionId) }
+            let others = dshToolActivities.filter { !keepIds.contains($0.sessionId) }.suffix(max(0, 120 - protected.count))
+            dshToolActivities = Array(others) + protected
         }
         if dshApprovalAudits.count > 100 {
-            dshApprovalAudits.removeFirst(dshApprovalAudits.count - 100)
+            let protected = dshApprovalAudits.filter { keepIds.contains($0.sessionId) }
+            let others = dshApprovalAudits.filter { !keepIds.contains($0.sessionId) }.suffix(max(0, 100 - protected.count))
+            dshApprovalAudits = Array(others) + protected
         }
     }
 
@@ -2218,6 +2228,7 @@ public final class LocalAgentHost: ObservableObject {
             persistedSessionIDs.remove(target)
             persistedSessionActivityByID.removeValue(forKey: target)
             persistedSessionPreviewByID.removeValue(forKey: target)
+            telemetryBySession.removeValue(forKey: target)
             lastStreamError = nil
             persistWorkspace()
         } catch {

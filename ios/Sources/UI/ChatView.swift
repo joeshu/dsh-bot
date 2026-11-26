@@ -780,7 +780,10 @@ public struct ChatView: View {
 
     private func lockPrivateConversation() {
         isPrivateUnlocked = false
+        input = ""
+        speechDraftPrefix = ""
         for thread in threadStore.threads(for: liveBot.id, includeArchived: true) {
+            host.setDraftInput("", for: thread.sessionId, isPrivate: true)
             host.discardSessionHistoryCache(thread.sessionId)
             if host.isSessionStreaming(thread.sessionId) {
                 Task { await host.abortActiveTurn(sessionId: thread.sessionId) }
@@ -979,14 +982,20 @@ public struct ChatView: View {
                 return
             }
             if !scrollToSearchResult(using: proxy) {
+                if followsLiveOutput || sessionMessages.last?.role == "user" {
+                    withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
+                }
+            }
+        }
+        .onChange(of: host.pendingApprovals.filter { $0.sessionId == activeSessionId }.count) { count in
+            if count > 0 {
                 withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
             }
         }
-        .onChange(of: host.pendingApprovals.count) { _ in
-            withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
-        }
-        .onChange(of: host.pendingDSHQuestions.count) { _ in
-            withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
+        .onChange(of: host.pendingDSHQuestions.filter { $0.sessionId == activeSessionId }.count) { count in
+            if count > 0 {
+                withAnimation { proxy.scrollTo("chat_bottom", anchor: .bottom) }
+            }
         }
         .onChange(of: host.dshToolActivities.count) { _ in
             guard followsLiveOutput else { return }
