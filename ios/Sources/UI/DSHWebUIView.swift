@@ -953,7 +953,10 @@ private struct LoopbackWebView: UIViewRepresentable {
             guard let fileURL = activeDownloadDestinations.removeValue(forKey: key) else { return }
             #if canImport(UIKit)
             DispatchQueue.main.async {
-                guard let presenter = Self.topViewController() else { return }
+                guard let presenter = Self.topViewController() else {
+                    try? FileManager.default.removeItem(at: fileURL)
+                    return
+                }
                 let sheet = UIActivityViewController(activityItems: [fileURL], applicationActivities: nil)
                 sheet.popoverPresentationController?.sourceView = presenter.view
                 sheet.popoverPresentationController?.sourceRect = CGRect(

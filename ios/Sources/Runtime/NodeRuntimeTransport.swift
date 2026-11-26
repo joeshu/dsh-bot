@@ -132,21 +132,27 @@ public final class NodeRuntimeTransport: IPCByteTransport, @unchecked Sendable {
         if alreadyClosed { handler() }
     }
 
+    private let writeQueue = DispatchQueue(label: "io.github.dsbot.node.write", qos: .userInitiated)
+    private var readLoopRunning = false
+
     public func write(_ data: Data) {
-        stateLock.lock()
-        let descriptor = hostFD
-        let isAvailable = !closed && descriptor >= 0
-        stateLock.unlock()
-        guard isAvailable else { return }
-        data.withUnsafeBytes { bytes in
-            guard let base = bytes.baseAddress else { return }
-            var offset = 0
-            while offset < bytes.count {
-                let written = Darwin.write(descriptor, base.advanced(by: offset), bytes.count - offset)
-                if written > 0 { offset += written; continue }
-                if written < 0 && errno == EINTR { continue }
-                close()
-                return
+        writeQueue.async { [weak self] in
+            guard let self else { return }
+            self.stateLock.lock()
+            let descriptor = self.hostFD
+            let isAvailable = !self.closed && descriptor >= 0
+            self.stateLock.unlock()
+            guard isAvailable else { return }
+            data.withUnsafeBytes { bytes in
+                guard let base = bytes.baseAddress else { return }
+                var offset = 0
+                while offset < bytes.count {
+                    let written = Darwin.write(descriptor, base.advanced(by: offset), bytes.count - offset)
+                    if written > 0 { offset += written; continue }
+                    if written < 0 && errno == EINTR { continue }
+                    self.close()
+                    return
+                }
             }
         }
     }
@@ -157,19 +163,41 @@ public final class NodeRuntimeTransport: IPCByteTransport, @unchecked Sendable {
         closed = true
         let descriptor = hostFD
         let unusedNodeDescriptor = nodeFD
-        hostFD = -1
+        let deferCloseToReader = readLoopRunning
+        if !deferCloseToReader {
+            hostFD = -1
+        }
         nodeFD = -1
         let callback = closeHandler
         stateLock.unlock()
         if descriptor >= 0 {
             _ = shutdown(descriptor, Int32(SHUT_RDWR))
-            _ = Darwin.close(descriptor)
+            if !deferCloseToReader {
+                writeQueue.async {
+                    _ = Darwin.close(descriptor)
+                }
+            }
         }
         if unusedNodeDescriptor >= 0 { _ = Darwin.close(unusedNodeDescriptor) }
         callback?()
     }
 
     private func readLoop() {
+        stateLock.lock()
+        readLoopRunning = true
+        stateLock.unlock()
+        defer {
+            stateLock.lock()
+            readLoopRunning = false
+            let descriptor = closed ? hostFD : -1
+            if closed { hostFD = -1 }
+            stateLock.unlock()
+            if descriptor >= 0 {
+                writeQueue.async {
+                    _ = Darwin.close(descriptor)
+                }
+            }
+        }
         var buffer = [UInt8](repeating: 0, count: 64 * 1024)
         while true {
             stateLock.lock()

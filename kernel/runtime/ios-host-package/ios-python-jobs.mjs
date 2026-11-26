@@ -106,7 +106,8 @@ export function mountIOSPythonJobTool(ctx) {
         throw new Error('Python background jobs are available only in an owning native iOS Bot session.')
       }
       const { runtime } = iosHost()
-      if (runtime.privateBotIds.has(session.id.slice(4))) {
+      const rootBotId = session.id.slice(4).split(':')[0]
+      if (runtime.privateBotIds.has(rootBotId)) {
         throw new Error('Python background jobs are disabled for private Bot sessions.')
       }
       const active = runtime.activeTurns.get(session.id)

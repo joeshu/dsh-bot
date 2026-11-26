@@ -29,18 +29,40 @@ function workspacePath(host, target) {
   return path.split(sep).join('/')
 }
 
+function resolveActiveTurn(ctx, runtime, session) {
+  const directId = session?.id
+  if (typeof directId === 'string') {
+    const direct = runtime.activeTurns.get(directId)
+    if (direct) return direct
+  }
+  let cursor = session?.header?.parentSession
+  if (typeof cursor !== 'string' || !cursor) return undefined
+  const sessionsSvc = ctx?.get?.('sessions')
+  const allRows = typeof sessionsSvc?.list === 'function' ? sessionsSvc.list() : []
+  const byId = new Map(allRows.map((row) => [String(row?.id ?? row?.header?.id ?? ''), row]))
+  const visited = new Set(typeof directId === 'string' ? [directId] : [])
+  for (let depth = 0; cursor && depth < 8 && !visited.has(cursor); depth += 1) {
+    visited.add(cursor)
+    const inherited = runtime.activeTurns.get(cursor)
+    if (inherited) return inherited
+    cursor = byId.get(cursor)?.header?.parentSession
+  }
+  return undefined
+}
+
 function apply(ctx) {
   const intent = (operation) => async (target, exec, next) => {
     const { runtime } = iosHost()
-    const active = runtime.activeTurns.get(exec?.agent?.session?.id)
-    if (!active) return next()
-    if (active.done) throw new Error('The DSH turn is already closed')
+    const active = resolveActiveTurn(ctx, runtime, exec?.agent?.session)
     const path = workspacePath(iosHost(), target)
-    if (active.permissionMode === 'readOnly') {
-      throw new Error(`只读保护模式已拦截 ${operation}（files/${path}）`)
-    }
-    if (active.permissionMode === 'autoReview') {
-      return next()
+    if (active) {
+      if (active.done) throw new Error('The DSH turn is already closed')
+      if (active.permissionMode === 'readOnly') {
+        throw new Error(`只读保护模式已拦截 ${operation}（files/${path}）`)
+      }
+      if (active.permissionMode === 'autoReview') {
+        return next()
+      }
     }
     const outcome = await ctx.approval.request({
       agent: exec.agent,
@@ -62,10 +84,9 @@ function apply(ctx) {
       }
 
       const { runtime } = iosHost()
-      const sessionId = execution?.agent?.session?.id
-      const active = typeof sessionId === 'string' ? runtime.activeTurns.get(sessionId) : undefined
-      // Browser sessions keep their own approval UI. Native Bot turns are
-      // confirmed here before the official DSH search provider can make a request.
+      const active = resolveActiveTurn(ctx, runtime, execution?.agent?.session)
+      // Browser sessions keep their own approval UI. Native Bot turns (and their
+      // subagents) are confirmed here before the official DSH search provider can make a request.
       if (!active) return downstream ?? { kind: 'allow' }
       if (active.done || !active.webSearchEnabled) {
         return { kind: 'deny', reason: 'Web search is disabled for this iOS turn.' }
@@ -96,11 +117,10 @@ function apply(ctx) {
     ctx.on('fs/delete-intent', intent('delete')),
     ctx.on('approval/request', (request, next) => {
       const { rpc, runtime } = iosHost()
-      const active = runtime.activeTurns.get(request?.agent?.session?.id)
+      const active = resolveActiveTurn(ctx, runtime, request?.agent?.session)
       const toolName = String(request?.toolName ?? '')
       // The DSH Web client owns approvals for browser sessions. The bridge only
-      // answers requests belonging to a native iOS Bot turn. The iOS entry's
-      // outer redteam handler records its one-shot grant after this answerer returns.
+      // answers requests belonging to a native iOS Bot turn (or its subagents).
       if (!active || active.done) return next()
       if (active.permissionMode === 'readOnly' && toolName !== 'run_code') return 'rejected'
 

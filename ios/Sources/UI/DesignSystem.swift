@@ -157,6 +157,17 @@ enum DSMarkdownSegment: Identifiable {
     }
 }
 
+private struct PrivateSessionEnvironmentKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    public var isPrivateSession: Bool {
+        get { self[PrivateSessionEnvironmentKey.self] }
+        set { self[PrivateSessionEnvironmentKey.self] = newValue }
+    }
+}
+
 public struct DSMarkdownText: View, Equatable {
     public static func == (lhs: DSMarkdownText, rhs: DSMarkdownText) -> Bool {
         lhs.raw == rhs.raw
@@ -168,6 +179,7 @@ public struct DSMarkdownText: View, Equatable {
     }
 
     let raw: String
+    @Environment(\.isPrivateSession) private var isPrivateSession
     @State private var copiedBlockId: Int?
     @State private var savedBlockId: Int?
     @State private var expandedCodeIds: Set<Int> = []
@@ -290,14 +302,16 @@ public struct DSMarkdownText: View, Equatable {
                 }
                 .foregroundColor(.secondary)
                 Spacer()
-                Button {
-                    saveCodeSnippetToWorkspace(lang: lang, body: body, blockId: id)
-                } label: {
-                    Label(savedBlockId == id ? "已存入" : "存工作区", systemImage: savedBlockId == id ? "checkmark.circle.fill" : "folder.badge.plus")
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(savedBlockId == id ? DSTheme.success : .secondary)
+                if !isPrivateSession {
+                    Button {
+                        saveCodeSnippetToWorkspace(lang: lang, body: body, blockId: id)
+                    } label: {
+                        Label(savedBlockId == id ? "已存入" : "存工作区", systemImage: savedBlockId == id ? "checkmark.circle.fill" : "folder.badge.plus")
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(savedBlockId == id ? DSTheme.success : .secondary)
+                    }
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
                 Button {
                     #if canImport(UIKit)
                     UIPasteboard.general.string = body

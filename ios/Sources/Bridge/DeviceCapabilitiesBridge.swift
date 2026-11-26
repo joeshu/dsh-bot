@@ -9,6 +9,8 @@ final class DeviceCapabilitiesBridge {
     @MainActor
     func speak(_ text: String) {
         guard !Task.isCancelled else { return }
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
+        try? AVAudioSession.sharedInstance().setActive(true, options: .notifyOthersOnDeactivation)
         if synthesizer.isSpeaking { synthesizer.stopSpeaking(at: .immediate) }
         let utterance = AVSpeechUtterance(string: text)
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
@@ -57,19 +59,22 @@ public final class SpeechInputController: ObservableObject {
     private let audioEngine = AVAudioEngine()
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
+    private var isStarting = false
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN")) ?? SFSpeechRecognizer()
 
     public init() {}
 
     public func toggle(onTranscript: @escaping (String) -> Void) {
-        if isRecording {
+        if isRecording || isStarting {
             stop()
         } else {
+            isStarting = true
             Task { await start(onTranscript: onTranscript) }
         }
     }
 
     public func stop() {
+        isStarting = false
         audioEngine.stop()
         audioEngine.inputNode.removeTap(onBus: 0)
         recognitionRequest?.endAudio()
@@ -81,10 +86,12 @@ public final class SpeechInputController: ObservableObject {
     }
 
     private func start(onTranscript: @escaping (String) -> Void) async {
+        defer { isStarting = false }
         errorMessage = nil
         let auth = await withCheckedContinuation { cont in
             SFSpeechRecognizer.requestAuthorization { status in cont.resume(returning: status) }
         }
+        guard isStarting else { return }
         guard auth == .authorized else {
             errorMessage = "请在系统设置中允许 DS Bot 使用语音识别。"
             return
@@ -92,6 +99,7 @@ public final class SpeechInputController: ObservableObject {
         let micGranted = await withCheckedContinuation { cont in
             AVAudioSession.sharedInstance().requestRecordPermission { ok in cont.resume(returning: ok) }
         }
+        guard isStarting else { return }
         guard micGranted else {
             errorMessage = "请在系统设置中允许 DS Bot 访问麦克风。"
             return
@@ -110,7 +118,12 @@ public final class SpeechInputController: ObservableObject {
             recognitionRequest = request
             let inputNode = audioEngine.inputNode
             let format = inputNode.outputFormat(forBus: 0)
-            inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak request] buffer, _ in
+            guard format.sampleRate > 0, format.channelCount > 0 else {
+                errorMessage = "当前音频输入通道不可用，请检查麦克风或蓝牙设备。"
+                stop()
+                return
+            }
+            inputNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { [weak request] buffer, _ in
                 request?.append(buffer)
             }
             audioEngine.prepare()

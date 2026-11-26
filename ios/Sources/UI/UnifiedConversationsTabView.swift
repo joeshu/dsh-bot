@@ -489,7 +489,7 @@ public struct UnifiedConversationsTabView: View {
         } label: {
             HStack(spacing: 12) {
                 ZStack(alignment: .bottomTrailing) {
-                    DSBotAvatar(initials: bot.name, color: DSTheme.botAvatarColor(bot), size: 46)
+                    DSBotAvatar(initials: bot.name, color: DSTheme.botAvatarColor(bot), size: 46, isPrivate: bot.isPrivate)
                     if isBotStreaming {
                         Circle()
                             .fill(DSTheme.brand)
@@ -550,7 +550,7 @@ public struct UnifiedConversationsTabView: View {
                                 .lineLimit(1)
                         }
 
-                        if threads.count > 1 || activeTitle != nil {
+                        if !bot.isPrivate && (threads.count > 1 || activeTitle != nil) {
                             Button {
                                 activeSheet = .threads(bot)
                             } label: {
@@ -576,15 +576,17 @@ public struct UnifiedConversationsTabView: View {
             }
             .padding(.vertical, 3)
         }
-        .swipeActions(edge: .leading, allowsFullSwipe: true) {
-            Button {
-                let thread = threadStore.createThread(for: bot.id)
-                activeSheet = .threadChat(bot, thread.address)
-                DSHaptics.impact(.light)
-            } label: {
-                Label("新话题", systemImage: "plus.bubble")
+        .swipeActions(edge: .leading, allowsFullSwipe: !bot.isPrivate) {
+            if !bot.isPrivate {
+                Button {
+                    let thread = threadStore.createThread(for: bot.id)
+                    activeSheet = .threadChat(bot, thread.address)
+                    DSHaptics.impact(.light)
+                } label: {
+                    Label("新话题", systemImage: "plus.bubble")
+                }
+                .tint(DSTheme.brand)
             }
-            .tint(DSTheme.brand)
         }
         .swipeActions(edge: .trailing) {
             if !bot.isMain {
@@ -593,14 +595,16 @@ public struct UnifiedConversationsTabView: View {
                     showDeleteConfirm = true
                 }
             }
-            Button("编辑") {
-                activeSheet = .edit(bot)
+            if !bot.isPrivate {
+                Button("编辑") {
+                    activeSheet = .edit(bot)
+                }
+                .tint(DSTheme.brand)
+                Button("话题") {
+                    activeSheet = .threads(bot)
+                }
+                .tint(.indigo)
             }
-            .tint(DSTheme.brand)
-            Button("话题") {
-                activeSheet = .threads(bot)
-            }
-            .tint(.indigo)
         }
         .contextMenu {
             if !bot.isPrivate {
@@ -609,25 +613,25 @@ public struct UnifiedConversationsTabView: View {
                 } label: {
                     Label("查看档案与服务商", systemImage: "person.text.rectangle")
                 }
-            }
-            Button {
-                activeSheet = .threads(bot)
-            } label: {
-                Label("管理子话题（\(threads.count)）", systemImage: "text.bubble")
-            }
-            Button {
-                let thread = threadStore.createThread(for: bot.id)
-                activeSheet = .threadChat(bot, thread.address)
-            } label: {
-                Label("新建子话题", systemImage: "plus.bubble")
-            }
-            Button {
-                activeSheet = .edit(bot)
-            } label: {
-                Label("编辑智能体", systemImage: "slider.horizontal.3")
+                Button {
+                    activeSheet = .threads(bot)
+                } label: {
+                    Label("管理子话题（\(threads.count)）", systemImage: "text.bubble")
+                }
+                Button {
+                    let thread = threadStore.createThread(for: bot.id)
+                    activeSheet = .threadChat(bot, thread.address)
+                } label: {
+                    Label("新建子话题", systemImage: "plus.bubble")
+                }
+                Button {
+                    activeSheet = .edit(bot)
+                } label: {
+                    Label("编辑智能体", systemImage: "slider.horizontal.3")
+                }
             }
             if !bot.isMain {
-                Divider()
+                if !bot.isPrivate { Divider() }
                 Button(role: .destructive) {
                     pendingDeleteBot = bot
                     showDeleteConfirm = true

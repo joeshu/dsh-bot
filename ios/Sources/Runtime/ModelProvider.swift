@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 enum ModelProviderError: Error, LocalizedError {
     case invalidAddress
@@ -240,22 +243,63 @@ final class SafeHTTPSRedirects: NSObject, URLSessionTaskDelegate {
     private let lock = NSLock()
 
     static func isPrivateOrLoopbackHost(_ rawHost: String) -> Bool {
-        let host = rawHost.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-        if host.isEmpty || host == "localhost" || host.hasSuffix(".local") || host.hasSuffix(".internal") {
+        var host = rawHost.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        if host.hasPrefix("[") && host.hasSuffix("]") {
+            host = String(host.dropFirst().dropLast())
+        }
+        if let zoneIndex = host.firstIndex(of: "%") {
+            host = String(host[..<zoneIndex])
+        }
+        while host.hasSuffix(".") {
+            host.removeLast()
+        }
+        if host.isEmpty || host == "localhost" || host.hasSuffix(".localhost") || host.hasSuffix(".local") || host.hasSuffix(".internal") {
             return true
         }
-        if host == "::1" || host == "::" || host.hasPrefix("fe80:") || host.hasPrefix("fc") || host.hasPrefix("fd") {
+        #if canImport(Darwin)
+        var v4 = in_addr()
+        if inet_pton(AF_INET, host, &v4) == 1 {
+            return isPrivateOrReservedIPv4(UInt32(bigEndian: v4.s_addr))
+        }
+        var v6 = in6_addr()
+        if inet_pton(AF_INET6, host, &v6) == 1 {
+            let bytes = withUnsafeBytes(of: v6) { Array($0) }
+            // Unspecified :: or loopback ::1
+            if bytes.dropLast().allSatisfy({ $0 == 0 }) && (bytes[15] == 0 || bytes[15] == 1) {
+                return true
+            }
+            // IPv4-mapped ::ffff:0:0/96 or IPv4-compatible ::0:0/96
+            let isMapped = bytes[0..<10].allSatisfy({ $0 == 0 }) && bytes[10] == 0xff && bytes[11] == 0xff
+            let isCompat = bytes[0..<12].allSatisfy({ $0 == 0 })
+            if isMapped || isCompat {
+                let addr = (UInt32(bytes[12]) << 24) | (UInt32(bytes[13]) << 16) | (UInt32(bytes[14]) << 8) | UInt32(bytes[15])
+                return isPrivateOrReservedIPv4(addr)
+            }
+            // Unique local fc00::/7, link-local fe80::/10, multicast ff00::/8
+            if (bytes[0] & 0xfe) == 0xfc { return true }
+            if bytes[0] == 0xfe && (bytes[1] & 0xc0) == 0x80 { return true }
+            if bytes[0] == 0xff { return true }
+            return false
+        }
+        #endif
+        // Reject non-canonical numeric IPv4 forms (e.g. 127.1, 0177.0.0.1, 2130706433)
+        let dotParts = host.split(separator: ".", omittingEmptySubsequences: false)
+        if dotParts.count >= 1 && dotParts.count <= 4 && dotParts.allSatisfy({ !$0.isEmpty && $0.allSatisfy({ ch in ch.isHexDigit || ch == "x" }) }) {
             return true
         }
-        let parts = host.split(separator: ".").compactMap { Int($0) }
-        if parts.count == 4 && parts.allSatisfy({ (0...255).contains($0) }) {
-            let (a, b) = (parts[0], parts[1])
-            if a == 10 || a == 127 || a == 0 { return true }
-            if a == 169 && b == 254 { return true }
-            if a == 172 && (16...31).contains(b) { return true }
-            if a == 192 && b == 168 { return true }
-            if a == 100 && (64...127).contains(b) { return true }
-        }
+        return false
+    }
+
+    private static func isPrivateOrReservedIPv4(_ addr: UInt32) -> Bool {
+        let a = Int((addr >> 24) & 0xff)
+        let b = Int((addr >> 16) & 0xff)
+        if a == 0 || a == 10 || a == 127 { return true }
+        if a == 100 && (64...127).contains(b) { return true }   // CGNAT 100.64.0.0/10
+        if a == 169 && b == 254 { return true }                  // Link-local
+        if a == 172 && (16...31).contains(b) { return true }     // RFC1918
+        if a == 192 && b == 168 { return true }                  // RFC1918
+        if a == 198 && (b == 18 || b == 19) { return true }      // Benchmarking 198.18.0.0/15
+        if a >= 224 { return true }                              // Multicast / reserved
         return false
     }
 

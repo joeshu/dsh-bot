@@ -44,7 +44,7 @@ public struct MainTabView: View {
 
     private var showPulseBar: Bool {
         guard let sid = pulseSessionId else { return false }
-        if host.visibleChatSessionId == sid { return false }
+        if host.visibleChatSessionId != nil { return false }
         if let activeTurn = host.activeTurnId, dismissedPulseTurnId == activeTurn, host.pendingApprovals.isEmpty {
             return false
         }
@@ -125,6 +125,13 @@ private struct GlobalBotPulseBar: View {
         host.streamingSessionId ?? host.pendingApprovals.first?.sessionId
     }
 
+    private var isPrivatePrimaryBot: Bool {
+        guard let sid = primarySessionId,
+              let address = host.resolveAddress(sid),
+              let bot = host.bot(for: address) else { return false }
+        return bot.isPrivate
+    }
+
     private var activeBotName: String {
         guard let sid = primarySessionId,
               let address = host.resolveAddress(sid),
@@ -136,6 +143,9 @@ private struct GlobalBotPulseBar: View {
     }
 
     private var statusSubtitle: String {
+        if isPrivatePrimaryBot {
+            return host.pendingApprovals.isEmpty ? "正在执行后台任务…" : "需解锁私密会话后查看并处理"
+        }
         if let approval = host.pendingApprovals.first {
             return "待审批：\(approval.tool)"
         }
@@ -167,7 +177,7 @@ private struct GlobalBotPulseBar: View {
             }
             .buttonStyle(.plain)
             Spacer(minLength: 4)
-            if let approval = host.pendingApprovals.first {
+            if !isPrivatePrimaryBot, let approval = host.pendingApprovals.first {
                 Button("批准") {
                     Task { await host.respondToApproval(id: approval.id, approved: true) }
                 }

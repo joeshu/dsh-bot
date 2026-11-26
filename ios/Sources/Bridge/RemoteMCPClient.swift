@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 public struct MCPToolDescriptor: Identifiable, Equatable {
     public let id: String
@@ -77,7 +78,9 @@ public actor RemoteMCPClient {
     }
 
     static func endpointURL(_ raw: String) throws -> URL {
-        guard let url = try ModelProvider.httpsComponents(raw.trimmingCharacters(in: .whitespacesAndNewlines)).url else {
+        let components = try ModelProvider.httpsComponents(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard let host = components.host, !SafeHTTPSRedirects.isPrivateOrLoopbackHost(host),
+              let url = components.url else {
             throw ModelProviderError.invalidAddress
         }
         return url
@@ -175,13 +178,14 @@ public actor RemoteMCPClient {
         if let keychainAccount {
             token = try await keychain.getSecret(account: keychainAccount, requireBiometrics: false)["value"] as? String
         }
-        let connection = "\(keychainAccount ?? "")|\(url.absoluteString)"
+        let tokenDigest = token.map { String(SHA256.hash(data: Data($0.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()) } ?? ""
+        let connection = "\(keychainAccount ?? "")|\(tokenDigest)|\(url.absoluteString)"
         let state = try await connect(url: url, token: token, connection: connection)
         try Task.checkCancellation()
         do {
             return try await send(url, token: token, sessionID: state.sessionID, protocolVersion: state.protocolVersion, method: method, params: params).result
-        } catch RemoteMCPError.http(404) {
-            // Streamable HTTP spec: 404 indicates expired session — re-initialize once and retry.
+        } catch RemoteMCPError.http(404), RemoteMCPError.http(401) {
+            // 404 indicates expired session; 401 may indicate stale session/token state — re-initialize once and retry.
             connections.removeValue(forKey: connection)
             let refreshed = try await connect(url: url, token: token, connection: connection)
             try Task.checkCancellation()
@@ -256,6 +260,10 @@ public actor RemoteMCPClient {
                 try Task.checkCancellation()
                 guard let event = try events.append(byte: byte) else { continue }
                 if let result = try decode(Data(event.utf8), id: id) { return (result, responseSessionID) }
+            }
+            if let trailing = events.finish(),
+               let result = try decode(Data(trailing.utf8), id: id) {
+                return (result, responseSessionID)
             }
         } else if mime.contains("application/json") || mime.isEmpty {
             var data = Data()

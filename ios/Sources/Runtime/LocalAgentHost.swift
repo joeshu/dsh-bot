@@ -7,6 +7,9 @@ import PDFKit
 #if canImport(Vision)
 import Vision
 #endif
+#if canImport(ImageIO)
+import ImageIO
+#endif
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -539,7 +542,8 @@ public final class LocalAgentHost: ObservableObject {
     }
 
     public func sessionPreview(for sessionId: String) -> String? {
-        guard bots.first(where: { $0.id == sessionId })?.isPrivate != true else { return nil }
+        let rootBotId = resolveAddress(sessionId)?.botID ?? sessionId
+        guard bots.first(where: { $0.id == rootBotId })?.isPrivate != true else { return nil }
         let message = messagesBySession[sessionId]?.last
         if let message,
            let activity = persistedSessionActivityByID[sessionId], activity > message.timestamp,
@@ -1375,19 +1379,38 @@ public final class LocalAgentHost: ObservableObject {
 
     private static func extractImageOCRText(from data: Data, maxChars: Int) -> String? {
         #if canImport(Vision) && canImport(UIKit)
-        guard let cgImage = UIImage(data: data)?.cgImage else { return nil }
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.recognitionLanguages = ["zh-Hans", "en-US"]
-        request.usesLanguageCorrection = true
-        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-        do {
-            try handler.perform([request])
-            let lines = (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
-            let joined = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-            return joined.isEmpty ? nil : String(joined.prefix(maxChars))
-        } catch {
-            return nil
+        return autoreleasepool {
+            let cgImage: CGImage? = {
+                #if canImport(ImageIO)
+                let createOpts: [CFString: Any] = [kCGImageSourceShouldCache: false]
+                if let source = CGImageSourceCreateWithData(data as CFData, createOpts as CFDictionary) {
+                    let thumbOpts: [CFString: Any] = [
+                        kCGImageSourceCreateThumbnailFromImageAlways: true,
+                        kCGImageSourceCreateThumbnailWithTransform: true,
+                        kCGImageSourceShouldCacheImmediately: true,
+                        kCGImageSourceThumbnailMaxPixelSize: 2048,
+                    ]
+                    if let thumb = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOpts as CFDictionary) {
+                        return thumb
+                    }
+                }
+                #endif
+                return UIImage(data: data)?.cgImage
+            }()
+            guard let cgImage else { return nil }
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.recognitionLanguages = ["zh-Hans", "en-US"]
+            request.usesLanguageCorrection = true
+            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+            do {
+                try handler.perform([request])
+                let lines = (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+                let joined = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                return joined.isEmpty ? nil : String(joined.prefix(maxChars))
+            } catch {
+                return nil
+            }
         }
         #else
         return nil
@@ -1537,7 +1560,7 @@ public final class LocalAgentHost: ObservableObject {
     }
 
     public func suspendForBackground() async {
-        persistWorkspace(immediate: true)
+        await flushWorkspacePersistence()
         guard let channel else { return }
         let suspendedSnapshots = activeTurnsBySession.map { ($0.key, $0.value.turnId) }
         if !suspendedSnapshots.isEmpty {
@@ -1547,7 +1570,7 @@ public final class LocalAgentHost: ObservableObject {
             pendingApprovals.removeAll()
             pendingDSHQuestions.removeAll()
         }
-        _ = try? await channel.request("agent.suspend", timeoutSeconds: 3)
+        _ = try? await channel.request("agent.suspend", timeoutSeconds: 12)
         for (sId, tId) in suspendedSnapshots {
             if activeTurnsBySession[sId]?.turnId == tId {
                 lastCancelledSessionId = sId
@@ -2365,15 +2388,19 @@ public final class LocalAgentHost: ObservableObject {
         }
         await rpc.registerHandler(method: "credential.resolve") { [weak self] params in
             guard let self else { throw IPCFrameError.channelClosed }
-            let provider = try self.configuredCredentialProvider(params)
-            let value = try await self.keychain.modelKey(provider: provider, migrateOfficialKey: self.migrateOfficialKey)
+            let (provider, migrate) = try await MainActor.run {
+                (try self.configuredCredentialProvider(params), self.migrateOfficialKey)
+            }
+            let value = try await self.keychain.modelKey(provider: provider, migrateOfficialKey: migrate)
             return ["value": value]
         }
         await rpc.registerHandler(method: "credential.describe") { [weak self] params in
             guard let self else { throw IPCFrameError.channelClosed }
             do {
-                let provider = try self.configuredCredentialProvider(params)
-                _ = try await self.keychain.modelKey(provider: provider, migrateOfficialKey: self.migrateOfficialKey)
+                let (provider, migrate) = try await MainActor.run {
+                    (try self.configuredCredentialProvider(params), self.migrateOfficialKey)
+                }
+                _ = try await self.keychain.modelKey(provider: provider, migrateOfficialKey: migrate)
                 return ["configured": true]
             } catch {
                 return ["configured": false]
@@ -2399,7 +2426,8 @@ public final class LocalAgentHost: ObservableObject {
             guard let self else { throw IPCFrameError.channelClosed }
             let action = params["action"] as? String ?? ""
             let args = params["args"] as? [String: Any] ?? [:]
-            return try await AgentBrowserController.shared.handleAction(action, args: args, workspace: self.workspace)
+            let ws = await MainActor.run { self.workspace }
+            return try await AgentBrowserController.shared.handleAction(action, args: args, workspace: ws)
         }
         await rpc.registerHandler(method: "native.tool.execute") { [weak self] params in
             guard let self, let name = params["name"] as? String else { throw IPCFrameError.invalidJSON }
@@ -2407,18 +2435,24 @@ public final class LocalAgentHost: ObservableObject {
             if name == "web_search" {
                 let botId = params["botId"] as? String ?? ""
                 let turnId = params["turnId"] as? String ?? ""
-                let targetBot = self.resolveAddress(botId).flatMap { self.bot(for: $0) }
-                let botUsesOfficial = (try? ModelProvider(self.effectiveApiBaseURL(for: targetBot)).isDeepSeek) == true
-                guard self.webSearchEnabled, botUsesOfficial,
-                      let ctx = self.activeTurnsBySession[botId],
-                      ctx.turnId == turnId, !ctx.sentCancellation else {
-                    throw IPCFrameError.remoteError(code: -32000, message: "当前会话不能发起网页搜索。")
+                let originalQuestion: String? = try await MainActor.run {
+                    let targetBot = self.resolveAddress(botId).flatMap { self.bot(for: $0) }
+                    let botUsesOfficial = (try? ModelProvider(self.effectiveApiBaseURL(for: targetBot)).isDeepSeek) == true
+                    guard self.webSearchEnabled, botUsesOfficial,
+                          let ctx = self.activeTurnsBySession[botId],
+                          ctx.turnId == turnId, !ctx.sentCancellation else {
+                        throw IPCFrameError.remoteError(code: -32000, message: "当前会话不能发起网页搜索。")
+                    }
+                    if self.effectiveWebSearchSendOriginalQuestion {
+                        guard let q = self.webSearchOriginalQuestionContext(sessionId: botId) else {
+                            throw IPCFrameError.remoteError(code: -32000, message: "无法展示将发送的原始问题上下文，已阻止网页搜索。")
+                        }
+                        return q
+                    }
+                    return nil
                 }
                 arguments.removeValue(forKey: "originalQuestion")
-                if self.effectiveWebSearchSendOriginalQuestion {
-                    guard let originalQuestion = self.webSearchOriginalQuestionContext(sessionId: botId) else {
-                        throw IPCFrameError.remoteError(code: -32000, message: "无法展示将发送的原始问题上下文，已阻止网页搜索。")
-                    }
+                if let originalQuestion {
                     arguments["originalQuestion"] = originalQuestion
                 }
             }
@@ -2486,6 +2520,33 @@ public final class LocalAgentHost: ObservableObject {
         }
     }
 
+    private func flushWorkspacePersistence() async {
+        guard workspaceReadable else { return }
+        persistDebounceWorkItem?.cancel()
+        persistDebounceWorkItem = nil
+        let botsSnapshot = bots
+        let chatsSnapshot = legacyMessagesBySession
+        let root = workspace
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            persistQueue.async { [weak self] in
+                do {
+                    try JSONEncoder().encode(botsSnapshot).write(
+                        to: root.appendingPathComponent("bots.json"),
+                        options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
+                    )
+                    try JSONEncoder().encode(chatsSnapshot).write(
+                        to: root.appendingPathComponent("chats.json"),
+                        options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
+                    )
+                    Task { @MainActor in self?.workspaceError = nil }
+                } catch {
+                    Task { @MainActor in self?.workspaceError = "保存本机工作区失败。请检查存储空间后重试。" }
+                }
+                continuation.resume()
+            }
+        }
+    }
+
     private func persistWorkspace(immediate: Bool = false) {
         guard workspaceReadable else { return }
         persistDebounceWorkItem?.cancel()
@@ -2495,8 +2556,14 @@ public final class LocalAgentHost: ObservableObject {
         let root = workspace
         let writeBlock: @Sendable () -> Void = { [weak self] in
             do {
-                try JSONEncoder().encode(botsSnapshot).write(to: root.appendingPathComponent("bots.json"), options: .atomic)
-                try JSONEncoder().encode(chatsSnapshot).write(to: root.appendingPathComponent("chats.json"), options: .atomic)
+                try JSONEncoder().encode(botsSnapshot).write(
+                    to: root.appendingPathComponent("bots.json"),
+                    options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
+                )
+                try JSONEncoder().encode(chatsSnapshot).write(
+                    to: root.appendingPathComponent("chats.json"),
+                    options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
+                )
                 Task { @MainActor in self?.workspaceError = nil }
             } catch {
                 Task { @MainActor in self?.workspaceError = "保存本机工作区失败。请检查存储空间后重试。" }
@@ -2790,7 +2857,8 @@ public final class LocalAgentHost: ObservableObject {
         let isWriteOrMutate = lowerTool.contains("write") || lowerTool.contains("edit") || lowerTool.contains("patch")
             || lowerTool.contains("delete") || lowerTool.contains("memory") || lowerTool == "terminal_exec"
             || lowerTool == "python_exec" || lowerTool == "run_code" || lowerTool == "python_job_start"
-            || lowerTool.hasPrefix("redteam_")
+            || lowerTool == "web_fetch" || lowerTool == "web_search" || lowerTool.hasPrefix("remote_mcp")
+            || lowerTool.hasPrefix("redteam_") || lowerTool.hasPrefix("browser_")
 
         let approval = PendingApproval(id: id, sessionId: sessionId, turnId: turnId, tool: tool, summary: summary, isDSH: params["source"] as? String == "dsh")
         pendingApprovals.append(approval)
@@ -2803,8 +2871,15 @@ public final class LocalAgentHost: ObservableObject {
             return
         }
 
-        if autoReviewEnabled || botMode == "autoReview" {
+        if botMode == "autoReview" {
             autoReviewLog.insert("[\(Date().formatted(date: .omitted, time: .shortened))] 沙盒免打扰放行：\(tool)", at: 0)
+            if autoReviewLog.count > 40 { autoReviewLog = Array(autoReviewLog.prefix(40)) }
+            Task { await respondToApproval(id: id, approved: true) }
+            return
+        }
+
+        if autoReviewEnabled && !isWriteOrMutate {
+            autoReviewLog.insert("[\(Date().formatted(date: .omitted, time: .shortened))] 只读自动审查放行：\(tool)", at: 0)
             if autoReviewLog.count > 40 { autoReviewLog = Array(autoReviewLog.prefix(40)) }
             Task { await respondToApproval(id: id, approved: true) }
             return

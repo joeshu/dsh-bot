@@ -513,11 +513,19 @@ struct ChatSessionConfigSheet: View {
             ?? scenes.first?.windows.first?.rootViewController
         var presenter = root
         while let next = presenter?.presentedViewController { presenter = next }
-        guard let presenter else { return }
+        guard let presenter else {
+            try? FileManager.default.removeItem(at: dest)
+            return
+        }
         let sheet = UIActivityViewController(activityItems: [dest], applicationActivities: nil)
         sheet.popoverPresentationController?.sourceView = presenter.view
         sheet.popoverPresentationController?.sourceRect = CGRect(x: presenter.view.bounds.midX, y: presenter.view.bounds.maxY - 60, width: 1, height: 1)
+        sheet.completionWithItemsHandler = { _, _, _, _ in
+            try? FileManager.default.removeItem(at: dest)
+        }
         presenter.present(sheet, animated: true)
+        #else
+        try? FileManager.default.removeItem(at: dest)
         #endif
     }
 }

@@ -3,35 +3,39 @@ import { iosHost } from './index.mjs'
 
 const ephemeralRecords = new Map()
 
+const OFFICIAL_DEEPSEEK_BASE_URL = 'https://api.deepseek.com'
+
 export default class IosKeychainCredentials extends CredentialProvider {
   async resolve(ref) {
-    if (ref !== 'DEEPSEEK_API_KEY') return undefined
+    if (ref !== 'DEEPSEEK_API_KEY' && ref !== 'DEEPSEEK_SEARCH_API_KEY') return undefined
     const { rpc, runtime } = iosHost()
-    const result = await rpc.request('credential.resolve', { apiBaseURL: runtime.apiBaseURL })
+    const apiBaseURL = ref === 'DEEPSEEK_SEARCH_API_KEY' ? OFFICIAL_DEEPSEEK_BASE_URL : runtime.apiBaseURL
+    const result = await rpc.request('credential.resolve', { apiBaseURL })
     return typeof result.value === 'string' && result.value.length
       ? { value: result.value, source: 'ios-keychain' } : undefined
   }
   async describe(ref) {
-    if (ref !== 'DEEPSEEK_API_KEY') return { configured: false, writable: false }
+    if (ref !== 'DEEPSEEK_API_KEY' && ref !== 'DEEPSEEK_SEARCH_API_KEY') return { configured: false, writable: false }
     const { rpc, runtime } = iosHost()
-    const result = await rpc.request('credential.describe', { apiBaseURL: runtime.apiBaseURL })
+    const apiBaseURL = ref === 'DEEPSEEK_SEARCH_API_KEY' ? OFFICIAL_DEEPSEEK_BASE_URL : runtime.apiBaseURL
+    const result = await rpc.request('credential.describe', { apiBaseURL })
     return { configured: result.configured === true, source: result.configured ? 'ios-keychain' : undefined, writable: false }
   }
   async set() { throw new Error('Credentials are managed by iOS Keychain settings') }
   async unset() { throw new Error('Credentials are managed by iOS Keychain settings') }
   async readRecord(ref) {
-    if (ref === 'DEEPSEEK_API_KEY') return undefined
+    if (ref === 'DEEPSEEK_API_KEY' || ref === 'DEEPSEEK_SEARCH_API_KEY') return undefined
     const value = ephemeralRecords.get(ref)
     return value === undefined ? undefined : { value, source: 'ios-ephemeral' }
   }
   async describeRecord(ref) {
-    if (ref === 'DEEPSEEK_API_KEY') return { configured: false, writable: false }
+    if (ref === 'DEEPSEEK_API_KEY' || ref === 'DEEPSEEK_SEARCH_API_KEY') return { configured: false, writable: false }
     const configured = ephemeralRecords.has(ref)
     return { configured, source: configured ? 'ios-ephemeral' : undefined, writable: true }
   }
   async listRecords() { return [...ephemeralRecords.keys()] }
   async modifyRecord(ref, updater) {
-    if (ref === 'DEEPSEEK_API_KEY') throw new Error('Credentials are managed by iOS Keychain settings')
+    if (ref === 'DEEPSEEK_API_KEY' || ref === 'DEEPSEEK_SEARCH_API_KEY') throw new Error('Credentials are managed by iOS Keychain settings')
     const current = ephemeralRecords.get(ref)
     const next = await updater(current)
     if (next === undefined) ephemeralRecords.delete(ref)
@@ -39,7 +43,7 @@ export default class IosKeychainCredentials extends CredentialProvider {
     return next
   }
   async deleteRecord(ref) {
-    if (ref === 'DEEPSEEK_API_KEY') throw new Error('Credentials are managed by iOS Keychain settings')
+    if (ref === 'DEEPSEEK_API_KEY' || ref === 'DEEPSEEK_SEARCH_API_KEY') throw new Error('Credentials are managed by iOS Keychain settings')
     ephemeralRecords.delete(ref)
   }
 }

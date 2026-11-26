@@ -796,7 +796,7 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
     let lastReasoningEffort = ''
 
     const refreshWorkspaceRules = () => {
-      const isPrivate = runtime.privateBotIds?.has(botId) === true
+      const isPrivate = isPrivateBotOrThread(botId)
       if (isPrivate) {
         rulesDisposer?.()
         rulesDisposer = undefined
@@ -925,6 +925,11 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
             }))
         : []
       const deny = enabled ? [...normalizedDisabledTools] : [...DISABLED_TOOL_NAMES].filter((name) => globalToolNames.has(name))
+      if (agentPreset === 'minimal') {
+        for (const restricted of ['workspace_write', 'workspace_edit', 'terminal_exec', 'git_workspace', 'js_eval', 'python_exec', 'python_job_start']) {
+          if (globalToolNames.has(restricted) && !deny.includes(restricted)) deny.push(restricted)
+        }
+      }
       if (!allowSubagent || !enabled) deny.push('subagent')
       if (enabled && !allowWebSearch) deny.push('web_search')
       if (!allowRedteam || !enabled) {
@@ -936,7 +941,7 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
       }
       const allowedRedteamTools = rtTools.filter((name) => !redteamToolDenial(redteamPolicy, name))
       const promptParts = []
-      if (enabled && !runtime.privateBotIds?.has(botId)) {
+      if (enabled && !isPrivateBotOrThread(botId)) {
         promptParts.push('App 内置浏览器可用：需要交互浏览网页、点击、填表、下拉选择、等待动态渲染或截图识图时，可直接调用 browser_open / browser_snapshot / browser_click / browser_type / browser_select / browser_press_key / browser_wait / browser_eval / browser_screenshot；遇到登录、2FA 或人机验证时必须立即调用 browser_handoff 请用户在内置浏览器中手动接管。')
       }
       if (thirdPartyTools.length > 0) {
@@ -1179,6 +1184,25 @@ async function boot() {
     args: [],
   })
   ctx = application.ctx
+  ctx.on('tools/pre-execute', async (execution, next) => {
+    const name = String(execution?.name ?? '')
+    if (!name.startsWith('redteam_')) return typeof next === 'function' ? next() : { kind: 'allow' }
+    const downstream = typeof next === 'function' ? await next() : { kind: 'allow' }
+    if (downstream?.kind && downstream.kind !== 'allow') return downstream
+    const policy = resolveRedteamPolicyForAgent(execution.agent)
+    if (!policy) return { kind: 'deny', reason: '当前会话尚未获得 dsh-purge-safe 红队工具授权。' }
+    const denial = redteamToolDenial(policy, name)
+    if (denial) return { kind: 'deny', reason: denial }
+    if (policy.isWeb && redteamToolNeedsApproval(policy, name)) {
+      if (!execution?.callId) return { kind: 'deny', reason: '红队工具调用缺少审批关联编号，已拒绝执行。' }
+      return {
+        kind: 'ask',
+        reason: `dsh-purge-safe 工具 ${name} 需要当前 Web 会话用户审批。`,
+        displayReason: { en: `Approve dsh-purge-safe tool ${name} for this session?`, zh: `允许当前会话调用红队工具 ${name}？` },
+      }
+    }
+    return downstream ?? { kind: 'allow' }
+  }, { global: true })
   ctx.tools.guard((execution) => {
     const name = String(execution?.name ?? '')
     if (!name.startsWith('redteam_')) return undefined
@@ -1187,14 +1211,14 @@ async function boot() {
     if (!policy) return { reason: '当前会话尚未获得 dsh-purge-safe 红队工具授权。' }
     const denial = redteamToolDenial(policy, name)
     if (denial) return { reason: denial }
-    if (!policy.isWeb && redteamToolNeedsApproval(policy, name)) {
+    if (redteamToolNeedsApproval(policy, name)) {
       const key = redteamApprovalKey(sessionId, execution.callId)
       const parentKey = policy.inheritedFrom ? redteamApprovalKey(policy.inheritedFrom, execution.callId) : ''
       const approved = runtime.redteamApprovalGrants.get(key) === true
         || (parentKey && runtime.redteamApprovalGrants.get(parentKey) === true)
       runtime.redteamApprovalGrants.delete(key)
       if (parentKey) runtime.redteamApprovalGrants.delete(parentKey)
-      if (!approved) return { reason: '此红队工具调用没有通过 iOS 会话审批，已拒绝执行。' }
+      if (!approved) return { reason: '此红队工具调用没有通过会话审批，已拒绝执行。' }
     }
     return undefined
   })

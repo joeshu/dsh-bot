@@ -69,7 +69,7 @@
       name: '@deepseek-ai/dsh-web-deepseek-api'
       config:
         searchBaseURL: https://api.deepseek.com/v1/tools
-        searchApiKeyEnv: DEEPSEEK_API_KEY
+        searchApiKeyEnv: DEEPSEEK_SEARCH_API_KEY
         searchBilling: api-key
         sendOriginalQuestion: false
         count: 5
@@ -136,7 +136,7 @@
       name: '@deepseek-ai/dsh-storage-sqlite'
       config:
         path: !!js process.env.DSH_HOME + '/dsh-storage.sqlite'
-        journalMode: wal
+        journalMode: truncate
 
     - id: storage-domain
       name: '@deepseek-ai/dsh-storage-domain'
@@ -275,7 +275,7 @@
           - id: tool-web
             name: '@deepseek-ai/dsh-tool-web'
             config:
-              fetch: true
+              fetch: false
               searchTimeoutMs: 60000
               searchMaxQueries: 5
           - id: tool-jobs
@@ -338,7 +338,7 @@
           - id: tool-web
             name: '@deepseek-ai/dsh-tool-web'
             config:
-              fetch: true
+              fetch: false
               searchTimeoutMs: 60000
               searchMaxQueries: 5
           - id: tool-jobs
@@ -404,7 +404,7 @@
           - id: tool-web
             name: '@deepseek-ai/dsh-tool-web'
             config:
-              fetch: true
+              fetch: false
               searchTimeoutMs: 60000
               searchMaxQueries: 5
           - id: tool-cordis
@@ -465,7 +465,7 @@
           - id: tool-web
             name: '@deepseek-ai/dsh-tool-web'
             config:
-              fetch: true
+              fetch: false
               searchTimeoutMs: 60000
               searchMaxQueries: 5
 
@@ -524,7 +524,7 @@
           - id: tool-web
             name: '@deepseek-ai/dsh-tool-web'
             config:
-              fetch: true
+              fetch: false
               searchTimeoutMs: 60000
               searchMaxQueries: 5
           - id: tool-jobs

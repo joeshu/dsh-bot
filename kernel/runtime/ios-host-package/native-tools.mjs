@@ -115,13 +115,17 @@ async function safePublicHttpsFetch(rawUrl, { maxBytes = 131_072, maxRedirects =
     if (!location || hop >= maxRedirects) throw new Error('web_fetch rejected invalid or excessive redirects')
     current = await assertSafePublicHttpsUrl(new URL(location, current).toString())
   }
+  const contentType = resp.headers.get('content-type') || 'text/plain'
+  const bodyKind = contentType.toLowerCase().includes('html') ? 'html' : 'text'
   const reader = resp.body?.getReader()
   if (!reader) {
     return {
       url: current.toString(),
       status: resp.status,
-      contentType: resp.headers.get('content-type') || 'text/plain',
-      body: { content: '' },
+      statusCode: resp.status,
+      contentType,
+      truncated: false,
+      body: { kind: bodyKind, content: '' },
     }
   }
   const chunks = []
@@ -149,8 +153,10 @@ async function safePublicHttpsFetch(rawUrl, { maxBytes = 131_072, maxRedirects =
   return {
     url: current.toString(),
     status: resp.status,
-    contentType: resp.headers.get('content-type') || 'text/plain',
-    body: { content: truncated ? `${text}\n…(truncated at ${maxBytes} bytes)` : text },
+    statusCode: resp.status,
+    contentType,
+    truncated,
+    body: { kind: bodyKind, content: truncated ? `${text}\n…(truncated at ${maxBytes} bytes)` : text },
   }
 }
 
@@ -451,7 +457,7 @@ function apply(context) {
         const sessionId = exec?.agent?.session?.id
         const active = typeof sessionId === 'string' ? runtime.activeTurns.get(sessionId) : undefined
         if (typeof sessionId === 'string' && sessionId.startsWith('ios:')) {
-          const botId = sessionId.slice(4)
+          const botId = sessionId.slice(4).split(':')[0]
           if (runtime.privateBotIds?.has(botId)) {
             throw new Error('私密会话禁止控制 App 内置浏览器。')
           }

@@ -539,7 +539,8 @@ public final class AgentBrowserController: NSObject, ObservableObject {
             return snap
 
         case "scroll":
-            let direction = (args["direction"] as? String ?? "down").lowercased()
+            let rawDirection = (args["direction"] as? String ?? "down").lowercased()
+            let direction = ["up", "down", "top", "bottom"].contains(rawDirection) ? rawDirection : "down"
             let amount = max(120, min(args["amount"] as? Int ?? 600, 3_000))
             let script = """
             (function() {
@@ -806,10 +807,9 @@ extension AgentBrowserController: WKNavigationDelegate, WKUIDelegate, WKDownload
         for navigationAction: WKNavigationAction,
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
-        // Handle target="_blank" links seamlessly inside the same Bot-controlled WebView
+        // Handle target="_blank" links seamlessly inside the same Bot-controlled WebView (HTTPS-only)
         if let url = navigationAction.request.url,
-           let scheme = url.scheme?.lowercased(),
-           (scheme == "https" || scheme == "http"),
+           url.scheme?.lowercased() == "https",
            let host = url.host,
            !SafeHTTPSRedirects.isPrivateOrLoopbackHost(host) {
             webView.load(navigationAction.request)
@@ -851,7 +851,7 @@ extension AgentBrowserController: WKNavigationDelegate, WKUIDelegate, WKDownload
             decisionHandler(.allow)
             return
         }
-        if scheme == "https" || scheme == "http" {
+        if scheme == "https" {
             if let host = target.host, SafeHTTPSRedirects.isPrivateOrLoopbackHost(host) {
                 decisionHandler(.cancel)
                 return
@@ -887,10 +887,18 @@ extension AgentBrowserController: WKNavigationDelegate, WKUIDelegate, WKDownload
 
     public func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
         download.delegate = self
+        if let pending = navigationContinuation {
+            navigationContinuation = nil
+            pending.resume(returning: ())
+        }
     }
 
     public func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
         download.delegate = self
+        if let pending = navigationContinuation {
+            navigationContinuation = nil
+            pending.resume(returning: ())
+        }
     }
 
     public func download(
