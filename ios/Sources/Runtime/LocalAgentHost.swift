@@ -122,6 +122,7 @@ public final class LocalAgentHost: ObservableObject {
     private final class ActiveTurnContext {
         let sessionId: String
         let turnId: String
+        let effectiveApiBaseURL: String
         let streamState: StreamingTurnState
         var pendingReasoningBuffer = ""
         var pendingContentBuffer = ""
@@ -135,9 +136,10 @@ public final class LocalAgentHost: ObservableObject {
         var stallWatchdogTask: Task<Void, Never>?
         var groupLeaseWatchdogTask: Task<Void, Never>?
 
-        init(sessionId: String, turnId: String, steerNote: String?) {
+        init(sessionId: String, turnId: String, effectiveApiBaseURL: String, steerNote: String?) {
             self.sessionId = sessionId
             self.turnId = turnId
+            self.effectiveApiBaseURL = effectiveApiBaseURL
             self.streamState = StreamingTurnState()
             self.streamState.begin(sessionId: sessionId, steerNote: steerNote)
         }
@@ -507,6 +509,25 @@ public final class LocalAgentHost: ObservableObject {
                 self?.handleNativeApprovalNotification(method: method, params: params)
             }
         }
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name("dsbot.providerProfileDeleted"),
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let deletedID = notification.object as? String else { return }
+            Task { @MainActor [weak self] in
+                self?.clearDanglingProviderProfile(deletedID)
+            }
+        }
+    }
+
+    private func clearDanglingProviderProfile(_ deletedID: String) {
+        var changed = false
+        for idx in bots.indices where bots[idx].providerProfileId == deletedID {
+            bots[idx].providerProfileId = nil
+            changed = true
+        }
+        if changed { persistWorkspace() }
     }
 
     private var draftInputsBySession: [String: String] = [:]
@@ -541,6 +562,17 @@ public final class LocalAgentHost: ObservableObject {
         }
     }
 
+    public func botMaxActivityDate(for botId: String) -> Date? {
+        let threadIds = BotThreadStore.shared.threads(for: botId, includeArchived: true).map(\.sessionId)
+        var latest = sessionActivityDate(for: botId)
+        for sid in threadIds {
+            if let date = sessionActivityDate(for: sid) {
+                latest = max(latest ?? date, date)
+            }
+        }
+        return latest
+    }
+
     public func sessionPreview(for sessionId: String) -> String? {
         let rootBotId = resolveAddress(sessionId)?.botID ?? sessionId
         guard bots.first(where: { $0.id == rootBotId })?.isPrivate != true else { return nil }
@@ -562,8 +594,8 @@ public final class LocalAgentHost: ObservableObject {
             uniquingKeysWith: { first, _ in first }
         )
         return candidates.sorted { left, right in
-            let leftDate = sessionActivityDate(for: left.id) ?? .distantPast
-            let rightDate = sessionActivityDate(for: right.id) ?? .distantPast
+            let leftDate = botMaxActivityDate(for: left.id) ?? .distantPast
+            let rightDate = botMaxActivityDate(for: right.id) ?? .distantPast
             if leftDate != rightDate { return leftDate > rightDate }
             return originalOrder[left.id, default: 0] < originalOrder[right.id, default: 0]
         }
@@ -579,9 +611,11 @@ public final class LocalAgentHost: ObservableObject {
     }
 
     public func setAgentPreset(sessionId: String, presetId: String) {
-        guard !isStreaming,
+        let rootId = resolveAddress(sessionId)?.botID ?? sessionId
+        guard !isBotStreaming(rootId),
               dshAgentPresets.contains(where: { $0.id == presetId && $0.isAvailable }),
-              let index = bots.firstIndex(where: { $0.id == sessionId }) else { return }
+              let index = bots.firstIndex(where: { $0.id == rootId }) else { return }
+        guard !(bots[index].isPrivate && presetId == "redteam") else { return }
         guard bots[index].agentPreset != presetId else { return }
         bots[index].agentPreset = presetId
         persistWorkspace()
@@ -589,9 +623,10 @@ public final class LocalAgentHost: ObservableObject {
     }
 
     public func setPermissionMode(sessionId: String, mode: String) {
-        guard !isStreaming,
+        let rootId = resolveAddress(sessionId)?.botID ?? sessionId
+        guard !isBotStreaming(rootId),
               ["ask", "autoReview", "readOnly"].contains(mode),
-              let index = bots.firstIndex(where: { $0.id == sessionId }) else { return }
+              let index = bots.firstIndex(where: { $0.id == rootId }) else { return }
         guard bots[index].permissionMode != mode else { return }
         bots[index].permissionMode = mode
         if mode == "readOnly", bots[index].agentPreset == "redteam" {
@@ -602,15 +637,16 @@ public final class LocalAgentHost: ObservableObject {
     }
 
     public func setReasoningEffort(sessionId: String, effort: String) {
+        let rootId = resolveAddress(sessionId)?.botID ?? sessionId
         guard ["low", "medium", "high"].contains(effort),
-              let index = bots.firstIndex(where: { $0.id == sessionId }) else { return }
+              let index = bots.firstIndex(where: { $0.id == rootId }) else { return }
         guard bots[index].reasoningEffort != effort else { return }
         bots[index].reasoningEffort = effort
         persistWorkspace()
         DSHaptics.impact(.light)
     }
 
-    /// Rolls back the trailing assistant reply (if any) and the last user message in local session state,
+    /// Rolls back the trailing assistant reply (if any) and the last user message in local session state + SQLite,
     /// returning the user's original prompt so it can be edited and resent cleanly (`rewind`).
     @discardableResult
     public func rewindLastTurn(sessionId: String) -> String? {
@@ -619,24 +655,42 @@ public final class LocalAgentHost: ObservableObject {
             return nil
         }
         let targetId = address.canonicalSessionId
-        guard !isStreaming, var list = messagesBySession[targetId], !list.isEmpty else { return nil }
+        guard !isSessionStreaming(targetId), var list = messagesBySession[targetId], !list.isEmpty else { return nil }
         guard let lastUserIdx = list.lastIndex(where: { $0.role == "user" }) else { return nil }
         let userText = list[lastUserIdx].content
+        let truncateSeq = list[lastUserIdx].sequence
         list.removeSubrange(lastUserIdx..<list.count)
         messagesBySession[targetId] = list
+        if let truncateSeq, let channel {
+            Task { [weak self] in
+                _ = try? await channel.request("session.truncateFromSeq", params: ["sessionId": targetId, "sequence": truncateSeq], timeoutSeconds: 15)
+                await self?.refreshSessionSummaries()
+            }
+        }
         return userText
     }
 
-    /// Removes a single message from the local session transcript (P1-2, bound to SessionAddress).
+    /// Removes a single message from the local session transcript and persists truncation when backed by SQLite sequence (P1-2).
     public func deleteMessage(sessionId: String, messageId: String) {
         guard let address = resolveAddress(sessionId) else {
             workspaceError = "无效的会话地址，已拒绝删除消息。"
             return
         }
         let targetId = address.canonicalSessionId
-        guard !isStreaming, var list = messagesBySession[targetId] else { return }
-        list.removeAll { $0.id == messageId }
+        guard !isSessionStreaming(targetId), var list = messagesBySession[targetId] else { return }
+        let removedSeq = list.first(where: { $0.id == messageId })?.sequence
+        if let idx = list.firstIndex(where: { $0.id == messageId }) {
+            list.removeSubrange(idx..<list.count)
+        } else {
+            list.removeAll { $0.id == messageId }
+        }
         messagesBySession[targetId] = list
+        if let removedSeq, let channel {
+            Task { [weak self] in
+                _ = try? await channel.request("session.truncateFromSeq", params: ["sessionId": targetId, "sequence": removedSeq], timeoutSeconds: 15)
+                await self?.refreshSessionSummaries()
+            }
+        }
         DSHaptics.impact(.light)
     }
 
@@ -677,9 +731,15 @@ public final class LocalAgentHost: ObservableObject {
         activeTurnsBySession[targetId]?.streamState.recentSteerNote = trimmed
         if isSessionStreaming(targetId) {
             await abortActiveTurn(sessionId: targetId)
-            for _ in 0..<25 {
+            for _ in 0..<50 {
                 if !isSessionStreaming(targetId) { break }
                 try? await Task.sleep(nanoseconds: 80_000_000)
+            }
+            if isSessionStreaming(targetId) {
+                lastErrorSessionId = targetId
+                lastStreamError = "上一轮正在中止收敛中，插话内容已保留，可稍候点击重发。"
+                DSHaptics.notify(.warning)
+                return
             }
         }
         await sendMessage(sessionId: targetId, text: "[插话引导] \(trimmed)", model: model)
@@ -709,17 +769,83 @@ public final class LocalAgentHost: ObservableObject {
         var title = baseName.isEmpty ? "导入会话" : baseName
         var parsed: [(role: String, content: String)] = []
 
+        // Support BotExportPayload config template import directly
+        if let exported = try? JSONDecoder().decode(BotExportPayload.self, from: data) {
+            let id = "imp_" + String(UUID().uuidString.prefix(6)).lowercased()
+            let bot = BotProfile(
+                id: id,
+                name: String(exported.name.prefix(24)),
+                roleLabel: exported.roleLabel,
+                model: exported.model,
+                systemPrompt: exported.systemPrompt,
+                section: "核心团队",
+                permissionMode: exported.permissionMode,
+                agentPreset: exported.agentPreset,
+                reasoningEffort: exported.reasoningEffort,
+                disabledTools: exported.disabledTools
+            )
+            bots.append(bot)
+            persistWorkspace()
+            return bot
+        }
+
         if let json = try? JSONSerialization.jsonObject(with: data) {
             if let dict = json as? [String: Any] {
                 if let t = dict["title"] as? String, !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     title = t
                 }
-                let rawMsgs = (dict["messages"] as? [[String: Any]]) ?? (dict["mapping"] as? [[String: Any]]) ?? []
-                for m in rawMsgs {
-                    let role = ((m["role"] as? String) ?? (m["author"] as? String) ?? "user").lowercased()
-                    let content = (m["content"] as? String) ?? (m["text"] as? String) ?? ""
-                    if !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        parsed.append((role.contains("assistant") || role.contains("bot") ? "assistant" : "user", content))
+                if let mappingDict = dict["mapping"] as? [String: [String: Any]] {
+                    var orderedNodes: [(createTime: Double, role: String, content: String)] = []
+                    // Prefer walking parent chain from current_node if available
+                    if let currentId = dict["current_node"] as? String, !currentId.isEmpty {
+                        var cursor: String? = currentId
+                        var chain: [[String: Any]] = []
+                        var visited = Set<String>()
+                        while let nodeId = cursor, visited.insert(nodeId).inserted, let node = mappingDict[nodeId] {
+                            chain.append(node)
+                            cursor = node["parent"] as? String
+                        }
+                        for node in chain.reversed() {
+                            if let msg = node["message"] as? [String: Any],
+                               let author = msg["author"] as? [String: Any],
+                               let role = (author["role"] as? String)?.lowercased(),
+                               role == "user" || role == "assistant",
+                               let contentObj = msg["content"] as? [String: Any] {
+                                let parts = (contentObj["parts"] as? [Any] ?? []).compactMap { $0 as? String }
+                                let body = parts.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                                if !body.isEmpty {
+                                    parsed.append((role, body))
+                                }
+                            }
+                        }
+                    }
+                    if parsed.isEmpty {
+                        for node in mappingDict.values {
+                            if let msg = node["message"] as? [String: Any],
+                               let author = msg["author"] as? [String: Any],
+                               let role = (author["role"] as? String)?.lowercased(),
+                               role == "user" || role == "assistant",
+                               let contentObj = msg["content"] as? [String: Any] {
+                                let parts = (contentObj["parts"] as? [Any] ?? []).compactMap { $0 as? String }
+                                let body = parts.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                                if !body.isEmpty {
+                                    let ct = msg["create_time"] as? Double ?? 0
+                                    orderedNodes.append((ct, role, body))
+                                }
+                            }
+                        }
+                        orderedNodes.sort { $0.createTime < $1.createTime }
+                        parsed = orderedNodes.map { ($0.role, $0.content) }
+                    }
+                }
+                if parsed.isEmpty {
+                    let rawMsgs = (dict["messages"] as? [[String: Any]]) ?? (dict["mapping"] as? [[String: Any]]) ?? []
+                    for m in rawMsgs {
+                        let role = ((m["role"] as? String) ?? (m["author"] as? String) ?? "user").lowercased()
+                        let content = (m["content"] as? String) ?? (m["text"] as? String) ?? ""
+                        if !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            parsed.append((role.contains("assistant") || role.contains("bot") ? "assistant" : "user", content))
+                        }
                     }
                 }
             } else if let arr = json as? [[String: Any]] {
@@ -804,6 +930,17 @@ public final class LocalAgentHost: ObservableObject {
             return
         }
         let targetBot = bot(for: address)
+        let targetProfile: ProviderProfile? = {
+            guard let pid = targetBot?.providerProfileId, !pid.isEmpty else { return nil }
+            return ProviderProfileStore.shared.profiles.first(where: { $0.id == pid })
+        }()
+        let effectiveURL = effectiveApiBaseURL(for: targetBot)
+        if activeTurnsBySession.values.contains(where: { $0.effectiveApiBaseURL != effectiveURL }) {
+            lastErrorSessionId = targetSessionId
+            lastStreamError = "当前有其他模型服务商地址的会话正在生成，请等待其完成后再并发发送不同服务商的请求。"
+            DSHaptics.notify(.warning)
+            return
+        }
         if let preset = targetBot?.agentPreset, (preset == "ptc-python" || preset == "cordis"),
            !MemoryGovernor.shared.canAdmitHeavyWork() {
             lastStreamError = "系统可用内存不足（< 180 MB），已拦截重型工具执行以避免闪退，请关闭其他应用后重试。"
@@ -820,7 +957,7 @@ public final class LocalAgentHost: ObservableObject {
         messagesBySession[targetSessionId, default: []].append(ChatMessageItem(sessionId: targetSessionId, role: "user", content: trimmed))
         persistWorkspace()
         let steerNote = pendingSteerNoteBySession.removeValue(forKey: targetSessionId)
-        let ctx = ActiveTurnContext(sessionId: targetSessionId, turnId: turnId, steerNote: steerNote)
+        let ctx = ActiveTurnContext(sessionId: targetSessionId, turnId: turnId, effectiveApiBaseURL: effectiveURL, steerNote: steerNote)
         activeTurnsBySession[targetSessionId] = ctx
         streamFirstTokenMs = nil
         lastStreamError = nil
@@ -847,10 +984,28 @@ public final class LocalAgentHost: ObservableObject {
         }
 
         let bot = targetBot
-        let effectiveURL = effectiveApiBaseURL(for: bot)
         let legacyHistory = (legacyMessagesBySession[targetSessionId] ?? []).suffix(12).map { message in
             ["role": message.role, "content": String(message.content.prefix(12_000))]
         }
+        var pinnedMemoriesText = ""
+        if bot?.isPrivate != true {
+            let rootBotId = address.botID
+            if let memRes = try? await channel.request("memory.journal", params: ["botId": rootBotId], timeoutSeconds: 5),
+               let records = memRes["records"] as? [[String: Any]] {
+                let pinned = records.filter { ($0["layer"] as? String) == "pinned" }.suffix(12)
+                if !pinned.isEmpty {
+                    pinnedMemoriesText = pinned.compactMap { row in
+                        let title = row["title"] as? String ?? ""
+                        let content = row["content"] as? String ?? ""
+                        guard !content.isEmpty else { return nil }
+                        return title.isEmpty ? "- \(String(content.prefix(400)))" : "- [\(title)] \(String(content.prefix(400)))"
+                    }.joined(separator: "\n")
+                }
+            }
+        }
+        let effectiveCustomTools = (targetProfile?.supportsTools ?? true) && customTools
+        let effectiveSupportsTools = targetProfile?.supportsTools ?? true
+        let endpointModels = orderedAvailableModels(for: effectiveURL)
         if bot?.isGroup == true {
             ctx.groupLeaseWatchdogTask = Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 90_000_000_000)
@@ -863,12 +1018,16 @@ public final class LocalAgentHost: ObservableObject {
         do {
             _ = try await channel.request("chat.send", params: [
                 "sessionId": targetSessionId, "turnId": turnId, "model": model, "apiBaseURL": effectiveURL,
-                "systemPrompt": bot?.systemPrompt ?? "", "isGroup": bot?.isGroup ?? false,
+                "endpointModels": endpointModels,
+                "systemPrompt": bot?.systemPrompt ?? "",
+                "pinnedMemories": pinnedMemoriesText,
+                "isGroup": bot?.isGroup ?? false,
                 "agentPreset": bot?.agentPreset ?? "standard", "permissionMode": bot?.permissionMode ?? "ask",
                 "reasoningEffort": bot?.reasoningEffort ?? "medium",
                 "disabledTools": bot?.disabledTools ?? [],
                 "subagentEnabled": subagentEnabled, "webSearchEnabled": webSearchEnabled,
-                "customTools": customTools,
+                "customTools": effectiveCustomTools,
+                "supportsTools": effectiveSupportsTools,
                 "redteamMode": bot?.redteamToolsEnabled ?? false,
                 "redteamWriteEnabled": bot?.redteamWriteEnabled ?? false,
                 "redteamSensitiveDataEnabled": bot?.redteamSensitiveDataEnabled ?? false,
@@ -1019,7 +1178,8 @@ public final class LocalAgentHost: ObservableObject {
         if let reasoningEffort, ["low", "medium", "high"].contains(reasoningEffort) {
             bots[idx].reasoningEffort = reasoningEffort
         }
-        if streamingSessionId == id,
+        let botIsStreaming = isBotStreaming(id)
+        if botIsStreaming,
            (redteamToolsEnabled != nil || redteamWriteEnabled != nil || redteamSensitiveDataEnabled != nil) {
             pluginStatus = "当前 Bot 正在执行；红队权限会在本轮完成后修改。"
         } else {
@@ -1040,7 +1200,9 @@ public final class LocalAgentHost: ObservableObject {
         if let agentPreset, agentPreset != bots[idx].agentPreset {
             if !dshAgentPresets.contains(where: { $0.id == agentPreset && $0.isAvailable }) {
                 pluginStatus = "所选 DSH 模式不可用；请刷新运行时模式列表后重试。"
-            } else if streamingSessionId == id {
+            } else if bots[idx].isPrivate && agentPreset == "redteam" {
+                pluginStatus = "私密会话禁止使用红队模式。"
+            } else if botIsStreaming {
                 pluginStatus = "当前 Bot 正在生成；请等待本轮完成后再切换模式。"
             } else {
                 bots[idx].agentPreset = agentPreset
@@ -1051,8 +1213,9 @@ public final class LocalAgentHost: ObservableObject {
     }
 
     public func setRedteamPermissions(sessionId: String, toolsEnabled: Bool? = nil, writeEnabled: Bool? = nil, sensitiveDataEnabled: Bool? = nil) {
-        guard let index = bots.firstIndex(where: { $0.id == sessionId }) else { return }
-        guard streamingSessionId != sessionId else {
+        let rootId = resolveAddress(sessionId)?.botID ?? sessionId
+        guard let index = bots.firstIndex(where: { $0.id == rootId }) else { return }
+        guard !isBotStreaming(rootId) else {
             pluginStatus = "当前 Bot 正在执行；红队权限会在本轮完成后修改。"
             return
         }
@@ -1084,12 +1247,13 @@ public final class LocalAgentHost: ObservableObject {
     }
 
     public func regenerateLastReply(sessionId: String, model: String) async {
-        guard !isStreaming, state == .ready else { return }
+        guard state == .ready else { return }
         guard let address = resolveAddress(sessionId) else {
             workspaceError = "无效的会话地址，已拒绝重新生成。"
             return
         }
         let targetId = address.canonicalSessionId
+        guard !isSessionStreaming(targetId) else { return }
         // DSH sessions are append-only event logs. Retrying creates another turn
         // with the same prompt so the visible transcript stays aligned with the
         // durable history after the next app launch.
@@ -1419,20 +1583,32 @@ public final class LocalAgentHost: ObservableObject {
 
     public func deleteBot(id: String) {
         guard let target = bots.first(where: { $0.id == id }), !target.isMain else { return }
+        var deletedSessionIds = BotThreadStore.shared.threads(for: id, includeArchived: true).map(\.sessionId)
+        if !deletedSessionIds.contains(id) { deletedSessionIds.append(id) }
         if target.isPrivate {
             var privateTombstones = Set(UserDefaults.standard.stringArray(forKey: "dsbot.privateSessionTombstones") ?? [])
             privateTombstones.insert(id)
+            for sid in deletedSessionIds { privateTombstones.insert(sid) }
             UserDefaults.standard.set(privateTombstones.sorted(), forKey: "dsbot.privateSessionTombstones")
         }
         bots.removeAll { $0.id == id }
-        discardSessionHistoryCache(id)
-        persistedSessionIDs.remove(id)
-        persistedSessionActivityByID.removeValue(forKey: id)
-        persistedSessionPreviewByID.removeValue(forKey: id)
-        legacyMessagesBySession.removeValue(forKey: id)
+        BotThreadStore.shared.removeAllThreads(for: id)
+        for sid in deletedSessionIds {
+            if isSessionStreaming(sid) {
+                Task { [weak self] in await self?.abortActiveTurn(sessionId: sid) }
+            }
+            discardSessionHistoryCache(sid)
+            persistedSessionIDs.remove(sid)
+            persistedSessionActivityByID.removeValue(forKey: sid)
+            persistedSessionPreviewByID.removeValue(forKey: sid)
+            legacyMessagesBySession.removeValue(forKey: sid)
+            setDraftInput("", for: sid, isPrivate: false)
+        }
         Task { [weak self] in
             await self?.syncPrivateSessionAccess()
-            await self?.deleteDSHSession(id)
+            for sid in deletedSessionIds {
+                await self?.deleteDSHSession(sid)
+            }
         }
         persistWorkspace()
         DSHaptics.impact(.medium)

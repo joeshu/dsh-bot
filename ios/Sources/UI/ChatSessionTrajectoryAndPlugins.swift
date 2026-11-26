@@ -384,34 +384,45 @@ struct ChatTrajectoryView: View {
 struct ChatSessionConfigSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var host: LocalAgentHost
+    @ObservedObject private var providerStore = ProviderProfileStore.shared
     let bot: BotProfile
     @Binding var selectedModel: String
+
+    private var liveBot: BotProfile {
+        host.bots.first(where: { $0.id == bot.id }) ?? bot
+    }
 
     var body: some View {
         NavigationStack {
             List {
                 Section("模型与权限") {
-                    Picker("模型", selection: $selectedModel) {
-                        let choices = host.models.isEmpty ? [selectedModel] : host.models
-                        ForEach(choices, id: \.self) { model in
-                            Text(model).tag(model)
-                        }
-                    }
+                    ModelSelectionView(
+                        host: host,
+                        model: $selectedModel,
+                        allowsTyping: !host.isOfficialEndpoint(host.effectiveApiBaseURL(for: liveBot)),
+                        endpointURL: host.effectiveApiBaseURL(for: liveBot)
+                    )
+                    .disabled(host.isBotStreaming(liveBot.id))
                     Picker("推理等级", selection: Binding(
-                        get: { bot.reasoningEffort },
-                        set: { host.setReasoningEffort(sessionId: bot.id, effort: $0) }
+                        get: { liveBot.reasoningEffort },
+                        set: { host.setReasoningEffort(sessionId: liveBot.id, effort: $0) }
                     )) {
                         Text("低（快速）").tag("low")
                         Text("中（均衡）").tag("medium")
                         Text("高（深度）").tag("high")
                     }
                     Picker("执行安全级别", selection: Binding(
-                        get: { bot.permissionMode },
-                        set: { host.setPermissionMode(sessionId: bot.id, mode: $0) }
+                        get: { liveBot.permissionMode },
+                        set: { host.setPermissionMode(sessionId: liveBot.id, mode: $0) }
                     )) {
                         Text("只读保护").tag("readOnly")
-                        Text("标准确认").tag("ask")
+                        Text("标准审批").tag("ask")
                         Text("沙盒免打扰").tag("autoReview")
+                    }
+                    .disabled(host.isBotStreaming(liveBot.id))
+                    if let profileId = liveBot.providerProfileId,
+                       let profile = providerStore.profiles.first(where: { $0.id == profileId }) {
+                        LabeledContent("专属服务商", value: profile.name)
                     }
                 }
 
@@ -442,7 +453,7 @@ struct ChatSessionConfigSheet: View {
                     }
                 }
 
-                if !bot.isPrivate {
+                if !liveBot.isPrivate {
                     Section("本 Bot 逐工具白名单") {
                         let toggleableTools: [(id: String, title: String)] = [
                             ("web_fetch", "联网抓取网页 (web_fetch)"),
@@ -453,11 +464,11 @@ struct ChatSessionConfigSheet: View {
                             ("js_eval", "QuickJS 沙盒 (js_eval)"),
                         ]
                         ForEach(toggleableTools, id: \.id) { tool in
-                            let isAllowed = !bot.disabledTools.contains(tool.id)
+                            let isAllowed = !liveBot.disabledTools.contains(tool.id)
                             Toggle(tool.title, isOn: Binding(
                                 get: { isAllowed },
                                 set: { enabled in
-                                    var next = Set(bot.disabledTools)
+                                    var next = Set(liveBot.disabledTools)
                                     if enabled {
                                         next.remove(tool.id)
                                         if tool.id == "browser_open" {
@@ -473,7 +484,7 @@ struct ChatSessionConfigSheet: View {
                                             }
                                         }
                                     }
-                                    host.setDisabledTools(botId: bot.id, disabledTools: Array(next))
+                                    host.setDisabledTools(botId: liveBot.id, disabledTools: Array(next))
                                 }
                             ))
                         }
@@ -1171,7 +1182,10 @@ struct SessionSkillsSheet: View {
                             .swipeActions(edge: .trailing) {
                                 if skill.isCustom {
                                     Button(role: .destructive) {
-                                        try? FileManager.default.removeItem(at: skill.url.deletingLastPathComponent())
+                                        let target = skill.url.lastPathComponent == "SKILL.md"
+                                            ? skill.url.deletingLastPathComponent()
+                                            : skill.url
+                                        try? FileManager.default.removeItem(at: target)
                                         reloadSkills()
                                     } label: {
                                         Label("删除", systemImage: "trash")
@@ -1262,9 +1276,13 @@ struct SessionSkillsSheet: View {
             .appendingPathComponent("skills", isDirectory: true)
             .appendingPathComponent(cleaned, isDirectory: true)
         let file = dir.appendingPathComponent("SKILL.md")
+        let trimmedBody = newBody.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fullContent = trimmedBody.hasPrefix("---")
+            ? newBody
+            : "---\nname: \(cleaned)\ndescription: Custom iOS workspace skill\n---\n\n\(newBody)"
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            try newBody.write(to: file, atomically: true, encoding: .utf8)
+            try fullContent.write(to: file, atomically: true, encoding: .utf8)
             showCreate = false
             newName = ""
             statusMessage = "已创建 Skill：files/skills/\(cleaned)/SKILL.md"
@@ -1590,6 +1608,8 @@ struct BotThreadsSheet: View {
 
     @State private var newTitle = ""
     @State private var showArchived = false
+    @State private var renamingThread: BotThread?
+    @State private var renameText = ""
 
     var body: some View {
         NavigationStack {
@@ -1649,6 +1669,26 @@ struct BotThreadsSheet: View {
                                 Label(thread.isPinned ? "取消置顶" : "置顶", systemImage: thread.isPinned ? "pin.slash" : "pin")
                             }
                             .tint(.orange)
+                            Button {
+                                renamingThread = thread
+                                renameText = thread.title
+                            } label: {
+                                Label("重命名", systemImage: "pencil")
+                            }
+                            .tint(DSTheme.brand)
+                        }
+                        .contextMenu {
+                            Button {
+                                renamingThread = thread
+                                renameText = thread.title
+                            } label: {
+                                Label("重命名话题", systemImage: "pencil")
+                            }
+                            Button {
+                                threadStore.togglePin(botId: bot.id, threadId: thread.id)
+                            } label: {
+                                Label(thread.isPinned ? "取消置顶" : "置顶", systemImage: thread.isPinned ? "pin.slash" : "pin")
+                            }
                         }
                         .swipeActions(edge: .trailing) {
                             if !thread.isDefault {
@@ -1679,6 +1719,19 @@ struct BotThreadsSheet: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("完成") { dismiss() }
+                }
+            }
+            .alert("重命名话题", isPresented: Binding(
+                get: { renamingThread != nil },
+                set: { if !$0 { renamingThread = nil } }
+            )) {
+                TextField("输入新名称", text: $renameText)
+                Button("取消", role: .cancel) { renamingThread = nil }
+                Button("保存") {
+                    if let target = renamingThread {
+                        threadStore.renameThread(botId: bot.id, threadId: target.id, title: renameText)
+                    }
+                    renamingThread = nil
                 }
             }
         }

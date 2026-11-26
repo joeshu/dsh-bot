@@ -158,6 +158,12 @@ public final class BotThreadStore: ObservableObject {
         return removedSessionId
     }
 
+    public func removeAllThreads(for botId: String) {
+        threadsByBot.removeValue(forKey: botId)
+        activeThreadIdByBot.removeValue(forKey: botId)
+        save()
+    }
+
     private func load() {
         let raw = AppSettings.string(.botThreadsJSON)
         guard !raw.isEmpty,
@@ -320,6 +326,7 @@ public final class ProviderProfileStore: ObservableObject {
         guard profiles.count > 1 else { return }
         profiles.removeAll { $0.id == id }
         save()
+        NotificationCenter.default.post(name: Notification.Name("dsbot.providerProfileDeleted"), object: id)
     }
 
     private func load() {

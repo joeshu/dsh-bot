@@ -55,6 +55,11 @@ struct SessionSearchResults: View {
             }
         }
         .task(id: requestNumber) { await search(append: appendPage) }
+        .onChange(of: query) { _ in
+            cursor = nil
+            appendPage = false
+            requestNumber += 1
+        }
         .onChange(of: publicBotIDs) { allowedIDs in
             results.removeAll { !allowedIDs.contains($0.botId) }
             cursor = nil

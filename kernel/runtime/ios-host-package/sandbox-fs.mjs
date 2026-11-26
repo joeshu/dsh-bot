@@ -59,6 +59,11 @@ export default class IosSandboxedFileSystem extends LocalFileSystem {
     if (trimmed.startsWith('files/')) {
       return join(this.sandboxRoot, trimmed.slice('files/'.length))
     }
+    // Remap stale iOS container UUID paths (e.g. /var/mobile/Containers/Data/Application/<OLD>/Documents/dsh-home/files/...)
+    const containerMatch = trimmed.match(/\/Containers\/Data\/Application\/[^/]+\/Documents\/dsh-home\/files(?:\/(.*))?$/)
+    if (containerMatch) {
+      return containerMatch[1] ? join(this.sandboxRoot, containerMatch[1]) : this.sandboxRoot
+    }
     return candidate
   }
 

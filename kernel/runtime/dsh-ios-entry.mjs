@@ -771,20 +771,22 @@ function registeredRedteamToolNames() {
   }
 }
 
-function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnabled, subagentEnabled, webSearchEnabled,
+function setupAgent({ botId, systemPrompt, pinnedMemories = '', legacyHistory, agentPreset, toolsEnabled, subagentEnabled, webSearchEnabled,
   redteamMode = false, redteamWriteEnabled = false, redteamSensitiveDataEnabled = false, permissionMode = 'ask' }) {
   const id = dshSessionId(botId)
   let setPersona = () => {}
   let setToolsEnabled = () => {}
   let redteamPolicy = { botId, enabled: false, write: false, sensitive: false, permissionMode: 'ask' }
   const setup = async (agentCtx) => {
+    agentCtx.__dsbotToolsMounted = true
     if (agentPreset !== 'minimal') {
       if (agentPreset !== 'ptc-python') mountIOSPythonTool(agentCtx)
-      if (agentPreset === 'standard' || agentPreset === 'cordis') mountIOSPythonJobTool(agentCtx)
+      if (agentPreset === 'standard' || agentPreset === 'cordis' || agentPreset === 'redteam') mountIOSPythonJobTool(agentCtx)
       mountIOSScheduleTools(agentCtx)
     }
     await ctx.agentPresets.mount(agentCtx, agentPreset)
     let personaDisposer
+    let pinnedMemoriesDisposer
     let rulesDisposer
     let reasoningDisposer
     let redteamPromptDisposer
@@ -865,14 +867,25 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
       }
     }
 
-    setPersona = (value) => {
+    setPersona = (value, memories = undefined) => {
       personaDisposer?.()
       personaDisposer = undefined
       if (typeof value === 'string' && value.trim()) {
         personaDisposer = agentCtx.systemPrompt.section({ name: 'dsbot-ios-persona', order: 900, text: value.trim() })
       }
+      if (memories !== undefined) {
+        pinnedMemoriesDisposer?.()
+        pinnedMemoriesDisposer = undefined
+        if (!isPrivateBotOrThread(botId) && typeof memories === 'string' && memories.trim()) {
+          pinnedMemoriesDisposer = agentCtx.systemPrompt.section({
+            name: 'dsbot-ios-pinned-memories',
+            order: 880,
+            text: `用户常驻记忆：\n${memories.trim()}`,
+          })
+        }
+      }
     }
-    setPersona(systemPrompt)
+    setPersona(systemPrompt, pinnedMemories)
     refreshWorkspaceRules()
     setToolsEnabled = (enabled, allowSubagent, allowWebSearch, allowRedteam = false,
       allowRedteamWrites = false, allowRedteamSensitive = false, redteamPermissionMode = 'ask',
@@ -1455,6 +1468,24 @@ async function boot() {
   } catch (error) {
     ctx?.logger?.warn?.(`Pure-JS workspaceFiles.search patch skipped: ${String(error)}`)
   }
+  ctx.on('agent/created', function ({ agent } = {}) {
+    const agentCtx = this?.tools ? this : agent?.ctx
+    if (!agentCtx || agentCtx.__dsbotToolsMounted) return
+    agentCtx.__dsbotToolsMounted = true
+    const sid = String(agent?.session?.id ?? '')
+    const presetId = typeof ctx?.agentPresets?.presetForSession === 'function'
+      ? ctx.agentPresets.presetForSession(agent?.session)
+      : 'standard'
+    if (presetId !== 'minimal') {
+      if (presetId !== 'ptc-python') {
+        try { mountIOSPythonTool(agentCtx) } catch {}
+      }
+      if (!isPrivateBotOrThread(botIdFromSession(sid)) && ['standard', 'cordis', 'redteam'].includes(presetId)) {
+        try { mountIOSPythonJobTool(agentCtx) } catch {}
+      }
+      try { mountIOSScheduleTools(agentCtx) } catch {}
+    }
+  }, { global: true })
   createIOSPluginManager({ rpc, runtime, workspace: WORKSPACE, profileDir: PROFILE_DIR, installAnchor: INSTALL_ANCHOR, safeMode, drainAgents: () => ctx.subagents.drainDescendants([...runtime.activeAgents.values()].map(({ agent }) => agent)) })
   await rpc.request('runtime.ready', runtimeInfo(), 30_000)
 }
@@ -1557,6 +1588,9 @@ async function startTurn(params, preparation) {
   if (runtime.activeTurns.has(dshSessionId(botId)) || runtime.activeTurns.size >= MAX_CONCURRENT_TURNS) {
     throw new Error('Another DSH turn is already running')
   }
+  if (Array.isArray(params.endpointModels) && params.endpointModels.length > 0) {
+    runtime.customCatalogModels = params.endpointModels.map(String).filter(Boolean)
+  }
   const nextApiBaseURL = typeof params.apiBaseURL === 'string' ? params.apiBaseURL : runtime.apiBaseURL
   const nextProviderBaseURL = routeForApiBase(nextApiBaseURL)
   runtime.apiBaseURL = nextApiBaseURL
@@ -1575,7 +1609,7 @@ async function startTurn(params, preparation) {
   const dshModel = model === 'deepseek-flash-thinking' ? 'deepseek-flash' : model
   const reasoningEnabled = model === 'deepseek-flash-thinking' || model === 'deepseek-v4-pro'
   const officialDeepSeek = isOfficialDeepSeekBase(runtime.apiBaseURL)
-  const toolsEnabled = officialDeepSeek || params.customTools === true
+  const toolsEnabled = params.supportsTools !== false && (officialDeepSeek || params.customTools === true)
   const webSearchEnabled = officialDeepSeek && params.webSearchEnabled === true
   const permissionMode = ['ask', 'autoReview', 'readOnly'].includes(params.permissionMode) ? params.permissionMode : 'ask'
   const redteamMode = params.redteamMode === true && runtime.redteamToolsEnabled && !isPrivateBotOrThread(botId)
@@ -1611,8 +1645,17 @@ async function startTurn(params, preparation) {
     ...(officialDeepSeek ? { reasoningEffort: reasoningEnabled ? dshReasoningEffort : 'off' } : {}),
   }
   if (!active) {
+    const existingWebAgent = typeof ctx.agents?.get === 'function' ? ctx.agents.get(id) : undefined
+    if (existingWebAgent) {
+      try {
+        await existingWebAgent.whenIdle?.()
+        await existingWebAgent.session?.handle?.close?.()
+        await existingWebAgent.dispose?.()
+      } catch {}
+    }
     const composition = setupAgent({
-      botId, systemPrompt: params.systemPrompt, legacyHistory: params.legacyHistory, agentPreset,
+      botId, systemPrompt: params.systemPrompt, pinnedMemories: params.pinnedMemories,
+      legacyHistory: params.legacyHistory, agentPreset,
       toolsEnabled, subagentEnabled: params.subagentEnabled === true, webSearchEnabled,
       redteamMode, redteamWriteEnabled, redteamSensitiveDataEnabled, permissionMode,
     })
@@ -1626,6 +1669,14 @@ async function startTurn(params, preparation) {
     } catch (error) {
       if (error instanceof SessionPersistenceNotFoundError) {
         handle = await ctx.agents.create({ sessionId: id, meta: { cwd: WORKSPACE_FILES }, agentOptions: options, setup: composition.setup })
+      } else if (String(error?.name || '').includes('SessionAlreadyOwned') || String(error?.message || '').includes('already owned')) {
+        const owner = runtime.persistence?.writeOwners?.get(id)
+        if (owner && !runtime.activeTurns.has(id)) {
+          await owner.close?.().catch(() => {})
+          handle = await ctx.agents.resume({ resumeSessionId: id, agentOptions: options, setup: composition.setup })
+        } else {
+          throw new Error('该会话当前正被 Web 工作台占用，请返回或关闭 Web 工作台页面后重试。')
+        }
       } else throw error
     }
     try {
@@ -1665,7 +1716,7 @@ async function startTurn(params, preparation) {
     // Only refresh when the caller explicitly requests a checkpoint refresh.
     if (params.forceRefreshPersona === true) {
       active.frozenSystemPrompt = typeof params.systemPrompt === 'string' ? params.systemPrompt : ''
-      active.setPersona(active.frozenSystemPrompt)
+      active.setPersona(active.frozenSystemPrompt, params.pinnedMemories)
     }
     active.setToolsEnabled(toolsEnabled, params.subagentEnabled === true, webSearchEnabled,
       redteamMode, redteamWriteEnabled, redteamSensitiveDataEnabled, permissionMode,
@@ -1807,16 +1858,22 @@ async function startTurn(params, preparation) {
   return { turnId, status: 'accepted', engine: 'node+dsh' }
 }
 
-rpc.handle('session.refreshPersona', async ({ sessionId, systemPrompt } = {}) => {
+rpc.handle('session.refreshPersona', async ({ sessionId, systemPrompt, pinnedMemories } = {}) => {
   const botId = String(sessionId ?? '').trim()
   if (!botId) return { refreshed: false }
-  const id = dshSessionId(botId)
-  const active = runtime.activeAgents.get(id)
-  if (!active) return { refreshed: false }
+  const rootId = dshSessionId(rootBotIdOf(botId))
+  const exactId = dshSessionId(botId)
   const nextPrompt = typeof systemPrompt === 'string' ? systemPrompt : ''
-  active.frozenSystemPrompt = nextPrompt
-  active.setPersona(nextPrompt)
-  return { refreshed: true }
+  const nextMemories = typeof pinnedMemories === 'string' ? pinnedMemories : undefined
+  let count = 0
+  for (const [key, active] of runtime.activeAgents.entries()) {
+    if (key === exactId || key === rootId || key.startsWith(`${rootId}:`)) {
+      active.frozenSystemPrompt = nextPrompt
+      active.setPersona(nextPrompt, nextMemories)
+      count += 1
+    }
+  }
+  return { refreshed: count > 0, count }
 })
 
 async function drainAndDispose(id, active) {
@@ -2068,8 +2125,14 @@ rpc.handle('web.sessions.list', async () => {
   return { sessions }
 })
 
+function resolveAnyHistorySessionId(raw) {
+  const value = String(raw ?? '').trim()
+  if (value.startsWith('ios:') || /^session-[A-Za-z0-9_-]{1,120}$/.test(value)) return value
+  return dshSessionId(value)
+}
+
 rpc.handle('session.history', async ({ sessionId }) => {
-  const id = String(sessionId ?? '').startsWith('ios:') ? String(sessionId) : dshSessionId(String(sessionId ?? ''))
+  const id = resolveAnyHistorySessionId(sessionId)
   const events = await runtime.persistence.history(id)
   return {
     sessionId: botIdFromSession(id),
@@ -2081,6 +2144,9 @@ rpc.handle('session.history', async ({ sessionId }) => {
 
 // Sequence cursors refer to raw events, including events with no visible row.
 function nativeHistorySessionId(sessionId) {
+  if (typeof sessionId === 'string' && /^session-[A-Za-z0-9_-]{1,120}$/.test(sessionId)) {
+    return sessionId
+  }
   if (!isValidSessionKey(sessionId)) {
     throw new TypeError('Invalid native session identifier')
   }
@@ -2291,11 +2357,10 @@ rpc.handle('session.history.markdown', async ({ sessionId } = {}) => {
 })
 
 rpc.handle('session.history.page', async ({ sessionId, beforeSeq } = {}) => {
-  if (!isValidSessionKey(sessionId)
-    || (beforeSeq !== undefined && (!Number.isSafeInteger(beforeSeq) || beforeSeq < 0))) {
+  if (beforeSeq !== undefined && (!Number.isSafeInteger(beforeSeq) || beforeSeq < 0)) {
     throw new TypeError('Invalid session history cursor')
   }
-  const id = dshSessionId(sessionId)
+  const id = nativeHistorySessionId(sessionId)
   await runtime.persistence.flushSession(id)
   const summary = await runtime.persistence.stat(id)
   const end = Math.min(beforeSeq ?? Infinity, summary?.eventCount ?? 0)
@@ -2335,7 +2400,7 @@ rpc.handle('session.history.page', async ({ sessionId, beforeSeq } = {}) => {
 })
 
 rpc.handle('schedule.list', async ({ botId }) => {
-  if (typeof botId !== 'string' || !/^[A-Za-z0-9_-]{1,80}$/.test(botId)) throw new TypeError('Invalid Bot id')
+  if (!isValidSessionKey(botId)) throw new TypeError('Invalid Bot id')
   const sessionId = dshSessionId(botId)
   const tasks = (await ctx.schedule.catalog())
     .filter((task) => iosScheduleTaskVisible(task, sessionId))
@@ -2344,8 +2409,8 @@ rpc.handle('schedule.list', async ({ botId }) => {
 })
 
 function iosJobsOwner(botId) {
-  if (typeof botId !== 'string' || !/^[A-Za-z0-9_-]{1,80}$/.test(botId)) throw new TypeError('Invalid Bot id')
-  if (runtime.privateBotIds.has(botId)) throw new Error('Background Jobs are disabled for private Bot sessions')
+  if (!isValidSessionKey(botId)) throw new TypeError('Invalid Bot id')
+  if (isPrivateBotOrThread(botId)) throw new Error('Background Jobs are disabled for private Bot sessions')
   return dshSessionId(botId)
 }
 
@@ -2412,7 +2477,7 @@ rpc.handle('jobs.kill', async ({ botId, jobId, reason } = {}) => {
 })
 
 rpc.handle('schedule.edit', async ({ botId, id, action, title, prompt, rrule, expectedUpdatedAt }) => {
-  if (typeof botId !== 'string' || !/^[A-Za-z0-9_-]{1,80}$/.test(botId)
+  if (!isValidSessionKey(botId)
     || typeof id !== 'string' || id.length > 160
     || !['pause', 'resume', 'delete', 'update'].includes(action)
     || (title !== undefined && (typeof title !== 'string' || title.length > 120))
@@ -2447,7 +2512,7 @@ rpc.handle('schedule.edit', async ({ botId, id, action, title, prompt, rrule, ex
 })
 
 rpc.handle('schedule.history', async ({ botId, id, limit, before }) => {
-  if (typeof botId !== 'string' || !/^[A-Za-z0-9_-]{1,80}$/.test(botId)
+  if (!isValidSessionKey(botId)
     || typeof id !== 'string' || id.length > 160
     || (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1 || limit > 100))
     || (before !== undefined && (typeof before !== 'string' || before.length > 256))) throw new TypeError('Invalid Schedule history request')
@@ -2467,16 +2532,17 @@ rpc.handle('schedule.history', async ({ botId, id, limit, before }) => {
 
 rpc.handle('session.private.update', async ({ botIds }) => {
   if (!Array.isArray(botIds) || botIds.length > 10_000
-    || botIds.some((id) => typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,80}$/.test(id))) {
+    || botIds.some((id) => !isValidSessionKey(id))) {
     throw new TypeError('Invalid private Bot id list')
   }
-  runtime.privateBotIds = new Set(botIds)
+  runtime.privateBotIds = new Set(botIds.map((id) => rootBotIdOf(id)))
   process.env.DS_BOT_IOS_PRIVATE_BOT_IDS = JSON.stringify([...runtime.privateBotIds])
   for (const botId of runtime.privateBotIds) {
     const owner = dshSessionId(botId)
     for (const job of ctx.jobs?.list(owner) ?? []) {
-      if (job.owner === owner && (job.status === 'running' || job.status === 'stopping')) {
-        try { ctx.jobs.kill(job.id, owner, 'Bot session was marked private') } catch { /* settled during the privacy update */ }
+      if ((job.owner === owner || String(job.owner).startsWith(`${owner}:`))
+        && (job.status === 'running' || job.status === 'stopping')) {
+        try { ctx.jobs.kill(job.id, job.owner, 'Bot session was marked private') } catch { /* settled during the privacy update */ }
       }
     }
   }
@@ -2485,7 +2551,7 @@ rpc.handle('session.private.update', async ({ botIds }) => {
 })
 
 rpc.handle('session.clear', async ({ sessionId }) => {
-  const id = dshSessionId(String(sessionId ?? ''))
+  const id = resolveAnyHistorySessionId(sessionId)
   const active = runtime.activeAgents.get(id)
   if (active) {
     if (runtime.activeTurns.has(id)) active.agent.cancel({ kind: 'user' })
@@ -2493,6 +2559,20 @@ rpc.handle('session.clear', async ({ sessionId }) => {
   }
   await runtime.persistence.delete(id)
   return { cleared: true }
+})
+
+rpc.handle('session.truncateFromSeq', async ({ sessionId, sequence } = {}) => {
+  const id = nativeHistorySessionId(sessionId)
+  if (!Number.isSafeInteger(sequence) || sequence < 0) {
+    throw new TypeError('Invalid truncation sequence')
+  }
+  if (runtime.activeTurns.has(id)) throw new Error('Cannot truncate an active session turn')
+  const active = runtime.activeAgents.get(id)
+  if (active) await drainAndDispose(id, active)
+  if (typeof runtime.persistence?.truncateFromSeq !== 'function') {
+    throw new Error('Session truncation is unavailable in this runtime')
+  }
+  return await runtime.persistence.truncateFromSeq(id, sequence)
 })
 
 // UI-owned workspace methods (memory, connectors, approvals, speech, local JS) are routed by

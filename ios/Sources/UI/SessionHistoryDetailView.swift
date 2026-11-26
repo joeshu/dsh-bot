@@ -18,6 +18,7 @@ struct SessionHistoryDetailView: View {
     let host: LocalAgentHost
     let bot: BotProfile
     let presentation: SessionHistoryPresentation
+    var sessionId: String? = nil
 
     @Environment(\.dismiss) private var dismiss
     @State private var content: String?
@@ -130,7 +131,7 @@ struct SessionHistoryDetailView: View {
         do {
             switch presentation {
             case .export:
-                let markdown = try await host.exportSessionMarkdown(sessionId: bot.id, botName: bot.name)
+                let markdown = try await host.exportSessionMarkdown(sessionId: sessionId ?? bot.id, botName: bot.name)
                 try Task.checkCancellation()
                 content = markdown
             case .message(let message):

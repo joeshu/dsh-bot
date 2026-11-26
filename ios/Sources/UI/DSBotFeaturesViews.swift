@@ -91,6 +91,8 @@ public struct SideChatSheet: View {
     @ObservedObject var host: LocalAgentHost
     let model: String
     let botId: String
+    let sessionId: String
+    let apiBaseURL: String?
     let botName: String
     let isPrivate: Bool
     @State private var status = ""
@@ -101,17 +103,19 @@ public struct SideChatSheet: View {
     @State private var includeRecentContext = false
     @State private var messages: [(role: String, text: String)] = []
 
-    public init(host: LocalAgentHost, model: String, botId: String, botName: String, isPrivate: Bool) {
+    public init(host: LocalAgentHost, model: String, botId: String, botName: String, isPrivate: Bool, sessionId: String? = nil, apiBaseURL: String? = nil) {
         self.host = host
         self.model = model
         self.botId = botId
+        self.sessionId = sessionId ?? botId
+        self.apiBaseURL = apiBaseURL
         self.botName = botName
         self.isPrivate = isPrivate
     }
 
     private var recentContext: [[String: String]] {
         guard includeRecentContext else { return [] }
-        return host.messages(for: botId).suffix(8).compactMap { message in
+        return host.messages(for: sessionId).suffix(8).compactMap { message in
             guard ["user", "assistant"].contains(message.role), message.incomplete != true,
                   !message.content.isEmpty else { return nil }
             return ["role": message.role, "content": String(message.content.prefix(2_000))]
@@ -125,7 +129,7 @@ public struct SideChatSheet: View {
                     Text("侧边对话不会打断主会话，也不会把侧边回复写回主会话。默认不附带聊天历史。")
                         .font(.caption)
                         .foregroundColor(.secondary)
-                    if !host.messages(for: botId).isEmpty {
+                    if !host.messages(for: sessionId).isEmpty {
                         Toggle("附带最近 8 条可见消息", isOn: $includeRecentContext)
                             .font(.caption)
                         Text(includeRecentContext
@@ -203,6 +207,7 @@ public struct SideChatSheet: View {
                         sending = true
                         let id = UUID().uuidString
                         let contextSnapshot = recentContext
+                        let endpoint = apiBaseURL ?? host.apiBaseURL
                         sideId = id
                         request = Task {
                             defer {
@@ -212,7 +217,7 @@ public struct SideChatSheet: View {
                             do {
                                 guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
                                 let response = try await rpc.request("side.ask", params: [
-                                    "model": model, "question": q, "apiBaseURL": host.apiBaseURL,
+                                    "model": model, "question": q, "apiBaseURL": endpoint,
                                     "sideId": id, "context": contextSnapshot
                                 ], timeoutSeconds: 95)
                                 guard let reply = response["reply"] as? String else { throw ModelProviderError.invalidResponse }
@@ -469,13 +474,18 @@ public struct JSSandboxPlaygroundView: View {
                         isRunning = true
                         Task {
                             defer { isRunning = false }
-                            if let res = try? await host.rpc()?.request("tools.jsEval", params: ["script": script]) {
+                            do {
+                                guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
+                                let res = try await rpc.request("tools.jsEval", params: ["script": script])
                                 let ok = res["ok"] as? Bool ?? false
                                 let val = res["value"] as? String ?? ""
                                 let logs = (res["logs"] as? [String] ?? []).joined(separator: "\n")
                                 let err = res["error"] as? String ?? ""
                                 output = ok ? [logs, val].filter { !$0.isEmpty }.joined(separator: "\n") : "错误：\(err)"
                                 DSHaptics.notify(ok ? .success : .error)
+                            } catch {
+                                output = "执行失败：\(error.localizedDescription)"
+                                DSHaptics.notify(.error)
                             }
                         }
                     }
@@ -500,11 +510,14 @@ public struct JSSandboxPlaygroundView: View {
             Section("本机设备状态探针 (device.status)") {
                 Button {
                     Task {
-                        if let st = try? await host.rpc()?.request("device.status"),
-                           let d = try? JSONSerialization.data(withJSONObject: st, options: [.prettyPrinted, .sortedKeys]),
-                           let s = String(data: d, encoding: .utf8) {
-                            deviceInfo = s
+                        do {
+                            guard let rpc = host.rpc() else { throw IPCFrameError.channelClosed }
+                            let st = try await rpc.request("device.status")
+                            let d = try JSONSerialization.data(withJSONObject: st, options: [.prettyPrinted, .sortedKeys])
+                            deviceInfo = String(decoding: d, as: UTF8.self)
                             DSHaptics.impact(.light)
+                        } catch {
+                            deviceInfo = "读取失败：\(error.localizedDescription)"
                         }
                     }
                 } label: {

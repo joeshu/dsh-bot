@@ -68,15 +68,7 @@ public struct UnifiedConversationsTabView: View {
     }
 
     private func lastActivityDate(for botId: String) -> Date {
-        let activeId = threadStore.activeSessionId(for: botId)
-        let activeDate = host.sessionActivityDate(for: activeId)
-        let rootDate = host.sessionActivityDate(for: botId)
-        switch (activeDate, rootDate) {
-        case let (a?, b?): return max(a, b)
-        case let (a?, nil): return a
-        case let (nil, b?): return b
-        case (nil, nil): return .distantPast
-        }
+        host.botMaxActivityDate(for: botId) ?? .distantPast
     }
 
     private var filteredBots: [BotProfile] {
@@ -193,7 +185,9 @@ public struct UnifiedConversationsTabView: View {
                             threadStore: threadStore,
                             onSelectThread: { chosenThread in
                                 threadStore.selectThread(chosenThread)
-                                activeSheet = .threadChat(target, chosenThread.address)
+                                DispatchQueue.main.async {
+                                    activeSheet = .threadChat(target, chosenThread.address)
+                                }
                             },
                             onDeleteSession: { sessionId in
                                 Task { await host.clearSession(sessionId) }
@@ -294,9 +288,10 @@ public struct UnifiedConversationsTabView: View {
                 }
             }
 
+            let trimmedQuery = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
             if filter == .webSessions {
                 webSessionsSection
-            } else if filter == .teams {
+            } else if filter == .teams || !host.unifiedNavigationV2 {
                 if groupedSections.isEmpty {
                     emptyStateSection
                 } else {
@@ -318,6 +313,10 @@ public struct UnifiedConversationsTabView: View {
                         }
                     }
                 }
+            }
+
+            if !trimmedQuery.isEmpty && filter != .privateSpace && filter != .webSessions {
+                SessionSearchResults(host: host, query: trimmedQuery)
             }
         }
     }

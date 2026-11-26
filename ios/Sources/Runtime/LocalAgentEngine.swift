@@ -790,14 +790,20 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
         guard approved else { return "The user did not approve this tool call." }
 
         do {
+            let rootEntityId = SessionAddress(parsing: sessionId)?.botID ?? sessionId
             switch name {
             case "memory_save":
                 let requested = text("layer")
                 let layer = ["pinned", "delta"].contains(requested) ? requested : "delta"
-                _ = try await store.addMemory(botId: sessionId, title: text("title"), content: text("content"), layer: layer)
+                let memTitle = text("title")
+                let memContent = text("content")
+                if case .hardBlock(let reason) = PrivacyGate.evaluateMemoryWrite(title: memTitle, content: memContent) {
+                    return "隐私闸门拦截：\(reason)"
+                }
+                _ = try await store.addMemory(botId: rootEntityId, title: memTitle, content: memContent, layer: layer)
                 return "Memory saved."
             case "group_todo_add":
-                _ = try await store.addGroupTodo(groupId: sessionId, text: text("text"))
+                _ = try await store.addGroupTodo(groupId: rootEntityId, text: text("text"))
                 return "Todo added."
             case "device_status":
                 let status = await device.deviceStatus()

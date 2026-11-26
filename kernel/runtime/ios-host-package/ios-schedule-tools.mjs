@@ -35,10 +35,12 @@ function callerSession(exec) {
 
 export function iosScheduleTaskVisible(task, sessionId) {
   const involved = Array.isArray(task?.involvedSessionIds) ? task.involvedSessionIds : []
-  if (!involved.includes(sessionId)) return false
+  const matchesTarget = involved.some((id) => id === sessionId || (typeof sessionId === 'string' && sessionId.startsWith('ios:') && String(id).startsWith(`${sessionId}:`)))
+  if (!matchesTarget) return false
   // Never disclose a task that crosses into another private Session, including
   // when an internal plugin has retargeted a task outside the native tools.
-  if (involved.some((id) => isIOSPrivateSessionId(id) && id !== sessionId)) return false
+  const targetRoot = typeof sessionId === 'string' && sessionId.startsWith('ios:') ? `ios:${sessionId.slice(4).split(':')[0]}` : sessionId
+  if (involved.some((id) => isIOSPrivateSessionId(id) && id !== targetRoot && !String(id).startsWith(`${targetRoot}:`))) return false
   return true
 }
 

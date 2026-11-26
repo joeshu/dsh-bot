@@ -283,6 +283,16 @@ async function executeWebFallbackTool(context, name, args, exec) {
     writeFileSync(abs, current.replace(oldText, newText), 'utf8')
     return { output: `已更新 files/${rel}` }
   }
+  if (name === 'device_status') {
+    if (rpc && typeof rpc.request === 'function') {
+      const st = await rpc.request('device.status', {}, 5_000)
+      return { output: JSON.stringify(st) }
+    }
+    return { output: JSON.stringify({ platform: process.platform, arch: process.arch, note: 'Running in DSH Web Workbench context' }) }
+  }
+  if (name === 'memory_save' || name === 'group_todo_add' || name === 'remote_mcp_list' || name === 'remote_mcp_call') {
+    throw new Error(`工具 ${name} 仅在原生 iOS Bot 会话中可用，当前 Web 工作台独立会话不支持该原生端侧桥接。`)
+  }
   return undefined
 }
 

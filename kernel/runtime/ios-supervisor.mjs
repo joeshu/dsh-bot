@@ -11,8 +11,9 @@ process.chdir(workspace)
 const socket = new net.Socket({ fd, readable: true, writable: true })
 const decoder = new FrameDecoder()
 const pending = new Map()
-let activeTurn
+const activeTurns = new Map()
 let recoveringRevision = false
+let unexpectedCrashCount = 0
 let worker
 let ready = false
 let closed = false
@@ -63,6 +64,7 @@ function launch() {
       if (message.method === 'runtime.ready') {
         clearTimeout(startupTimer)
         ready = true
+        unexpectedCrashCount = 0
         send(message)
         if (restart !== undefined) {
           send({ jsonrpc: '2.0', id: restart, result: { restarted: true, safeMode, rolledBack: recoveringRevision } })
@@ -72,10 +74,14 @@ function launch() {
         continue
       } else if (!message.method) {
         const request = pending.get(message.id)
-        if (request?.method === 'chat.send' && message.error && activeTurn?.turnId === request.params?.turnId) activeTurn = undefined
+        if (request?.method === 'chat.send' && message.error && request.params?.turnId) {
+          activeTurns.delete(String(request.params.turnId))
+        }
         pending.delete(message.id)
       }
-      if (message.method === "chat.done") activeTurn = undefined
+      if (message.method === 'chat.done' && message.params?.turnId) {
+        activeTurns.delete(String(message.params.turnId))
+      }
       send(message)
     }
   })
@@ -86,24 +92,31 @@ function launch() {
     if (closed) return
     for (const id of pending.keys()) fail(id, 'DSH engine stopped before completing the request')
     pending.clear()
-    if (activeTurn) {
-      send({ jsonrpc: '2.0', method: 'chat.done', params: {
-        ...activeTurn, status: 'error', error: 'DSH 引擎已停止，正在恢复',
-      } })
-      activeTurn = undefined
+    if (activeTurns.size > 0) {
+      for (const turnInfo of activeTurns.values()) {
+        send({ jsonrpc: '2.0', method: 'chat.done', params: {
+          ...turnInfo, status: 'error', error: 'DSH 引擎已停止，正在恢复',
+        } })
+      }
+      activeTurns.clear()
     }
     const wasReady = ready
     ready = false
     if (wasReady && restart !== undefined) {
       safeMode = false
       launch()
+    } else if (wasReady && restart === undefined && unexpectedCrashCount < 2) {
+      unexpectedCrashCount += 1
+      setTimeout(() => { if (!closed) launch() }, 750).unref()
     } else if (restart !== undefined && !recoveringRevision && !safeMode) {
       recoveringRevision = true
       launch()
     } else if (!safeMode) {
+      recoveringRevision = false
       safeMode = true
       setTimeout(() => { if (!closed) launch() }, 750).unref()
     } else {
+      recoveringRevision = false
       if (restart !== undefined) fail(restart, 'DSH recovery failed')
       send({ jsonrpc: '2.0', method: 'runtime.failed', params: { message: bootError ?? 'DSH recovery failed' } })
     }
@@ -115,16 +128,16 @@ socket.on('data', (buffer) => {
   try { messages = decoder.push(buffer) } catch { socket.destroy(); return }
   for (const message of messages) {
     if (message.method === 'runtime.restart') {
-      if (!ready || restart !== undefined || pending.size || activeTurn) fail(message.id, 'DSH is busy')
+      if (!ready || restart !== undefined || pending.size || activeTurns.size > 0) fail(message.id, 'DSH is busy')
       else {
         restart = message.id
         stopWorker()
       }
     } else if (ready && restart === undefined) {
       if (message.method && message.id !== undefined) pending.set(message.id, message)
-      if (message.method === 'chat.send' && !activeTurn) {
-        const { sessionId, turnId } = message.params ?? {}
-        activeTurn = { sessionId, turnId }
+      if (message.method === 'chat.send' && message.params?.turnId) {
+        const { sessionId, turnId } = message.params
+        activeTurns.set(String(turnId), { sessionId, turnId })
       }
       worker.postMessage({ data: encodeFrame(message) })
     } else if (message.method && message.id !== undefined) {

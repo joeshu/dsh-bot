@@ -383,6 +383,38 @@ export class SQLiteSessionPersistence extends SessionPersistence {
     this.db.prepare('DELETE FROM sessions WHERE id = ?').run(id)
   }
 
+  async truncateFromSeq(id, fromSeq) {
+    if (!Number.isSafeInteger(fromSeq) || fromSeq < 0) throw new TypeError('Invalid sequence for truncation')
+    const writer = this.writeOwners.get(id)
+    if (writer) await writer.close()
+    const db = this.db
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      db.prepare('DELETE FROM session_events WHERE session_id = ? AND seq >= ?').run(id, fromSeq)
+      const seqRow = db.prepare('SELECT COALESCE(MAX(seq) + 1, 0) AS nextSeq FROM session_events WHERE session_id = ?').get(id)
+      const nextSeq = Number(seqRow?.nextSeq ?? 0)
+      const lastEvent = db.prepare(`SELECT json_extract(event_json, '$.time') AS time
+        FROM session_events WHERE session_id = ? ORDER BY seq DESC LIMIT 1`).get(id)
+      const lastMessage = db.prepare(`SELECT event_json FROM session_events
+        WHERE session_id = ?
+          AND (json_extract(event_json, '$.type') = 'assistant/message'
+            OR (json_extract(event_json, '$.type') = 'user/message'
+              AND (json_type(event_json, '$.data.source') IS NULL
+                OR json_type(event_json, '$.data.source.kind') = 'text'
+                OR json_extract(event_json, '$.data.source.kind') = 'user')))
+        ORDER BY seq DESC LIMIT 1`).get(id)
+      const preview = lastMessage ? lastMessagePreview(JSON.parse(lastMessage.event_json)) ?? '' : ''
+      db.prepare(`UPDATE sessions
+        SET next_seq = ?, revision = revision + 1, last_activity_at = ?, last_message_preview = ?
+        WHERE id = ?`).run(nextSeq, Number.isSafeInteger(lastEvent?.time) ? lastEvent.time : null, preview, id)
+      db.exec('COMMIT')
+      return { truncated: true, nextSeq }
+    } catch (error) {
+      db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
   async history(id) {
     const handle = await this.open(id, 'read')
     try { return (await handle.read()).events } finally { await handle.close() }

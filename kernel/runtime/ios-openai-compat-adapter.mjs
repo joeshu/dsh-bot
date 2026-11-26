@@ -80,11 +80,14 @@ export function anthropicToOpenAiRequest(body) {
 
     if (msg.role === 'assistant') {
       const textParts = []
+      const thinkingParts = []
       const toolCalls = []
       for (const b of msg.content) {
         if (!b) continue
         if (b.type === 'text' && typeof b.text === 'string') {
           textParts.push(b.text)
+        } else if (b.type === 'thinking' && typeof b.thinking === 'string') {
+          thinkingParts.push(b.thinking)
         } else if (b.type === 'tool_use') {
           toolCalls.push({
             id: String(b.id ?? `call_${toolCalls.length}`),
@@ -100,6 +103,7 @@ export function anthropicToOpenAiRequest(body) {
         role: 'assistant',
         content: textParts.length > 0 ? textParts.join('') : (toolCalls.length > 0 ? null : ''),
       }
+      if (thinkingParts.length > 0) entry.reasoning_content = thinkingParts.join('\n')
       if (toolCalls.length > 0) entry.tool_calls = toolCalls
       messages.push(entry)
     }
@@ -110,7 +114,7 @@ export function anthropicToOpenAiRequest(body) {
     messages,
     stream: body.stream !== false,
   }
-  if (typeof body.max_tokens === 'number' && body.max_tokens > 0 && body.max_tokens < 32768) {
+  if (typeof body.max_tokens === 'number' && body.max_tokens > 0) {
     out.max_tokens = body.max_tokens
   }
   if (typeof body.temperature === 'number') out.temperature = body.temperature
@@ -496,7 +500,7 @@ export function ensureAnthropicStreamComplete(response) {
   let seenMessageStart = false
   let seenMessageDelta = false
   let seenMessageStop = false
-  let openBlockIndex = null
+  const openBlockIndices = new Set()
   let tail = ''
 
   const scanText = (chunkText) => {
@@ -511,8 +515,8 @@ export function ensureAnthropicStreamComplete(response) {
       try {
         const evt = JSON.parse(payload)
         if (evt.type === 'message_start') seenMessageStart = true
-        else if (evt.type === 'content_block_start' && typeof evt.index === 'number') openBlockIndex = evt.index
-        else if (evt.type === 'content_block_stop' && evt.index === openBlockIndex) openBlockIndex = null
+        else if (evt.type === 'content_block_start' && typeof evt.index === 'number') openBlockIndices.add(evt.index)
+        else if (evt.type === 'content_block_stop' && typeof evt.index === 'number') openBlockIndices.delete(evt.index)
         else if (evt.type === 'message_delta') seenMessageDelta = true
         else if (evt.type === 'message_stop') seenMessageStop = true
       } catch {}
@@ -534,8 +538,8 @@ export function ensureAnthropicStreamComplete(response) {
         if (tail.trim()) scanText('\n')
         if (seenMessageStart && !seenMessageStop) {
           let suffix = '\n\n'
-          if (openBlockIndex !== null) {
-            suffix += formatSse('content_block_stop', { type: 'content_block_stop', index: openBlockIndex })
+          for (const idx of [...openBlockIndices].sort((a, b) => a - b)) {
+            suffix += formatSse('content_block_stop', { type: 'content_block_stop', index: idx })
           }
           if (!seenMessageDelta) {
             suffix += formatSse('message_delta', {

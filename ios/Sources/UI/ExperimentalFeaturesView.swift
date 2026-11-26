@@ -478,11 +478,18 @@ public struct GitWorktreeTrackerView: View {
     }
 
     private func refreshGitStatus() async {
-        guard let rpc = host.rpc() else { return }
+        guard let rpc = host.rpc() else {
+            statusBanner = "DSH 引擎尚未连接。"
+            return
+        }
         isLoading = true
         defer { isLoading = false }
-        if let res = try? await rpc.request("git.status", timeoutSeconds: 15) {
+        do {
+            let res = try await rpc.request("git.status", timeoutSeconds: 15)
             applyStatusResponse(res)
+            statusBanner = ""
+        } catch {
+            statusBanner = "读取 Git 状态失败：\(error.localizedDescription)"
         }
     }
 
@@ -497,23 +504,36 @@ public struct GitWorktreeTrackerView: View {
     }
 
     private func createSnapshot() async {
-        guard let rpc = host.rpc() else { return }
+        guard let rpc = host.rpc() else {
+            statusBanner = "DSH 引擎尚未连接。"
+            return
+        }
         isLoading = true
         defer { isLoading = false }
         let msg = snapshotMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let res = try? await rpc.request("git.snapshot", params: ["message": msg.isEmpty ? "Workspace snapshot" : msg], timeoutSeconds: 15) {
+        do {
+            let res = try await rpc.request("git.snapshot", params: ["message": msg.isEmpty ? "Workspace snapshot" : msg], timeoutSeconds: 15)
             snapshotMessage = ""
             diffText = ""
             applyStatusResponse(res)
+            statusBanner = "已创建工作区快照基线。"
+        } catch {
+            statusBanner = "创建快照失败：\(error.localizedDescription)"
         }
     }
 
     private func loadDiff(path: String?) async {
-        guard let rpc = host.rpc() else { return }
+        guard let rpc = host.rpc() else {
+            statusBanner = "DSH 引擎尚未连接。"
+            return
+        }
         var params: [String: Any] = [:]
         if let path { params["path"] = path }
-        if let res = try? await rpc.request("git.diff", params: params, timeoutSeconds: 15) {
+        do {
+            let res = try await rpc.request("git.diff", params: params, timeoutSeconds: 15)
             diffText = res["diff"] as? String ?? ""
+        } catch {
+            statusBanner = "读取 Diff 失败：\(error.localizedDescription)"
         }
     }
 
@@ -792,9 +812,21 @@ public struct SessionDiagnosticsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var host: LocalAgentHost
     let bot: BotProfile
+    let sessionId: String?
+    @State private var cachedDbBytes: Int64 = 0
+
+    public init(host: LocalAgentHost, bot: BotProfile, sessionId: String? = nil) {
+        self.host = host
+        self.bot = bot
+        self.sessionId = sessionId
+    }
+
+    private var targetSessionId: String {
+        sessionId ?? bot.id
+    }
 
     private var messages: [ChatMessageItem] {
-        host.messages(for: bot.id)
+        host.messages(for: targetSessionId)
     }
 
     private var userCount: Int {
@@ -817,7 +849,7 @@ public struct SessionDiagnosticsSheet: View {
         NavigationStack {
             Form {
                 Section("当前会话概览") {
-                    LabeledContent("会话 ID", value: bot.id)
+                    LabeledContent("会话 ID", value: targetSessionId)
                     LabeledContent("模型", value: bot.model)
                     LabeledContent("权限模式", value: bot.permissionModeLabel)
                     LabeledContent("用户消息 / 回复", value: "\(userCount) / \(assistantCount)")
@@ -831,15 +863,16 @@ public struct SessionDiagnosticsSheet: View {
                 Section("运行时与存储") {
                     let memSnap = MemoryGovernor.shared.snapshot
                     LabeledContent("内嵌引擎", value: host.embeddedRuntimeLabel ?? "NodeMobile 24.22.3")
-                    LabeledContent("SQLite 大小", value: ByteCountFormatter.string(fromByteCount: host.sqliteDatabaseSizeBytes(), countStyle: .file))
+                    LabeledContent("SQLite 大小", value: ByteCountFormatter.string(fromByteCount: cachedDbBytes, countStyle: .file))
                     LabeledContent("物理内存 / Jetsam 余量", value: String(format: "%.1f MB / %.1f MB", memSnap.physFootprintMB, memSnap.availableMB))
                     LabeledContent("压力等级 / 打开 FD", value: "\(memSnap.tier.displayName) · \(memSnap.openFDCount) FD")
                     LabeledContent("自动授权审查", value: host.autoReviewEnabled ? "已开启" : "关闭")
                     Button {
                         let mem = MemoryGovernor.shared.refreshSnapshot()
+                        cachedDbBytes = host.sqliteDatabaseSizeBytes()
                         let rawReport = """
                         DS-Bot Session Diagnostics
-                        sessionId: \(bot.id)
+                        sessionId: \(targetSessionId)
                         model: \(bot.model)
                         preset: \(bot.agentPreset)
                         messages: user=\(userCount), assistant=\(assistantCount)
@@ -868,7 +901,10 @@ public struct SessionDiagnosticsSheet: View {
             }
             .navigationTitle("会话数据诊断")
             .navigationBarTitleDisplayMode(.inline)
-            .onAppear { MemoryGovernor.shared.refreshSnapshot() }
+            .onAppear {
+                MemoryGovernor.shared.refreshSnapshot()
+                cachedDbBytes = host.sqliteDatabaseSizeBytes()
+            }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("完成") { dismiss() }

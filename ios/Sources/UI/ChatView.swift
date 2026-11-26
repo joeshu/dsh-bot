@@ -117,6 +117,8 @@ public struct ChatView: View {
     @State private var lastScrollAt = Date.distantPast
     @State private var expandStreamingReasoning = true
     @State private var pendingSearchMessageID: String?
+    @State private var currentThreadId: String
+    @State private var speechDraftPrefix = ""
     @Environment(\.scenePhase) private var chatScenePhase
 
     @MainActor
@@ -125,12 +127,15 @@ public struct ChatView: View {
         self.host = host
         self.searchResultMessageID = targetMessageID
         self.initialAddress = initialAddress
+        let resolvedThread = (initialAddress?.botID == bot.id ? initialAddress?.threadID : nil)
+            ?? BotThreadStore.shared.activeThread(for: bot.id).id
         let initialSessionId: String
         if let initialAddress, initialAddress.botID == bot.id {
             initialSessionId = initialAddress.canonicalSessionId
         } else {
             initialSessionId = BotThreadStore.shared.activeSessionId(for: bot.id)
         }
+        _currentThreadId = State(initialValue: resolvedThread)
         _pendingSearchMessageID = State(initialValue: targetMessageID)
         _selectedModel = State(initialValue: host.modelSelection(bot.model))
         _input = State(initialValue: bot.isPrivate ? "" : host.draftInput(for: initialSessionId))
@@ -142,7 +147,8 @@ public struct ChatView: View {
     }
 
     private var activeThread: BotThread {
-        threadStore.activeThread(for: liveBot.id)
+        let all = threadStore.threads(for: liveBot.id, includeArchived: true)
+        return all.first(where: { $0.id == currentThreadId }) ?? threadStore.activeThread(for: liveBot.id)
     }
 
     private var activeSessionId: String {
@@ -211,7 +217,7 @@ public struct ChatView: View {
     }
 
     private var latestHeadings: [MarkdownHeading] {
-        guard !host.isStreaming else { return [] }
+        guard !host.isSessionStreaming(activeSessionId) else { return [] }
         let candidate = sessionMessages.last(where: { $0.role == "assistant" })?.content ?? ""
         return MarkdownOutlineParser.extractHeadings(from: candidate)
     }
@@ -262,8 +268,12 @@ public struct ChatView: View {
             }
         }
         .onChange(of: host.apiBaseURL) { _ in selectedModel = host.modelSelection(liveBot.model) }
+        .onChange(of: speechInput.errorMessage) { err in
+            if let err, !err.isEmpty { actionStatus = err }
+        }
         .onAppear {
             if let initialAddress, initialAddress.botID == bot.id {
+                currentThreadId = initialAddress.threadID ?? "default"
                 threadStore.selectAddress(initialAddress)
             }
             host.visibleChatSessionId = activeSessionId
@@ -308,7 +318,7 @@ public struct ChatView: View {
                         .buttonStyle(.plain)
 
                         Button {
-                            if !host.isStreaming {
+                            if !host.isBotStreaming(liveBot.id) {
                                 activeSheet = .modelPicker
                             }
                         } label: {
@@ -365,7 +375,7 @@ public struct ChatView: View {
                                     Text(host.agentPresetName(liveBot.agentPreset)).tag(liveBot.agentPreset)
                                 }
                             }
-                            .disabled(host.isStreaming)
+                            .disabled(host.isBotStreaming(liveBot.id))
                             Picker("审批档位：\(liveBot.permissionModeLabel)", selection: Binding(
                                 get: { liveBot.permissionMode },
                                 set: { host.setPermissionMode(sessionId: liveBot.id, mode: $0) }
@@ -374,7 +384,7 @@ public struct ChatView: View {
                                 Text("标准审批").tag("ask")
                                 Text("沙盒免打扰").tag("autoReview")
                             }
-                            .disabled(host.isSessionStreaming(activeSessionId))
+                            .disabled(host.isBotStreaming(liveBot.id))
                         }
                         ModelSelectionView(
                             host: host,
@@ -387,7 +397,7 @@ public struct ChatView: View {
                         } label: {
                             Label("搜索 / 刷新全部模型…", systemImage: "magnifyingglass")
                         }
-                        .disabled(host.isSessionStreaming(activeSessionId))
+                        .disabled(host.isBotStreaming(liveBot.id))
                         if host.redteamStatus.installed {
                             Section("dsh-purge-safe 会话授权") {
                                 Toggle("允许本 Bot 调用红队工具", isOn: Binding(
@@ -418,7 +428,7 @@ public struct ChatView: View {
                                         .foregroundStyle(.secondary)
                                 }
                             }
-                            .disabled(liveBot.isPrivate || !host.redteamModeEnabled || host.isStreaming)
+                            .disabled(liveBot.isPrivate || !host.redteamModeEnabled || host.isBotStreaming(liveBot.id))
                         }
                         Section {
                             Button {
@@ -450,7 +460,7 @@ public struct ChatView: View {
                             } label: {
                                 Label("压缩当前上下文 (/compact)", systemImage: "arrow.down.right.and.arrow.up.left")
                             }
-                            .disabled(host.isStreaming || sessionMessages.isEmpty)
+                            .disabled(host.isSessionStreaming(activeSessionId) || sessionMessages.isEmpty)
                             Button {
                                 activeSheet = .workspaceFiles
                             } label: {
@@ -475,7 +485,7 @@ public struct ChatView: View {
                             } label: {
                                 Label("粘贴剪贴板文本为附件", systemImage: "doc.on.clipboard")
                             }
-                            .disabled(host.isStreaming)
+                            .disabled(host.isSessionStreaming(activeSessionId))
                             #endif
                             if !liveBot.isPrivate {
                                 Button {
@@ -512,7 +522,7 @@ public struct ChatView: View {
                             } label: {
                                 Label("导出会话为 Markdown", systemImage: "square.and.arrow.up")
                             }
-                            .disabled(host.streamingSessionId == activeSessionId)
+                            .disabled(host.isSessionStreaming(activeSessionId))
                             if liveBot.isPrivate {
                                 Button {
                                     lockPrivateConversation()
@@ -525,7 +535,7 @@ public struct ChatView: View {
                             } label: {
                                 Label("清空当前话题（\(activeThread.title)）", systemImage: "trash")
                             }
-                            .disabled(host.isStreaming)
+                            .disabled(host.isSessionStreaming(activeSessionId))
                         }
                     } label: {
                         Image(systemName: "ellipsis.circle")
@@ -541,7 +551,7 @@ public struct ChatView: View {
         }
         .confirmationDialog("确定清空「\(liveBot.name) · \(activeThread.title)」的全部聊天记录？其他话题不受影响。", isPresented: $showClearConfirm, titleVisibility: .visible) {
             Button("清空当前话题", role: .destructive) {
-                guard !isLocked, !host.isStreaming else { return }
+                guard !isLocked, !host.isSessionStreaming(activeSessionId) else { return }
                 let targetId = activeSessionId
                 Task {
                     await host.clearSession(targetId)
@@ -602,12 +612,13 @@ public struct ChatView: View {
     private func sheetContent(for sheet: ChatActiveSheet) -> some View {
         switch sheet {
         case .history(let presentation):
-            SessionHistoryDetailView(host: host, bot: liveBot, presentation: presentation)
+            SessionHistoryDetailView(host: host, bot: liveBot, presentation: presentation, sessionId: activeSessionId)
         case .threads:
             BotThreadsSheet(
                 bot: liveBot,
                 threadStore: threadStore,
                 onSelectThread: { thread in
+                    currentThreadId = thread.id
                     threadStore.selectThread(thread)
                 },
                 onDeleteSession: { sessionId in
@@ -616,7 +627,8 @@ public struct ChatView: View {
             )
         case .sideChat:
             SideChatSheet(host: host, model: selectedModel, botId: liveBot.id,
-                          botName: liveBot.name, isPrivate: liveBot.isPrivate)
+                          botName: liveBot.name, isPrivate: liveBot.isPrivate,
+                          sessionId: activeSessionId, apiBaseURL: host.effectiveApiBaseURL(for: liveBot))
         case .groupWorkspace:
             GroupWorkspaceSheet(host: host, groupId: bot.id)
         case .memory:
@@ -635,14 +647,14 @@ public struct ChatView: View {
         case .botProfile:
             BotProfileSheet(bot: liveBot, host: host)
         case .diagnostics:
-            SessionDiagnosticsSheet(host: host, bot: liveBot)
+            SessionDiagnosticsSheet(host: host, bot: liveBot, sessionId: activeSessionId)
         case .scheduleManager:
             NavigationStack { ScheduleManagerView(host: host, botId: liveBot.id) }
         case .jobsManager:
             NavigationStack { JobsManagerView(host: host, botId: liveBot.id) }
         case .agentBrowser:
             AgentBrowserSheet(workspace: host.workspace) { prompt in
-                guard !host.isStreaming else {
+                guard !host.isSessionStreaming(activeSessionId) else {
                     input = prompt
                     return
                 }
@@ -691,9 +703,13 @@ public struct ChatView: View {
                         .listRowBackground(Color.clear)
                     } else {
                         ForEach(candidates) { candidate in
+                            let candidateSid = threadStore.activeSessionId(for: candidate.id)
                             Button {
                                 referencedBot = candidate
                                 activeSheet = nil
+                                if host.messages(for: candidateSid).isEmpty {
+                                    Task { try? await host.loadSessionHistory(candidateSid) }
+                                }
                             } label: {
                                 HStack(spacing: 12) {
                                     DSBotAvatar(
@@ -704,7 +720,7 @@ public struct ChatView: View {
                                     )
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text(candidate.name).font(.subheadline.weight(.semibold))
-                                        Text("\(host.messages(for: candidate.id).count) 条消息 · \(candidate.roleLabel)")
+                                        Text("\(host.messages(for: candidateSid).count) 条消息 · \(candidate.roleLabel)")
                                             .font(.caption)
                                             .foregroundStyle(.secondary)
                                     }
@@ -1064,7 +1080,7 @@ public struct ChatView: View {
         }
 
         if host.smartActionCardsEnabled,
-           !host.isStreaming,
+           !host.isSessionStreaming(activeSessionId),
            let lastAssistant = sessionMessages.last(where: { $0.role == "assistant" }),
            !lastAssistant.content.isEmpty {
             smartActionCardsBar(for: lastAssistant)
@@ -1085,7 +1101,7 @@ public struct ChatView: View {
             .padding(.horizontal, 12)
             .padding(.bottom, 6)
         }
-        if host.lastErrorSessionId == activeSessionId, let errMsg = host.lastStreamError, !host.isStreaming {
+        if host.lastErrorSessionId == activeSessionId, let errMsg = host.lastStreamError, !host.isSessionStreaming(activeSessionId) {
             DSBannerCard(
                 icon: "exclamationmark.triangle.fill",
                 tint: DSTheme.danger,
@@ -1098,7 +1114,7 @@ public struct ChatView: View {
             .padding(.bottom, 6)
         }
 
-        if !host.isStreaming, host.lastCancelledSessionId == activeSessionId {
+        if !host.isSessionStreaming(activeSessionId), host.lastCancelledSessionId == activeSessionId {
             HStack(spacing: 6) {
                 Image(systemName: "stop.circle")
                     .font(.caption2)
@@ -1249,7 +1265,7 @@ public struct ChatView: View {
             if msg.incomplete == true {
                 HStack(spacing: 8) {
                     DSStatusBadge("回复未完成", color: DSTheme.warning, icon: "exclamationmark.circle")
-                    if !isUser && !host.isStreaming && msg.id == sessionMessages.last(where: { $0.role == "assistant" })?.id {
+                    if !isUser && !host.isSessionStreaming(activeSessionId) && msg.id == sessionMessages.last(where: { $0.role == "assistant" })?.id {
                         Button {
                             Task {
                                 await host.sendMessage(
@@ -1294,7 +1310,7 @@ public struct ChatView: View {
             DSMarkdownText(msg.content)
                 .equatable()
                 .contextMenu {
-                    if isUser && !host.isStreaming {
+                    if isUser && !host.isSessionStreaming(activeSessionId) {
                         Button {
                             input = msg.content
                             DSHaptics.impact(.light)
@@ -1335,14 +1351,14 @@ public struct ChatView: View {
                     } label: {
                         Label("存入常驻记忆", systemImage: "brain.head.profile")
                     }
-                    if !host.isStreaming {
+                    if !host.isSessionStreaming(activeSessionId) {
                         Button(role: .destructive) {
                             host.deleteMessage(sessionId: activeSessionId, messageId: msg.id)
                         } label: {
                             Label("删除此条消息", systemImage: "trash")
                         }
                     }
-                    if !isUser && !host.isStreaming {
+                    if !isUser && !host.isSessionStreaming(activeSessionId) {
                         if msg.incomplete == true {
                             Button {
                                 Task {
@@ -1378,7 +1394,7 @@ public struct ChatView: View {
                 MessageFooterActionBar(
                     text: msg.content,
                     timestamp: msg.timestamp,
-                    canRegenerate: !host.isStreaming && msg.id == sessionMessages.last(where: { $0.role != "user" })?.id,
+                    canRegenerate: !host.isSessionStreaming(activeSessionId) && msg.id == sessionMessages.last(where: { $0.role != "user" })?.id,
                     onRegenerate: {
                         Task { await host.regenerateLastReply(sessionId: activeSessionId, model: selectedModel) }
                     }
@@ -1652,6 +1668,10 @@ public struct ChatView: View {
                         } else {
                             input.removeSubrange(atRange)
                             referencedBot = targetBot
+                            let targetSid = threadStore.activeSessionId(for: targetBot.id)
+                            if host.messages(for: targetSid).isEmpty {
+                                Task { try? await host.loadSessionHistory(targetSid) }
+                            }
                         }
                     }
                 )
@@ -1798,8 +1818,14 @@ public struct ChatView: View {
                 .help("模型、安全权限与智能体协作")
 
                 Button {
+                    if !speechInput.isRecording {
+                        speechDraftPrefix = input.trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+                    let capturedPrefix = speechDraftPrefix
                     speechInput.toggle { transcript in
-                        input = transcript
+                        let clean = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !clean.isEmpty else { return }
+                        input = capturedPrefix.isEmpty ? clean : "\(capturedPrefix) \(clean)"
                     }
                     if let err = speechInput.errorMessage {
                         actionStatus = err
@@ -1913,7 +1939,8 @@ public struct ChatView: View {
                         }
                         var refPrefix = ""
                         if let ref = referencedBot {
-                            let snippet = host.messages(for: ref.id).suffix(6).map { msg in
+                            let refSessionId = threadStore.activeSessionId(for: ref.id)
+                            let snippet = host.messages(for: refSessionId).suffix(6).map { msg in
                                 "\(msg.role == "user" ? "用户" : ref.name): \(String(msg.content.prefix(600)))"
                             }.joined(separator: "\n")
                             if !snippet.isEmpty {
@@ -1942,7 +1969,7 @@ public struct ChatView: View {
                             .font(.title2)
                             .foregroundColor((input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachedFiles.isEmpty) ? .secondary : DSTheme.brand)
                     }
-                    .disabled(host.state != .ready || host.isStreaming || (input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachedFiles.isEmpty))
+                    .disabled(host.state != .ready || host.isSessionStreaming(activeSessionId) || (input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachedFiles.isEmpty))
                 }
             }
             .padding(.horizontal, 12)
@@ -1973,16 +2000,34 @@ public struct ChatView: View {
                     contextLimit: 128_000,
                     enabledPluginCount: host.installedPlugins.filter(\.enabled).count,
                     onTapTrajectory: {
-                        withAnimation(.easeInOut(duration: 0.16)) {
-                            sessionViewMode = sessionViewMode == .trajectory ? .dialogue : .trajectory
+                        if host.sessionDiagnosticsEnabled {
+                            activeSheet = .diagnostics
+                        } else {
+                            withAnimation(.easeInOut(duration: 0.16)) {
+                                sessionViewMode = sessionViewMode == .trajectory ? .dialogue : .trajectory
+                            }
                         }
                     },
                     onTapCompact: {
-                        guard !host.isStreaming else { return }
+                        guard !host.isSessionStreaming(activeSessionId) else { return }
                         Task { await host.sendMessage(sessionId: activeSessionId, text: "/compact", model: selectedModel) }
                     }
                 )
                 .background(DSTheme.surfacePrimary)
+                if host.sessionDiagnosticsEnabled {
+                    HStack(spacing: 8) {
+                        Label("诊断模式：\(activeSessionId)", systemImage: "stethoscope")
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Spacer()
+                        Button("详情") { activeSheet = .diagnostics }
+                            .font(.caption2.weight(.semibold))
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 4)
+                    .background(DSTheme.surfaceSecondary.opacity(0.6))
+                }
             }
         }
     }

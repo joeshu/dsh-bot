@@ -270,7 +270,9 @@ public struct ModelServiceSettingsView: View {
                         id: existing.id,
                         name: existing.name,
                         apiBaseURL: existing.apiBaseURL,
-                        defaultModel: modelId
+                        defaultModel: modelId,
+                        protocolKind: existing.protocolKind,
+                        supportsTools: existing.supportsTools
                     ))
                 }
                 status = "已将「\(modelId)」设为默认模型并同步应用到全部智能体。"

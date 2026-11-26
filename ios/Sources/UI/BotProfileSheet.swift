@@ -26,6 +26,7 @@ public enum BotProfileTab: String, CaseIterable, Identifiable {
 public struct BotProfileSheet: View {
     let bot: BotProfile
     @ObservedObject var host: LocalAgentHost
+    @ObservedObject private var providerStore = ProviderProfileStore.shared
 
     @AppStorage("dsbot.profile.selectedTab") private var selectedTabRaw: String = BotProfileTab.work.rawValue
     @State private var refreshStatus: String = ""
@@ -231,12 +232,13 @@ public struct BotProfileSheet: View {
                     set: { host.setAgentPreset(sessionId: liveBot.id, presetId: $0) }
                 )) {
                     ForEach(host.dshAgentPresets) { preset in
-                        Text(preset.isAvailable ? preset.name : "\(preset.name)（不可用）")
+                        let allowed = preset.isAvailable && !(preset.id == "redteam" && (liveBot.isPrivate || !host.redteamStatus.installed))
+                        Text(allowed ? preset.name : "\(preset.name)（不可用）")
                             .tag(preset.id)
-                            .disabled(!preset.isAvailable)
+                            .disabled(!allowed)
                     }
                 }
-                .disabled(host.isStreaming)
+                .disabled(host.isBotStreaming(liveBot.id))
 
                 Picker("审批档位", selection: Binding(
                     get: { liveBot.permissionMode },
@@ -246,14 +248,14 @@ public struct BotProfileSheet: View {
                     Text("标准审批").tag("ask")
                     Text("沙盒免打扰").tag("autoReview")
                 }
-                .disabled(host.isStreaming)
+                .disabled(host.isBotStreaming(liveBot.id))
 
                 Picker("专属模型服务商", selection: Binding(
                     get: { liveBot.providerProfileId ?? "" },
                     set: { host.setBotProviderProfile(sessionId: liveBot.id, profileId: $0.isEmpty ? nil : $0) }
                 )) {
                     Text("跟随全局设置").tag("")
-                    ForEach(ProviderProfileStore.shared.profiles) { profile in
+                    ForEach(providerStore.profiles) { profile in
                         Text(profile.name).tag(profile.id)
                     }
                 }
@@ -265,7 +267,7 @@ public struct BotProfileSheet: View {
                         get: { host.modelSelection(liveBot.model) },
                         set: { host.setBotModel(sessionId: liveBot.id, model: $0) }
                     ),
-                    allowsTyping: false,
+                    allowsTyping: !host.isOfficialEndpoint(host.effectiveApiBaseURL(for: liveBot)),
                     endpointURL: host.effectiveApiBaseURL(for: liveBot)
                 )
                 .disabled(host.isBotStreaming(liveBot.id))
