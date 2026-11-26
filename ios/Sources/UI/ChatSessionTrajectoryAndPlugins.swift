@@ -1223,7 +1223,9 @@ struct SessionSkillsSheet: View {
 
     private func reloadSkills() {
         var found: [SkillEntry] = []
+        var seenNames = Set<String>()
         let dirs: [(URL, Bool)] = [
+            (workspace.appendingPathComponent("files/skills", isDirectory: true), true),
             (workspace.appendingPathComponent("skills", isDirectory: true), true),
             (workspace.appendingPathComponent("redteam/skills", isDirectory: true), false),
         ]
@@ -1234,6 +1236,7 @@ struct SessionSkillsSheet: View {
                 guard skillFile.pathExtension.lowercased() == "md",
                       let text = try? String(contentsOf: skillFile, encoding: .utf8) else { continue }
                 let name = item.hasDirectoryPath ? item.lastPathComponent : item.deletingPathExtension().lastPathComponent
+                guard seenNames.insert(name.lowercased()).inserted else { continue }
                 let preview = text.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
                 found.append(SkillEntry(id: skillFile.path, name: name, url: skillFile, preview: String(preview.prefix(120)), isCustom: isCustom))
             }
@@ -1246,14 +1249,17 @@ struct SessionSkillsSheet: View {
             .replacingOccurrences(of: "/", with: "-")
             .replacingOccurrences(of: " ", with: "-")
         guard !cleaned.isEmpty else { return }
-        let dir = workspace.appendingPathComponent("skills", isDirectory: true).appendingPathComponent(cleaned, isDirectory: true)
+        let dir = workspace
+            .appendingPathComponent("files", isDirectory: true)
+            .appendingPathComponent("skills", isDirectory: true)
+            .appendingPathComponent(cleaned, isDirectory: true)
         let file = dir.appendingPathComponent("SKILL.md")
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             try newBody.write(to: file, atomically: true, encoding: .utf8)
             showCreate = false
             newName = ""
-            statusMessage = "已创建 Skill：\(cleaned)"
+            statusMessage = "已创建 Skill：files/skills/\(cleaned)/SKILL.md"
             reloadSkills()
         } catch {
             statusMessage = "创建失败：\(error.localizedDescription)"

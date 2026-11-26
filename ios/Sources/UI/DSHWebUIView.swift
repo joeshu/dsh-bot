@@ -276,6 +276,7 @@ public struct DSHWebUIView: View {
                 url: url,
                 allowedPort: allowedPort,
                 reloadToken: reloadToken,
+                initialSessionId: initialSessionId,
                 viewportMode: viewportMode,
                 textScalePercent: textScale.rawValue,
                 onProgress: { progress in
@@ -354,15 +355,10 @@ public struct DSHWebUIView: View {
             }
             errorMessage = nil
             allowedPort = port
-            if let targetSession = initialSessionId?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !targetSession.isEmpty,
-               var comps = URLComponents(url: parsed, resolvingAgainstBaseURL: false) {
-                let encoded = targetSession.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? targetSession
-                comps.path = "/session/\(encoded)"
-                launchURL = comps.url ?? parsed
-            } else {
-                launchURL = parsed
-            }
+            // Always load the exact root `/?token=...` URL from `web.ui.info`:
+            // `BrowserAuth.authorizeIndex` strictly requires `url.pathname === "/"` when `?token=` is present.
+            // Target session deep-linking is seeded into `localStorage['dsh.sessions.current']` at document start.
+            launchURL = parsed
         } catch {
             guard !Task.isCancelled, generation == host.runtimeGeneration else { return }
             launchURL = nil
@@ -383,12 +379,36 @@ private struct LoopbackWebView: UIViewRepresentable {
     let url: URL
     let allowedPort: Int
     let reloadToken: UUID
+    let initialSessionId: String?
     let viewportMode: DSHWebViewportMode
     let textScalePercent: Int
     let onProgress: (Double) -> Void
     let onThemeChanged: (Color, Bool) -> Void
     let onNativeAction: (String) -> Void
     let onDisconnect: (String) -> Void
+
+    private static func sessionSeedScript(sessionId: String?, reloadToken: UUID) -> String? {
+        guard let raw = sessionId?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty,
+              let jsonData = try? JSONSerialization.data(withJSONObject: ["sessionId": raw]),
+              let payload = String(data: jsonData, encoding: .utf8),
+              let tokenData = try? JSONSerialization.data(withJSONObject: [reloadToken.uuidString]),
+              let tokenArr = String(data: tokenData, encoding: .utf8) else {
+            return nil
+        }
+        return """
+        (function() {
+          try {
+            var tokenKey = '__dsbot_seeded_session_token';
+            var currentToken = (\(tokenArr))[0];
+            if (window.sessionStorage && window.sessionStorage.getItem(tokenKey) !== currentToken) {
+              window.sessionStorage.setItem(tokenKey, currentToken);
+              window.localStorage.setItem('dsh.sessions.current', JSON.stringify(\(payload)));
+            }
+          } catch (_) {}
+        })();
+        """
+    }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
@@ -556,21 +576,33 @@ private struct LoopbackWebView: UIViewRepresentable {
     })();
     """
 
+    private func installUserScripts(on controller: WKUserContentController) {
+        controller.removeAllUserScripts()
+        if let seed = Self.sessionSeedScript(sessionId: initialSessionId, reloadToken: reloadToken) {
+            controller.addUserScript(WKUserScript(
+                source: seed,
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: true
+            ))
+        }
+        controller.addUserScript(WKUserScript(
+            source: Self.mobileStyleInjectScript,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        ))
+        controller.addUserScript(WKUserScript(
+            source: Self.mobileBridgeAndEnhancementScript,
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: true
+        ))
+    }
+
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
         config.allowsInlineMediaPlayback = true
         config.userContentController.add(WeakWebScriptMessageHandler(context.coordinator), name: "dsbotNative")
-        config.userContentController.addUserScript(WKUserScript(
-            source: Self.mobileStyleInjectScript,
-            injectionTime: .atDocumentStart,
-            forMainFrameOnly: true
-        ))
-        config.userContentController.addUserScript(WKUserScript(
-            source: Self.mobileBridgeAndEnhancementScript,
-            injectionTime: .atDocumentEnd,
-            forMainFrameOnly: true
-        ))
+        installUserScripts(on: config.userContentController)
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
@@ -603,6 +635,7 @@ private struct LoopbackWebView: UIViewRepresentable {
         if context.coordinator.lastLoadedToken != reloadToken || context.coordinator.lastLoadedURL != url {
             context.coordinator.lastLoadedURL = url
             context.coordinator.lastLoadedToken = reloadToken
+            installUserScripts(on: webView.configuration.userContentController)
             webView.load(URLRequest(url: url))
         }
     }

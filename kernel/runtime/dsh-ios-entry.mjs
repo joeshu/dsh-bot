@@ -24,7 +24,7 @@ import { installCustomEndpointCompatFetch } from './ios-openai-compat-adapter.mj
 
 const IPC_FD = Number(process.argv.find((arg) => arg.startsWith('--ipc-fd='))?.slice('--ipc-fd='.length))
 const WORKSPACE = process.argv.find((arg) => arg.startsWith('--workspace='))?.slice('--workspace='.length)
-const WORKSPACE_FILES = WORKSPACE ? join(WORKSPACE, 'files') : undefined
+let WORKSPACE_FILES = WORKSPACE ? join(WORKSPACE, 'files') : undefined
 const API_BASE = process.argv.find((arg) => arg.startsWith('--api-base='))?.slice('--api-base='.length) || 'https://api.deepseek.com'
 const PRIVATE_SESSION_IDS_ARG = process.argv.find((arg) => arg.startsWith('--private-session-ids='))?.slice('--private-session-ids='.length) ?? 'W10'
 function initialPrivateBotIds(value) {
@@ -47,12 +47,46 @@ process.env.DS_BOT_IOS_REDTEAM_WEB_WRITE = '0'
 process.env.DS_BOT_IOS_REDTEAM_WEB_SENSITIVE = '0'
 if (!workerData?.supervised) process.chdir(WORKSPACE)
 mkdirSync(WORKSPACE_FILES, { recursive: true })
+try { WORKSPACE_FILES = realpathSync(WORKSPACE_FILES) } catch {}
+process.env.DSH_AGENTS_HOME = WORKSPACE_FILES
 const WORKSPACE_ROOT_MARKER = join(WORKSPACE_FILES, '.dsbot-ios-workspace-root')
 if (!existsSync(WORKSPACE_ROOT_MARKER)) {
   try { writeFileSync(WORKSPACE_ROOT_MARKER, '', { flag: 'wx' }) } catch (error) {
     if (error?.code !== 'EEXIST') throw error
   }
 }
+
+function syncLegacySkillsToWorkspaceFiles() {
+  if (!WORKSPACE || !WORKSPACE_FILES) return
+  const legacySkillsDir = join(WORKSPACE, 'skills')
+  const sandboxSkillsDir = join(WORKSPACE_FILES, 'skills')
+  if (!existsSync(legacySkillsDir)) return
+  try {
+    const entries = readdirSync(legacySkillsDir, { withFileTypes: true })
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') || entry.isSymbolicLink()) continue
+      if (entry.isDirectory()) {
+        const srcSkill = join(legacySkillsDir, entry.name, 'SKILL.md')
+        const dstDir = join(sandboxSkillsDir, entry.name)
+        const dstSkill = join(dstDir, 'SKILL.md')
+        if (existsSync(srcSkill) && !existsSync(dstSkill)) {
+          mkdirSync(dstDir, { recursive: true })
+          copyFileSync(srcSkill, dstSkill)
+        }
+      } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.md')) {
+        const folder = entry.name.replace(/\.md$/i, '')
+        const srcFile = join(legacySkillsDir, entry.name)
+        const dstDir = join(sandboxSkillsDir, folder)
+        const dstSkill = join(dstDir, 'SKILL.md')
+        if (!existsSync(dstSkill)) {
+          mkdirSync(dstDir, { recursive: true })
+          copyFileSync(srcFile, dstSkill)
+        }
+      }
+    }
+  } catch {}
+}
+syncLegacySkillsToWorkspaceFiles()
 
 const PROFILE = 'dsbot-ios'
 const PROFILE_BUNDLE = '@dsbot/dsh-ios-profile'
@@ -782,7 +816,8 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
         } catch {}
       }
       try {
-        const skillsDir = join(WORKSPACE, 'skills')
+        syncLegacySkillsToWorkspaceFiles()
+        const skillsDir = join(WORKSPACE_FILES, 'skills')
         if (existsSync(skillsDir)) {
           const entries = readdirSync(skillsDir, { withFileTypes: true }).slice(0, 20)
           const names = []
@@ -795,7 +830,7 @@ function setupAgent({ botId, systemPrompt, legacyHistory, agentPreset, toolsEnab
             }
           }
           if (names.length > 0) {
-            chunks.push(`工作区可用用户 Skills（位于 skills/）：${names.join(', ')}。当用户提及相关技能时可读取对应 SKILL.md 遵循其流程。`)
+            chunks.push(`工作区可用用户 Skills（位于 skills/<名称>/SKILL.md）：${names.join(', ')}。当用户提及相关技能时可读取对应 skills/<名称>/SKILL.md 遵循其流程。`)
           }
         }
       } catch {}
@@ -1229,6 +1264,29 @@ async function boot() {
   await cleanupPendingPluginRemovals(PROFILE_DIR)
   try {
     const wsRegistry = ctx?.get?.('workspaceRegistry')
+    const wsController = ctx?.get?.('workspaceController')
+    if (wsController && wsRegistry && !wsController.__dsbotDefaultWorkspacePatched) {
+      wsController.initializeDefault = async function iosInitializeDefaultWorkspace() {
+        let workspace = await wsRegistry.initializeDefault(async () => WORKSPACE_FILES)
+        if (!workspace && wsRegistry.list().length === 0 && typeof wsRegistry.create === 'function') {
+          const created = await wsRegistry.create(WORKSPACE_FILES)
+          workspace = created?.workspace ?? created
+        }
+        workspace ??= wsRegistry.list()[0]
+        if (!workspace) return undefined
+        return {
+          workspace: {
+            workspaceId: workspace.id ?? workspace.workspaceId,
+            path: workspace.path,
+            title: workspace.title,
+            sessionIds: workspace.sessionIds ?? [],
+            createdAt: workspace.createdAt,
+            updatedAt: workspace.updatedAt,
+          },
+        }
+      }
+      wsController.__dsbotDefaultWorkspacePatched = true
+    }
     if (wsRegistry && typeof wsRegistry.list === 'function' && wsRegistry.list().length === 0) {
       if (typeof wsRegistry.initializeDefault === 'function') {
         await wsRegistry.initializeDefault(async () => WORKSPACE_FILES)
@@ -1238,6 +1296,15 @@ async function boot() {
       if (wsRegistry.list().length === 0 && typeof wsRegistry.create === 'function') {
         await wsRegistry.create(WORKSPACE_FILES)
       }
+    }
+    // Anchor unscoped Web session creation (`session/create` without workspaceId/cwd) inside WORKSPACE_FILES
+    // and report desktop native file openers as unavailable on iOS.
+    const sessionController = ctx?.get?.('sessionController')
+    if (sessionController) {
+      if (sessionController.commands) {
+        sessionController.commands.defaultCwd = WORKSPACE_FILES
+      }
+      sessionController.canOpenPath = () => false
     }
   } catch (error) {
     ctx?.logger?.warn?.(`Default iOS workspace initialization skipped: ${String(error)}`)
@@ -1295,10 +1362,19 @@ async function boot() {
         const query = String(request?.query ?? '').trim()
         if (!query) throw new Error('query must not be blank')
         signal?.throwIfAborted?.()
-        const root = resolve(workspaceFileScope?.workspaceRoot || WORKSPACE_FILES)
+        let root = WORKSPACE_FILES
+        try {
+          const resolvedRoot = await ctx.fs.resolve(workspaceFileScope?.workspaceRoot || WORKSPACE_FILES, { signal })
+          root = ctx.fs.processPath(resolvedRoot)
+        } catch {
+          root = WORKSPACE_FILES
+        }
         const maxResults = Number.isInteger(request?.maxResults) && request.maxResults > 0 ? Math.min(request.maxResults, 500) : 200
         const maxEntries = 10_000
         const includeHidden = request?.includeHidden === true
+        const excludedRaw = Array.isArray(request?.excludedPaths) ? request.excludedPaths.filter((p) => typeof p === 'string' && p.length > 0) : []
+        const excludedNames = new Set(excludedRaw.filter((p) => !p.includes('/')))
+        const excludedRelPaths = new Set(excludedRaw.filter((p) => p.includes('/')).map((p) => p.replace(/^\/+|\/+$/g, '')))
         const needle = query.toLowerCase()
         const byPath = query.includes('/')
         const entries = new Map()
@@ -1328,9 +1404,11 @@ async function boot() {
               break
             }
             const name = dirent.name
-            if (VCS_NAMES.has(name) || dirent.isSymbolicLink()) continue
+            if (name === '.dsbot-ios-workspace-root' || name === '.DS_Store') continue
+            if (VCS_NAMES.has(name) || excludedNames.has(name) || dirent.isSymbolicLink()) continue
             if (!includeHidden && name.startsWith('.')) continue
             const relPath = relDir ? `${relDir}/${name}` : name
+            if (excludedRelPaths.has(relPath)) continue
             if (dirent.isDirectory()) {
               admit(relPath, 'directory')
               queue.push(relPath)

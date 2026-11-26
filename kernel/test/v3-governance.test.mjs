@@ -624,3 +624,47 @@ test('v3 sandbox: every dsh-agent-instructions preset in cordis.patch.yml pins p
     )
   }
 })
+
+test('v3 web-workbench: sandboxPolicy root, onboarding bypass, public-session waterfall bridge, exact Fetch routes, canonical WORKSPACE_FILES, skills/ unification, and deep-link auth fix', () => {
+  const repoRoot = join(__dirname, '..', '..')
+  const patchSrc = readFileSync(join(runtimeDir, 'ios-profile-package/cordis.patch.yml'), 'utf8')
+  const entrySrc = readFileSync(join(runtimeDir, 'dsh-ios-entry.mjs'), 'utf8')
+  const privateAccessSrc = readFileSync(join(runtimeDir, 'ios-host-package/private-session-access.mjs'), 'utf8')
+  const webUISrc = readFileSync(join(repoRoot, 'ios/Sources/UI/DSHWebUIView.swift'), 'utf8')
+  const skillsViewSrc = readFileSync(join(repoRoot, 'ios/Sources/UI/WorkspaceFilesAndSkillsView.swift'), 'utf8')
+  const chatSkillsSrc = readFileSync(join(repoRoot, 'ios/Sources/UI/ChatSessionTrajectoryAndPlugins.swift'), 'utf8')
+
+  // 1. cordis.patch.yml workspace & Web UI defaults
+  assert.match(patchSrc, /id:\s*sandbox-policy[\s\S]{0,160}workspaceRoot:\s*!!js process\.env\.DSH_HOME \+ '\/files'/, 'sandbox-policy must pin workspaceRoot to $DSH_HOME/files')
+  assert.match(patchSrc, /id:\s*ui-settings-general[\s\S]{0,120}welcomeNoticeVersion:\s*'2026-09-28\.1'/, 'ui-settings-general must pre-acknowledge welcomeNoticeVersion for embedded iOS Web UI')
+  assert.match(patchSrc, /id:\s*ui-settings-models[\s\S]{0,120}credentialOnboarding:\s*false/, 'ui-settings-models must disable browser credential onboarding modal on iOS')
+  const redteamBlock = patchSrc.split(/- id: agent-preset-redteam\b/)[1]?.split(/\n    - id: typert\b/)[0] ?? ''
+  assert.match(redteamBlock, /@deepseek-ai\/dsh-skill-filesystem/, 'agent-preset-redteam must mount dsh-skill-filesystem')
+  assert.match(redteamBlock, /@deepseek-ai\/dsh-tool-skill/, 'agent-preset-redteam must mount dsh-tool-skill')
+  assert.match(redteamBlock, /@deepseek-ai\/dsh-plan-mode/, 'agent-preset-redteam must mount dsh-plan-mode')
+  assert.match(redteamBlock, /@deepseek-ai\/dsh-tool-jobs/, 'agent-preset-redteam must mount dsh-tool-jobs')
+
+  // 2. private-session-access.mjs exact Fetch routes & waterfall bridge for Web approvals/questions
+  assert.match(privateAccessSrc, /'\/api\/changes\.summary'/, 'private-session-access.mjs must allow /api/changes.summary for public sessions')
+  assert.match(privateAccessSrc, /'\/api\/changes\.diff'/, 'private-session-access.mjs must allow /api/changes.diff for public sessions')
+  assert.match(privateAccessSrc, /'\/api\/file'/, 'private-session-access.mjs must allow /api/file (jailed by IosSandboxedFileSystem)')
+  assert.match(privateAccessSrc, /'\/api\/present\.host'/, 'private-session-access.mjs must allow /api/present.host')
+  assert.match(privateAccessSrc, /installGatewayWaterfallBridge/, 'private-session-access.mjs must bridge public-session waterfall events for Web UI approvals & questions')
+  assert.match(privateAccessSrc, /isPublicWaterfallAgentId/, 'waterfall bridge must refuse private sessions')
+
+  // 3. dsh-ios-entry.mjs canonical WORKSPACE_FILES, DSH_AGENTS_HOME, defaultCwd, initializeDefault, and skills sync
+  assert.match(entrySrc, /WORKSPACE_FILES = realpathSync\(WORKSPACE_FILES\)/, 'dsh-ios-entry.mjs must canonicalize WORKSPACE_FILES for /var -> /private/var alignment')
+  assert.match(entrySrc, /process\.env\.DSH_AGENTS_HOME = WORKSPACE_FILES/, 'dsh-ios-entry.mjs must anchor DSH_AGENTS_HOME inside WORKSPACE_FILES')
+  assert.match(entrySrc, /sessionController\.commands\.defaultCwd = WORKSPACE_FILES/, 'dsh-ios-entry.mjs must anchor unscoped Web sessions to WORKSPACE_FILES')
+  assert.match(entrySrc, /wsController\.initializeDefault = async function iosInitializeDefaultWorkspace/, 'dsh-ios-entry.mjs must pin workspaceController.initializeDefault to WORKSPACE_FILES')
+  assert.match(entrySrc, /syncLegacySkillsToWorkspaceFiles/, 'dsh-ios-entry.mjs must migrate legacy skills into files/skills')
+
+  // 4. DSHWebUIView.swift deep-link auth fix (no /session/<id>?token=... 401)
+  assert.doesNotMatch(webUISrc, /comps\.path\s*=\s*"\/session\//, 'DSHWebUIView must never rewrite /?token=... path to /session/<id> (causes HTTP 401)')
+  assert.match(webUISrc, /dsh\.sessions\.current/, 'DSHWebUIView must seed dsh.sessions.current in localStorage for initialSessionId deep-linking')
+
+  // 5. Swift Skills views anchored in files/skills
+  assert.match(skillsViewSrc, /\.appendingPathComponent\("files", isDirectory: true\)\s*\.appendingPathComponent\("skills", isDirectory: true\)/, 'SkillsManagerView must store skills in files/skills')
+  assert.match(chatSkillsSrc, /\.appendingPathComponent\("files", isDirectory: true\)\s*\.appendingPathComponent\("skills", isDirectory: true\)/, 'UserSkillsSheetView must store skills in files/skills')
+})
+

@@ -6,6 +6,12 @@ const EXACT_SESSION_BOUND_PATHS = new Set([
   '/api/session.export',
   '/api/session.markdown',
   '/api/session/uploadFileBinary',
+  '/api/changes.summary',
+  '/api/changes.diff',
+])
+const EXACT_STATELESS_PUBLIC_PATHS = new Set([
+  '/api/file',
+  '/api/present.host',
 ])
 // These Hosts APIs either write the plugin profile / global schedules or spawn
 // desktop-only native apps (`open -t` / Finder) that do not exist on iOS.
@@ -224,10 +230,16 @@ async function apply(ctx) {
     } catch {
       return next()
     }
+    if (EXACT_STATELESS_PUBLIC_PATHS.has(pathname)) {
+      return requestPrincipal.run({ allowOwnerExactFetch: true }, next)
+    }
+    if (pathname === '/api/$events/result') {
+      return requestPrincipal.run({ allowWaterfallAnswer: true }, next)
+    }
     if (!EXACT_SESSION_BOUND_PATHS.has(pathname)) return next()
     // These upstream exact Fetch handlers are owner-only and bypass Remote
     // access policy. Keep them working for public Sessions, but hide private
-    // Session existence before export or raw upload reaches the handler.
+    // Session existence before export, diff, or raw upload reaches the handler.
     if (typeof sessionId === 'string' && !knownHeaders.has(sessionId)) {
       const live = ctx.get?.('sessions')?.get?.(sessionId)
       if (live?.header?.id === sessionId) {
@@ -243,6 +255,108 @@ async function apply(ctx) {
     }
     return requestPrincipal.run({ allowOwnerExactFetch: true }, next)
   })
+
+  // Bridge TypertGateway waterfall events (`approval/request` & `user-questions/request`)
+  // to authenticated `ios-web` browser clients ONLY for non-private sessions, while keeping
+  // `client.answers === false` so `broadcastRemoteEvent` continues enforcing `remoteAccess.decide`
+  // on every `emit` event.
+  let restoreGateway = () => {}
+  const installGatewayWaterfallBridge = () => {
+    const gateway = ctx.get?.('typertGateway')
+    if (!gateway || gateway.__dsbotWebWaterfallPatched) return
+    const origHasLiveClient = typeof gateway.hasLiveClient === 'function' ? gateway.hasLiveClient.bind(gateway) : null
+    const origStartRemoteEvent = typeof gateway.startRemoteEvent === 'function' ? gateway.startRemoteEvent.bind(gateway) : null
+    const origOpenRemoteEvents = typeof gateway.openRemoteEvents === 'function' ? gateway.openRemoteEvents.bind(gateway) : null
+    const origDispatchRpc = typeof gateway.dispatchRpc === 'function' ? gateway.dispatchRpc.bind(gateway) : null
+
+    const isEligibleWebEventClient = (client) =>
+      Boolean(client && !client.answers && client.peer === browserPeer && client.peer?.interactions === 'answer' && !client.signal?.aborted)
+
+    const isPublicWaterfallAgentId = (agentId) => {
+      if (typeof agentId !== 'string' || !agentId) return false
+      if (!knownHeaders.has(agentId)) {
+        const live = ctx.get?.('sessions')?.get?.(agentId)
+        if (live?.header?.id === agentId) {
+          knownHeaders.set(agentId, live.header)
+          sessionIndexReady = true
+          refreshPrivateClosure()
+        }
+      }
+      return !isPrivateSession(agentId)
+    }
+
+    if (origHasLiveClient) {
+      gateway.hasLiveClient = function iosHasLiveClient() {
+        if (origHasLiveClient()) return true
+        for (const client of this.remoteEventClients?.values?.() ?? []) {
+          if (isEligibleWebEventClient(client)) return true
+        }
+        return false
+      }
+    }
+
+    if (origStartRemoteEvent) {
+      gateway.startRemoteEvent = function iosStartRemoteEvent(source) {
+        const beforeIds = new Set(this.pendingRemoteEvents?.keys?.() ?? [])
+        origStartRemoteEvent(source)
+        const agentId = source?.context?.agentId
+        if (!isPublicWaterfallAgentId(agentId)) return
+        for (const [id, pending] of this.pendingRemoteEvents?.entries?.() ?? []) {
+          if (beforeIds.has(id)) continue
+          for (const client of this.remoteEventClients?.values?.() ?? []) {
+            if (isEligibleWebEventClient(client) && !pending.deliveries.has(client)) {
+              this.deliverRemoteEvent(pending, client)
+            }
+          }
+        }
+      }
+    }
+
+    if (origOpenRemoteEvents) {
+      gateway.openRemoteEvents = async function* iosOpenRemoteEvents(payload, signal, peer) {
+        const gen = origOpenRemoteEvents(payload, signal, peer)
+        const first = await gen.next()
+        if (first.done) return
+        const clientId = first.value?.clientId
+        const client = clientId ? this.remoteEventClients?.get?.(clientId) : undefined
+        if (isEligibleWebEventClient(client)) {
+          for (const pending of this.pendingRemoteEvents?.values?.() ?? []) {
+            if (isPublicWaterfallAgentId(pending?.frame?.agentId) && !pending.deliveries.has(client)) {
+              this.deliverRemoteEvent(pending, client)
+            }
+          }
+        }
+        try {
+          yield first.value
+          yield* gen
+        } finally {
+          await gen.return?.()
+        }
+      }
+    }
+
+    if (origDispatchRpc) {
+      gateway.dispatchRpc = function iosDispatchRpc(endpoint, payload, signal, peer) {
+        if (endpoint === '$events/result' && peer === browserPeer) {
+          return requestPrincipal.run({ allowOwnerExactFetch: true }, () => origDispatchRpc(endpoint, payload, signal, peer))
+        }
+        return origDispatchRpc(endpoint, payload, signal, peer)
+      }
+    }
+
+    gateway.__dsbotWebWaterfallPatched = true
+    restoreGateway = () => {
+      if (origHasLiveClient) gateway.hasLiveClient = origHasLiveClient
+      if (origStartRemoteEvent) gateway.startRemoteEvent = origStartRemoteEvent
+      if (origOpenRemoteEvents) gateway.openRemoteEvents = origOpenRemoteEvents
+      if (origDispatchRpc) gateway.dispatchRpc = origDispatchRpc
+      delete gateway.__dsbotWebWaterfallPatched
+    }
+  }
+  installGatewayWaterfallBridge()
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['typertGateway'], () => { installGatewayWaterfallBridge() })
+  }
 
   function trackSessionHeader(session) {
     if (typeof session?.id !== 'string' || session.header?.id !== session.id) return
@@ -290,6 +404,7 @@ async function apply(ctx) {
   ctx.typert?.local?.subscribe?.(() => remoteAccess.invalidate(WEB_PRINCIPAL))
   ctx.typert?.remotes?.subscribe?.(() => remoteAccess.invalidate(WEB_PRINCIPAL))
   ctx.effect(() => () => {
+    restoreGateway()
     unregisterPolicy()
     if (originalPrincipalDescriptor) Object.defineProperty(browserPeer, 'principal', originalPrincipalDescriptor)
     else delete browserPeer.principal

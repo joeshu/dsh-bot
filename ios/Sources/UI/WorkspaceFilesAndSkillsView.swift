@@ -354,7 +354,7 @@ public struct WorkspaceFilesView: View {
     }
 }
 
-// MARK: - 9. DSH Skills Manager (`Documents/dsh-home/skills/<name>/SKILL.md`)
+// MARK: - 9. DSH Skills Manager (`Documents/dsh-home/files/skills/<name>/SKILL.md`)
 
 public struct SkillsManagerView: View {
     @ObservedObject var host: LocalAgentHost
@@ -388,8 +388,26 @@ public struct SkillsManagerView: View {
     }
 
     private var skillsRoot: URL {
-        let dir = LocalAgentTransport.defaultWorkspace.appendingPathComponent("skills", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let fm = FileManager.default
+        let dir = LocalAgentTransport.defaultWorkspace
+            .appendingPathComponent("files", isDirectory: true)
+            .appendingPathComponent("skills", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        // Non-destructively migrate any legacy skills stored at `<workspace>/skills/` into `<workspace>/files/skills/`
+        let legacyDir = LocalAgentTransport.defaultWorkspace.appendingPathComponent("skills", isDirectory: true)
+        if let legacyItems = try? fm.contentsOfDirectory(at: legacyDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+            for item in legacyItems {
+                let srcFile = item.hasDirectoryPath ? item.appendingPathComponent("SKILL.md") : item
+                guard srcFile.pathExtension.lowercased() == "md", fm.fileExists(atPath: srcFile.path) else { continue }
+                let folder = item.hasDirectoryPath ? item.lastPathComponent : item.deletingPathExtension().lastPathComponent
+                let dstDir = dir.appendingPathComponent(folder, isDirectory: true)
+                let dstFile = dstDir.appendingPathComponent("SKILL.md")
+                if !fm.fileExists(atPath: dstFile.path) {
+                    try? fm.createDirectory(at: dstDir, withIntermediateDirectories: true)
+                    try? fm.copyItem(at: srcFile, to: dstFile)
+                }
+            }
+        }
         return dir
     }
 
