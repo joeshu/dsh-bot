@@ -1,9 +1,9 @@
 import { randomUUID, createHash } from 'node:crypto'
 import { copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { isIP } from 'node:net'
-import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { gunzipSync } from 'node:zlib'
+import { createGunzip } from 'node:zlib'
 import semver from 'semver'
 import {
   createRuntimeResolution,
@@ -98,7 +98,7 @@ const DESKTOP_ONLY_BUNDLES = new Set([
 const DEFAULT_SOURCES = [
   {
     id: 'dsh-market', name: 'dsh-market',
-    url: 'https://cdn.jsdelivr.net/npm/dsh-plugin-catalog/index.json', enabled: false, builtIn: true,
+    url: 'https://cdn.jsdelivr.net/npm/dsh-plugin-catalog/index.json', enabled: true, builtIn: true,
   },
   {
     id: 'dshfind', name: 'dshfind',
@@ -395,7 +395,22 @@ function tarNumber(header, start, length) {
 
 async function unpackNpmTarball(compressed, destination, { stripSingleRoot = false } = {}) {
   if (compressed.byteLength > MAX_ARCHIVE_BYTES) throw new RangeError('插件压缩包超过 48 MiB')
-  const tar = gunzipSync(compressed, { maxOutputLength: MAX_UNPACKED_BYTES })
+  const tar = await new Promise((resolveTar, rejectTar) => {
+    const gunzip = createGunzip()
+    const chunks = []
+    let total = 0
+    gunzip.on('data', (chunk) => {
+      total += chunk.length
+      if (total > MAX_UNPACKED_BYTES) {
+        gunzip.destroy(new RangeError('插件解压后超过 128 MiB'))
+        return
+      }
+      chunks.push(chunk)
+    })
+    gunzip.once('error', rejectTar)
+    gunzip.once('end', () => resolveTar(Buffer.concat(chunks, total)))
+    gunzip.end(compressed)
+  })
   let offset = 0
   let unpacked = 0
   let fileCount = 0
@@ -875,7 +890,7 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
         if (info.isFile() && ['.js', '.mjs', '.cjs'].includes(extension)) {
           if (info.size > 8 * 1024 * 1024) throw new RangeError('iOS 插件单个 JavaScript 文件不得超过 8 MiB')
           const source = await readFile(filePath, 'utf8')
-          if (/(?:from\s*|import\s*\(?\s*|require\s*\(\s*)['"](?:node:)?(?:inspector|vm)(?:\/[^'"]*)?['"]/.test(source)) {
+          if (/(?:from\s*|import\s*\(?\s*|require\s*\(\s*)['"](?:node:)?(?:child_process|worker_threads|cluster|inspector|vm)(?:\/[^'"]*)?['"]/.test(source)) {
             unsupportedImports.push(relative(root, filePath))
           }
         }

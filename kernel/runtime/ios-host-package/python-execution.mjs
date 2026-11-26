@@ -13,7 +13,7 @@ function executionKey(botId, turnId) {
   return `${botId}\u0000${turnId}`
 }
 
-export async function executeIOSPython({ code, botId, turnId }) {
+export async function executeIOSPython({ code, botId, turnId, signal }) {
   if (typeof code !== 'string' || !code.trim() || code.length > MAX_CODE_CHARACTERS
       || Buffer.byteLength(code, 'utf8') > MAX_CODE_BYTES || code.includes('\u0000')) {
     throw new TypeError('Python code must be non-empty, contain no NUL, and fit within 16,000 characters.')
@@ -21,10 +21,17 @@ export async function executeIOSPython({ code, botId, turnId }) {
   if (typeof botId !== 'string' || !botId || typeof turnId !== 'string' || !turnId) {
     throw new TypeError('Python execution requires an active Bot turn.')
   }
+  if (signal?.aborted) {
+    throw new Error('Local Python execution was aborted.')
+  }
 
   const key = executionKey(botId, turnId)
   const releaseWorkerSlot = await acquireIOSPythonWorker({ timeoutMs: 30_000 })
   if (!releaseWorkerSlot) throw new Error('The local Python runtime is busy with another isolated execution.')
+  if (signal?.aborted) {
+    releaseWorkerSlot()
+    throw new Error('Local Python execution was aborted.')
+  }
   if (executions.has(key)) {
     releaseWorkerSlot()
     throw new Error('This Bot turn already has an active Python execution.')
@@ -48,10 +55,12 @@ export async function executeIOSPython({ code, botId, turnId }) {
     const job = {
       stop(error) { settle(error) },
     }
+    const onAbort = () => settle(new Error('Local Python execution was aborted.'))
     const settle = (error, output) => {
       if (settled) return
       settled = true
       clearTimeout(timeout)
+      signal?.removeEventListener?.('abort', onAbort)
       void worker.terminate().catch(() => {}).then(() => {
         releaseWorkerSlot()
         if (executions.get(key) === job) executions.delete(key)
@@ -61,6 +70,7 @@ export async function executeIOSPython({ code, botId, turnId }) {
     }
 
     executions.set(key, job)
+    signal?.addEventListener?.('abort', onAbort, { once: true })
     worker.on('message', (message) => {
       if (message?.type !== 'completed') return
       settle(undefined, message.output)
