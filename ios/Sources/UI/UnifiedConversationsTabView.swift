@@ -45,6 +45,7 @@ public struct UnifiedConversationsTabView: View {
     @State private var searchText = ""
     @State private var showSearch = false
     @State private var activeSheet: ConversationsActiveSheet?
+    @State private var presentedWebSession: WebSessionSummary?
     @State private var pendingDeleteBot: BotProfile?
     @State private var showDeleteConfirm = false
     @State private var importBanner: String?
@@ -203,6 +204,9 @@ public struct UnifiedConversationsTabView: View {
                                 }
                         }
                     }
+                }
+                .fullScreenCover(item: $presentedWebSession) { session in
+                    DSHWebUIView(host: host, initialSessionId: session.sessionId)
                 }
                 .confirmationDialog(
                     "确定删除「\(pendingDeleteBot?.name ?? "")」及其全部聊天记录？",
@@ -436,8 +440,8 @@ public struct UnifiedConversationsTabView: View {
                 .listRowBackground(Color.clear)
             } else {
                 ForEach(filteredWebSessions) { session in
-                    NavigationLink {
-                        DSHWebUIView(host: host, initialSessionId: session.sessionId)
+                    Button {
+                        presentedWebSession = session
                     } label: {
                         HStack(spacing: 12) {
                             ZStack {
@@ -463,9 +467,13 @@ public struct UnifiedConversationsTabView: View {
                                     .foregroundStyle(.secondary)
                                     .lineLimit(2)
                             }
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.tertiary)
                         }
                         .padding(.vertical, 3)
                     }
+                    .buttonStyle(.plain)
                 }
             }
         } header: {

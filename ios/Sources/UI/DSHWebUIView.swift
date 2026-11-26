@@ -106,12 +106,11 @@ public struct DSHWebUIView: View {
         }
         .toolbar(.hidden, for: .navigationBar)
         .toolbar(.hidden, for: .tabBar)
-        .preferredColorScheme(webIsDark.map { $0 ? .dark : .light })
         .sheet(isPresented: $showAgentBrowser) {
             AgentBrowserSheet(workspace: host.workspace)
         }
         .task(id: host.runtimeGeneration) {
-            await loadWebUIInfo()
+            await loadWebUIInfo(preserveIfSamePort: true)
         }
         .onChange(of: scenePhase) { newPhase in
             if newPhase == .active, host.state == .ready {
@@ -300,6 +299,12 @@ public struct DSHWebUIView: View {
                     launchURL = nil
                     loadProgress = 0
                     errorMessage = reason
+                },
+                onProcessTerminate: {
+                    Task {
+                        reloadToken = UUID()
+                        await loadWebUIInfo()
+                    }
                 }
             )
             .ignoresSafeArea(edges: .bottom)
@@ -389,23 +394,24 @@ private struct LoopbackWebView: UIViewRepresentable {
     let onThemeChanged: (Color, Bool) -> Void
     let onNativeAction: (String) -> Void
     let onDisconnect: (String) -> Void
+    let onProcessTerminate: () -> Void
 
-    private static func sessionSeedScript(sessionId: String?, reloadToken: UUID) -> String? {
+    private static func sessionSeedScript(sessionId: String?) -> String? {
         guard let raw = sessionId?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty,
               let jsonData = try? JSONSerialization.data(withJSONObject: ["sessionId": raw]),
               let payload = String(data: jsonData, encoding: .utf8),
-              let tokenData = try? JSONSerialization.data(withJSONObject: [reloadToken.uuidString]),
-              let tokenArr = String(data: tokenData, encoding: .utf8) else {
+              let keyData = try? JSONSerialization.data(withJSONObject: [raw]),
+              let keyArr = String(data: keyData, encoding: .utf8) else {
             return nil
         }
         return """
         (function() {
           try {
-            var tokenKey = '__dsbot_seeded_session_token';
-            var currentToken = (\(tokenArr))[0];
-            if (window.sessionStorage && window.sessionStorage.getItem(tokenKey) !== currentToken) {
-              window.sessionStorage.setItem(tokenKey, currentToken);
+            var tokenKey = '__dsbot_seeded_session_id';
+            var targetId = (\(keyArr))[0];
+            if (window.sessionStorage && window.sessionStorage.getItem(tokenKey) !== targetId) {
+              window.sessionStorage.setItem(tokenKey, targetId);
               window.localStorage.setItem('dsh.sessions.current', JSON.stringify(\(payload)));
             }
           } catch (_) {}
@@ -421,7 +427,8 @@ private struct LoopbackWebView: UIViewRepresentable {
             onProgress: onProgress,
             onThemeChanged: onThemeChanged,
             onNativeAction: onNativeAction,
-            onDisconnect: onDisconnect
+            onDisconnect: onDisconnect,
+            onProcessTerminate: onProcessTerminate
         )
     }
 
@@ -581,7 +588,7 @@ private struct LoopbackWebView: UIViewRepresentable {
 
     private func installUserScripts(on controller: WKUserContentController) {
         controller.removeAllUserScripts()
-        if let seed = Self.sessionSeedScript(sessionId: initialSessionId, reloadToken: reloadToken) {
+        if let seed = Self.sessionSeedScript(sessionId: initialSessionId) {
             controller.addUserScript(WKUserScript(
                 source: seed,
                 injectionTime: .atDocumentStart,
@@ -630,6 +637,7 @@ private struct LoopbackWebView: UIViewRepresentable {
         context.coordinator.onThemeChanged = onThemeChanged
         context.coordinator.onNativeAction = onNativeAction
         context.coordinator.onDisconnect = onDisconnect
+        context.coordinator.onProcessTerminate = onProcessTerminate
         if context.coordinator.viewportMode != viewportMode || context.coordinator.textScalePercent != textScalePercent {
             context.coordinator.viewportMode = viewportMode
             context.coordinator.textScalePercent = textScalePercent
@@ -663,6 +671,7 @@ private struct LoopbackWebView: UIViewRepresentable {
         var onThemeChanged: (Color, Bool) -> Void
         var onNativeAction: (String) -> Void
         var onDisconnect: (String) -> Void
+        var onProcessTerminate: () -> Void
         private var progressObservation: NSKeyValueObservation?
         private var memoryTrimObserver: NSObjectProtocol?
         private var recentCrashTimestamps: [Date] = []
@@ -675,7 +684,8 @@ private struct LoopbackWebView: UIViewRepresentable {
             onProgress: @escaping (Double) -> Void,
             onThemeChanged: @escaping (Color, Bool) -> Void,
             onNativeAction: @escaping (String) -> Void,
-            onDisconnect: @escaping (String) -> Void
+            onDisconnect: @escaping (String) -> Void,
+            onProcessTerminate: @escaping () -> Void
         ) {
             self.allowedPort = allowedPort
             self.viewportMode = viewportMode
@@ -684,6 +694,7 @@ private struct LoopbackWebView: UIViewRepresentable {
             self.onThemeChanged = onThemeChanged
             self.onNativeAction = onNativeAction
             self.onDisconnect = onDisconnect
+            self.onProcessTerminate = onProcessTerminate
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -773,8 +784,8 @@ private struct LoopbackWebView: UIViewRepresentable {
             recentCrashTimestamps = recentCrashTimestamps.filter { now.timeIntervalSince($0) < 15 }
             recentCrashTimestamps.append(now)
             if recentCrashTimestamps.count <= 2 {
-                // Auto-recover seamlessly from transient iOS WKWebContent Jetsam termination
-                webView.reload()
+                // Re-fetch fresh tokenized URL instead of stale webView.reload() which can 401 or hit a dead port.
+                onProcessTerminate()
             } else {
                 onDisconnect("Web 渲染进程多次因系统内存紧张中断，请点击重试加载。")
             }
@@ -912,11 +923,24 @@ private struct LoopbackWebView: UIViewRepresentable {
             decidePolicyFor navigationResponse: WKNavigationResponse,
             decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
         ) {
-            if let http = navigationResponse.response as? HTTPURLResponse,
-               let disposition = http.value(forHTTPHeaderField: "Content-Disposition")?.lowercased(),
-               disposition.contains("attachment") {
-                decisionHandler(.download)
-                return
+            if let http = navigationResponse.response as? HTTPURLResponse {
+                if navigationResponse.isForMainFrame && http.statusCode == 401 {
+                    decisionHandler(.cancel)
+                    let now = Date()
+                    recentCrashTimestamps = recentCrashTimestamps.filter { now.timeIntervalSince($0) < 15 }
+                    recentCrashTimestamps.append(now)
+                    if recentCrashTimestamps.count <= 2 {
+                        onProcessTerminate()
+                    } else {
+                        onDisconnect("本机 Web 工作台认证未通过（HTTP 401），请点击重试加载。")
+                    }
+                    return
+                }
+                if let disposition = http.value(forHTTPHeaderField: "Content-Disposition")?.lowercased(),
+                   disposition.contains("attachment") {
+                    decisionHandler(.download)
+                    return
+                }
             }
             if !navigationResponse.canShowMIMEType {
                 decisionHandler(.download)

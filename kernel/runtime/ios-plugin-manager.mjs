@@ -908,7 +908,7 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
         if (info.isFile() && ['.js', '.mjs', '.cjs'].includes(extension)) {
           if (info.size > 8 * 1024 * 1024) throw new RangeError('iOS 插件单个 JavaScript 文件不得超过 8 MiB')
           const source = await readFile(filePath, 'utf8')
-          if (/(?:from\s*|import\s*\(?\s*|require\s*\(\s*)['"](?:node:)?(?:child_process|worker_threads|cluster|inspector|vm)(?:\/[^'"]*)?['"]/.test(source)) {
+          if (/(?:from\s*|import\s*\(?\s*|require\s*\(\s*)['"](?:node:)?(?:inspector|vm)(?:\/[^'"]*)?['"]/.test(source)) {
             unsupportedImports.push(relative(root, filePath))
           }
         }

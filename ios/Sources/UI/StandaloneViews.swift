@@ -230,6 +230,7 @@ public struct ToolsHubTabView: View {
     @ObservedObject private var memoryGovernor = MemoryGovernor.shared
     @ObservedObject private var budgetGovernor = CostBudgetGovernor.shared
     @State private var showAgentBrowser = false
+    @State private var showWebWorkbench = false
 
     public init(host: LocalAgentHost) {
         self.host = host
@@ -240,8 +241,8 @@ public struct ToolsHubTabView: View {
             List {
                 // Hero Section: Embedded DSH Web Workbench + Built-in Agent Browser
                 Section {
-                    NavigationLink {
-                        DSHWebUIView(host: host)
+                    Button {
+                        showWebWorkbench = true
                     } label: {
                         HStack(spacing: 14) {
                             ZStack {
@@ -256,6 +257,7 @@ public struct ToolsHubTabView: View {
                                 HStack(spacing: 6) {
                                     Text("打开 DSH Web 工作台")
                                         .font(.headline)
+                                        .foregroundStyle(.primary)
                                     DSStatusBadge("Loopback", color: DSTheme.brand)
                                 }
                                 Text("内嵌官方 Web UI、会话 ZIP/Markdown 导出与社区 dsh-client-ui-* 插件")
@@ -263,9 +265,14 @@ public struct ToolsHubTabView: View {
                                     .foregroundStyle(.secondary)
                                     .lineLimit(2)
                             }
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.tertiary)
                         }
                         .padding(.vertical, 6)
                     }
+                    .buttonStyle(.plain)
 
                     Button {
                         showAgentBrowser = true
@@ -439,6 +446,9 @@ public struct ToolsHubTabView: View {
             .navigationTitle("工作台")
             .sheet(isPresented: $showAgentBrowser) {
                 AgentBrowserSheet(workspace: host.workspace)
+            }
+            .fullScreenCover(isPresented: $showWebWorkbench) {
+                DSHWebUIView(host: host)
             }
         }
     }
