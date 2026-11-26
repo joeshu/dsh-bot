@@ -119,6 +119,14 @@ def verify_runtime(archive, prefix, names):
                      app_boot_path, ios_profile_package, ios_profile_patch, ios_host_package, framework_binary_path,
                      framework_root + "Info.plist", prefix + "NodeMobile-LICENSE.txt"]:
         require(required in names and archive.getinfo(required).file_size > 0, f"Missing embedded runtime component: {required}")
+    host_source = Path(__file__).resolve().parent.parent / "kernel" / "runtime" / "ios-host-package"
+    for host_module in sorted(host_source.glob("*.mjs")):
+        full = prefix + "DSHRuntime/node_modules/@dsbot/dsh-ios-host/" + host_module.name
+        if full not in ios_host_files:
+            ios_host_files.append(full)
+    for native in names:
+        require(not native.lower().endswith((".so", ".dylib", ".node")) or "/Frameworks/" in native,
+                f"Desktop native binary must not ship in DSHRuntime: {native}")
     for required in ios_host_files:
         require(required in names and archive.getinfo(required).file_size > 0, f"Missing iOS profile adapter module: {required}")
     manifest = json.loads(archive.read(runtime_path))

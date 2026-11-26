@@ -232,7 +232,11 @@ class IPARegressionTests(unittest.TestCase):
                              }}).encode())
             for name in ["index.mjs", "credentials.mjs", "session-persistence.mjs", "native-tools.mjs",
                          "approval.mjs", "ios-python-tool.mjs", "python-execution.mjs", "python-worker.mjs",
-                         "python-worker-gate.mjs", "ios-python-jobs.mjs", "ios-ptc-runtime.mjs", "ios-ptc-python-worker.mjs", "ios-ptc-executor.mjs"]:
+                         "python-worker-gate.mjs", "ios-python-jobs.mjs", "ios-ptc-runtime.mjs", "ios-ptc-python-worker.mjs", "ios-ptc-executor.mjs"] + sorted(
+                    {item.name for item in (Path(__file__).resolve().parents[2] / "kernel" / "runtime" / "ios-host-package").glob("*.mjs")}
+                    - {"index.mjs", "credentials.mjs", "session-persistence.mjs", "native-tools.mjs", "approval.mjs", "ios-python-tool.mjs",
+                       "python-execution.mjs", "python-worker.mjs", "python-worker-gate.mjs", "ios-python-jobs.mjs", "ios-ptc-runtime.mjs",
+                       "ios-ptc-python-worker.mjs", "ios-ptc-executor.mjs"}):
                 archive.writestr(base + "DSHRuntime/node_modules/@dsbot/dsh-ios-host/" + name, b"// adapter")
             for package, version in PACKAGES.items():
                 archive.writestr(base + "DSHRuntime/node_modules/" + package + "/package.json", json.dumps({"version": version}).encode())

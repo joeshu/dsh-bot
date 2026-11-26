@@ -81,8 +81,8 @@ class SQLiteSessionHandle {
     if (length !== undefined && (!Number.isSafeInteger(length) || length < 0)) throw new RangeError('Session read length must be a non-negative safe integer')
     await this.owner.flushHandleLive(this)
     const rows = length === undefined
-      ? this.owner.db.prepare('SELECT event_json FROM session_events WHERE session_id = ? AND seq >= ? ORDER BY seq').all(this.id, offset)
-      : this.owner.db.prepare('SELECT event_json FROM session_events WHERE session_id = ? AND seq >= ? ORDER BY seq LIMIT ?').all(this.id, offset, length)
+      ? this.owner.stmt('SELECT event_json FROM session_events WHERE session_id = ? AND seq >= ? ORDER BY seq').all(this.id, offset)
+      : this.owner.stmt('SELECT event_json FROM session_events WHERE session_id = ? AND seq >= ? ORDER BY seq LIMIT ?').all(this.id, offset, length)
     abortIfRequested(options.signal)
     const events = rows.map((row) => JSON.parse(row.event_json))
     assertContiguous(this.id, events, offset)
@@ -96,24 +96,24 @@ class SQLiteSessionHandle {
     abortIfRequested(options.signal)
     const batch = materializeAppendBatch(events)
     if (batch.length === 0) return
-    const row = this.owner.db.prepare('SELECT next_seq FROM sessions WHERE id = ?').get(this.id)
+    const row = this.owner.stmt('SELECT next_seq FROM sessions WHERE id = ?').get(this.id)
     if (!row) throw new SessionPersistenceNotFoundError(this.id)
     assertContiguous(this.id, batch, row.next_seq)
     this.owner.db.exec('BEGIN IMMEDIATE')
     try {
-      const current = this.owner.db.prepare('SELECT next_seq FROM sessions WHERE id = ?').get(this.id)
+      const current = this.owner.stmt('SELECT next_seq FROM sessions WHERE id = ?').get(this.id)
       if (!current) throw new SessionPersistenceNotFoundError(this.id)
       assertContiguous(this.id, batch, current.next_seq)
-      const insert = this.owner.db.prepare('INSERT INTO session_events(session_id, seq, event_json) VALUES (?, ?, ?)')
+      const insert = this.owner.stmt('INSERT INTO session_events(session_id, seq, event_json) VALUES (?, ?, ?)')
       for (const event of batch) insert.run(this.id, event.seq, JSON.stringify(event))
-      this.owner.db.prepare('UPDATE sessions SET next_seq = ?, revision = revision + 1 WHERE id = ?')
+      this.owner.stmt('UPDATE sessions SET next_seq = ?, revision = revision + 1 WHERE id = ?')
         .run(current.next_seq + batch.length, this.id)
       const lastActivityAt = batch.at(-1)?.time
       let preview
       for (let index = batch.length - 1; index >= 0 && preview === undefined; index -= 1) {
         preview = lastMessagePreview(batch[index])
       }
-      this.owner.db.prepare(`UPDATE sessions
+      this.owner.stmt(`UPDATE sessions
         SET last_activity_at = COALESCE(?, last_activity_at),
             last_message_preview = COALESCE(?, last_message_preview)
         WHERE id = ?`).run(Number.isSafeInteger(lastActivityAt) ? lastActivityAt : null, preview ?? null, this.id)
@@ -166,7 +166,7 @@ class SQLiteSessionHandle {
     if (this.access !== 'write') throw new SessionReadOnlyError(this.id, 'flush')
     abortIfRequested(options.signal)
     await this.drainLive()
-    this.owner.checkpoint()
+    this.owner.checkpoint('PASSIVE')
     abortIfRequested(options.signal)
   }
 
@@ -250,8 +250,18 @@ export class SQLiteSessionPersistence extends SessionPersistence {
     return db
   }
 
+  stmt(sql) {
+    const db = this.db
+    if (this._stmtDb !== db) { this._stmts = new Map(); this._stmtDb = db }
+    let statement = this._stmts.get(sql)
+    if (!statement) { statement = db.prepare(sql); this._stmts.set(sql, statement) }
+    return statement
+  }
+
   closeDatabaseHandle() {
     if (!this._db) return
+    this._stmts = new Map()
+    this._stmtDb = null
     try {
       this._db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
     } finally {
