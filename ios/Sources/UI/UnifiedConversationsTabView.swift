@@ -488,7 +488,7 @@ public struct UnifiedConversationsTabView: View {
         } label: {
             HStack(spacing: 12) {
                 ZStack(alignment: .bottomTrailing) {
-                    DSBotAvatar(initials: bot.name, color: DSTheme.botAvatarColor(bot), size: 46, isPrivate: bot.isPrivate)
+                    DSBotAvatar(initials: bot.name, color: DSTheme.botAvatarColor(bot), isPrivate: bot.isPrivate, size: 46)
                     if isBotStreaming {
                         Circle()
                             .fill(DSTheme.brand)
