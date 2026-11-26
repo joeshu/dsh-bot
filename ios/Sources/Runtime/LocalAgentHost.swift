@@ -649,7 +649,7 @@ public final class LocalAgentHost: ObservableObject {
     /// Rolls back the trailing assistant reply (if any) and the last user message in local session state + SQLite,
     /// returning the user's original prompt so it can be edited and resent cleanly (`rewind`).
     @discardableResult
-    public func rewindLastTurn(sessionId: String) -> String? {
+    public func rewindLastTurn(sessionId: String) async -> String? {
         guard let address = resolveAddress(sessionId) else {
             workspaceError = "无效的会话地址，已拒绝撤回操作。"
             return nil
@@ -659,19 +659,19 @@ public final class LocalAgentHost: ObservableObject {
         guard let lastUserIdx = list.lastIndex(where: { $0.role == "user" }) else { return nil }
         let userText = list[lastUserIdx].content
         let truncateSeq = list[lastUserIdx].sequence
+        if let truncateSeq, let channel {
+            _ = try? await channel.request("session.truncateFromSeq", params: ["sessionId": targetId, "sequence": truncateSeq], timeoutSeconds: 15)
+            dshToolActivities.removeAll { $0.sessionId == targetId && (($0.sequence ?? Int.max) >= truncateSeq || ($0.callSequence ?? Int.max) >= truncateSeq) }
+            dshApprovalAudits.removeAll { $0.sessionId == targetId && ($0.sequence ?? Int.max) >= truncateSeq }
+        }
         list.removeSubrange(lastUserIdx..<list.count)
         messagesBySession[targetId] = list
-        if let truncateSeq, let channel {
-            Task { [weak self] in
-                _ = try? await channel.request("session.truncateFromSeq", params: ["sessionId": targetId, "sequence": truncateSeq], timeoutSeconds: 15)
-                await self?.refreshSessionSummaries()
-            }
-        }
+        await refreshSessionSummaries()
         return userText
     }
 
-    /// Removes a single message from the local session transcript and persists truncation when backed by SQLite sequence (P1-2).
-    public func deleteMessage(sessionId: String, messageId: String) {
+    /// Removes a message and all subsequent turns from the session transcript and awaits SQLite truncation.
+    public func deleteMessage(sessionId: String, messageId: String) async {
         guard let address = resolveAddress(sessionId) else {
             workspaceError = "无效的会话地址，已拒绝删除消息。"
             return
@@ -679,18 +679,18 @@ public final class LocalAgentHost: ObservableObject {
         let targetId = address.canonicalSessionId
         guard !isSessionStreaming(targetId), var list = messagesBySession[targetId] else { return }
         let removedSeq = list.first(where: { $0.id == messageId })?.sequence
+        if let removedSeq, let channel {
+            _ = try? await channel.request("session.truncateFromSeq", params: ["sessionId": targetId, "sequence": removedSeq], timeoutSeconds: 15)
+            dshToolActivities.removeAll { $0.sessionId == targetId && (($0.sequence ?? Int.max) >= removedSeq || ($0.callSequence ?? Int.max) >= removedSeq) }
+            dshApprovalAudits.removeAll { $0.sessionId == targetId && ($0.sequence ?? Int.max) >= removedSeq }
+        }
         if let idx = list.firstIndex(where: { $0.id == messageId }) {
             list.removeSubrange(idx..<list.count)
         } else {
             list.removeAll { $0.id == messageId }
         }
         messagesBySession[targetId] = list
-        if let removedSeq, let channel {
-            Task { [weak self] in
-                _ = try? await channel.request("session.truncateFromSeq", params: ["sessionId": targetId, "sequence": removedSeq], timeoutSeconds: 15)
-                await self?.refreshSessionSummaries()
-            }
-        }
+        await refreshSessionSummaries()
         DSHaptics.impact(.light)
     }
 
@@ -699,6 +699,7 @@ public final class LocalAgentHost: ObservableObject {
         guard let index = bots.firstIndex(where: { $0.id == botId }) else { return }
         bots[index].disabledTools = Array(Set(disabledTools)).sorted()
         persistWorkspace()
+        schedulePrivateSessionAccessSync()
     }
 
     public func setBotModel(sessionId: String, model: String) {
@@ -745,15 +746,23 @@ public final class LocalAgentHost: ObservableObject {
         await sendMessage(sessionId: targetId, text: "[插话引导] \(trimmed)", model: model)
     }
 
-    /// Refreshes session summaries and reloads visible non-private history after closing the DSH Web Workbench.
+    /// Refreshes session summaries and cleanly reloads non-private histories modified by Web Workbench or background tasks.
     public func syncFromWebWorkbench() async {
-        guard state == .ready, !isStreaming else { return }
+        guard state == .ready else { return }
         await refreshSessionSummaries()
         await refreshPluginState()
+        // Invalidate cached non-private non-streaming sessions so returning to any Bot reloads fresh SQLite truth.
+        let cachedIds = Array(loadedHistoryIDs)
+        for cachedId in cachedIds {
+            guard !isSessionStreaming(cachedId) else { continue }
+            if let address = resolveAddress(cachedId), bot(for: address)?.isPrivate == true { continue }
+            loadedHistoryIDs.remove(cachedId)
+            messagesBySession[cachedId] = nil
+        }
         if let visibleId = visibleChatSessionId,
            let address = resolveAddress(visibleId),
+           !isSessionStreaming(address.canonicalSessionId),
            bot(for: address)?.isPrivate != true {
-            loadedHistoryIDs.remove(address.canonicalSessionId)
             try? await loadSessionHistory(address.canonicalSessionId)
         }
     }
@@ -1254,11 +1263,8 @@ public final class LocalAgentHost: ObservableObject {
         }
         let targetId = address.canonicalSessionId
         guard !isSessionStreaming(targetId) else { return }
-        // DSH sessions are append-only event logs. Retrying creates another turn
-        // with the same prompt so the visible transcript stays aligned with the
-        // durable history after the next app launch.
-        guard let lastUser = messagesBySession[targetId]?.last(where: { $0.role == "user" }) else { return }
-        await sendMessage(sessionId: targetId, text: lastUser.content, model: model)
+        guard let prompt = await rewindLastTurn(sessionId: targetId) else { return }
+        await sendMessage(sessionId: targetId, text: prompt, model: model)
     }
 
     public func exportSessionMarkdown(sessionId: String, botName: String) async throws -> String {
@@ -2546,6 +2552,106 @@ public final class LocalAgentHost: ObservableObject {
     }
 
     private func registerRuntimeBridge(on rpc: IPCChannel) async {
+        await rpc.registerHandler(method: "native.image.process") { params in
+            guard let b64 = params["base64"] as? String,
+                  let inputData = Data(base64Encoded: b64),
+                  !inputData.isEmpty else {
+                throw IPCFrameError.invalidJSON
+            }
+            let maxWidth = (params["maxWidth"] as? NSNumber)?.intValue ?? 0
+            let maxHeight = (params["maxHeight"] as? NSNumber)?.intValue ?? 0
+            let maxBytes = (params["maxBytes"] as? NSNumber)?.intValue ?? 4 * 1024 * 1024
+            let preserveAlpha = params["preserveAlpha"] as? Bool ?? false
+            let probeOnly = params["probeOnly"] as? Bool ?? false
+            return try await Task.detached(priority: .userInitiated) {
+                #if canImport(ImageIO) && canImport(CoreGraphics)
+                guard let source = CGImageSourceCreateWithData(inputData as CFData, nil),
+                      let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+                      let rawW = props[kCGImagePropertyPixelWidth] as? Int,
+                      let rawH = props[kCGImagePropertyPixelHeight] as? Int,
+                      rawW > 0, rawH > 0 else {
+                    throw NSError(domain: "DSBotImageIO", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid image data"])
+                }
+                let orientation = (props[kCGImagePropertyOrientation] as? Int) ?? 1
+                let swapped = orientation >= 5 && orientation <= 8
+                let effW = swapped ? rawH : rawW
+                let effH = swapped ? rawW : rawH
+                let hasAlpha = (props[kCGImagePropertyHasAlpha] as? Bool) ?? false
+                let srcType = CGImageSourceGetType(source) as String? ?? ""
+                let detectedMime: String = {
+                    if srcType.contains("png") { return "image/png" }
+                    if srcType.contains("jpeg") || srcType.contains("jpg") { return "image/jpeg" }
+                    if srcType.contains("webp") { return "image/webp" }
+                    if srcType.contains("gif") { return "image/gif" }
+                    return hasAlpha ? "image/png" : "image/jpeg"
+                }()
+                if probeOnly {
+                    return [
+                        "width": effW,
+                        "height": effH,
+                        "mediaType": detectedMime,
+                        "hasAlpha": hasAlpha,
+                    ]
+                }
+                let targetMaxEdge: Int = {
+                    let capW = maxWidth > 0 ? maxWidth : effW
+                    let capH = maxHeight > 0 ? maxHeight : effH
+                    return max(1, min(max(effW, effH), max(capW, capH)))
+                }()
+                let thumbOpts: [CFString: Any] = [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceShouldCacheImmediately: true,
+                    kCGImageSourceThumbnailMaxPixelSize: targetMaxEdge,
+                ]
+                guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOpts as CFDictionary)
+                    ?? CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                    throw NSError(domain: "DSBotImageIO", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to decode image"])
+                }
+                let outW = cgImage.width
+                let outH = cgImage.height
+                let wantPNG = preserveAlpha && hasAlpha
+                let qualities: [CGFloat] = [0.85, 0.72, 0.58, 0.44]
+                var encodedData: Data?
+                var outMime = wantPNG ? "image/png" : "image/jpeg"
+                if wantPNG {
+                    let mutable = NSMutableData()
+                    if let dest = CGImageDestinationCreateWithData(mutable, UTType.png.identifier as CFString, 1, nil) {
+                        CGImageDestinationAddImage(dest, cgImage, nil)
+                        if CGImageDestinationFinalize(dest), mutable.length <= maxBytes {
+                            encodedData = mutable as Data
+                        }
+                    }
+                }
+                if encodedData == nil {
+                    outMime = "image/jpeg"
+                    for q in qualities {
+                        let mutable = NSMutableData()
+                        if let dest = CGImageDestinationCreateWithData(mutable, UTType.jpeg.identifier as CFString, 1, nil) {
+                            CGImageDestinationAddImage(dest, cgImage, [kCGImageDestinationLossyCompressionQuality: q] as CFDictionary)
+                            if CGImageDestinationFinalize(dest) {
+                                encodedData = mutable as Data
+                                if mutable.length <= maxBytes { break }
+                            }
+                        }
+                    }
+                }
+                guard let finalBytes = encodedData, !finalBytes.isEmpty else {
+                    throw NSError(domain: "DSBotImageIO", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to encode image"])
+                }
+                return [
+                    "base64": finalBytes.base64EncodedString(),
+                    "width": outW,
+                    "height": outH,
+                    "mediaType": outMime,
+                    "hasAlpha": outMime == "image/png" ? hasAlpha : false,
+                ]
+                #else
+                throw NSError(domain: "DSBotImageIO", code: 4, userInfo: [NSLocalizedDescriptionKey: "ImageIO unavailable"])
+                #endif
+            }.value
+        }
+
         await rpc.registerHandler(method: "runtime.ready") { [weak self] params in
             let plugins = Set(params["plugins"] as? [String] ?? [])
             guard try EmbeddedRuntimeManifest.load().matches(params),
@@ -2940,30 +3046,78 @@ public final class LocalAgentHost: ObservableObject {
         }
         telemetryBySession[targetSessionId] = telemetry
 
-        let authoritativeContent = (params["finalContent"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let authoritativeReasoning = (params["finalReasoning"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let finalText: String
-        if !authoritativeContent.isEmpty && (ctx.streamState.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || authoritativeContent.count > ctx.streamState.content.count) {
-            finalText = authoritativeContent
-        } else {
-            finalText = ctx.streamState.content
+        // Stamp authoritative SQLite id & sequence onto the user message sent in this turn so rewind/delete always truncate SQLite.
+        if let userMeta = params["userMessage"] as? [String: Any],
+           let userSeq = userMeta["seq"] as? Int,
+           var list = messagesBySession[targetSessionId],
+           let lastUserIdx = list.lastIndex(where: { $0.role == "user" && $0.sequence == nil }) {
+            let existing = list[lastUserIdx]
+            let authId = (userMeta["id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? existing.id
+            let authTs: Date = {
+                if let ms = userMeta["timestamp"] as? NSNumber { return Date(timeIntervalSince1970: ms.doubleValue / 1_000) }
+                return existing.timestamp
+            }()
+            list[lastUserIdx] = ChatMessageItem(
+                id: authId,
+                sessionId: existing.sessionId,
+                role: existing.role,
+                content: existing.content,
+                reasoning: existing.reasoning,
+                timestamp: authTs,
+                sequence: userSeq
+            )
+            messagesBySession[targetSessionId] = list
         }
-        let finalThink: String
-        if !authoritativeReasoning.isEmpty && (ctx.streamState.reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || authoritativeReasoning.count > ctx.streamState.reasoning.count) {
-            finalThink = authoritativeReasoning
-        } else {
-            finalThink = ctx.streamState.reasoning
-        }
-        if !finalText.isEmpty || !finalThink.isEmpty {
-            var item = ChatMessageItem(sessionId: targetSessionId, role: "assistant", content: finalText, reasoning: finalThink)
-            item.incomplete = params["status"] as? String != "completed"
-            if let transcript = params["transcript"],
-               let bytes = try? JSONSerialization.data(withJSONObject: transcript) {
-                item.transcript = try? JSONDecoder().decode([ProviderMessage].self, from: bytes)
-                item.providerProfile = params["profile"] as? String
+
+        let isIncomplete = params["status"] as? String != "completed"
+        if let persistedRounds = params["assistantMessages"] as? [[String: Any]], !persistedRounds.isEmpty {
+            var appendedAny = false
+            for round in persistedRounds {
+                let text = round["content"] as? String ?? ""
+                let think = round["reasoning"] as? String ?? ""
+                guard !text.isEmpty || !think.isEmpty else { continue }
+                let msgId = (round["id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? UUID().uuidString
+                let seq = round["seq"] as? Int
+                let ts: Date = {
+                    if let ms = round["timestamp"] as? NSNumber { return Date(timeIntervalSince1970: ms.doubleValue / 1_000) }
+                    return Date()
+                }()
+                var item = ChatMessageItem(id: msgId, sessionId: targetSessionId, role: "assistant", content: text, reasoning: think, timestamp: ts, sequence: seq)
+                item.incomplete = isIncomplete
+                if let existingIdx = messagesBySession[targetSessionId]?.firstIndex(where: { $0.id == msgId }) {
+                    messagesBySession[targetSessionId]?[existingIdx] = item
+                } else {
+                    messagesBySession[targetSessionId, default: []].append(item)
+                }
+                appendedAny = true
             }
-            messagesBySession[targetSessionId, default: []].append(item)
-            persistWorkspace()
+            if appendedAny { persistWorkspace() }
+        } else {
+            let authoritativeContent = (params["finalContent"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let authoritativeReasoning = (params["finalReasoning"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let finalText: String
+            if !authoritativeContent.isEmpty && (ctx.streamState.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || authoritativeContent.count > ctx.streamState.content.count) {
+                finalText = authoritativeContent
+            } else {
+                finalText = ctx.streamState.content
+            }
+            let finalThink: String
+            if !authoritativeReasoning.isEmpty && (ctx.streamState.reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || authoritativeReasoning.count > ctx.streamState.reasoning.count) {
+                finalThink = authoritativeReasoning
+            } else {
+                finalThink = ctx.streamState.reasoning
+            }
+            if !finalText.isEmpty || !finalThink.isEmpty {
+                var item = ChatMessageItem(sessionId: targetSessionId, role: "assistant", content: finalText, reasoning: finalThink)
+                item.incomplete = isIncomplete
+                if let transcript = params["transcript"],
+                   let bytes = try? JSONSerialization.data(withJSONObject: transcript) {
+                    item.transcript = try? JSONDecoder().decode([ProviderMessage].self, from: bytes)
+                    item.providerProfile = params["profile"] as? String
+                }
+                messagesBySession[targetSessionId, default: []].append(item)
+                persistWorkspace()
+            }
         }
         if let usage = params["usage"] as? [String: Any] {
             let model = usage["model"] as? String ?? ModelProvider.defaultModel
@@ -2998,6 +3152,20 @@ public final class LocalAgentHost: ObservableObject {
         Task { @MainActor [weak self] in
             for await (method, params) in stream {
                 guard let self else { break }
+                if method == "session.changed" {
+                    if let changedId = params["sessionId"] as? String,
+                       !changedId.isEmpty,
+                       !self.isSessionStreaming(changedId) {
+                        self.loadedHistoryIDs.remove(changedId)
+                        self.messagesBySession[changedId] = nil
+                        if self.visibleChatSessionId == changedId {
+                            Task { @MainActor [weak self] in
+                                try? await self?.loadSessionHistory(changedId)
+                            }
+                        }
+                    }
+                    continue
+                }
                 if method == "runtime.failed" {
                     let message = params["message"] as? String ?? "内嵌 DSH 运行时启动失败。"
                     self.resolveRuntimeReadiness(.remoteError(code: -32000, message: message))

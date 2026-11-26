@@ -18,7 +18,8 @@
     "./ios-schedule-tools": "./ios-schedule-tools.mjs",
     "./ios-ptc-runtime": "./ios-ptc-runtime.mjs",
     "./ios-ptc-executor": "./ios-ptc-executor.mjs",
-    "./ios-directory-picker-browse": "./ios-directory-picker-browse.mjs"
+    "./ios-directory-picker-browse": "./ios-directory-picker-browse.mjs",
+    "./ios-attachment-store": "./ios-attachment-store.mjs"
   },
   "dependencies": {
     "@deepseek-ai/dsh-credentials": "0.2.2-rc.5",

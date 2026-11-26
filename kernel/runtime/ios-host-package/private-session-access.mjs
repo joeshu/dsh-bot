@@ -392,6 +392,24 @@ async function apply(ctx) {
     remoteAccess.invalidate(WEB_PRINCIPAL)
   })
 
+  ctx.on('ios/session/mutated', ({ sessionId, kind } = {}) => {
+    if (typeof sessionId !== 'string' || !sessionId) return
+    if (kind === 'clear') {
+      knownHeaders.delete(sessionId)
+      attachmentIdsBySession.delete(sessionId)
+    } else if (kind === 'truncate') {
+      if (typeof persistence?.listAttachmentIds === 'function') {
+        const fresh = persistence.listAttachmentIds().get(sessionId)
+        if (fresh && fresh.size > 0) attachmentIdsBySession.set(sessionId, fresh)
+        else attachmentIdsBySession.delete(sessionId)
+      } else {
+        attachmentIdsBySession.delete(sessionId)
+      }
+    }
+    refreshPrivateClosure()
+    remoteAccess.invalidate(WEB_PRINCIPAL)
+  })
+
   ctx.on('domain/changed', (change) => {
     if (change?.domain === 'workspace') remoteAccess.invalidate(WEB_PRINCIPAL)
   })

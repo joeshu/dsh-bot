@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events'
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { readdir, readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 import { parentPort, workerData } from 'node:worker_threads'
 import net from 'node:net'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -1884,11 +1884,11 @@ async function startTurn(params, preparation) {
       const mediaType = mimeByExt[`.${extMatch[1]}`]
       try {
         const bytes = await readFile(fullPath)
-        if (!bytes || bytes.byteLength === 0 || bytes.byteLength > 4 * 1024 * 1024) continue
-        if (attachmentsSvc && typeof attachmentsSvc.storeImage === 'function') {
-          const stored = await attachmentsSvc.storeImage(bytes, mediaType)
-          if (stored?.ref) {
-            contentBlocks.push({ type: 'image', attachment: stored.ref })
+        if (!bytes || bytes.byteLength === 0 || bytes.byteLength > 20 * 1024 * 1024) continue
+        if (attachmentsSvc && typeof attachmentsSvc.saveImage === 'function') {
+          const stored = await attachmentsSvc.saveImage({ data: bytes, mediaType, name: basename(fullPath) })
+          if (stored?.attachmentId) {
+            contentBlocks.push({ type: 'image', attachment: stored })
           }
         }
       } catch {}
@@ -1918,24 +1918,46 @@ async function startTurn(params, preparation) {
     let turnUsage
     let finalContent = ''
     let finalReasoning = ''
+    let persistedUserMessage
+    let persistedAssistantMessages = []
+    let nextSeq
     try {
       await active.agent.whenIdle()
       await ctx.sessions.flush(active.agent.session)
       const events = active.agent.session.snapshotEvents()
+      nextSeq = active.agent.session.seq
       const turnEvents = events.filter((event) => event.seq >= startSeq)
       const assistantParts = []
       const reasoningParts = []
       for (const event of turnEvents) {
+        if (event.type === 'user/message' && !persistedUserMessage && (!event.data?.source || event.data.source.kind === 'user')) {
+          persistedUserMessage = {
+            id: `dsh-${id}-${event.seq}`,
+            seq: event.seq,
+            timestamp: event.time,
+          }
+          continue
+        }
         if (event.type !== 'assistant/message') continue
         const blocks = event.data?.message?.content
         const textPart = messageText(blocks)
         if (textPart) assistantParts.push(textPart)
+        let thinkPart = ''
         if (Array.isArray(blocks)) {
-          const thinkPart = blocks
+          thinkPart = blocks
             .filter((b) => b?.type === 'thinking' && typeof b.thinking === 'string')
             .map((b) => b.thinking)
             .join('')
           if (thinkPart) reasoningParts.push(thinkPart)
+        }
+        if (textPart || thinkPart) {
+          persistedAssistantMessages.push({
+            id: `dsh-${id}-${event.seq}`,
+            seq: event.seq,
+            content: textPart,
+            reasoning: thinkPart,
+            timestamp: event.time,
+          })
         }
       }
       finalContent = assistantParts.join('\n\n')
@@ -1971,7 +1993,7 @@ async function startTurn(params, preparation) {
         }
       }
       if (inputTokens > 0 || cacheReadTokens > 0 || outputTokens > 0) {
-        turnUsage = { model: dshModel, inputTokens, cacheReadTokens, outputTokens }
+        turnUsage = { model, inputTokens, cacheReadTokens, outputTokens }
       }
     } catch (reason) {
       status = 'error'
@@ -1989,6 +2011,9 @@ async function startTurn(params, preparation) {
         durationMs,
         ...(finalContent ? { finalContent } : {}),
         ...(finalReasoning ? { finalReasoning } : {}),
+        ...(persistedUserMessage ? { userMessage: persistedUserMessage } : {}),
+        ...(persistedAssistantMessages.length > 0 ? { assistantMessages: persistedAssistantMessages } : {}),
+        ...(Number.isSafeInteger(nextSeq) ? { nextSeq } : {}),
         ...(error ? { error } : {}),
         ...(turnUsage ? { usage: turnUsage } : {}),
       })
@@ -2774,14 +2799,30 @@ rpc.handle('bots.policy.sync', async ({ bots } = {}) => {
   return { synced: next.size }
 })
 
+function purgeSessionQueryRows(sessionId) {
+  try {
+    const sq = ctx?.get?.('sessionQuery')
+    if (sq?._db) {
+      try { sq._db.prepare('DELETE FROM search_events WHERE session_id = ?').run(sessionId) } catch {}
+      try { sq._db.prepare('DELETE FROM search_sessions WHERE session_id = ?').run(sessionId) } catch {}
+    }
+  } catch {}
+}
+
 rpc.handle('session.clear', async ({ sessionId }) => {
   const id = resolveAnyHistorySessionId(sessionId)
-  const active = runtime.activeAgents.get(id)
-  if (active) {
-    if (runtime.activeTurns.has(id)) active.agent.cancel({ kind: 'user' })
-    await drainAndDispose(id, active)
-  }
+  await releaseSessionAgent(id, { forceCancel: true })
   await runtime.persistence.delete(id)
+  try {
+    const wsRegistry = ctx?.get?.('workspaceRegistry')
+    if (wsRegistry && typeof wsRegistry.list === 'function') {
+      for (const ws of wsRegistry.list()) {
+        if (typeof ws.detachSession === 'function') await ws.detachSession(id).catch(() => {})
+      }
+    }
+  } catch {}
+  purgeSessionQueryRows(id)
+  ctx?.emit?.('ios/session/mutated', { sessionId: id, kind: 'clear' })
   return { cleared: true }
 })
 
@@ -2790,13 +2831,17 @@ rpc.handle('session.truncateFromSeq', async ({ sessionId, sequence } = {}) => {
   if (!Number.isSafeInteger(sequence) || sequence < 0) {
     throw new TypeError('Invalid truncation sequence')
   }
-  if (runtime.activeTurns.has(id)) throw new Error('Cannot truncate an active session turn')
-  const active = runtime.activeAgents.get(id)
-  if (active) await drainAndDispose(id, active)
+  if (runtime.activeTurns.has(id) || ctx?.agents?.get?.(id)?.status === 'running') {
+    throw new Error('Cannot truncate an active session turn')
+  }
+  await releaseSessionAgent(id)
   if (typeof runtime.persistence?.truncateFromSeq !== 'function') {
     throw new Error('Session truncation is unavailable in this runtime')
   }
-  return await runtime.persistence.truncateFromSeq(id, sequence)
+  const result = await runtime.persistence.truncateFromSeq(id, sequence)
+  purgeSessionQueryRows(id)
+  ctx?.emit?.('ios/session/mutated', { sessionId: id, kind: 'truncate' })
+  return result
 })
 
 // UI-owned workspace methods (memory, connectors, approvals, speech, local JS) are routed by

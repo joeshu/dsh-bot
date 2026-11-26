@@ -610,7 +610,9 @@
         documentsDirectory: !!js process.env.DSH_HOME + '/files'
 
     - id: attachments
-      name: '@deepseek-ai/dsh-attachment-local'
+      name: '@dsbot/dsh-ios-host/ios-attachment-store'
+      config:
+        dshHome: !!js process.env.DSH_HOME
 
     - id: modules
       name: '@deepseek-ai/dsh-client-modules'

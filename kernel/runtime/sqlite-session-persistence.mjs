@@ -533,10 +533,38 @@ export class SQLiteSessionPersistence extends SessionPersistence {
     if (!Number.isSafeInteger(fromSeq) || fromSeq < 0) throw new TypeError('Invalid sequence for truncation')
     const writer = this.writeOwners.get(id)
     if (writer) await writer.close()
+    // Invalidate any open read handles for this session so stale reads cannot observe torn state.
+    for (const handle of this.handlesFor(id)) {
+      if (handle.access === 'read') {
+        handle.closed = true
+        this.release(handle)
+      }
+    }
     const db = this.db
     db.exec('BEGIN IMMEDIATE')
     try {
-      db.prepare('DELETE FROM session_events WHERE session_id = ? AND seq >= ?').run(id, fromSeq)
+      const sessionRow = db.prepare('SELECT inherited_event_count, next_seq FROM sessions WHERE id = ?').get(id)
+      if (!sessionRow) {
+        db.exec('COMMIT')
+        return { truncated: false, nextSeq: 0 }
+      }
+      const inherited = Number.isSafeInteger(sessionRow.inherited_event_count) ? sessionRow.inherited_event_count : 0
+      let effectiveFromSeq = Math.max(fromSeq, inherited)
+      // Snap effectiveFromSeq backwards if it lands inside an unclosed compaction/start..end or turn/start..end bracket.
+      const priorRows = db.prepare(`SELECT seq, json_extract(event_json, '$.type') AS type
+        FROM session_events WHERE session_id = ? AND seq < ? ORDER BY seq ASC`).all(id, effectiveFromSeq)
+      let openCompactionSeq = null
+      let openTurnSeq = null
+      for (const r of priorRows) {
+        if (r.type === 'compaction/start') openCompactionSeq = r.seq
+        else if (r.type === 'compaction/end') openCompactionSeq = null
+        else if (r.type === 'turn/start') openTurnSeq = r.seq
+        else if (r.type === 'turn/end') openTurnSeq = null
+      }
+      if (openCompactionSeq !== null) effectiveFromSeq = Math.min(effectiveFromSeq, Math.max(inherited, openCompactionSeq))
+      if (openTurnSeq !== null) effectiveFromSeq = Math.min(effectiveFromSeq, Math.max(inherited, openTurnSeq))
+
+      db.prepare('DELETE FROM session_events WHERE session_id = ? AND seq >= ?').run(id, effectiveFromSeq)
       db.prepare('DELETE FROM session_attachments WHERE session_id = ?').run(id)
       const remaining = db.prepare(`SELECT event_json FROM session_events WHERE session_id = ? AND event_json LIKE '%"attachmentId"%'`).all(id)
       const insertAtt = db.prepare('INSERT OR IGNORE INTO session_attachments(session_id, attachment_id) VALUES (?, ?)')
@@ -556,15 +584,18 @@ export class SQLiteSessionPersistence extends SessionPersistence {
           AND (json_extract(event_json, '$.type') = 'assistant/message'
             OR (json_extract(event_json, '$.type') = 'user/message'
               AND (json_type(event_json, '$.data.source') IS NULL
-                OR json_type(event_json, '$.data.source.kind') = 'text'
                 OR json_extract(event_json, '$.data.source.kind') = 'user')))
         ORDER BY seq DESC LIMIT 1`).get(id)
+      const lastTitleRow = db.prepare(`SELECT json_extract(event_json, '$.data.title') AS title
+        FROM session_events WHERE session_id = ? AND json_extract(event_json, '$.type') = 'session/title'
+        ORDER BY seq DESC LIMIT 1`).get(id)
       const preview = lastMessage ? lastMessagePreview(JSON.parse(lastMessage.event_json)) ?? '' : ''
+      const title = typeof lastTitleRow?.title === 'string' && lastTitleRow.title.trim() ? lastTitleRow.title.trim() : null
       db.prepare(`UPDATE sessions
-        SET next_seq = ?, revision = revision + 1, last_activity_at = ?, last_message_preview = ?
-        WHERE id = ?`).run(nextSeq, Number.isSafeInteger(lastEvent?.time) ? lastEvent.time : null, preview, id)
+        SET next_seq = ?, revision = revision + 1, last_activity_at = ?, last_message_preview = ?, title = ?
+        WHERE id = ?`).run(nextSeq, Number.isSafeInteger(lastEvent?.time) ? lastEvent.time : null, preview, title, id)
       db.exec('COMMIT')
-      return { truncated: true, nextSeq }
+      return { truncated: true, nextSeq, effectiveFromSeq }
     } catch (error) {
       db.exec('ROLLBACK')
       throw error

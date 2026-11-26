@@ -106,6 +106,7 @@ public struct ChatView: View {
     @State private var followsLiveOutput = true
     @State private var showClearConfirm = false
     @State private var showPrivateExportConfirm = false
+    @State private var pendingDeleteMessage: ChatMessageItem? = nil
     @State private var activeSheet: ChatActiveSheet?
     @State private var referencedBot: BotProfile?
     @State private var attachedFiles: [LocalAgentHost.AttachedWorkspaceFile] = []
@@ -606,6 +607,25 @@ public struct ChatView: View {
             }
         }
         #endif
+        .alert(
+            "删除此处及后续对话？",
+            isPresented: Binding(
+                get: { pendingDeleteMessage != nil },
+                set: { if !$0 { pendingDeleteMessage = nil } }
+            ),
+            presenting: pendingDeleteMessage
+        ) { target in
+            Button("取消", role: .cancel) { pendingDeleteMessage = nil }
+            Button("删除此处及后续", role: .destructive) {
+                let targetId = target.id
+                pendingDeleteMessage = nil
+                Task {
+                    await host.deleteMessage(sessionId: activeSessionId, messageId: targetId)
+                }
+            }
+        } message: { _ in
+            Text("DSH 会话日志按时间线截断，此操作将永久删除该条消息及其之后的全部对话轮次。")
+        }
     }
 
     @ViewBuilder
@@ -1312,8 +1332,13 @@ public struct ChatView: View {
                 .contextMenu {
                     if isUser && !host.isSessionStreaming(activeSessionId) {
                         Button {
-                            input = msg.content
-                            DSHaptics.impact(.light)
+                            let edited = msg.content
+                            let targetMsgId = msg.id
+                            Task {
+                                await host.deleteMessage(sessionId: activeSessionId, messageId: targetMsgId)
+                                input = edited
+                                DSHaptics.impact(.light)
+                            }
                         } label: {
                             Label("编辑并重发", systemImage: "pencil.line")
                         }
@@ -1353,9 +1378,9 @@ public struct ChatView: View {
                     }
                     if !host.isSessionStreaming(activeSessionId) {
                         Button(role: .destructive) {
-                            host.deleteMessage(sessionId: activeSessionId, messageId: msg.id)
+                            pendingDeleteMessage = msg
                         } label: {
-                            Label("删除此条消息", systemImage: "trash")
+                            Label("删除此处及后续对话…", systemImage: "trash")
                         }
                     }
                     if !isUser && !host.isSessionStreaming(activeSessionId) {
@@ -1548,13 +1573,15 @@ public struct ChatView: View {
     }
 
     private func rewindLastUserTurn() {
-        guard let previous = host.rewindLastTurn(sessionId: activeSessionId) else {
-            actionStatus = "当前没有可回退的上一轮消息。"
-            return
+        Task {
+            guard let previous = await host.rewindLastTurn(sessionId: activeSessionId) else {
+                actionStatus = "当前没有可回退的上一轮消息。"
+                return
+            }
+            input = previous
+            actionStatus = "已撤回上一轮并回填到输入框，可直接修改重发。"
+            DSHaptics.impact(.light)
         }
-        input = previous
-        actionStatus = "已撤回上一轮并回填到输入框，可直接修改重发。"
-        DSHaptics.impact(.light)
     }
 
     private var composerBar: some View {

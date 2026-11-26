@@ -407,8 +407,21 @@ export function installCustomEndpointCompatFetch({ getProviderBaseURL, isOfficia
       return await baseFetch(input, init)
     }
 
+    if (parsedUrl.origin !== activeParsed.origin) {
+      return await baseFetch(input, init)
+    }
+
+    // Custom OpenAI-compat / third-party endpoints do not implement Anthropic Files API;
+    // return 404 so dsh-llm-deepseek immediately falls back to inline base64 image content.
+    if (parsedUrl.pathname.endsWith('/files')) {
+      return new Response(JSON.stringify({ error: { type: 'not_found_error', message: 'Files API not supported on custom endpoint' } }), {
+        status: 404,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+
     // Only intercept Anthropic Messages POSTs targeting the active custom endpoint origin
-    if (parsedUrl.origin !== activeParsed.origin || !parsedUrl.pathname.endsWith('/messages')) {
+    if (!parsedUrl.pathname.endsWith('/messages')) {
       return await baseFetch(input, init)
     }
 
