@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import time
 import urllib.request
 from zipfile import ZipFile
 
@@ -22,6 +23,21 @@ NUMPY_SHA256 = "800c98edc0c864dfa49f07005680c699b4b42b84eae1f8cb19d35b3634e7f05c
 PYODIDE_LICENSE_SHA256 = "1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5"
 NUMPY_LICENSE_SHA256 = "01fb016849aa427edb1bbbbd55f91c26ca6cadb32a5b20e7f000655dd05b0760"
 MAX_WHEEL_BYTES = 32 * 1024 * 1024
+
+
+
+def fetch_with_retry(request, timeout, limit, attempts=4):
+    """Download with bounded exponential backoff; digests are still verified by callers."""
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read(limit)
+        except Exception as error:  # network/CDN hiccups only; integrity is checked afterwards
+            last_error = error
+            if attempt + 1 < attempts:
+                time.sleep(2 ** attempt)
+    raise SystemExit(f"Download failed after {attempts} attempts: {last_error}")
 
 
 def sha256_bytes(value):
@@ -57,8 +73,7 @@ def main():
 
     wheel_url = f"https://cdn.jsdelivr.net/pyodide/v{PYODIDE_VERSION}/full/{wheel_name}"
     request = urllib.request.Request(wheel_url, headers={"User-Agent": "DSBot-iOS-runtime-builder/1"})
-    with urllib.request.urlopen(request, timeout=90) as response:
-        wheel = response.read(MAX_WHEEL_BYTES + 1)
+    wheel = fetch_with_retry(request, 90, MAX_WHEEL_BYTES + 1)
     if len(wheel) > MAX_WHEEL_BYTES:
         raise SystemExit("The pinned NumPy wheel exceeds the 32 MiB staging limit")
     if sha256_bytes(wheel) != NUMPY_SHA256:
@@ -86,8 +101,7 @@ def main():
 
     license_url = "https://raw.githubusercontent.com/pyodide/pyodide/0.29.5/LICENSE"
     license_request = urllib.request.Request(license_url, headers={"User-Agent": "DSBot-iOS-runtime-builder/1"})
-    with urllib.request.urlopen(license_request, timeout=30) as response:
-        pyodide_license = response.read(24 * 1024)
+    pyodide_license = fetch_with_retry(license_request, 30, 24 * 1024)
     if sha256_bytes(pyodide_license) != PYODIDE_LICENSE_SHA256:
         raise SystemExit("Pyodide MPL-2.0 license text does not match the pinned release")
     (DESTINATION / "LICENSE-PYODIDE-MPL-2.0.txt").write_bytes(pyodide_license)
