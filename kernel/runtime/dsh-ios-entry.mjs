@@ -234,9 +234,26 @@ export function flattenToolSchema(schema, defs = undefined, depth = 0) {
 function eventMessages(events, botId) {
   const messages = []
   for (const event of events) {
-    if (event.type === 'user/message' && (!event.data.source || event.data.source.kind === 'user')) {
-      const content = messageText(event.data.content)
-      if (content) messages.push({ id: event.data.id, sessionId: botId, role: 'user', content, reasoning: '', timestamp: event.time, sequence: event.seq })
+    if (event.type === 'user/message') {
+      const sourceKind = event.data?.source?.kind
+      if (sourceKind === 'model-selection' || sourceKind === 'tool-jobs') continue
+      if (sourceKind === 'compaction') {
+        messages.push({
+          id: event.data?.id ?? `compact-${event.seq}`,
+          sessionId: botId,
+          role: 'assistant',
+          content: '📦 **上下文已压缩检查点**\n\n历史对话已由 DSH 自动压缩以节省上下文窗口。',
+          reasoning: '',
+          timestamp: event.time,
+          sequence: event.seq,
+        })
+        continue
+      }
+      if (!sourceKind || sourceKind === 'user' || sourceKind === 'schedule') {
+        const raw = messageText(event.data.content)
+        const content = sourceKind === 'schedule' && raw ? `⏰ [定时任务] ${raw}` : raw
+        if (content) messages.push({ id: event.data.id, sessionId: botId, role: 'user', content, reasoning: '', timestamp: event.time, sequence: event.seq })
+      }
     } else if (event.type === 'assistant/message') {
       const content = messageText(event.data.message?.content)
       const reasoning = Array.isArray(event.data.message?.content)
@@ -894,11 +911,26 @@ function setupAgent({ botId, systemPrompt, pinnedMemories = '', legacyHistory, a
     }
     setPersona(systemPrompt, pinnedMemories)
     refreshWorkspaceRules()
+    let groupContextDisposer
+    let lastGroupContext = ''
     setToolsEnabled = (enabled, allowSubagent, allowWebSearch, allowRedteam = false,
       allowRedteamWrites = false, allowRedteamSensitive = false, redteamPermissionMode = 'ask',
-      reasoningEffort = 'medium', disabledTools = []) => {
+      reasoningEffort = 'medium', disabledTools = [], isGroupSession = false, groupContextText = '') => {
       refreshWorkspaceRules()
       setReasoningEffort(reasoningEffort)
+      const normalizedGroupContext = isGroupSession && typeof groupContextText === 'string' ? groupContextText.trim().slice(0, 6_000) : ''
+      if (normalizedGroupContext !== lastGroupContext) {
+        lastGroupContext = normalizedGroupContext
+        groupContextDisposer?.()
+        groupContextDisposer = undefined
+        if (normalizedGroupContext) {
+          groupContextDisposer = agentCtx.systemPrompt.section({
+            name: 'dsbot-ios-group-context',
+            order: 858,
+            text: normalizedGroupContext,
+          })
+        }
+      }
       const normalizedPermissionMode = ['ask', 'autoReview', 'readOnly'].includes(redteamPermissionMode) ? redteamPermissionMode : 'ask'
       const normalizedDisabledTools = Array.isArray(disabledTools) ? [...new Set(disabledTools.map(String).filter(Boolean))].sort() : []
       const rtTools = registeredRedteamToolNames()
@@ -912,6 +944,7 @@ function setupAgent({ botId, systemPrompt, pinnedMemories = '', legacyHistory, a
         normalizedPermissionMode,
         rtTools,
         normalizedDisabledTools,
+        isGroupSession,
       })
       // Keep system prompt prefix and Cordis guards untouched across identical turns to maximize Prompt Cache hits
       if (policyKey === lastToolsPolicyKey) {
@@ -945,6 +978,7 @@ function setupAgent({ botId, systemPrompt, pinnedMemories = '', legacyHistory, a
             }))
         : []
       const deny = enabled ? [...normalizedDisabledTools] : [...DISABLED_TOOL_NAMES].filter((name) => globalToolNames.has(name))
+      if (!isGroupSession && !deny.includes('group_todo_add')) deny.push('group_todo_add')
       if (agentPreset === 'minimal') {
         for (const restricted of ['workspace_write', 'workspace_edit', 'terminal_exec', 'git_workspace', 'js_eval', 'python_exec', 'python_job_start']) {
           if (globalToolNames.has(restricted) && !deny.includes(restricted)) deny.push(restricted)
@@ -1621,6 +1655,32 @@ async function boot() {
         }
       }
     }
+    // Restore interactive approval prompts for subagents delegated from an active Native 'ask' turn
+    // (upstream dsh-subagent appends approval/policy = 'never' by default).
+    const parentSid = agent?.session?.header?.parentSession
+    if (typeof parentSid === 'string' && parentSid && typeof agent?.session?.append === 'function') {
+      let cursor = parentSid
+      const seen = new Set([sid])
+      const allSessions = typeof ctx?.sessions?.list === 'function' ? ctx.sessions.list() : []
+      const byId = new Map(allSessions.map((s) => [String(s?.id ?? s?.header?.id ?? ''), s]))
+      let rootTurn
+      for (let depth = 0; cursor && depth < 8 && !seen.has(cursor); depth += 1) {
+        seen.add(cursor)
+        const activeTurn = runtime.activeTurns.get(cursor)
+        if (activeTurn && !activeTurn.done) {
+          rootTurn = activeTurn
+          break
+        }
+        cursor = byId.get(cursor)?.header?.parentSession
+      }
+      if (rootTurn && rootTurn.permissionMode === 'ask') {
+        try {
+          if (ctx?.approval?.overrideOf?.(agent.session) === 'never') {
+            agent.session.append('approval/policy', { policy: 'ask', source: 'ios-native-inherit' })
+          }
+        } catch {}
+      }
+    }
   }, { global: true })
   createIOSPluginManager({ rpc, runtime, workspace: WORKSPACE, profileDir: PROFILE_DIR, installAnchor: INSTALL_ANCHOR, safeMode, drainAgents: () => ctx.subagents.drainDescendants([...runtime.activeAgents.values()].map(({ agent }) => agent)) })
   await rpc.request('runtime.ready', runtimeInfo(), 30_000)
@@ -1727,18 +1787,25 @@ async function startTurn(params, preparation) {
   if (runtime.activeTurns.has(dshSessionId(botId)) || runtime.activeTurns.size >= MAX_CONCURRENT_TURNS) {
     throw new Error('Another DSH turn is already running')
   }
-  if (Array.isArray(params.endpointModels) && params.endpointModels.length > 0) {
+  const isPrivateRequest = isPrivateBotOrThread(botId)
+  if (!isPrivateRequest && Array.isArray(params.endpointModels) && params.endpointModels.length > 0) {
     runtime.customCatalogModels = params.endpointModels.map(String).filter(Boolean)
   }
   const nextApiBaseURL = typeof params.apiBaseURL === 'string' ? params.apiBaseURL : runtime.apiBaseURL
   const nextProviderBaseURL = routeForApiBase(nextApiBaseURL)
   runtime.apiBaseURL = nextApiBaseURL
   if (nextProviderBaseURL !== runtime.providerBaseURL) {
+    // Guard against clobbering providerBaseURL while a Web session is actively streaming on the current endpoint.
+    const busyWebAgent = (typeof ctx?.agents?.list === 'function' ? ctx.agents.list() : [])
+      .find((a) => a?.status === 'running' && !runtime.activeTurns.has(a.id))
+    if (busyWebAgent) {
+      throw new Error('Web 工作台正在另一接口上运行对话，请等待 Web 回复完成后再切换自定义服务商。')
+    }
     for (const [id, active] of runtime.activeAgents) await drainAndDispose(id, active)
     // Cordis validates the plain config and owns the volatile references.
-    // Fiber.update applies this through Cordis' normal update lifecycle.
-    const nextConfig = { baseURL: nextProviderBaseURL }
-    if (!isOfficialDeepSeekBase(nextApiBaseURL) && Array.isArray(runtime.customCatalogModels) && runtime.customCatalogModels.length > 0) {
+    // Always preserve thinking: 'enabled' so reasoning_effort stays functional across switches.
+    const nextConfig = { baseURL: nextProviderBaseURL, thinking: 'enabled' }
+    if (!isOfficialDeepSeekBase(nextApiBaseURL) && !isPrivateRequest && Array.isArray(runtime.customCatalogModels) && runtime.customCatalogModels.length > 0) {
       nextConfig.models = runtime.customCatalogModels.map((id) => inferCustomModelCapabilities(id))
     }
     await runtime.providerFiber.update(nextConfig)
@@ -1859,7 +1926,7 @@ async function startTurn(params, preparation) {
     }
     active.setToolsEnabled(toolsEnabled, params.subagentEnabled === true, webSearchEnabled,
       redteamMode, redteamWriteEnabled, redteamSensitiveDataEnabled, permissionMode,
-      requestedEffort, disabledTools)
+      requestedEffort, disabledTools, params.isGroup === true, typeof params.groupContext === 'string' ? params.groupContext : '')
   }
 
   if (preparation.cancelled || runtime.suspended) {
@@ -2378,17 +2445,33 @@ function nativeHistorySessionId(sessionId) {
   return dshSessionId(sessionId)
 }
 
-// Keep native search on the same DSH index as Web, with a native Bot allowlist.
+// Keep native search on the same DSH index as Web, with a native Bot allowlist (including all child threads).
 rpc.handle('session.search', async ({ query, botIds, cursor } = {}) => {
   if (typeof query !== 'string' || !query.trim() || Array.from(query).length > 160
     || !Array.isArray(botIds) || botIds.length > 5000
     || (cursor !== undefined && (typeof cursor !== 'string' || cursor.length > 8192))) {
     throw new TypeError('Invalid native session search request')
   }
-  const allowed = new Set(botIds.map((botId) => {
+  const allowedRoots = new Set()
+  const allowed = new Set()
+  for (const botId of botIds) {
+    if (isPrivateBotOrThread(botId)) continue
     const id = nativeHistorySessionId(botId)
-    return isPrivateBotOrThread(botId) ? undefined : id
-  }).filter(Boolean))
+    allowed.add(id)
+    if (id.startsWith('ios:')) allowedRoots.add(id)
+  }
+  // Expand root Bot IDs to include all persisted non-private child threads (ios:<botId>:<threadId>).
+  if (allowedRoots.size > 0 && typeof runtime.persistence?.list === 'function') {
+    const allPersisted = await runtime.persistence.list()
+    for (const item of allPersisted) {
+      const sid = String(item?.header?.id ?? '')
+      if (!sid.startsWith('ios:')) continue
+      const botKey = botIdFromSession(sid)
+      if (isPrivateBotOrThread(botKey)) continue
+      const rootId = dshSessionId(rootBotIdOf(botKey))
+      if (allowedRoots.has(rootId)) allowed.add(sid)
+    }
+  }
   if (!allowed.size) return { results: [] }
   const provider = ctx.get('sessionQuery')
   if (!provider) throw new Error('DSH session search is unavailable')
@@ -2405,7 +2488,7 @@ rpc.handle('session.search', async ({ query, botIds, cursor } = {}) => {
   const results = []
   for (const { header, bestMatch } of page.items) {
     const botId = botIdFromSession(header.id)
-    if (!allowed.has(header.id) || isPrivateBotOrThread(botId) || header.parentSession != null) continue
+    if (!allowed.has(header.id) || isPrivateBotOrThread(botId) || header.origin === 'subagent') continue
     results.push({
       botId, sequence: bestMatch.seq, timestamp: bestMatch.time, snippet: bestMatch.snippet,
     })
@@ -2420,7 +2503,7 @@ rpc.handle('session.search.context', async ({ sessionId, sequence } = {}) => {
   }
   await runtime.persistence.flushSession(id)
   const summary = await runtime.persistence.stat(id)
-  if (!summary || summary.header.parentSession != null || sequence >= summary.eventCount) {
+  if (!summary || summary.header.origin === 'subagent' || sequence >= summary.eventCount) {
     throw new Error('Search result is unavailable')
   }
   const start = Math.max(0, sequence - 20)
@@ -2653,11 +2736,17 @@ function iosJobPublicView(job) {
   }
 }
 
+function iosJobBelongsToOwner(jobOwner, rootOwner) {
+  const value = String(jobOwner ?? '')
+  return value === rootOwner || value.startsWith(`${rootOwner}:`)
+}
+
 rpc.handle('jobs.list', async ({ botId } = {}) => {
   const owner = iosJobsOwner(botId)
   if (!ctx.jobs) throw new Error('DSH Jobs is unavailable in this runtime')
-  const jobs = ctx.jobs.list(owner)
-    .filter((job) => job.owner === owner)
+  const allJobs = typeof ctx.jobs.listAll === 'function' ? ctx.jobs.listAll() : ctx.jobs.list(owner)
+  const jobs = allJobs
+    .filter((job) => iosJobBelongsToOwner(job.owner, owner))
     .sort((left, right) => right.startedAt - left.startedAt)
     .slice(0, 100)
     .map(iosJobPublicView)
@@ -2669,13 +2758,16 @@ rpc.handle('jobs.output', async ({ botId, jobId, from = 0 } = {}) => {
   if (typeof jobId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/.test(jobId)
     || !Number.isSafeInteger(from) || from < 0) throw new TypeError('Invalid Jobs output request')
   if (!ctx.jobs) throw new Error('DSH Jobs is unavailable in this runtime')
+  const allJobs = typeof ctx.jobs.listAll === 'function' ? ctx.jobs.listAll() : ctx.jobs.list(owner)
+  const matched = allJobs.find((j) => String(j.id) === jobId && iosJobBelongsToOwner(j.owner, owner))
+  const effectiveOwner = matched?.owner ?? owner
   let job
-  try { job = ctx.jobs.get(jobId, owner) } catch { return { found: false } }
-  if (job.owner !== owner || from > job.output.total) return { found: false }
-  const output = ctx.jobs.readAt(jobId, from, owner)
+  try { job = ctx.jobs.get(jobId, effectiveOwner) } catch { return { found: false } }
+  if (!iosJobBelongsToOwner(job.owner, owner) || from > job.output.total) return { found: false }
+  const output = ctx.jobs.readAt(jobId, from, effectiveOwner)
   return {
     found: true,
-    job: iosJobPublicView(ctx.jobs.get(jobId, owner)),
+    job: iosJobPublicView(ctx.jobs.get(jobId, effectiveOwner)),
     chunks: output.chunks.map((chunk) => ({
       at: chunk.at,
       text: chunk.text,
@@ -2694,11 +2786,123 @@ rpc.handle('jobs.kill', async ({ botId, jobId, reason } = {}) => {
     throw new TypeError('Invalid Jobs cancellation request')
   }
   if (!ctx.jobs) throw new Error('DSH Jobs is unavailable in this runtime')
+  const allJobs = typeof ctx.jobs.listAll === 'function' ? ctx.jobs.listAll() : ctx.jobs.list(owner)
+  const matched = allJobs.find((j) => String(j.id) === jobId && iosJobBelongsToOwner(j.owner, owner))
+  const effectiveOwner = matched?.owner ?? owner
   let current
-  try { current = ctx.jobs.get(jobId, owner) } catch { return { found: false } }
-  if (current.owner !== owner) return { found: false }
-  const result = ctx.jobs.kill(jobId, owner, reason ?? 'Cancelled from the iOS Jobs manager')
-  return { found: true, result, job: iosJobPublicView(ctx.jobs.get(jobId, owner)) }
+  try { current = ctx.jobs.get(jobId, effectiveOwner) } catch { return { found: false } }
+  if (!iosJobBelongsToOwner(current.owner, owner)) return { found: false }
+  const result = ctx.jobs.kill(jobId, effectiveOwner, reason ?? 'Cancelled from the iOS Jobs manager')
+  return { found: true, result, job: iosJobPublicView(ctx.jobs.get(jobId, effectiveOwner)) }
+})
+
+rpc.handle('command.execute', async ({ sessionId, commandLine } = {}) => {
+  const botId = String(sessionId ?? '').trim()
+  const line = typeof commandLine === 'string' ? commandLine.trim() : ''
+  if (!isValidSessionKey(botId) || !line.startsWith('/')) {
+    throw new TypeError('Invalid DSH slash command request')
+  }
+  if (!ctx?.commands || typeof ctx.commands.execute !== 'function') {
+    throw new Error('DSH command service is unavailable')
+  }
+  const id = dshSessionId(botId)
+  if (runtime.activeTurns.has(id) || ctx?.agents?.get?.(id)?.status === 'running') {
+    throw new Error('当前会话正在生成中，请等待本轮完成后再执行斜杠命令。')
+  }
+  let agent = runtime.activeAgents.get(id)?.agent ?? ctx?.agents?.get?.(id)
+  let tempHandle
+  if (!agent) {
+    const policy = runtime.botPolicies.get(rootBotIdOf(botId))
+    const preset = policy?.agentPreset || ctx.agentPresets.defaultId
+    const composition = setupAgent({
+      botId,
+      systemPrompt: policy?.systemPrompt ?? '',
+      pinnedMemories: policy?.pinnedMemories ?? '',
+      agentPreset: preset,
+      toolsEnabled: true,
+      subagentEnabled: false,
+      webSearchEnabled: false,
+      permissionMode: policy?.permissionMode ?? 'ask',
+    })
+    const options = { provider: 'deepseek-official', model: 'deepseek-flash' }
+    if (await runtime.persistence.stat(id)) {
+      tempHandle = await ctx.agents.resume({ resumeSessionId: id, agentOptions: options, setup: composition.setup })
+    } else {
+      tempHandle = await ctx.agents.create({ sessionId: id, meta: { cwd: WORKSPACE_FILES }, agentOptions: options, setup: composition.setup })
+    }
+    agent = tempHandle.agent
+  }
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(new Error('Command timed out')), 60_000)
+  try {
+    const result = await ctx.commands.execute(agent, line, [], controller.signal)
+    await ctx.sessions.flush(agent.session).catch(() => {})
+    return {
+      ok: true,
+      command: line,
+      result: typeof result === 'string' ? result : (result?.message ?? result?.text ?? ''),
+    }
+  } finally {
+    clearTimeout(timer)
+    if (tempHandle) {
+      await tempHandle.dispose?.().catch(() => {})
+      runtime.allAgentHandles.delete(id)
+    }
+  }
+})
+
+rpc.handle('session.ensureWebReady', async ({ sessionId, title } = {}) => {
+  const botId = String(sessionId ?? '').trim()
+  if (!isValidSessionKey(botId)) throw new TypeError('Invalid sessionId')
+  if (isPrivateBotOrThread(botId)) throw new Error('Private Bot sessions cannot be opened in Web Workbench')
+  const id = dshSessionId(botId)
+  const cleanTitle = typeof title === 'string' ? title.trim().slice(0, 120) : ''
+  const existing = await runtime.persistence.stat(id)
+  if (!existing) {
+    const handle = await ctx.agents.create({
+      sessionId: id,
+      meta: { cwd: WORKSPACE_FILES },
+      agentOptions: { provider: 'deepseek-official', model: 'deepseek-flash' },
+      setup: async (agentCtx) => {
+        installModelSelection(agentCtx)
+        await ctx.agentPresets.mount(agentCtx, ctx.agentPresets.defaultId)
+      },
+    })
+    try {
+      if (cleanTitle) {
+        try { handle.agent.session.append('session/title', { title: cleanTitle, source: 'user' }) } catch {}
+      }
+      await ctx.sessions.flush(handle.agent.session)
+    } finally {
+      await handle.dispose?.().catch(() => {})
+      runtime.allAgentHandles.delete(id)
+    }
+  } else if (cleanTitle && !existing.title) {
+    const live = ctx?.agents?.get?.(id)
+    if (live?.session) {
+      try {
+        live.session.append('session/title', { title: cleanTitle, source: 'user' })
+        await ctx.sessions.flush(live.session)
+      } catch {}
+    }
+  }
+  try {
+    const wsRegistry = ctx?.get?.('workspaceRegistry')
+    if (wsRegistry && typeof wsRegistry.list === 'function') {
+      let ws = wsRegistry.list().find((item) => item.path === WORKSPACE_FILES) ?? wsRegistry.list()[0]
+      if (!ws && typeof wsRegistry.create === 'function') {
+        const created = await wsRegistry.create(WORKSPACE_FILES)
+        ws = created?.workspace ?? created
+      }
+      if (ws && typeof ws.attachSession === 'function') {
+        await ws.attachSession(id).catch(() => {})
+      }
+      if (wsRegistry.archivedSessionIds?.includes(id) && typeof wsRegistry.unarchiveSession === 'function') {
+        await wsRegistry.unarchiveSession(id).catch(() => {})
+      }
+    }
+  } catch {}
+  return { ready: true, dshSessionId: id }
 })
 
 rpc.handle('schedule.edit', async ({ botId, id, action, title, prompt, rrule, expectedUpdatedAt }) => {
@@ -3162,7 +3366,7 @@ async function syncProviderModelCatalog({ apiBaseURL, models, defaultModel } = {
             : []))
     : []
 
-  const nextConfig = { baseURL: nextProviderBaseURL }
+  const nextConfig = { baseURL: nextProviderBaseURL, thinking: 'enabled' }
   if (!official && effectiveIds.length > 0) {
     nextConfig.models = effectiveIds.map((id) => inferCustomModelCapabilities(id))
   }

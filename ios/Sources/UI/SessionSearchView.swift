@@ -1,12 +1,12 @@
 import SwiftUI
 
 private struct SessionSearchHit: Identifiable {
-    let botId: String
+    let sessionKey: String
+    let rootBotId: String
     let sequence: Int
     let snippet: String
 
-    // The official index returns one best match per session.
-    var id: String { botId }
+    var id: String { sessionKey }
 }
 
 struct SessionSearchResults: View {
@@ -27,12 +27,22 @@ struct SessionSearchResults: View {
     var body: some View {
         Section("历史消息") {
             ForEach(results) { hit in
-                if let bot = host.bots.first(where: { $0.id == hit.botId && !$0.isPrivate }) {
+                if let bot = host.bots.first(where: { $0.id == hit.rootBotId && !$0.isPrivate }) {
                     NavigationLink {
-                        SessionSearchContextView(host: host, bot: bot, sequence: hit.sequence)
+                        SessionSearchContextView(host: host, bot: bot, sessionKey: hit.sessionKey, sequence: hit.sequence)
                     } label: {
                         VStack(alignment: .leading, spacing: 4) {
-                            Text(bot.name).font(.headline)
+                            HStack(spacing: 6) {
+                                Text(bot.name).font(.headline)
+                                if hit.sessionKey.contains(":") {
+                                    Text("子话题")
+                                        .font(.caption2)
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 1)
+                                        .background(Color.secondary.opacity(0.15))
+                                        .clipShape(Capsule())
+                                }
+                            }
                             Text(hit.snippet).font(.subheadline).foregroundStyle(.secondary).lineLimit(3)
                         }
                     }
@@ -61,7 +71,7 @@ struct SessionSearchResults: View {
             requestNumber += 1
         }
         .onChange(of: publicBotIDs) { allowedIDs in
-            results.removeAll { !allowedIDs.contains($0.botId) }
+            results.removeAll { !allowedIDs.contains($0.rootBotId) }
             cursor = nil
             appendPage = false
             requestNumber += 1
@@ -88,11 +98,12 @@ struct SessionSearchResults: View {
             let rows = response["results"] as? [[String: Any]] ?? []
             var seen = Set(append ? results.map(\.id) : [])
             let hits = rows.compactMap { row -> SessionSearchHit? in
-                guard let botId = row["botId"] as? String, let sequence = row["sequence"] as? Int,
-                      let snippet = row["snippet"] as? String,
-                      host.bots.contains(where: { $0.id == botId && !$0.isPrivate }),
-                      seen.insert(botId).inserted else { return nil }
-                return SessionSearchHit(botId: botId, sequence: sequence, snippet: snippet)
+                guard let sessionKey = row["botId"] as? String, let sequence = row["sequence"] as? Int,
+                      let snippet = row["snippet"] as? String else { return nil }
+                let rootId = sessionKey.split(separator: ":", maxSplits: 1).first.map(String.init) ?? sessionKey
+                guard host.bots.contains(where: { $0.id == rootId && !$0.isPrivate }),
+                      seen.insert(sessionKey).inserted else { return nil }
+                return SessionSearchHit(sessionKey: sessionKey, rootBotId: rootId, sequence: sequence, snippet: snippet)
             }
             if !append { results = [] }
             results.append(contentsOf: hits)
@@ -106,6 +117,7 @@ struct SessionSearchResults: View {
 private struct SessionSearchContextView: View {
     @ObservedObject var host: LocalAgentHost
     let bot: BotProfile
+    let sessionKey: String
     let sequence: Int
 
     @State private var messages: [ChatMessageItem] = []
@@ -115,6 +127,10 @@ private struct SessionSearchContextView: View {
 
     private var visible: Bool {
         host.bots.contains { $0.id == bot.id && !$0.isPrivate }
+    }
+
+    private var targetMessageID: String {
+        messages.first(where: { $0.sequence == sequence })?.id ?? "dsh-ios:\(sessionKey)-\(sequence)"
     }
 
     var body: some View {
@@ -145,7 +161,7 @@ private struct SessionSearchContextView: View {
                 guard visible else { return }
                 failed = false
                 do {
-                    messages = try await host.searchSessionContext(botId: bot.id, sequence: sequence)
+                    messages = try await host.searchSessionContext(botId: sessionKey, sequence: sequence)
                     await Task.yield()
                     if visible && !Task.isCancelled { proxy.scrollTo(sequence, anchor: .center) }
                 } catch {
@@ -156,11 +172,18 @@ private struct SessionSearchContextView: View {
         .navigationTitle("历史上下文")
         .toolbar {
             if visible {
-                NavigationLink("打开会话") { ChatView(bot: bot, host: host) }
+                NavigationLink("打开会话") {
+                    ChatView(
+                        bot: bot,
+                        host: host,
+                        targetMessageID: targetMessageID,
+                        initialAddress: host.resolveAddress(sessionKey)
+                    )
+                }
             }
         }
         .sheet(item: $presentation) { item in
-            if visible { SessionHistoryDetailView(host: host, bot: bot, presentation: item) }
+            if visible { SessionHistoryDetailView(host: host, bot: bot, presentation: item, sessionId: sessionKey) }
         }
         .onChange(of: visible) { allowed in
             if !allowed {

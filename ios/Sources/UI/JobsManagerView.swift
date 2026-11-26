@@ -8,7 +8,7 @@ public struct JobsBotPickerView: View {
 
     private var eligibleBots: [BotProfile] {
         host.sortBySessionActivity(host.bots.filter {
-            !$0.isPrivate && ($0.agentPreset == "standard" || $0.agentPreset == "cordis")
+            !$0.isPrivate && ($0.agentPreset == "standard" || $0.agentPreset == "cordis" || $0.agentPreset == "redteam")
         })
     }
 

@@ -1,10 +1,31 @@
 import { randomUUID } from 'node:crypto'
 import { iosHost } from './index.mjs'
 
+function resolveActiveTurn(ctx, runtime, session) {
+  const directId = session?.id
+  if (typeof directId === 'string') {
+    const direct = runtime.activeTurns.get(directId)
+    if (direct) return direct
+  }
+  let cursor = session?.header?.parentSession
+  if (typeof cursor !== 'string' || !cursor) return undefined
+  const sessionsSvc = ctx?.get?.('sessions')
+  const allRows = typeof sessionsSvc?.list === 'function' ? sessionsSvc.list() : []
+  const byId = new Map(allRows.map((row) => [String(row?.id ?? row?.header?.id ?? ''), row]))
+  const visited = new Set(typeof directId === 'string' ? [directId] : [])
+  for (let depth = 0; cursor && depth < 8 && !visited.has(cursor); depth += 1) {
+    visited.add(cursor)
+    const inherited = runtime.activeTurns.get(cursor)
+    if (inherited) return inherited
+    cursor = byId.get(cursor)?.header?.parentSession
+  }
+  return undefined
+}
+
 function apply(ctx) {
   const dispose = ctx.on('user-questions/request', (request, next) => {
     const { rpc, runtime } = iosHost()
-    const active = runtime.activeTurns.get(request?.agent?.session?.id)
+    const active = resolveActiveTurn(ctx, runtime, request?.agent?.session)
     // Browser DSH sessions are answered by the official Web question panel.
     if (!active || active.done) return next()
 
@@ -34,7 +55,7 @@ function apply(ctx) {
       })
     }
     return answer.finally(cleanup)
-  })
+  }, { global: true, prepend: true })
   ctx.effect(() => () => dispose(), 'dsbot-ios.user-questions')
 }
 

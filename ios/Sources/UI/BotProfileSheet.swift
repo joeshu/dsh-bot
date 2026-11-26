@@ -25,6 +25,7 @@ public enum BotProfileTab: String, CaseIterable, Identifiable {
 /// SessionsTabView, BotRosterTabView, and ChatView with zero dead closures.
 public struct BotProfileSheet: View {
     let bot: BotProfile
+    let sessionId: String?
     @ObservedObject var host: LocalAgentHost
     @ObservedObject private var providerStore = ProviderProfileStore.shared
 
@@ -34,9 +35,14 @@ public struct BotProfileSheet: View {
     @State private var showDiagnostics = false
     @Environment(\.dismiss) private var dismiss
 
-    public init(bot: BotProfile, host: LocalAgentHost) {
+    public init(bot: BotProfile, host: LocalAgentHost, sessionId: String? = nil) {
         self.bot = bot
         self.host = host
+        self.sessionId = sessionId
+    }
+
+    private var effectiveSessionId: String {
+        sessionId ?? liveBot.id
     }
 
     private var selectedTab: Binding<BotProfileTab> {
@@ -51,11 +57,11 @@ public struct BotProfileSheet: View {
     }
 
     private var recentActivities: [DSHToolActivity] {
-        host.dshToolActivities.filter { $0.sessionId == liveBot.id }.suffix(12).reversed()
+        host.dshToolActivities.filter { $0.sessionId == effectiveSessionId }.suffix(12).reversed()
     }
 
     private var fileActivities: [DSHToolActivity] {
-        host.dshToolActivities.filter { $0.sessionId == liveBot.id && $0.fileSummary != nil }.suffix(15).reversed()
+        host.dshToolActivities.filter { $0.sessionId == effectiveSessionId && $0.fileSummary != nil }.suffix(15).reversed()
     }
 
     public var body: some View {
@@ -111,7 +117,7 @@ public struct BotProfileSheet: View {
                 LabeledContent("默认模型", value: host.modelSelection(liveBot.model))
                 LabeledContent("DSH 模式", value: host.agentPresetName(liveBot.agentPreset))
                 LabeledContent("审批档位", value: liveBot.permissionModeLabel)
-                LabeledContent("本地消息数", value: "\(host.messages(for: liveBot.id).count)")
+                LabeledContent("本地消息数", value: "\(host.messages(for: effectiveSessionId).count)")
             }
             Section("近期工具调用") {
                 if recentActivities.isEmpty {

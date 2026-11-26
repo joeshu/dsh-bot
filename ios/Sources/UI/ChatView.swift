@@ -118,6 +118,7 @@ public struct ChatView: View {
     @State private var lastScrollAt = Date.distantPast
     @State private var expandStreamingReasoning = true
     @State private var pendingSearchMessageID: String?
+    @State private var didApplyInitialAddress = false
     @State private var currentThreadId: String
     @State private var speechDraftPrefix = ""
     @Environment(\.scenePhase) private var chatScenePhase
@@ -273,7 +274,8 @@ public struct ChatView: View {
             if let err, !err.isEmpty { actionStatus = err }
         }
         .onAppear {
-            if let initialAddress, initialAddress.botID == bot.id {
+            if !didApplyInitialAddress, let initialAddress, initialAddress.botID == bot.id {
+                didApplyInitialAddress = true
                 currentThreadId = initialAddress.threadID ?? "default"
                 threadStore.selectAddress(initialAddress)
             }
@@ -457,7 +459,7 @@ public struct ChatView: View {
                                 Label("侧边旁路对话 (/side)", systemImage: "bubble.left.and.exclamationmark.bubble.right")
                             }
                             Button {
-                                Task { await host.sendMessage(sessionId: activeSessionId, text: "/compact", model: selectedModel) }
+                                runCompactCommand()
                             } label: {
                                 Label("压缩当前上下文 (/compact)", systemImage: "arrow.down.right.and.arrow.up.left")
                             }
@@ -665,7 +667,7 @@ public struct ChatView: View {
         case .editBot:
             EditBotSheet(bot: liveBot, host: host)
         case .botProfile:
-            BotProfileSheet(bot: liveBot, host: host)
+            BotProfileSheet(bot: liveBot, host: host, sessionId: activeSessionId)
         case .diagnostics:
             SessionDiagnosticsSheet(host: host, bot: liveBot, sessionId: activeSessionId)
         case .scheduleManager:
@@ -808,7 +810,15 @@ public struct ChatView: View {
                         enabledPlugins: host.installedPlugins.filter(\.enabled),
                         thirdPartyTools: host.thirdPartyPluginTools,
                         onOpenPlugins: { activeSheet = .pluginManager },
-                        onOpenWebWorkbench: { activeSheet = .webWorkbench },
+                        onOpenWebWorkbench: {
+                            Task {
+                                if !liveBot.isPrivate {
+                                    let title = activeThread.id == "default" ? liveBot.name : "\(liveBot.name) · \(activeThread.title)"
+                                    await host.ensureSessionWebReady(sessionId: activeSessionId, title: title)
+                                }
+                                activeSheet = .webWorkbench
+                            }
+                        },
                         onOpenBrowser: { activeSheet = .agentBrowser },
                         onInsertToolPrompt: { snippet in
                             sessionViewMode = .dialogue
@@ -1464,7 +1474,7 @@ public struct ChatView: View {
 
                 if sessionMessages.count >= 8 {
                     Button {
-                        Task { await host.sendMessage(sessionId: activeSessionId, text: "/compact", model: selectedModel) }
+                        runCompactCommand()
                     } label: {
                         Label("压缩上下文", systemImage: "arrow.down.right.and.arrow.up.left")
                             .font(.caption)
@@ -1584,6 +1594,21 @@ public struct ChatView: View {
         }
     }
 
+    private func runCompactCommand() {
+        let targetId = activeSessionId
+        actionStatus = "正在执行 DSH 上下文压缩 (/compact)…"
+        Task {
+            do {
+                let output = try await host.executeSlashCommand(sessionId: targetId, commandLine: "/compact")
+                actionStatus = output.isEmpty ? "上下文压缩完成。" : output
+                DSHaptics.notify(.success)
+            } catch {
+                actionStatus = "上下文压缩失败：\(error.localizedDescription)"
+                DSHaptics.notify(.error)
+            }
+        }
+    }
+
     private var composerBar: some View {
         VStack(spacing: 0) {
             Divider()
@@ -1624,7 +1649,7 @@ public struct ChatView: View {
                     onCompact: {
                         showCommandPalette = false
                         input = ""
-                        Task { await host.sendMessage(sessionId: activeSessionId, text: "/compact", model: selectedModel) }
+                        runCompactCommand()
                     },
                     onOpenConfig: {
                         showCommandPalette = false
@@ -2037,7 +2062,7 @@ public struct ChatView: View {
                     },
                     onTapCompact: {
                         guard !host.isSessionStreaming(activeSessionId) else { return }
-                        Task { await host.sendMessage(sessionId: activeSessionId, text: "/compact", model: selectedModel) }
+                        runCompactCommand()
                     }
                 )
                 .background(DSTheme.surfacePrimary)

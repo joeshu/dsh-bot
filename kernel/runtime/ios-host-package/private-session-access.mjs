@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { iosHost } from './index.mjs'
 
 const WEB_PRINCIPAL = Object.freeze({ kind: 'ios-web' })
 const OWNER_PRINCIPAL = Object.freeze({ kind: 'owner' })
@@ -272,6 +273,23 @@ async function apply(ctx) {
     const isEligibleWebEventClient = (client) =>
       Boolean(client && !client.answers && client.peer === browserPeer && client.peer?.interactions === 'answer' && !client.signal?.aborted)
 
+    const hasActiveNativeTurn = (agentId) => {
+      try {
+        const turns = iosHost()?.runtime?.activeTurns
+        if (!turns || turns.size === 0) return false
+        let cursor = agentId
+        const seen = new Set()
+        for (let depth = 0; cursor && depth < 16 && !seen.has(cursor); depth += 1) {
+          seen.add(cursor)
+          const active = turns.get(cursor)
+          if (active && !active.done) return true
+          cursor = knownHeaders.get(cursor)?.parentSession
+            ?? ctx.get?.('sessions')?.get?.(cursor)?.header?.parentSession
+        }
+      } catch {}
+      return false
+    }
+
     const isPublicWaterfallAgentId = (agentId) => {
       if (typeof agentId !== 'string' || !agentId) return false
       if (!knownHeaders.has(agentId)) {
@@ -282,6 +300,7 @@ async function apply(ctx) {
           refreshPrivateClosure()
         }
       }
+      if (hasActiveNativeTurn(agentId)) return false
       return !isPrivateSession(agentId)
     }
 

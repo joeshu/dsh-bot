@@ -1015,13 +1015,51 @@ public final class LocalAgentHost: ObservableObject {
         let effectiveCustomTools = (targetProfile?.supportsTools ?? true) && customTools
         let effectiveSupportsTools = targetProfile?.supportsTools ?? true
         let endpointModels = orderedAvailableModels(for: effectiveURL)
+        var groupContextText = ""
         if bot?.isGroup == true {
+            var parts: [String] = []
+            let roster = bots.filter { !$0.isPrivate && !$0.isGroup }.prefix(12)
+                .map { "- @\($0.name)（\($0.roleLabel)）" }.joined(separator: "\n")
+            if !roster.isEmpty {
+                parts.append("当前群聊协作团队成员名册：\n\(roster)")
+            }
+            if let gRes = try? await channel.request("group.state", params: ["groupId": address.botID], timeoutSeconds: 5) {
+                if let goals = gRes["goals"] as? [[String: Any]], !goals.isEmpty {
+                    let goalLines = goals.prefix(12).compactMap { g -> String? in
+                        let title = g["title"] as? String ?? ""
+                        let status = g["status"] as? String ?? "open"
+                        guard !title.isEmpty else { return nil }
+                        return "- [\(status)] \(title)"
+                    }.joined(separator: "\n")
+                    if !goalLines.isEmpty { parts.append("群目标：\n\(goalLines)") }
+                }
+                if let todos = gRes["todos"] as? [[String: Any]], !todos.isEmpty {
+                    let todoLines = todos.prefix(20).compactMap { t -> String? in
+                        let title = t["title"] as? String ?? ""
+                        let done = t["done"] as? Bool == true
+                        let assignee = t["assignee"] as? String ?? ""
+                        guard !title.isEmpty else { return nil }
+                        return "- [\(done ? "x" : " ")] \(title)\(assignee.isEmpty ? "" : " (@\(assignee))")"
+                    }.joined(separator: "\n")
+                    if !todoLines.isEmpty { parts.append("群待办：\n\(todoLines)") }
+                }
+            }
+            groupContextText = parts.joined(separator: "\n\n")
             ctx.groupLeaseWatchdogTask = Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 90_000_000_000)
-                guard let self, let active = self.activeTurnsBySession[targetSessionId], active.turnId == turnId else { return }
-                self.lastErrorSessionId = targetSessionId
-                self.lastStreamError = "群聊编排超过 90 秒租约（interrupted），已安全中止等待。"
-                await self.abortActiveTurn(sessionId: targetSessionId)
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 15_000_000_000)
+                    guard let self, let active = self.activeTurnsBySession[targetSessionId], active.turnId == turnId else { return }
+                    let waitingUser = self.pendingApprovals.contains { $0.turnId == turnId }
+                        || self.pendingDSHQuestions.contains { $0.turnId == turnId }
+                    if waitingUser { continue }
+                    let idleSeconds = Date().timeIntervalSince(active.lastActivityAt)
+                    if idleSeconds >= 90 {
+                        self.lastErrorSessionId = targetSessionId
+                        self.lastStreamError = "群聊编排连续 90 秒无输出（interrupted），已安全中止等待。"
+                        await self.abortActiveTurn(sessionId: targetSessionId)
+                        return
+                    }
+                }
             }
         }
         do {
@@ -1031,6 +1069,7 @@ public final class LocalAgentHost: ObservableObject {
                 "systemPrompt": bot?.systemPrompt ?? "",
                 "pinnedMemories": pinnedMemoriesText,
                 "isGroup": bot?.isGroup ?? false,
+                "groupContext": groupContextText,
                 "agentPreset": bot?.agentPreset ?? "standard", "permissionMode": bot?.permissionMode ?? "ask",
                 "reasoningEffort": bot?.reasoningEffort ?? "medium",
                 "disabledTools": bot?.disabledTools ?? [],
@@ -1049,6 +1088,37 @@ public final class LocalAgentHost: ObservableObject {
             lastStreamError = error.localizedDescription
             finishTurn(for: targetSessionId)
         }
+    }
+
+    /// Executes a real DSH slash command (`/compact`, `/plan`, etc.) via `ctx.commands.execute`
+    /// instead of sending the slash text as a normal chat prompt.
+    @discardableResult
+    public func executeSlashCommand(sessionId: String, commandLine: String) async throws -> String {
+        guard state == .ready, let channel else { throw IPCFrameError.channelClosed }
+        guard let address = resolveAddress(sessionId) else {
+            throw NSError(domain: "DSBotCommand", code: 400, userInfo: [NSLocalizedDescriptionKey: "无效的会话地址"])
+        }
+        let targetId = address.canonicalSessionId
+        let response = try await channel.request("command.execute", params: [
+            "sessionId": targetId,
+            "commandLine": commandLine,
+        ], timeoutSeconds: 65)
+        loadedHistoryIDs.remove(targetId)
+        messagesBySession[targetId] = nil
+        try? await loadSessionHistory(targetId)
+        await refreshSessionSummaries()
+        return response["result"] as? String ?? ""
+    }
+
+    /// Ensures an `ios:<sessionId>` header exists in SQLite, is attached to the default workspace,
+    /// and carries a readable title before deep-linking into the Web Workbench.
+    public func ensureSessionWebReady(sessionId: String, title: String) async {
+        guard state == .ready, let channel else { return }
+        guard let address = resolveAddress(sessionId), bot(for: address)?.isPrivate != true else { return }
+        _ = try? await channel.request("session.ensureWebReady", params: [
+            "sessionId": address.canonicalSessionId,
+            "title": title,
+        ], timeoutSeconds: 15)
     }
 
     public func refreshRedteamStatus() async {
