@@ -77,7 +77,7 @@ def main():
     shutil.copytree(
         node_modules,
         DESTINATION / "node_modules",
-        ignore=shutil.ignore_patterns("*.map", ".DS_Store", "*.node", "*.dylib", "*.so", "*.dll", "*.exe", "*.wasm", "pyodide"),
+        ignore=shutil.ignore_patterns("*.map", ".DS_Store", "*.node", "*.dylib", "*.so", "*.dll", "*.exe", "*.wasm", "pyodide", "*.d.ts", "*.d.mts", "*.d.cts", "*.cc", "*.h", "sharp-libvips-*", "sharp-linux-*", "sharp-darwin-*", "sharp-win32-*"),
     )
     vendor_source = SOURCE / "vendor" / "dsh-profile-boot"
     vendor_destination = DESTINATION / "vendor" / "dsh-profile-boot"

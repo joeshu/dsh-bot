@@ -36,8 +36,8 @@ permissions:
 # spend an hour compiling identical device and simulator slices. Regular IPA
 # builds keep their own run ID and may still proceed independently.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.build_security_runtime == 'true' && 'security-node-24.22.3' || github.run_id }}
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.build_security_runtime == 'true' && 'security-node-24.22.3' || (github.event_name == 'workflow_dispatch' && github.run_id || github.ref) }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
   build-security-slice:
