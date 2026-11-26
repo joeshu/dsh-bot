@@ -3195,9 +3195,23 @@ function saveGitTrackerState(state) {
 
 function computeWorkspaceGitStatus() {
   const tracker = loadGitTrackerState()
-  const currentFiles = walkWorkspaceTree(resolve(WORKSPACE_FILES))
-  const currentMap = new Map(currentFiles.map((f) => [f.path, f]))
   const baseline = tracker.files || {}
+  // Avoid reading every file into memory: reuse the baseline SHA when (size, mtime) match.
+  const currentFiles = walkWorkspaceTree(resolve(WORKSPACE_FILES), resolve(WORKSPACE_FILES), [], { includeContent: false })
+  for (const file of currentFiles) {
+    const prev = baseline[file.path]
+    if (prev && prev.size === file.size && prev.mtimeMs === file.mtimeMs && prev.sha) {
+      file.sha = prev.sha
+      continue
+    }
+    try {
+      const abs = join(resolve(WORKSPACE_FILES), file.path)
+      file.sha = file.size <= 524_288
+        ? createHash('sha1').update(readFileSync(abs)).digest('hex')
+        : `size:${file.size}`
+    } catch { file.sha = `size:${file.size}` }
+  }
+  const currentMap = new Map(currentFiles.map((f) => [f.path, f]))
   const changes = []
 
   for (const file of currentFiles) {
@@ -3680,6 +3694,31 @@ async function runSingleVirtualCommand(term, rawSegment) {
   }
 }
 
+function splitTerminalSegments(line) {
+  const segments = []
+  let current = ''
+  let quote = ''
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i]
+    if (quote) {
+      current += ch
+      if (ch === '\\' && quote === '"' && i + 1 < line.length) { current += line[++i]; continue }
+      if (ch === quote) quote = ''
+      continue
+    }
+    if (ch === '"' || ch === "'") { quote = ch; current += ch; continue }
+    if (ch === ';' || (ch === '&' && line[i + 1] === '&')) {
+      if (ch === '&') i += 1
+      if (current.trim()) segments.push(current.trim())
+      current = ''
+      continue
+    }
+    current += ch
+  }
+  if (current.trim()) segments.push(current.trim())
+  return segments
+}
+
 async function executeVirtualTerminalCommand(sessionId, commandLine) {
   const term = getVirtualTerminalSession(sessionId)
   const raw = String(commandLine ?? '').trim()
@@ -3688,7 +3727,7 @@ async function executeVirtualTerminalCommand(sessionId, commandLine) {
   if (term.history.length > 100) term.history.splice(0, term.history.length - 100)
   pushDevtoolsLog('info', 'terminal', `[${term.id}] $ ${raw}`)
 
-  const segments = raw.split(/\s*(?:&&|;)\s*/).filter(Boolean)
+  const segments = splitTerminalSegments(raw)
   const outputs = []
   let exitCode = 0
   for (const seg of segments) {

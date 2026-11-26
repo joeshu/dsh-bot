@@ -668,3 +668,18 @@ test('v3 web-workbench: sandboxPolicy root, onboarding bypass, public-session wa
   assert.match(chatSkillsSrc, /\.appendingPathComponent\("files", isDirectory: true\)\s*\.appendingPathComponent\("skills", isDirectory: true\)/, 'UserSkillsSheetView must store skills in files/skills')
 })
 
+
+test('v3 governance: phase 3/4 hardening (abortable python, bounded gunzip, cached statements, quote-aware terminal, light git status)', () => {
+  const py = readFileSync(join(runtimeDir, 'ios-host-package', 'python-execution.mjs'), 'utf8')
+  assert.match(py, /signal\?\.addEventListener\?\.\('abort'/)
+  const pm = readFileSync(join(runtimeDir, 'ios-plugin-manager.mjs'), 'utf8')
+  assert.match(pm, /createGunzip/)
+  assert.doesNotMatch(pm, /gunzipSync/)
+  assert.match(pm, /child_process\|worker_threads\|cluster\|inspector\|vm/)
+  const sqlite = readFileSync(join(runtimeDir, 'sqlite-session-persistence.mjs'), 'utf8')
+  assert.match(sqlite, /stmt\(sql\)/)
+  assert.doesNotMatch(sqlite, /owner\.db\.prepare\(/)
+  const entry = readFileSync(join(runtimeDir, 'dsh-ios-entry.mjs'), 'utf8')
+  assert.match(entry, /function splitTerminalSegments/)
+  assert.match(entry, /Avoid reading every file into memory/)
+})
