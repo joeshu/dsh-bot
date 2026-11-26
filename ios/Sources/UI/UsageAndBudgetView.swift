@@ -105,18 +105,26 @@ public struct ConnectorsAndUsageView: View {
             }
 
             Section("成本估算与预算守卫（3 态显示）") {
-                let primaryModel = modelUsage.first?.id ?? ModelProvider.defaultModel
-                let costState = CostBudgetGovernor.estimateCost(
-                    model: primaryModel,
-                    inputTokens: usageTotals.inputTokens,
-                    cacheReadTokens: usageTotals.cacheReadTokens,
-                    outputTokens: usageTotals.outputTokens
-                )
+                let costState: CostDisplayState = modelUsage.isEmpty
+                    ? CostBudgetGovernor.estimateCost(
+                        model: ModelProvider.defaultModel,
+                        inputTokens: usageTotals.inputTokens,
+                        cacheReadTokens: usageTotals.cacheReadTokens,
+                        outputTokens: usageTotals.outputTokens
+                    )
+                    : CostBudgetGovernor.estimateTotalCost(
+                        models: modelUsage.map {
+                            (model: $0.id, inputTokens: $0.totals.inputTokens, cacheReadTokens: $0.totals.cacheReadTokens, outputTokens: $0.totals.outputTokens)
+                        }
+                    )
                 let cacheRatio = CostBudgetGovernor.cacheHitRatio(
                     inputTokens: usageTotals.inputTokens,
                     cacheReadTokens: usageTotals.cacheReadTokens
                 )
-                LabeledContent("预估费用（\(primaryModel)）", value: costState.formattedLabel)
+                LabeledContent(
+                    modelUsage.count > 1 ? "累计预估费用（多模型合计）" : "预估费用（\(modelUsage.first?.id ?? ModelProvider.defaultModel)）",
+                    value: costState.formattedLabel
+                )
                 LabeledContent("今日累计预估", value: String(format: "$%.4f", costGovernor.todayEstimatedSpendUSD))
                 LabeledContent("Prompt Cache 命中率", value: String(format: "%.1f%%", cacheRatio * 100))
                 if let warning = costGovernor.activeBudgetWarning {

@@ -690,3 +690,32 @@ test('v3 governance: plugin upgrade keeps backup until boot settles; local dirs 
   assert.match(pm, /revision\.backup/)
   assert.match(pm, /localStaging/)
 })
+
+test('v3 governance: phase 3/4 full closure (SQLite attachment index, GitHub catalog, Cordis config ID, Web usage, Swift perf/pricing/outline)', () => {
+  const sqlite = readFileSync(join(runtimeDir, 'sqlite-session-persistence.mjs'), 'utf8')
+  assert.match(sqlite, /CREATE TABLE IF NOT EXISTS session_attachments/)
+  assert.match(sqlite, /listAttachmentIds\(\)/)
+  assert.match(sqlite, /backfillSessionAttachments\(\)/)
+
+  const priv = readFileSync(join(runtimeDir, 'ios-host-package', 'private-session-access.mjs'), 'utf8')
+  assert.match(priv, /persistence\.listAttachmentIds/)
+
+  const pm = readFileSync(join(runtimeDir, 'ios-plugin-manager.mjs'), 'utf8')
+  assert.match(pm, /resolvePluginCordisEntryId/)
+  assert.match(pm, /sourceType === 'npm' \|\| sourceType === 'github'/)
+
+  const entry = readFileSync(join(runtimeDir, 'dsh-ios-entry.mjs'), 'utf8')
+  assert.match(entry, /uncachedInputTokens/)
+  assert.match(entry, /web-workbench/)
+
+  const repoRoot = join(__dirname, '..', '..')
+  const transport = readFileSync(join(repoRoot, 'ios/Sources/Runtime/NodeRuntimeTransport.swift'), 'utf8')
+  assert.match(transport, /--max-old-space-size=48/)
+  const ipc = readFileSync(join(repoRoot, 'ios/Sources/Runtime/IPCChannel.swift'), 'utf8')
+  assert.match(ipc, /private var readOffset = 0/)
+  const cost = readFileSync(join(repoRoot, 'ios/Sources/Runtime/CostAndBudgetGovernor.swift'), 'utf8')
+  assert.match(cost, /deepseek-v4-pro/)
+  assert.match(cost, /estimateTotalCost/)
+  const features = readFileSync(join(repoRoot, 'ios/Sources/UI/DSBotFeaturesViews.swift'), 'utf8')
+  assert.match(features, /var fenceChar: Character\? = nil/)
+})

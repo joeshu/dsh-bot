@@ -1307,8 +1307,12 @@ struct MessageWorkspaceFileCards: View {
         let byteCount: Int64
     }
 
+    private static let fileRefRegex: NSRegularExpression? = try? NSRegularExpression(
+        pattern: #"(?:files/[A-Za-z0-9._/\-]+)"#
+    )
+
     private var resolvedFiles: [ResolvedFile] {
-        guard let regex = try? NSRegularExpression(pattern: #"(?:files/[A-Za-z0-9._/\-]+)"#) else { return [] }
+        guard let regex = Self.fileRefRegex else { return [] }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         var seen = Set<String>()
         var out: [ResolvedFile] = []
@@ -1492,24 +1496,14 @@ struct ChatAtMentionPalette: View {
     let onSelectFile: (String) -> Void
     let onSelectBot: (BotProfile) -> Void
 
+    @State private var indexedFiles: [String] = []
+
     private var matchingFiles: [String] {
-        let root = workspace.appendingPathComponent("files", isDirectory: true)
-        guard let enumerator = FileManager.default.enumerator(
-            at: root,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else { return [] }
         let needle = query.lowercased()
-        var found: [String] = []
-        while let url = enumerator.nextObject() as? URL {
-            guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
-            let rel = url.path.replacingOccurrences(of: root.path + "/", with: "")
-            if needle.isEmpty || rel.lowercased().contains(needle) {
-                found.append("files/\(rel)")
-                if found.count >= 8 { break }
-            }
+        if needle.isEmpty {
+            return Array(indexedFiles.prefix(8))
         }
-        return found
+        return Array(indexedFiles.filter { $0.lowercased().contains(needle) }.prefix(8))
     }
 
     private var matchingBots: [BotProfile] {
@@ -1522,78 +1516,100 @@ struct ChatAtMentionPalette: View {
     var body: some View {
         let files = matchingFiles
         let chats = matchingBots
-        if !files.isEmpty || !chats.isEmpty {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 6) {
-                    if !files.isEmpty {
-                        Text("工作区文件")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 10)
-                            .padding(.top, 4)
-                        ForEach(files, id: \.self) { rel in
-                            Button {
-                                onSelectFile(rel)
-                            } label: {
-                                HStack(spacing: 8) {
-                                    Image(systemName: "doc.text")
-                                        .font(.caption)
-                                        .foregroundStyle(DSTheme.brand)
-                                    Text(rel)
-                                        .font(.subheadline)
-                                        .foregroundStyle(.primary)
-                                        .lineLimit(1)
-                                        .truncationMode(.middle)
-                                    Spacer()
-                                }
+        Group {
+            if !files.isEmpty || !chats.isEmpty {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        if !files.isEmpty {
+                            Text("工作区文件")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.secondary)
                                 .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .contentShape(Rectangle())
+                                .padding(.top, 4)
+                            ForEach(files, id: \.self) { rel in
+                                Button {
+                                    onSelectFile(rel)
+                                } label: {
+                                    HStack(spacing: 8) {
+                                        Image(systemName: "doc.text")
+                                            .font(.caption)
+                                            .foregroundStyle(DSTheme.brand)
+                                        Text(rel)
+                                            .font(.subheadline)
+                                            .foregroundStyle(.primary)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                        Spacer()
+                                    }
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
+                        }
+                        if !chats.isEmpty {
+                            Text("引用对话 / 提及 Bot")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 10)
+                                .padding(.top, 4)
+                            ForEach(chats) { candidate in
+                                Button {
+                                    onSelectBot(candidate)
+                                } label: {
+                                    HStack(spacing: 8) {
+                                        Image(systemName: "quote.bubble")
+                                            .font(.caption)
+                                            .foregroundStyle(.indigo)
+                                        Text(candidate.name)
+                                            .font(.subheadline)
+                                            .foregroundStyle(.primary)
+                                        Spacer()
+                                        Text(candidate.isGroup ? "群聊" : "会话")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                            }
                         }
                     }
-                    if !chats.isEmpty {
-                        Text("引用对话 / 提及 Bot")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 10)
-                            .padding(.top, 4)
-                        ForEach(chats) { candidate in
-                            Button {
-                                onSelectBot(candidate)
-                            } label: {
-                                HStack(spacing: 8) {
-                                    Image(systemName: "quote.bubble")
-                                        .font(.caption)
-                                        .foregroundStyle(.indigo)
-                                    Text(candidate.name)
-                                        .font(.subheadline)
-                                        .foregroundStyle(.primary)
-                                    Spacer()
-                                    Text(candidate.isGroup ? "群聊" : "会话")
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                }
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
+                    .padding(.vertical, 6)
                 }
+                .frame(maxHeight: 200)
+                .background(DSTheme.surfaceSecondary)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(Color.secondary.opacity(0.16), lineWidth: 0.75)
+                )
+                .padding(.horizontal, 12)
                 .padding(.vertical, 6)
             }
-            .frame(maxHeight: 200)
-            .background(DSTheme.surfaceSecondary)
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(Color.secondary.opacity(0.16), lineWidth: 0.75)
-            )
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
+        }
+        .task(id: workspace) {
+            let root = workspace.appendingPathComponent("files", isDirectory: true)
+            let loaded: [String] = await Task.detached(priority: .utility) {
+                guard let enumerator = FileManager.default.enumerator(
+                    at: root,
+                    includingPropertiesForKeys: [.isRegularFileKey],
+                    options: [.skipsHiddenFiles]
+                ) else { return [] }
+                var collected: [String] = []
+                let prefix = root.path + "/"
+                while let url = enumerator.nextObject() as? URL {
+                    guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
+                    let rel = url.path.replacingOccurrences(of: prefix, with: "")
+                    collected.append("files/\(rel)")
+                    if collected.count >= 256 { break }
+                }
+                return collected.sorted()
+            }.value
+            indexedFiles = loaded
         }
     }
 }

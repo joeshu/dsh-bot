@@ -455,6 +455,15 @@ async function apply(ctx) {
   }
 
   async function loadAttachmentReferences(rows) {
+    if (typeof persistence.listAttachmentIds === 'function') {
+      const indexed = persistence.listAttachmentIds()
+      for (const snapshot of rows) {
+        const sessionId = snapshot?.header?.id
+        if (typeof sessionId !== 'string') continue
+        attachmentIdsBySession.set(sessionId, indexed.get(sessionId) ?? new Set())
+      }
+      return
+    }
     for (const snapshot of rows) {
       const sessionId = snapshot?.header?.id
       if (typeof sessionId !== 'string') continue

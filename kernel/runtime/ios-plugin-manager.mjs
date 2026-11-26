@@ -747,8 +747,11 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
 
   function catalogEntry(entry, source) {
     const versions = Array.isArray(entry.versions) ? entry.versions : []
-    const latest = latestVersion(versions.filter((item) => item?.source?.type === 'npm')) ?? latestVersion(versions)
-    const npmSource = latest?.source?.type === 'npm'
+    const latest = latestVersion(versions.filter((item) => item?.source?.type === 'npm'))
+      ?? latestVersion(versions.filter((item) => item?.source?.type === 'github'))
+      ?? latestVersion(versions)
+    const sourceType = latest?.source?.type ?? 'unknown'
+    const supportedSource = sourceType === 'npm' || sourceType === 'github'
     return {
       name: entry.name,
       title: localizedTitle(entry),
@@ -759,8 +762,8 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
       category: typeof entry.metadata?.category === 'string' ? entry.metadata.category : '',
       sourceId: source.id,
       sourceName: source.name,
-      installable: npmSource && packageName(entry.name) && Boolean(latest?.version),
-      installSource: npmSource ? 'npm' : (latest?.source?.type ?? 'unknown'),
+      installable: supportedSource && packageName(entry.name) && Boolean(latest?.version),
+      installSource: sourceType,
     }
   }
 
@@ -1123,8 +1126,14 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
     const index = await loadCatalog(source)
     const entry = index.plugins.find((item) => item.name === name)
     const releases = Array.isArray(entry?.versions) ? entry.versions : []
-    const release = releases.find((item) => item?.version === version && item.source?.type === 'npm')
+    const release = releases.find((item) => item?.version === version && (item.source?.type === 'npm' || item.source?.type === 'github'))
     if (!release) throw new Error('插件版本不在当前启用的索引源中')
+    if (release.source?.type === 'github') {
+      const repoSpec = release.source.repo || release.source.repository || release.source.url || entry?.repository?.url || ''
+      const refSuffix = release.source.ref ? `#${release.source.ref}` : ''
+      if (!repoSpec) throw new Error('GitHub 插件索引缺少仓库地址')
+      return await installFromGithub(refSuffix && !String(repoSpec).includes('#') ? `${repoSpec}${refSuffix}` : String(repoSpec))
+    }
     const registryName = name.replace('/', '%2f')
     const metadataBuffer = await fetchBuffer(`https://registry.npmjs.org/${registryName}`, MAX_INDEX_BYTES)
     let metadata
@@ -1472,6 +1481,23 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
     const config = configs[pkgName] && typeof configs[pkgName] === 'object' ? configs[pkgName] : {}
     return { name: pkgName, config }
   })
+  async function resolvePluginCordisEntryId(pkgName) {
+    try {
+      const pkgDir = resolve(profileDir, 'node_modules', ...pkgName.split('/'))
+      assertInside(resolve(profileDir, 'node_modules'), pkgDir)
+      const manifest = JSON.parse(await readFile(join(pkgDir, 'package.json'), 'utf8'))
+      const patchRel = manifest?.dsh?.bundle?.patch
+      if (typeof patchRel === 'string' && patchRel.trim()) {
+        const patchAbs = resolve(pkgDir, patchRel)
+        assertInside(pkgDir, patchAbs)
+        const patchText = await readFile(patchAbs, 'utf8')
+        const idMatch = patchText.match(/^\s*-?\s*id:\s*['"]?([A-Za-z0-9._/@:-]+)['"]?\s*$/m)
+        if (idMatch?.[1]) return idMatch[1]
+      }
+    } catch { /* fallback to package name */ }
+    return pkgName
+  }
+
   rpc.handle('plugins.config.set', async ({ name, config }) => {
     const pkgName = String(name ?? '')
     validatePackageName(pkgName)
@@ -1480,10 +1506,13 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
     }
     const serialized = JSON.stringify(config)
     if (serialized.length > 32 * 1024) throw new Error('插件配置不能超过 32 KB')
+    const entryId = await resolvePluginCordisEntryId(pkgName)
     const configs = await readPluginConfigs()
     configs[pkgName] = config
+    if (entryId !== pkgName) configs[entryId] = config
     await writePluginConfigs(configs)
-    return { name: pkgName, saved: true, restartRequired: true }
+    runtime.profileRestartRequired = true
+    return { name: pkgName, entryId, saved: true, restartRequired: true }
   })
   rpc.handle('plugins.disableAll', async () => mutateProfile(async () => {
     const before = readProfileManifest('dsh', profileDir)

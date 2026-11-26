@@ -58,7 +58,13 @@ static char *copy_value(JSContext *context, JSValueConst value) {
         length = max_output;
         while (length && ((unsigned char)text[length] & 0xc0) == 0x80) --length;
     }
-    char *copy = strndup(text, length);
+    char *copy = malloc(length + 1);
+    if (copy) {
+        for (size_t i = 0; i < length; ++i) {
+            copy[i] = text[i] == '\0' ? ' ' : text[i];
+        }
+        copy[length] = '\0';
+    }
     JS_FreeCString(context, text);
     return copy;
 }
@@ -98,8 +104,14 @@ DSBotJavaScriptResult dsbot_evaluate_javascript(const char *script, size_t lengt
     JSValue value = JS_Eval(context, script, length, "script.js", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsObject(value)) {
         JSValue rendered = JS_JSONStringify(context, value, JS_UNDEFINED, JS_UNDEFINED);
-        JS_FreeValue(context, value);
-        value = rendered;
+        if (JS_IsException(rendered)) {
+            JSValue ignored = JS_GetException(context);
+            JS_FreeValue(context, ignored);
+            JS_FreeValue(context, rendered);
+        } else {
+            JS_FreeValue(context, value);
+            value = rendered;
+        }
     }
     if (JS_IsException(value)) {
         JSValue error = JS_GetException(context);
@@ -111,6 +123,9 @@ DSBotJavaScriptResult dsbot_evaluate_javascript(const char *script, size_t lengt
         if (!result.value) result.error = strdup("JavaScript 结果无法转换。");
     }
     JS_FreeValue(context, value);
+    for (size_t i = 0; i < evaluation.length; ++i) {
+        if (evaluation.logs[i] == '\0') evaluation.logs[i] = ' ';
+    }
     result.logs = strdup(evaluation.logs);
     JS_FreeContext(context);
     JS_FreeRuntime(runtime);

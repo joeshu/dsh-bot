@@ -2,13 +2,19 @@ import Foundation
 
 /// Redacts raw, URL-encoded, and JSON-escaped secret values as well as common API token patterns.
 public enum SecretRedactor {
-    private static let tokenPatterns: [String] = [
+    private static let compiledTokenRegexes: [NSRegularExpression] = [
         #"sk-[A-Za-z0-9_\-]{16,}"#,
         #"gh[pousr]_[A-Za-z0-9]{20,}"#,
         #"AKIA[0-9A-Z]{16}"#,
+        #"AIza[0-9A-Za-z_\-]{30,}"#,
+        #"hf_[A-Za-z0-9]{20,}"#,
+        #"glpat-[A-Za-z0-9_\-]{16,}"#,
+        #"xox[baprs]-[A-Za-z0-9\-]{16,}"#,
+        #"tvly-[A-Za-z0-9_\-]{16,}"#,
+        #"pplx-[A-Za-z0-9_\-]{16,}"#,
         #"Bearer\s+[A-Za-z0-9\._\-]{16,}"#,
         #"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"#
-    ]
+    ].compactMap { try? NSRegularExpression(pattern: $0, options: []) }
 
     public static func redact(_ text: String, secrets: [String: String]) -> String {
         var result = text
@@ -35,8 +41,7 @@ public enum SecretRedactor {
 
     public static func redactCommonTokens(_ text: String) -> String {
         var result = text
-        for pattern in tokenPatterns {
-            guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { continue }
+        for regex in compiledTokenRegexes {
             let range = NSRange(result.startIndex..<result.endIndex, in: result)
             result = regex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: "[secret:REDACTED]")
         }
@@ -52,14 +57,18 @@ public enum PrivacyGateDecision: Equatable, Sendable {
 
 /// Dual-layer write-before-commit privacy gate for persistent memory entries.
 public enum PrivacyGate {
-    private static let hardBlockRules: [(pattern: String, reason: String)] = [
+    private static let compiledHardBlockRules: [(regex: NSRegularExpression, reason: String)] = [
         (#"\b\d{17}[\dXx]\b"#, "检测到疑似身份证号，已禁止写入持久记忆。"),
         (#"\b(?:\d[ -]*?){16,19}\b"#, "检测到疑似银行卡/信用卡号，已禁止写入持久记忆。"),
         (#"sk-[A-Za-z0-9_\-]{16,}"#, "检测到疑似 API Key（sk-...），已禁止写入持久记忆。"),
         (#"gh[pousr]_[A-Za-z0-9]{20,}"#, "检测到疑似 GitHub Token，已禁止写入持久记忆。"),
         (#"AKIA[0-9A-Z]{16}"#, "检测到疑似云服务 Access Key，已禁止写入持久记忆。"),
+        (#"(?:AIza[0-9A-Za-z_\-]{30,}|hf_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_\-]{16,}|xox[baprs]-[A-Za-z0-9\-]{16,}|tvly-[A-Za-z0-9_\-]{16,}|pplx-[A-Za-z0-9_\-]{16,})"#, "检测到疑似第三方服务 Token，已禁止写入持久记忆。"),
         (#"-----BEGIN [A-Z ]*PRIVATE KEY-----"#, "检测到私钥片段，已禁止写入持久记忆。")
-    ]
+    ].compactMap { item in
+        guard let regex = try? NSRegularExpression(pattern: item.0, options: []) else { return nil }
+        return (regex, item.1)
+    }
 
     private static let softWarnKeywords: [String] = [
         "密码", "口令", "病历", "诊断书", "体检报告", "银行账户", "税号", "合同编号", "password", "passcode"
@@ -67,9 +76,9 @@ public enum PrivacyGate {
 
     public static func evaluateMemoryWrite(title: String, content: String) -> PrivacyGateDecision {
         let combined = "\(title)\n\(content)"
-        for rule in hardBlockRules {
-            if let regex = try? NSRegularExpression(pattern: rule.pattern, options: []),
-               regex.firstMatch(in: combined, options: [], range: NSRange(combined.startIndex..<combined.endIndex, in: combined)) != nil {
+        let fullRange = NSRange(combined.startIndex..<combined.endIndex, in: combined)
+        for rule in compiledHardBlockRules {
+            if rule.regex.firstMatch(in: combined, options: [], range: fullRange) != nil {
                 return .hardBlock(reason: rule.reason)
             }
         }

@@ -105,7 +105,16 @@ class SQLiteSessionHandle {
       if (!current) throw new SessionPersistenceNotFoundError(this.id)
       assertContiguous(this.id, batch, current.next_seq)
       const insert = this.owner.stmt('INSERT INTO session_events(session_id, seq, event_json) VALUES (?, ?, ?)')
-      for (const event of batch) insert.run(this.id, event.seq, JSON.stringify(event))
+      const insertAttachment = this.owner.stmt('INSERT OR IGNORE INTO session_attachments(session_id, attachment_id) VALUES (?, ?)')
+      for (const event of batch) {
+        const serialized = JSON.stringify(event)
+        insert.run(this.id, event.seq, serialized)
+        if (serialized.includes('"attachmentId"')) {
+          for (const attachmentId of extractEventAttachmentIds(event)) {
+            insertAttachment.run(this.id, attachmentId)
+          }
+        }
+      }
       this.owner.stmt('UPDATE sessions SET next_seq = ?, revision = revision + 1 WHERE id = ?')
         .run(current.next_seq + batch.length, this.id)
       const lastActivityAt = batch.at(-1)?.time
@@ -241,11 +250,21 @@ export class SQLiteSessionPersistence extends SessionPersistence {
           event_json TEXT NOT NULL,
           PRIMARY KEY (session_id, seq)
         );
+        CREATE TABLE IF NOT EXISTS session_attachments (
+          session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          attachment_id TEXT NOT NULL,
+          PRIMARY KEY (session_id, attachment_id)
+        );
+        CREATE TABLE IF NOT EXISTS schema_meta (
+          key TEXT PRIMARY KEY NOT NULL,
+          value TEXT NOT NULL
+        );
       `)
       const sessionColumns = new Set(db.prepare('PRAGMA table_info(sessions)').all().map((row) => row.name))
       if (!sessionColumns.has('last_activity_at')) db.exec('ALTER TABLE sessions ADD COLUMN last_activity_at INTEGER')
       if (!sessionColumns.has('last_message_preview')) db.exec('ALTER TABLE sessions ADD COLUMN last_message_preview TEXT')
       this.backfillSessionSummaries()
+      this.backfillSessionAttachments()
     }
     return db
   }
@@ -393,6 +412,43 @@ export class SQLiteSessionPersistence extends SessionPersistence {
     this.db.prepare('DELETE FROM sessions WHERE id = ?').run(id)
   }
 
+  backfillSessionAttachments() {
+    const done = this.db.prepare("SELECT value FROM schema_meta WHERE key = 'attachments_indexed'").get()
+    if (done?.value === '1') return
+    const rows = this.db.prepare(`SELECT session_id, event_json FROM session_events WHERE event_json LIKE '%"attachmentId"%'`).all()
+    const insert = this.db.prepare('INSERT OR IGNORE INTO session_attachments(session_id, attachment_id) VALUES (?, ?)')
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      for (const row of rows) {
+        try {
+          const event = JSON.parse(row.event_json)
+          for (const attachmentId of extractEventAttachmentIds(event)) {
+            insert.run(row.session_id, attachmentId)
+          }
+        } catch { /* ignore malformed row */ }
+      }
+      this.db.prepare("INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('attachments_indexed', '1')").run()
+      this.db.exec('COMMIT')
+    } catch (error) {
+      try { this.db.exec('ROLLBACK') } catch {}
+      throw error
+    }
+  }
+
+  listAttachmentIds() {
+    const map = new Map()
+    const rows = this.stmt('SELECT session_id, attachment_id FROM session_attachments').all()
+    for (const row of rows) {
+      let set = map.get(row.session_id)
+      if (!set) {
+        set = new Set()
+        map.set(row.session_id, set)
+      }
+      set.add(row.attachment_id)
+    }
+    return map
+  }
+
   async truncateFromSeq(id, fromSeq) {
     if (!Number.isSafeInteger(fromSeq) || fromSeq < 0) throw new TypeError('Invalid sequence for truncation')
     const writer = this.writeOwners.get(id)
@@ -401,6 +457,16 @@ export class SQLiteSessionPersistence extends SessionPersistence {
     db.exec('BEGIN IMMEDIATE')
     try {
       db.prepare('DELETE FROM session_events WHERE session_id = ? AND seq >= ?').run(id, fromSeq)
+      db.prepare('DELETE FROM session_attachments WHERE session_id = ?').run(id)
+      const remaining = db.prepare(`SELECT event_json FROM session_events WHERE session_id = ? AND event_json LIKE '%"attachmentId"%'`).all(id)
+      const insertAtt = db.prepare('INSERT OR IGNORE INTO session_attachments(session_id, attachment_id) VALUES (?, ?)')
+      for (const row of remaining) {
+        try {
+          for (const attachmentId of extractEventAttachmentIds(JSON.parse(row.event_json))) {
+            insertAtt.run(id, attachmentId)
+          }
+        } catch { /* ignore */ }
+      }
       const seqRow = db.prepare('SELECT COALESCE(MAX(seq) + 1, 0) AS nextSeq FROM session_events WHERE session_id = ?').get(id)
       const nextSeq = Number(seqRow?.nextSeq ?? 0)
       const lastEvent = db.prepare(`SELECT json_extract(event_json, '$.time') AS time
@@ -429,4 +495,46 @@ export class SQLiteSessionPersistence extends SessionPersistence {
     const handle = await this.open(id, 'read')
     try { return (await handle.read()).events } finally { await handle.close() }
   }
+}
+
+function collectBlockAttachmentIds(content, output) {
+  if (!Array.isArray(content)) return
+  for (const block of content) {
+    if (!block || typeof block !== 'object' || Array.isArray(block)
+      || !['image', 'file'].includes(block.type)
+      || !block.attachment || typeof block.attachment !== 'object') continue
+    const id = block.attachment.attachmentId
+    if (typeof id === 'string' && id) output.push(id)
+  }
+}
+
+function extractEventAttachmentIds(event) {
+  const output = []
+  const data = event?.data
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return output
+  switch (event.type) {
+    case 'user/message':
+    case 'tool/ptc-dispatch':
+      collectBlockAttachmentIds(data.content, output)
+      break
+    case 'system/message':
+    case 'developer/message':
+    case 'tool/result':
+    case 'team/message/queued':
+      collectBlockAttachmentIds(data.message?.content, output)
+      break
+    case 'agent/inbox/spliced':
+      if (Array.isArray(data.inserted)) {
+        for (const message of data.inserted) collectBlockAttachmentIds(message?.content, output)
+      }
+      break
+    case 'compaction/summary':
+      collectBlockAttachmentIds(data.summary, output)
+      collectBlockAttachmentIds(data.rawOutput, output)
+      break
+    case 'assistant/message':
+      collectBlockAttachmentIds(data.message?.content, output)
+      break
+  }
+  return output
 }

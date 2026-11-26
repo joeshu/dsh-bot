@@ -387,8 +387,10 @@ function usageCounts(value) {
   const output = outputTokens ?? 0
   const cacheRead = cacheReadTokens ?? 0
   const cacheWrite = cacheWriteTokens ?? 0
+  const uncachedInput = Math.max(0, input)
   return {
     inputTokens: input,
+    uncachedInputTokens: uncachedInput,
     outputTokens: output,
     cacheReadTokens: cacheRead,
     cacheWriteTokens: cacheWrite,
@@ -406,13 +408,14 @@ function usageFromStream(stream) {
 }
 
 function emptyUsageTotals() {
-  return { calls: 0, inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, totalTokens: 0 }
+  return { calls: 0, inputTokens: 0, uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, totalTokens: 0 }
 }
 
 function addUsageTotals(totals, usage) {
   const add = (left, right) => left > Number.MAX_SAFE_INTEGER - right ? Number.MAX_SAFE_INTEGER : left + right
   totals.calls = add(totals.calls, 1)
   totals.inputTokens = add(totals.inputTokens, usage.inputTokens)
+  totals.uncachedInputTokens = add(totals.uncachedInputTokens, usage.uncachedInputTokens ?? usage.inputTokens)
   totals.cacheReadTokens = add(totals.cacheReadTokens, usage.cacheReadTokens)
   totals.cacheWriteTokens = add(totals.cacheWriteTokens, usage.cacheWriteTokens)
   totals.outputTokens = add(totals.outputTokens, usage.outputTokens)
@@ -459,9 +462,9 @@ async function dshUsageSummary({ dayWindows } = {}) {
   let unreportedCalls = 0
   let unreadSessions = 0
   for (const snapshot of snapshots) {
-    const botId = ownerBotId(snapshot)
-    if (!botId) continue
     const sessionId = String(snapshot.header.id)
+    const botId = ownerBotId(snapshot) ?? (sessionId.startsWith('session-') ? 'web-workbench' : undefined)
+    if (!botId) continue
     let handle
     try {
       handle = await runtime.persistence.open(sessionId, 'read')

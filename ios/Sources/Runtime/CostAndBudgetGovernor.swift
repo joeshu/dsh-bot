@@ -127,7 +127,8 @@ public final class CostBudgetGovernor: ObservableObject {
         let cacheReadRatePerM: Double
         let outputRatePerM: Double
 
-        if lower.contains("deepseek-reasoner") || lower.contains("deepseek-r1") {
+        if lower.contains("deepseek-reasoner") || lower.contains("deepseek-r1")
+            || lower.contains("deepseek-v4-pro") || lower.contains("deepseek-flash-thinking") {
             inputRatePerM = 0.55
             cacheReadRatePerM = 0.14
             outputRatePerM = 2.19
@@ -144,6 +145,36 @@ public final class CostBudgetGovernor: ObservableObject {
             + (Double(max(0, cacheReadTokens)) / 1_000_000.0) * cacheReadRatePerM
             + (Double(max(0, outputTokens)) / 1_000_000.0) * outputRatePerM
         return .exact(cost)
+    }
+
+    /// Aggregates estimated cost per model so mixed-model usage is priced accurately.
+    nonisolated public static func estimateTotalCost(
+        models: [(model: String, inputTokens: Int, cacheReadTokens: Int, outputTokens: Int)]
+    ) -> CostDisplayState {
+        guard !models.isEmpty else { return .exact(0) }
+        var totalUSD = 0.0
+        var hasKnownPaid = false
+        var hasFree = false
+        var hasUnknown = false
+        for item in models {
+            switch estimateCost(
+                model: item.model,
+                inputTokens: item.inputTokens,
+                cacheReadTokens: item.cacheReadTokens,
+                outputTokens: item.outputTokens
+            ) {
+            case .exact(let usd):
+                totalUSD += usd
+                hasKnownPaid = true
+            case .free:
+                hasFree = true
+            case .unknown:
+                hasUnknown = true
+            }
+        }
+        if hasKnownPaid { return .exact(totalUSD) }
+        if hasFree && !hasUnknown { return .free }
+        return hasUnknown ? .unknown : .exact(0)
     }
 
     /// Computes Prompt Cache hit ratio across uncached input and cached read tokens.

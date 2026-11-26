@@ -137,9 +137,14 @@ extension KeychainBridge {
             let account = modelAccount(provider)
             let status = try insertSecret(query: passwordQuery(account: account), data: Data(value.utf8))
             if status == errSecSuccess { return value }
-            if status == errSecDuplicateItem,
-               let current = try await getSecret(account: account, requireBiometrics: false)["value"] as? String,
-               !current.isEmpty { return current }
+            if status == errSecDuplicateItem {
+                if let current = try await getSecret(account: account, requireBiometrics: false)["value"] as? String,
+                   !current.isEmpty {
+                    return current
+                }
+                _ = try setSecret(account: account, value: value)
+                return value
+            }
             throw KeychainBridgeError.osStatus(status)
         }
         throw ModelProviderError.missingKey

@@ -396,6 +396,10 @@ public struct DSMarkdownText: View, Equatable {
         }
     }
 
+    private static let codeKeywordRegex: NSRegularExpression? = try? NSRegularExpression(
+        pattern: #"\b(?:func|struct|class|enum|let|var|if|else|guard|return|async|await|try|catch|import|public|private|const|function|def|for|while|switch|case|export|default|true|false|nil|null)\b"#
+    )
+
     private static func highlightCodeLine(_ line: String, lang: String) -> AttributedString {
         var attr = AttributedString(line)
         let lowerLang = lang.lowercased()
@@ -418,16 +422,12 @@ public struct DSMarkdownText: View, Equatable {
             attr.foregroundColor = .secondary
             return attr
         }
-        let keywords = ["func", "struct", "class", "enum", "let", "var", "if", "else", "guard", "return", "async", "await", "try", "catch", "import", "public", "private", "const", "function", "def", "for", "while", "switch", "case", "export", "default", "true", "false", "nil", "null"]
-        for kw in keywords {
-            let pattern = "\\b\(kw)\\b"
-            if let regex = try? NSRegularExpression(pattern: pattern) {
-                let ns = line as NSString
-                for match in regex.matches(in: line, range: NSRange(location: 0, length: ns.length)) {
-                    if let r = Range(match.range, in: line),
-                       let ar = Range(r, in: attr) {
-                        attr[ar].foregroundColor = .indigo
-                    }
+        if let regex = Self.codeKeywordRegex {
+            let ns = line as NSString
+            for match in regex.matches(in: line, range: NSRange(location: 0, length: ns.length)) {
+                if let r = Range(match.range, in: line),
+                   let ar = Range(r, in: attr) {
+                    attr[ar].foregroundColor = .indigo
                 }
             }
         }

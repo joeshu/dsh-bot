@@ -40,33 +40,49 @@ public struct IPCFrameCodec {
 
 public final class IPCFrameDecoder {
     private var buffer = Data()
+    private var readOffset = 0
 
     public init() {}
 
-    public var pendingBytes: Int { buffer.count }
+    public var pendingBytes: Int { buffer.count - readOffset }
 
     public func push(_ chunk: Data) throws -> [[String: Any]] {
-        buffer.append(chunk)
+        if !chunk.isEmpty {
+            buffer.append(chunk)
+        }
         var messages: [[String: Any]] = []
 
-        while buffer.count >= 4 {
-            let length = buffer.prefix(4).withUnsafeBytes { raw -> Int in
+        while buffer.count - readOffset >= 4 {
+            let headerStart = buffer.startIndex + readOffset
+            let length = buffer[headerStart..<(headerStart + 4)].withUnsafeBytes { raw -> Int in
                 let val = raw.loadUnaligned(as: UInt32.self)
                 return Int(UInt32(bigEndian: val))
             }
             guard length > 0 && length <= IPCFrameCodec.maxFrameBytes else {
                 buffer.removeAll()
+                readOffset = 0
                 throw IPCFrameError.invalidFrameLength(length)
             }
-            guard buffer.count >= 4 + length else { break }
+            guard buffer.count - readOffset >= 4 + length else { break }
 
-            let payload = buffer.subdata(in: 4..<(4 + length))
-            buffer.removeSubrange(0..<(4 + length))
+            let payloadStart = headerStart + 4
+            let payload = buffer.subdata(in: payloadStart..<(payloadStart + length))
+            readOffset += 4 + length
 
             guard let obj = try JSONSerialization.jsonObject(with: payload) as? [String: Any] else {
                 throw IPCFrameError.invalidJSON
             }
             messages.append(obj)
+        }
+
+        if readOffset > 0 {
+            if readOffset >= buffer.count {
+                buffer.removeAll(keepingCapacity: true)
+                readOffset = 0
+            } else if readOffset >= 4096 && readOffset * 2 >= buffer.count {
+                buffer.removeSubrange(buffer.startIndex..<(buffer.startIndex + readOffset))
+                readOffset = 0
+            }
         }
 
         return messages

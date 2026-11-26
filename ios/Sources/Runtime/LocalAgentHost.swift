@@ -1836,6 +1836,7 @@ public final class LocalAgentHost: ObservableObject {
             receipt = try? await workspaceCapabilities.nativeWorkspaceRequest(method: "approval.respond", params: params)
         }
         if receipt?["found"] as? Bool == true {
+            if resolvedRequestIDs.count > 500 { resolvedRequestIDs.removeAll(keepingCapacity: true) }
             resolvedRequestIDs.insert(id)
             pendingApprovals.removeAll { $0.id == id }
         } else {
@@ -1858,6 +1859,7 @@ public final class LocalAgentHost: ObservableObject {
             "questionId": id, "turnId": question.turnId, "sessionId": question.sessionId, "answers": answers
         ])
         if receipt?["found"] as? Bool == true {
+            if resolvedRequestIDs.count > 500 { resolvedRequestIDs.removeAll(keepingCapacity: true) }
             resolvedRequestIDs.insert(id)
             pendingDSHQuestions.removeAll { $0.id == id }
         } else {
@@ -2723,12 +2725,22 @@ public final class LocalAgentHost: ObservableObject {
         }
     }
 
+    private var lastPersistedLegacySignature: Int = -1
+
     private func persistWorkspace(immediate: Bool = false) {
         guard workspaceReadable else { return }
         persistDebounceWorkItem?.cancel()
         persistDebounceWorkItem = nil
         let botsSnapshot = bots
-        let chatsSnapshot = legacyMessagesBySession
+        var sig = legacyMessagesBySession.count
+        for (k, msgs) in legacyMessagesBySession {
+            sig = sig &* 31 &+ k.hashValue &+ msgs.count &+ (msgs.last?.id.hashValue ?? 0)
+        }
+        let shouldWriteLegacyChats = (sig != lastPersistedLegacySignature)
+        let chatsSnapshot: [String: [ChatMessageItem]]? = shouldWriteLegacyChats ? legacyMessagesBySession : nil
+        if shouldWriteLegacyChats {
+            lastPersistedLegacySignature = sig
+        }
         let root = workspace
         let writeBlock: @Sendable () -> Void = { [weak self] in
             do {
@@ -2736,10 +2748,12 @@ public final class LocalAgentHost: ObservableObject {
                     to: root.appendingPathComponent("bots.json"),
                     options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
                 )
-                try JSONEncoder().encode(chatsSnapshot).write(
-                    to: root.appendingPathComponent("chats.json"),
-                    options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
-                )
+                if let chatsSnapshot {
+                    try JSONEncoder().encode(chatsSnapshot).write(
+                        to: root.appendingPathComponent("chats.json"),
+                        options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
+                    )
+                }
                 Task { @MainActor in self?.workspaceError = nil }
             } catch {
                 Task { @MainActor in self?.workspaceError = "保存本机工作区失败。请检查存储空间后重试。" }
@@ -2754,31 +2768,51 @@ public final class LocalAgentHost: ObservableObject {
         persistQueue.asyncAfter(deadline: .now() + .milliseconds(250), execute: item)
     }
 
-    private func streamingDraftURL() -> URL {
-        workspace.appendingPathComponent("streaming-draft.json")
+    private func streamingDraftURL(turnId: String? = nil) -> URL {
+        if let turnId, !turnId.isEmpty {
+            let safeId = turnId.replacingOccurrences(of: "[^A-Za-z0-9._-]", with: "_", options: .regularExpression)
+            return workspace
+                .appendingPathComponent("streaming-drafts", isDirectory: true)
+                .appendingPathComponent("\(safeId).json")
+        }
+        return workspace.appendingPathComponent("streaming-draft.json")
     }
 
     private func restoreInterruptedStreamingDraftIfNeeded() {
-        let url = streamingDraftURL()
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        defer { try? FileManager.default.removeItem(at: url) }
-        guard let data = try? Data(contentsOf: url),
-              let draft = try? JSONDecoder().decode(StreamingDraftRecord.self, from: data),
-              (!draft.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-               || !draft.reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) else {
-            return
+        var draftURLs: [URL] = []
+        let legacyURL = streamingDraftURL()
+        if FileManager.default.fileExists(atPath: legacyURL.path) {
+            draftURLs.append(legacyURL)
         }
-        var recovered = ChatMessageItem(
-            sessionId: draft.sessionId,
-            role: "assistant",
-            content: draft.content,
-            reasoning: draft.reasoning,
-            timestamp: draft.updatedAt
-        )
-        recovered.incomplete = true
-        messagesBySession[draft.sessionId, default: []].append(recovered)
-        legacyMessagesBySession[draft.sessionId, default: []].append(recovered)
-        persistWorkspace(immediate: true)
+        let draftsDir = workspace.appendingPathComponent("streaming-drafts", isDirectory: true)
+        if let files = try? FileManager.default.contentsOfDirectory(at: draftsDir, includingPropertiesForKeys: nil) {
+            draftURLs.append(contentsOf: files.filter { $0.pathExtension == "json" })
+        }
+        guard !draftURLs.isEmpty else { return }
+        var recoveredAny = false
+        for url in draftURLs {
+            defer { try? FileManager.default.removeItem(at: url) }
+            guard let data = try? Data(contentsOf: url),
+                  let draft = try? JSONDecoder().decode(StreamingDraftRecord.self, from: data),
+                  (!draft.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                   || !draft.reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) else {
+                continue
+            }
+            var recovered = ChatMessageItem(
+                sessionId: draft.sessionId,
+                role: "assistant",
+                content: draft.content,
+                reasoning: draft.reasoning,
+                timestamp: draft.updatedAt
+            )
+            recovered.incomplete = true
+            messagesBySession[draft.sessionId, default: []].append(recovered)
+            legacyMessagesBySession[draft.sessionId, default: []].append(recovered)
+            recoveredAny = true
+        }
+        if recoveredAny {
+            persistWorkspace(immediate: true)
+        }
     }
 
     private func checkpointStreamingDraftIfNeeded(for ctx: ActiveTurnContext) {
@@ -2795,18 +2829,23 @@ public final class LocalAgentHost: ObservableObject {
             reasoning: ctx.streamState.reasoning,
             updatedAt: now
         )
-        let url = streamingDraftURL()
+        let url = streamingDraftURL(turnId: ctx.turnId)
         persistQueue.async {
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             if let encoded = try? JSONEncoder().encode(draft) {
-                try? encoded.write(to: url, options: .atomic)
+                try? encoded.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
             }
         }
     }
 
-    private func clearStreamingDraft() {
-        let url = streamingDraftURL()
+    private func clearStreamingDraft(turnId: String? = nil) {
+        let url = streamingDraftURL(turnId: turnId)
+        let legacyURL = streamingDraftURL()
         persistQueue.async {
             try? FileManager.default.removeItem(at: url)
+            if turnId == nil {
+                try? FileManager.default.removeItem(at: legacyURL)
+            }
         }
     }
 
@@ -2855,6 +2894,7 @@ public final class LocalAgentHost: ObservableObject {
             return
         }
         flushPendingStreamBuffers(for: targetSessionId)
+        clearStreamingDraft(turnId: ctx.turnId)
         if activeTurnsBySession.count <= 1 {
             clearStreamingDraft()
         }

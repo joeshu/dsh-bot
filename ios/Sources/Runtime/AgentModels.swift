@@ -459,8 +459,11 @@ public final class StreamingTurnState: ObservableObject {
     @Published public var startedAt: Date?
     @Published public var recentSteerNote: String?
 
-    private var inCodeFence = false
+    private var fenceChar: Character? = nil
+    private var fenceLength: Int = 0
     private var tailBuffer = ""
+    private var currentBlockLines: [String] = []
+    private var pendingLineBuffer = ""
 
     public init() {}
 
@@ -476,36 +479,58 @@ public final class StreamingTurnState: ObservableObject {
         self.elapsedSeconds = 0
         self.startedAt = Date()
         self.recentSteerNote = steerNote
-        self.inCodeFence = false
+        self.fenceChar = nil
+        self.fenceLength = 0
         self.tailBuffer = ""
+        self.currentBlockLines = []
+        self.pendingLineBuffer = ""
+    }
+
+    private static func parseFenceMarker(_ trimmed: String) -> (Character, Int, Bool)? {
+        guard let first = trimmed.first, first == "`" || first == "~" else { return nil }
+        var count = 0
+        for ch in trimmed {
+            if ch == first { count += 1 } else { break }
+        }
+        guard count >= 3 else { return nil }
+        let rest = trimmed.dropFirst(count).trimmingCharacters(in: .whitespaces)
+        return (first, count, rest.isEmpty)
     }
 
     /// Incrementally appends streaming content in O(delta) time, sealing completed paragraphs
-    /// outside open fenced code blocks into `stableBlocks` so completed Markdown blocks are never re-parsed.
+    /// outside open CommonMark fenced code blocks into `stableBlocks` without rescanning previous lines.
     public func appendContent(_ delta: String) {
         guard !delta.isEmpty else { return }
         content += delta
-        tailBuffer += delta
+        pendingLineBuffer += delta
 
-        // Fast path: only scan for paragraph boundaries when a newline was added
         guard delta.contains("\n") else {
-            liveTail = tailBuffer
+            if currentBlockLines.isEmpty {
+                liveTail = pendingLineBuffer
+            } else {
+                liveTail = tailBuffer + "\n" + pendingLineBuffer
+            }
             return
         }
 
-        // Process complete lines in tailBuffer while keeping the trailing partial line
-        var lines = tailBuffer.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        let trailingPartial = lines.popLast() ?? ""
-        var currentBlockLines: [String] = []
+        var parts = pendingLineBuffer.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        pendingLineBuffer = parts.popLast() ?? ""
         var sealedAny = false
-        var localInFence = inCodeFence
 
-        for line in lines {
+        for line in parts {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("```") {
-                localInFence.toggle()
+            if let (ch, count, isClosingOnly) = Self.parseFenceMarker(trimmed) {
+                if let activeChar = fenceChar {
+                    if ch == activeChar && count >= fenceLength && isClosingOnly {
+                        fenceChar = nil
+                        fenceLength = 0
+                    }
+                } else {
+                    fenceChar = ch
+                    fenceLength = count
+                }
                 currentBlockLines.append(line)
-            } else if !localInFence && trimmed.isEmpty {
+            } else if fenceChar == nil && trimmed.isEmpty {
                 let candidate = currentBlockLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
                 if !candidate.isEmpty {
                     stableBlocks.append(candidate)
@@ -517,16 +542,16 @@ public final class StreamingTurnState: ObservableObject {
             }
         }
 
-        if sealedAny {
-            inCodeFence = localInFence
-            if !trailingPartial.isEmpty || !currentBlockLines.isEmpty {
-                currentBlockLines.append(trailingPartial)
-                tailBuffer = currentBlockLines.joined(separator: "\n")
-            } else {
-                tailBuffer = ""
-            }
+        if sealedAny || !parts.isEmpty {
+            tailBuffer = currentBlockLines.joined(separator: "\n")
         }
-        liveTail = tailBuffer
+        if tailBuffer.isEmpty {
+            liveTail = pendingLineBuffer
+        } else if pendingLineBuffer.isEmpty {
+            liveTail = tailBuffer
+        } else {
+            liveTail = tailBuffer + "\n" + pendingLineBuffer
+        }
     }
 
     public func reset() {
@@ -541,8 +566,11 @@ public final class StreamingTurnState: ObservableObject {
         elapsedSeconds = 0
         startedAt = nil
         recentSteerNote = nil
-        inCodeFence = false
+        fenceChar = nil
+        fenceLength = 0
         tailBuffer = ""
+        currentBlockLines = []
+        pendingLineBuffer = ""
     }
 }
 

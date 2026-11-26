@@ -13,17 +13,37 @@ public struct MarkdownHeading: Identifiable, Equatable {
 
 public enum MarkdownOutlineParser {
     public static func extractHeadings(from text: String) -> [MarkdownHeading] {
-        text.split(separator: "\n", omittingEmptySubsequences: false).enumerated().compactMap { idx, rawLine in
+        var headings: [MarkdownHeading] = []
+        var fenceChar: Character? = nil
+        var fenceLen = 0
+        for (idx, rawLine) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
-            if line.hasPrefix("### ") {
-                return MarkdownHeading(id: "h_\(idx)", level: 3, title: String(line.dropFirst(4)))
-            } else if line.hasPrefix("## ") {
-                return MarkdownHeading(id: "h_\(idx)", level: 2, title: String(line.dropFirst(3)))
-            } else if line.hasPrefix("# ") {
-                return MarkdownHeading(id: "h_\(idx)", level: 1, title: String(line.dropFirst(2)))
+            if let first = line.first, first == "`" || first == "~" {
+                let count = line.prefix(while: { $0 == first }).count
+                if count >= 3 {
+                    let rest = line.dropFirst(count).trimmingCharacters(in: .whitespaces)
+                    if let active = fenceChar {
+                        if first == active && count >= fenceLen && rest.isEmpty {
+                            fenceChar = nil
+                            fenceLen = 0
+                        }
+                    } else {
+                        fenceChar = first
+                        fenceLen = count
+                    }
+                    continue
+                }
             }
-            return nil
+            guard fenceChar == nil else { continue }
+            if line.hasPrefix("### ") {
+                headings.append(MarkdownHeading(id: "h_\(idx)", level: 3, title: String(line.dropFirst(4))))
+            } else if line.hasPrefix("## ") {
+                headings.append(MarkdownHeading(id: "h_\(idx)", level: 2, title: String(line.dropFirst(3))))
+            } else if line.hasPrefix("# ") {
+                headings.append(MarkdownHeading(id: "h_\(idx)", level: 1, title: String(line.dropFirst(2))))
+            }
         }
+        return headings
     }
 }
 
