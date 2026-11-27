@@ -112,6 +112,38 @@ def wait_for_serial_socket(
     )
 
 
+def query_qemu_status(socket_path: pathlib.Path) -> str:
+    """Return QMP VM status and CPU registers when serial startup fails."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(1)
+            connection.connect(str(socket_path))
+            with connection.makefile("rb") as reader:
+                greeting = json.loads(reader.readline())
+                if "QMP" not in greeting:
+                    return f"unexpected QMP greeting: {greeting!r}"
+                connection.sendall(b'{"execute":"qmp_capabilities","id":1}\r\n')
+                while True:
+                    response = json.loads(reader.readline())
+                    if response.get("id") == 1:
+                        break
+                connection.sendall(b'{"execute":"query-status","id":2}\r\n')
+                while True:
+                    status = json.loads(reader.readline())
+                    if status.get("id") == 2:
+                        break
+                connection.sendall(
+                    b'{"execute":"human-monitor-command","arguments":{"command-line":"info registers"},"id":3}\r\n'
+                )
+                while True:
+                    registers = json.loads(reader.readline())
+                    if registers.get("id") == 3:
+                        break
+        return json.dumps({"status": status.get("return"), "registers": registers.get("return")}, ensure_ascii=True)
+    except Exception as error:
+        return f"QMP diagnostics unavailable: {error}"
+
+
 def output_until_marker(link: SerialLink, session_id: int, marker: bytes, timeout: int) -> bytes:
     return output_until_markers(link, session_id, (marker,), timeout)
 
@@ -287,7 +319,9 @@ def main() -> None:
     serial_log.unlink(missing_ok=True)
     with tempfile.TemporaryDirectory(prefix="dsbot-uart-") as temporary:
         socket_path = pathlib.Path(temporary) / "serial.sock"
+        qmp_socket_path = pathlib.Path(temporary) / "qmp.sock"
         qemu_output_path = pathlib.Path(temporary) / "qemu-output.log"
+        qemu_debug_path = pathlib.Path(temporary) / "qemu-debug.log"
         command = [
             qemu,
             "-machine", "virt,gic-version=2",
@@ -301,7 +335,10 @@ def main() -> None:
             "earlycon=pl011,mmio32,0x09000000 console=ttyAMA0,115200 loglevel=8 ignore_loglevel rdinit=/init panic=10",
             "-display", "none",
             "-monitor", "none",
+            "-qmp", f"unix:{qmp_socket_path},server=on,wait=off",
             "-serial", f"unix:{socket_path},server=on,wait=off",
+            "-d", "guest_errors,cpu_reset",
+            "-D", str(qemu_debug_path),
             "-no-reboot",
         ]
         qemu_output = qemu_output_path.open("wb")
@@ -331,6 +368,11 @@ def main() -> None:
             detail = qemu_output_path.read_text(encoding="utf-8", errors="replace")[-4096:]
             print("QEMU output:")
             print(detail if detail else "<empty>")
+            print("QEMU guest status and CPU registers:")
+            print(query_qemu_status(qmp_socket_path))
+            qemu_debug = qemu_debug_path.read_text(encoding="utf-8", errors="replace")[-4096:]
+            print("QEMU guest debug log:")
+            print(qemu_debug if qemu_debug else "<empty>")
             raise
         finally:
             if connection is not None:
