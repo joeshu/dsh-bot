@@ -258,6 +258,7 @@ def main() -> None:
     serial_log.unlink(missing_ok=True)
     with tempfile.TemporaryDirectory(prefix="dsbot-uart-") as temporary:
         socket_path = pathlib.Path(temporary) / "serial.sock"
+        qemu_stderr_path = pathlib.Path(temporary) / "qemu-stderr.log"
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server.bind(str(socket_path))
         server.listen(1)
@@ -277,20 +278,32 @@ def main() -> None:
             "-serial", f"unix:{socket_path},server=off,wait=off",
             "-no-reboot",
         ]
-        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        qemu_stderr = qemu_stderr_path.open("wb")
+        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=qemu_stderr)
         connection: socket.socket | None = None
         link: SerialLink | None = None
         deadline = time.monotonic() + max(1, args.timeout)
         try:
             while connection is None and time.monotonic() < deadline:
-                if process.poll() is not None:
-                    raise RuntimeError(f"QEMU exited before opening the guest serial channel (status {process.returncode})")
                 try:
                     connection, _ = server.accept()
                 except TimeoutError:
+                    if process.poll() is not None:
+                        qemu_stderr.flush()
+                        detail = qemu_stderr_path.read_text(encoding="utf-8", errors="replace")[-4096:]
+                        suffix = f"\nQEMU stderr:\n{detail}" if detail else "\nQEMU wrote no stderr."
+                        raise RuntimeError(
+                            "QEMU exited before opening the guest serial channel "
+                            f"(status {process.returncode}).{suffix}"
+                        )
                     continue
             if connection is None:
-                raise TimeoutError("QEMU did not connect its serial device to the smoke harness")
+                qemu_stderr.flush()
+                detail = qemu_stderr_path.read_text(encoding="utf-8", errors="replace")[-4096:]
+                suffix = f"\nQEMU stderr:\n{detail}" if detail else "\nQEMU wrote no stderr."
+                raise TimeoutError(
+                    "QEMU did not connect its serial device to the smoke harness." + suffix
+                )
             link = SerialLink(connection)
             link.wait_for_text(marker, deadline)
             if has_pty_agent:
@@ -298,6 +311,12 @@ def main() -> None:
                 smoke_guest_pty_isolation(link, args.timeout)
             else:
                 smoke_serial_shell(link, args.timeout)
+        except Exception:
+            if link and link.raw:
+                boot_text = link.raw.split(MAGIC, 1)[0]
+                print("Guest serial output before smoke failure:")
+                print(boot_text[-8192:].decode("utf-8", "replace"), end="")
+            raise
         finally:
             if connection:
                 connection.close()
@@ -309,6 +328,7 @@ def main() -> None:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=5)
+            qemu_stderr.close()
             serial_log.write_bytes(link.raw if link else b"")
 
     raw = serial_log.read_bytes()
