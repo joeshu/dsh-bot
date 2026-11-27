@@ -45,7 +45,6 @@ BUILTIN_OPTIONS = (
     "VIRTIO_BLK",
     "EXT4_FS",
     "FUSE_FS",
-    "DEVPTS_FS",
     "UNIX98_PTYS",
     "DEVTMPFS",
     "DEVTMPFS_MOUNT",
