@@ -108,6 +108,7 @@ public actor ARM64GuestPTYBroker {
             throw ARM64GuestPTYProtocolError.sessionLimitReached
         }
         let sessionID = try await directory.sessionID(for: owner)
+        guard sessions[sessionID] == nil else { throw ARM64GuestPTYProtocolError.sessionNotOpen }
         do {
             try Task.checkCancellation()
         } catch {
@@ -118,7 +119,6 @@ public actor ARM64GuestPTYBroker {
             await directory.revoke(owner: owner)
             throw ARM64GuestPTYProtocolError.sessionLimitReached
         }
-        guard sessions[sessionID] == nil else { throw ARM64GuestPTYProtocolError.sessionNotOpen }
 
         var payload = Data()
         payload.append(UInt8(rows >> 8))
