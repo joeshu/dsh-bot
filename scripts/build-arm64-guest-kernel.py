@@ -29,7 +29,7 @@ SOURCES = {
         "sha512": "88599ffdec96d150c1feb9b261ba93bb0301a9d0e1ad6bef7aeab1f5372cbfc57d8b43c7e902bd8f76921d1dbd8189663c142ea869e51d0e2b483b150ee00fe0",
     },
     "patch-6.18.60.patch.xz": {
-        "url": f"{KERNEL_BASE_URL}/patch-6.18.60.patch.xz",
+        "url": f"{KERNEL_BASE_URL}/patch-6.18.60.xz",
         "sha512": "fce959c563635d4374cba148b7f1b8b64a143e5b42bd8e86afee7dfdc76b9d887afb5a032249ac16518ee95e73b3c1a459f15926a035780493c5b3b9fbd3b51b",
     },
     "0001-powerpc-boot-wrapper-Add-z-notext-flag-for-ppc64le.patch": {
@@ -123,7 +123,11 @@ def download(name: str, spec: dict[str, str], cache: pathlib.Path) -> pathlib.Pa
         raise RuntimeError(f"Refusing untrusted source URL for {name}")
     cache.mkdir(parents=True, exist_ok=True)
     request = urllib.request.Request(spec["url"], headers={"User-Agent": "DSBot-ARM64-kernel-builder/1"})
-    with urllib.request.urlopen(request, timeout=60) as response:
+    try:
+        response_context = urllib.request.urlopen(request, timeout=60)
+    except Exception as error:
+        raise RuntimeError(f"Could not download pinned kernel input {name}: {error}") from error
+    with response_context as response:
         final = urllib.parse.urlparse(response.geturl())
         if final.scheme != "https" or final.hostname not in allowed_hosts:
             raise RuntimeError(f"Refusing redirected source URL for {name}")
