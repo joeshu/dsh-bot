@@ -62,6 +62,17 @@ def add_ios_platform_to_official_profile_loader(path):
     path.write_text(source.replace(admission, ios_admission, 1), encoding="utf-8")
 
 
+def relax_loopback_cookie_samesite_for_ios_wkwebview(path):
+    source = path.read_text(encoding="utf-8")
+    if "DS_BOT_IOS_HOST" in source:
+        return
+    needle = 'const attributes = `${name}=${value}; Max-Age=${String(maxAgeSeconds)}; Path=/; Expires=${new Date(expiresAt).toUTCString()}; HttpOnly; SameSite=Strict`;'
+    replacement = 'const sameSite = process.env.DS_BOT_IOS_HOST === "1" ? "Lax" : "Strict";\n\tconst attributes = `${name}=${value}; Max-Age=${String(maxAgeSeconds)}; Path=/; Expires=${new Date(expiresAt).toUTCString()}; HttpOnly; SameSite=${sameSite}`;'
+    if source.count(needle) != 1:
+        raise SystemExit("Unexpected dsh-client-connection sessionCookie format; review iOS WKWebView SameSite patch")
+    path.write_text(source.replace(needle, replacement, 1), encoding="utf-8")
+
+
 def main():
     lockfile = SOURCE / "package-lock.json"
     node_modules = SOURCE / "node_modules"
@@ -90,6 +101,8 @@ def main():
     shutil.copytree(vendor_source, vendor_destination, ignore=shutil.ignore_patterns("*.map", ".DS_Store"))
     profile_loader = DESTINATION / "node_modules" / "@deepseek-ai" / "dsh-app-boot" / "lib" / "index.js"
     add_ios_platform_to_official_profile_loader(profile_loader)
+    client_connection = DESTINATION / "node_modules" / "@deepseek-ai" / "dsh-client-connection" / "lib" / "index.js"
+    relax_loopback_cookie_samesite_for_ios_wkwebview(client_connection)
 
     package = json.loads((SOURCE / "package.json").read_text(encoding="utf-8"))
     lock = json.loads(lockfile.read_text(encoding="utf-8"))

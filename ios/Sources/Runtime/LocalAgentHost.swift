@@ -2627,9 +2627,14 @@ public final class LocalAgentHost: ObservableObject {
         }
     }
 
-    private func updatePluginRecovery(_ enabled: Bool) {
+    private func updatePluginRecovery(_ enabled: Bool, bootError: String = "") {
         isDSHRecoveryMode = enabled
-        if enabled { pluginStatus = "DSH 已进入恢复模式。可在插件页停用或卸载问题插件。" }
+        if enabled {
+            let trimmed = bootError.trimmingCharacters(in: .whitespacesAndNewlines)
+            pluginStatus = trimmed.isEmpty
+                ? "DSH 已进入恢复模式。可在插件页停用或卸载问题插件。"
+                : "DSH 已进入恢复模式（\(trimmed)）。可在插件页停用或卸载问题插件。"
+        }
     }
 
     private func registerRuntimeBridge(on rpc: IPCChannel) async {
@@ -2743,6 +2748,7 @@ public final class LocalAgentHost: ObservableObject {
                    || plugins.contains("ios-session-persistence")
                    || plugins.contains("dsbot-ios-sqlite-session-persistence")) else { throw IPCFrameError.invalidJSON }
             let safeMode = params["safeMode"] as? Bool == true
+            let bootError = params["bootError"] as? String ?? ""
             let shouldResyncSettings = await MainActor.run {
                 self?.state == .ready && self?.runtimeRestartInProgress == false
             }
@@ -2750,7 +2756,7 @@ public final class LocalAgentHost: ObservableObject {
                 await MainActor.run { self?.effectiveWebSearchSendOriginalQuestion = false }
             }
             await MainActor.run {
-                self?.updatePluginRecovery(safeMode)
+                self?.updatePluginRecovery(safeMode, bootError: bootError)
                 self?.runtimeGeneration = UUID()
                 self?.resolveRuntimeReadiness()
             }

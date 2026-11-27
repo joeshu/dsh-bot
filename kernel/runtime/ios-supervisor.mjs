@@ -41,19 +41,24 @@ const workerHeapMB = Number.isFinite(parsedWorkerHeapMB) && parsedWorkerHeapMB >
   ? Math.floor(parsedWorkerHeapMB)
   : 320
 
+let lastBootError = ''
+
 function launch() {
   const threadDecoder = new FrameDecoder()
   let bootError
   const thread = new Worker(new URL('./dsh-ios-entry.mjs', import.meta.url), {
     argv: args,
-    workerData: { supervised: true, safeMode, recoveringRevision },
+    workerData: { supervised: true, safeMode, recoveringRevision, lastBootError: safeMode ? lastBootError : '' },
     resourceLimits: {
       maxOldGenerationSizeMb: workerHeapMB,
       maxYoungGenerationSizeMb: 32,
     },
   })
   worker = thread
-  startupTimer = setTimeout(() => { void thread.terminate() }, 25_000).unref()
+  startupTimer = setTimeout(() => {
+    bootError = 'DSH 启动超时（>75s），已自动切入安全恢复模式'
+    void thread.terminate()
+  }, 75_000).unref()
   thread.on('message', ({ data }) => {
     if (!data || thread !== worker || closed) return
     for (const message of threadDecoder.push(data)) {
@@ -65,9 +70,10 @@ function launch() {
         clearTimeout(startupTimer)
         ready = true
         unexpectedCrashCount = 0
+        if (!safeMode) lastBootError = ''
         send(message)
         if (restart !== undefined) {
-          send({ jsonrpc: '2.0', id: restart, result: { restarted: true, safeMode, rolledBack: recoveringRevision } })
+          send({ jsonrpc: '2.0', id: restart, result: { restarted: true, safeMode, rolledBack: recoveringRevision, bootError: safeMode ? lastBootError : '' } })
           restart = undefined
         }
         recoveringRevision = false
@@ -90,6 +96,7 @@ function launch() {
     clearTimeout(startupTimer)
     clearTimeout(stopTimer)
     if (closed) return
+    if (bootError) lastBootError = String(bootError)
     for (const id of pending.keys()) fail(id, 'DSH engine stopped before completing the request')
     pending.clear()
     if (activeTurns.size > 0) {
@@ -104,6 +111,7 @@ function launch() {
     ready = false
     if (wasReady && restart !== undefined) {
       safeMode = false
+      lastBootError = ''
       launch()
     } else if (wasReady && restart === undefined && unexpectedCrashCount < 2) {
       unexpectedCrashCount += 1

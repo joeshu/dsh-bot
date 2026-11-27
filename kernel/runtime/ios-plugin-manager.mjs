@@ -732,10 +732,33 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
     return enabled[0]
   }
 
+  function catalogFallbackUrls(source) {
+    if (source.id === 'dsh-market' && source.url.includes('cdn.jsdelivr.net/npm/dsh-plugin-catalog/index.json')) {
+      return [
+        source.url,
+        'https://fastly.jsdelivr.net/npm/dsh-plugin-catalog/index.json',
+        'https://unpkg.com/dsh-plugin-catalog/index.json',
+        'https://api.dshfind.com/market/dsh-index.json',
+      ]
+    }
+    return [source.url]
+  }
+
   async function loadCatalog(source, force = false) {
     const cached = catalogCache.get(source.id)
     if (!force && cached && Date.now() - cached.at < 5 * 60_000) return cached.index
-    const buffer = await fetchBuffer(source.url, MAX_INDEX_BYTES, 15_000)
+    const urls = catalogFallbackUrls(source)
+    let lastError
+    let buffer
+    for (const candidateUrl of urls) {
+      try {
+        buffer = await fetchBuffer(candidateUrl, MAX_INDEX_BYTES, 25_000)
+        break
+      } catch (error) {
+        lastError = error
+      }
+    }
+    if (!buffer) throw lastError ?? new Error('无法拉取插件索引')
     let index
     try { index = JSON.parse(buffer.toString('utf8')) } catch { throw new Error('插件索引不是有效 JSON') }
     if (!index || index.format !== 1 || !Array.isArray(index.plugins)) throw new Error('只支持 DSH format 1 插件索引')

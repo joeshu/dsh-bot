@@ -37,6 +37,7 @@ public struct DSHWebUIView: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.colorScheme) private var systemColorScheme
     @State private var launchURL: URL?
+    @State private var authCookies: [HTTPCookie] = []
     @State private var allowedPort: Int = 0
     @State private var errorMessage: String?
     @State private var loadProgress: Double = 0
@@ -278,6 +279,7 @@ public struct DSHWebUIView: View {
         if let url = launchURL, allowedPort > 0 {
             LoopbackWebView(
                 url: url,
+                authCookies: authCookies,
                 allowedPort: allowedPort,
                 reloadToken: reloadToken,
                 initialSessionId: initialSessionId,
@@ -357,9 +359,9 @@ public struct DSHWebUIView: View {
     }
 
     /// Exchanges the one-shot `?token=` URL via URLSession (without following the 303 redirect),
-    /// writes the resulting signed HttpOnly session cookie directly into `WKWebsiteDataStore.default().httpCookieStore`,
-    /// and returns the clean loopback root URL so `WKWebView` never hits iOS WebKit's 303 + `SameSite=Strict` cookie-drop race.
-    private static func exchangeTokenCookie(from authURL: URL, cleanBaseURL: URL) async -> URL {
+    /// parses the signed HttpOnly session cookies, and returns them together with the clean loopback root URL
+    /// so `LoopbackWebView` can commit them directly into its live `WKWebView` cookie store before loading.
+    private static func exchangeTokenCookie(from authURL: URL, cleanBaseURL: URL) async -> (url: URL, cookies: [HTTPCookie]) {
         final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate {
             func urlSession(
                 _ session: URLSession,
@@ -384,7 +386,7 @@ public struct DSHWebUIView: View {
             let (_, response) = try await session.data(for: req)
             guard let http = response as? HTTPURLResponse,
                   (200...399).contains(http.statusCode) else {
-                return authURL
+                return (authURL, [])
             }
             var stringHeaders: [String: String] = [:]
             for (k, v) in http.allHeaderFields {
@@ -394,15 +396,11 @@ public struct DSHWebUIView: View {
             }
             let cookies = HTTPCookie.cookies(withResponseHeaderFields: stringHeaders, for: cleanBaseURL)
             guard !cookies.isEmpty else {
-                return http.statusCode == 200 ? cleanBaseURL : authURL
+                return (http.statusCode == 200 ? cleanBaseURL : authURL, [])
             }
-            let cookieStore = WKWebsiteDataStore.default().httpCookieStore
-            for cookie in cookies {
-                await cookieStore.setCookie(cookie)
-            }
-            return cleanBaseURL
+            return (cleanBaseURL, cookies)
         } catch {
-            return authURL
+            return (authURL, [])
         }
     }
 
@@ -413,6 +411,7 @@ public struct DSHWebUIView: View {
         }
         guard let rpc = host.rpc() else {
             launchURL = nil
+            authCookies = []
             errorMessage = "DSH 运行时尚未就绪，请稍候重试。"
             return
         }
@@ -426,6 +425,7 @@ public struct DSHWebUIView: View {
                   parsed.scheme == "http", parsed.port == port,
                   parsed.host == "127.0.0.1" else {
                 launchURL = nil
+                authCookies = []
                 errorMessage = "DSH Web 工作台未启动（当前可能处于恢复模式）。"
                 return
             }
@@ -435,14 +435,16 @@ public struct DSHWebUIView: View {
             let cleanBaseURL = (info["baseUrl"] as? String).flatMap(URL.init(string:))
                 ?? URL(string: "http://127.0.0.1:\(port)/")
                 ?? parsed
-            let targetURL = await Self.exchangeTokenCookie(from: parsed, cleanBaseURL: cleanBaseURL)
+            let exchanged = await Self.exchangeTokenCookie(from: parsed, cleanBaseURL: cleanBaseURL)
             guard !Task.isCancelled, generation == host.runtimeGeneration else { return }
             errorMessage = nil
             allowedPort = port
-            launchURL = targetURL
+            authCookies = exchanged.cookies
+            launchURL = exchanged.url
         } catch {
             guard !Task.isCancelled, generation == host.runtimeGeneration else { return }
             launchURL = nil
+            authCookies = []
             errorMessage = "无法获取 Web 工作台地址：\(error.localizedDescription)"
         }
     }
@@ -458,6 +460,7 @@ private final class WeakWebScriptMessageHandler: NSObject, WKScriptMessageHandle
 
 private struct LoopbackWebView: UIViewRepresentable {
     let url: URL
+    let authCookies: [HTTPCookie]
     let allowedPort: Int
     let reloadToken: UUID
     let initialSessionId: String?
@@ -680,6 +683,30 @@ private struct LoopbackWebView: UIViewRepresentable {
         ))
     }
 
+    private func loadAuthenticated(_ targetURL: URL, cookies: [HTTPCookie], into webView: WKWebView) {
+        var request = URLRequest(url: targetURL)
+        request.httpShouldHandleCookies = true
+        if !cookies.isEmpty {
+            let headerFields = HTTPCookie.requestHeaderFields(with: cookies)
+            for (key, value) in headerFields {
+                request.setValue(value, forHTTPHeaderField: key)
+            }
+            let store = webView.configuration.websiteDataStore.httpCookieStore
+            let group = DispatchGroup()
+            for cookie in cookies {
+                group.enter()
+                store.setCookie(cookie) {
+                    group.leave()
+                }
+            }
+            group.notify(queue: .main) { [weak webView] in
+                webView?.load(request)
+            }
+        } else {
+            webView.load(request)
+        }
+    }
+
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
@@ -700,7 +727,7 @@ private struct LoopbackWebView: UIViewRepresentable {
         context.coordinator.lastLoadedToken = reloadToken
         context.coordinator.viewportMode = viewportMode
         context.coordinator.textScalePercent = textScalePercent
-        webView.load(URLRequest(url: url))
+        loadAuthenticated(url, cookies: authCookies, into: webView)
         return webView
     }
 
@@ -720,7 +747,7 @@ private struct LoopbackWebView: UIViewRepresentable {
             context.coordinator.lastLoadedURL = url
             context.coordinator.lastLoadedToken = reloadToken
             installUserScripts(on: webView.configuration.userContentController)
-            webView.load(URLRequest(url: url))
+            loadAuthenticated(url, cookies: authCookies, into: webView)
         }
     }
 

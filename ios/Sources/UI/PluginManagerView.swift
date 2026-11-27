@@ -440,9 +440,17 @@ public struct PluginManagerView: View {
 
             Section(host.pluginSourceName.map { "来自 \($0)" } ?? "插件目录") {
                 if host.pluginCatalog.isEmpty && !host.isLoadingPlugins {
-                    Text("没有匹配结果。可刷新索引、更换来源，或在“已安装”页直接粘贴 GitHub 仓库地址安装。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("没有匹配结果或索引拉取超时。可点击下方重试、切换到 dshfind 索引源，或在“已安装”页直接粘贴 GitHub 仓库地址安装。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Button("重新读取索引") {
+                            Task { await host.discoverPlugins(query: searchText, forceRefresh: true) }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                    .padding(.vertical, 4)
                 }
                 ForEach(host.pluginCatalog) { item in
                     VStack(alignment: .leading, spacing: 7) {

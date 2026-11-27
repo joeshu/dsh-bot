@@ -1704,6 +1704,7 @@ const runtimeInfo = () => ({
   webProviders: ctx?.web?.listProviders(),
   webUI: webUiInfo(),
   pluginIndexFormat: 1, safeMode: workerData?.safeMode === true,
+  bootError: typeof workerData?.lastBootError === 'string' ? workerData.lastBootError : '',
   plugins: runtime.activePlugins,
   tools: [...NATIVE_TOOL_NAMES, ...DEVELOPER_TOOL_NAMES],
 })
