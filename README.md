@@ -43,6 +43,8 @@ The generated IPA report also breaks out compressed and uncompressed sizes for t
 
 ## Candidate and release gates
 
+Push and pull-request builds now produce a separate pinned Alpine ARM64 serial-shell bootstrap artifact; manual runs can opt in with **build_arm64_guest_image**. It contains a Linux kernel and a small BusyBox root filesystem (about 14 MiB total); it is **not included in the IPA**. This is only the guest boot payload: it has no QEMU iOS SE runtime, persistent disk, shared workspace, package installer bridge, or Web/Bot PTY connection. The app therefore still does not provide a full Linux shell or PTY. Those capabilities require the native backend, durable workspace boundary, command approval path, and interactive terminal stream to land and pass device acceptance.
+
 - The **iOS Native IPA** workflow builds the candidate and runs simulator validation. It uploads the unsigned IPA and its report for review.
 - The **iOS Native Release** `stage` operation may publish a preview candidate after checking its exact IPA hash and source commit.
 - `promote` is blocked unless the archived report says the embedded Node runtime is current and release-eligible. It also requires recorded re-signed device acceptance, including install, cold launch, upgrade, chat, cancellation, approval and rejection flows.

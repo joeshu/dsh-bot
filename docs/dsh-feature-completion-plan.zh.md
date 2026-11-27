@@ -75,6 +75,7 @@ DSH `dsh-api-remote-access` 只约束 Typert Gateway Remote API。它能在 `ses
 4. **P1 Schedule 后台体验**：原生 Bot 前台 Schedule、规则编辑、投递回执和任务级隔离已接通。剩余是可取消且有截止时间的 best-effort `BGTask` 唤醒/通知设计，以及更明确的漏投与恢复诊断。上游 Schedule 是 Host-wide 单计时器；在后台唤醒前还要让它跳过已锁定的私密 Session，避免设备锁定时自动执行私密任务。BGTask 仍不能承诺准点。
 5. **P2 Jobs 持久执行**：基础 DSH Jobs 已接入并提供离线 Python 生产方、原生管理页与完整 owner 隔离。若产品需要 Host 重启后恢复或系统挂起时持续运行，需要另行实现 Swift 持久 task broker 与 iOS BackgroundTasks/通知适配，并保留目前无 shell 的生产方边界；iOS 系统调度不承诺准点。
 6. **P2 Web 插件写管理**：Web 页面保持只读，直到原生宿主授权/审查/回滚接口闭环。
+7. **P1 ARM64 Linux 终端**：已落地可复现的 Alpine ARM64 serial-shell bootstrap 镜像构建，内核与根文件系统按 SHA-256 固定，并为 Alpine 包记录 SPDX license 与源码仓库版本；该产物目前只作为独立 CI artifact。后续必须依序完成：精简到仅 aarch64-softmmu 的 iOS TCI/QEMU 后端与 GPL 源码义务审查；可恢复的持久 guest 磁盘；Bot/Web 与原生 UI 共用的受认证 PTY 流及取消/后台恢复；将既有 files/ 工作区安全共享进 guest；主机侧联网拉取并验证签名 APK、guest 离线安装、工具目录选择 UI；最后再将产物纳入 IPA 并做设备验收。终端 Bot 调用在可证明策略前必须逐条显示完整命令并经用户批准，不能依赖 shell 字符串静态分析推断只读。
 
 ## 代码位置
 
