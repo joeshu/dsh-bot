@@ -1,0 +1,86 @@
+name: ARM64 iOS TCI Runtime
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qemu-ios-tci-runtime
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 240
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      UTM_UPSTREAM_COMMIT: 3d4b8d8cb1ce93a8b1a9610695c12487685f0c15
+      LIBUCONTEXT_COMMIT: 9b1d8f01a6e99166f9808c79966abe10786de8b6
+      BUILD_ROOT: ${{ runner.temp }}/qemu-ios-tci-build
+      UTM_SOURCE: ${{ runner.temp }}/utm-qemu-source
+      ARTIFACT_DIR: ${{ runner.temp }}/qemu-ios-tci-artifact
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Meson and Ninja plus Apple build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install --quiet bison flex glib
+          python3 -m venv "$RUNNER_TEMP/qemu-venv"
+          "$RUNNER_TEMP/qemu-venv/bin/python" -m pip install --require-hashes --no-deps \
+            -r "$GITHUB_WORKSPACE/scripts/qemu-ios-tci-host-requirements.txt"
+          {
+            echo "$RUNNER_TEMP/qemu-venv/bin"
+            echo "$(brew --prefix bison)/bin"
+            echo "$(brew --prefix flex)/bin"
+            echo "$(brew --prefix glib)/bin"
+          } >> "$GITHUB_PATH"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Fetch pinned UTM build glue and apply the reviewed minimal target patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$UTM_SOURCE"
+          git -C "$UTM_SOURCE" init --quiet
+          git -C "$UTM_SOURCE" remote add origin https://github.com/utmapp/UTM.git
+          git -C "$UTM_SOURCE" fetch --quiet --depth 1 origin "$UTM_UPSTREAM_COMMIT"
+          git -C "$UTM_SOURCE" checkout --quiet --detach FETCH_HEAD
+          [[ "$(git -C "$UTM_SOURCE" rev-parse HEAD)" == "$UTM_UPSTREAM_COMMIT" ]]
+          python3 "$GITHUB_WORKSPACE/scripts/patch-utm-qemu-ios-tci.py" "$UTM_SOURCE"
+
+      - name: Build only aarch64-softmmu with TCI and pinned source hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$BUILD_ROOT"
+          cd "$BUILD_ROOT"
+          MINIMAL_TCI=1 \
+          SOURCE_HASH_LOCK="$GITHUB_WORKSPACE/scripts/qemu-ios-tci-sources.sha256" \
+          NCPU=4 RETRY_ATTEMPTS=5 RETRY_DELAY=10 \
+            bash "$UTM_SOURCE/scripts/build_dependencies.sh" -p ios-tci -a arm64
+
+      - name: Stage stripped frameworks, source and license report
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/scripts/package-qemu-ios-tci.py" \
+            --repo "$GITHUB_WORKSPACE" \
+            --upstream "$UTM_SOURCE" \
+            --build-dir "$BUILD_ROOT/build-iOS-TCI-arm64" \
+            --sysroot "$BUILD_ROOT/sysroot-iOS-TCI-arm64" \
+            --output "$ARTIFACT_DIR"
+          (cd "$ARTIFACT_DIR" && shasum -a 256 -c SHA256SUMS.txt)
+          cat "$ARTIFACT_DIR/build-report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qemu-ios-tci-aarch64-${{ github.sha }}
+          path: ${{ runner.temp }}/qemu-ios-tci-artifact/
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0

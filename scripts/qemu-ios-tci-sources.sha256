@@ -1,0 +1,8 @@
+# SHA-256 checksums for the only source archives downloaded by the minimal iOS TCI build.
+6fc69c01688c9458a57eb9a1664c9aba372ccda420a02bf4429fe610e7e7d591  pkg-config-0.29.2.tar.gz
+8c72678628a5dd8782f08ad421d5a441e42c1c5c1b33e0bc211cbfcf1f3b3978  libffi-3.5.0.tar.gz
+e6a1b1b589654277ee790cce3734f07876ac4ccfaecbee8afa0b649cf529cc04  libiconv-1.16.tar.gz
+a07d9e1a57a4279c5ece71c26dc44eea12bd518ea9ff695d53e722997032b614  glib-2.83.0.tar.xz
+a7592bef0156d7c27545487a52245669b00cf7e70054505381cff2136d890ca8  pixman-0.38.0.tar.gz
+3970542143b7c11e6a09a4d2b50f30a133473c41f15ed0bdcc3b7a1c450d9a5c  libslirp-v4.9.1.tar.gz
+7c9605290b34152debb842e965a55d2e4fbba4793e536ab677b4027e5dc0ba1a  qemu-10.0.12-utm.tar.xz
