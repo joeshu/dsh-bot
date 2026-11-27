@@ -153,7 +153,7 @@ jobs:
             --kernel-manifest "$KERNEL_DIR/kernel-build-manifest.json" \
             --pty-agent "$KERNEL_DIR/dsbot-guest-pty-agent"
           python3 "$GITHUB_WORKSPACE/scripts/smoke-arm64-guest-boot.py" --guest-dir "$GUEST_DIR"
-          echo "- Minimal ARM64 kernel booted under host QEMU TCG; guest PTY passed interactive input/output, job control, resize, Ctrl-C, and close checks." >> "$GITHUB_STEP_SUMMARY"
+          echo "- Minimal ARM64 kernel booted under host QEMU TCG; guest PTY passed executed input/output, job control, resize, Ctrl-C, concurrent workspace isolation, 128 MiB workspace quota, and close checks." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Stage stripped frameworks, source and license report
         shell: bash

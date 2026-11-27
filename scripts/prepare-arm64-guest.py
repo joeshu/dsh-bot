@@ -77,9 +77,11 @@ mount -t sysfs -o nosuid,nodev,noexec,ro sysfs /sys 2>/dev/null || true
 mount -t devtmpfs -o nosuid devtmpfs /dev 2>/dev/null || true
 mount -t devpts -o nosuid,noexec,mode=0620 devpts /dev/pts 2>/dev/null || true
 chmod 0755 /tmp
+mkdir -p /home/dsbot/.sessions
+mount -t tmpfs -o nosuid,nodev,size=128m,nr_inodes=16384,mode=0755 tmpfs /home/dsbot/.sessions
 echo dsbot-arm64 > /proc/sys/kernel/hostname 2>/dev/null || true
 echo 'DS Bot ARM64 Linux guest PTY agent protocol v1.'
-echo 'Guest workspaces are volatile in this bootstrap image; network is disabled.'
+echo 'Guest workspaces are volatile and capped at 128 MiB; network is disabled.'
 exec /usr/sbin/dsbot-guest-pty-agent
 """
 
@@ -350,7 +352,7 @@ def write_guest(
             "serial": "PL011 UART, 115200 8N1",
         },
         "scope": (
-            "guest PTY agent bootstrap; volatile workspaces; no persistent block disk or QEMU runtime"
+            "guest PTY agent bootstrap; volatile 128 MiB-capped workspaces; no persistent block disk or QEMU runtime"
             if pty_agent
             else "serial shell bootstrap image; no persistent block disk or QEMU runtime"
         ),
@@ -396,6 +398,8 @@ def write_guest(
             "guestPath": "/usr/sbin/dsbot-guest-pty-agent",
             "license": "MIT",
             "staticAarch64ELF": True,
+            "maxConcurrentSessions": 4,
+            "workspaceQuotaBytes": 134217728,
         }
     manifest_path = output / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

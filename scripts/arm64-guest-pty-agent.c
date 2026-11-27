@@ -46,7 +46,7 @@
 #define MAX_OUTPUT_QUEUE (1024u * 1024u)
 #define MAX_SESSIONS 4
 #define PTY_READ_BYTES (16u * 1024u)
-#define SESSION_CLOSE_GRACE_SECONDS 2
+#define SESSION_CLOSE_GRACE_MILLISECONDS 2000u
 
 enum FrameType {
     FRAME_CREATE = 1,
@@ -74,7 +74,7 @@ struct GuestSession {
     int child_exited;
     int pty_eof;
     int wait_status;
-    time_t kill_deadline;
+    uint64_t kill_deadline_ms;
 };
 
 static struct GuestSession sessions[MAX_SESSIONS];
@@ -86,6 +86,17 @@ static size_t serial_output_offset;
 static size_t serial_output_capacity;
 static int serial_fd = -1;
 static int kernel_log_fd = -1;
+
+static uint64_t monotonic_milliseconds(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+}
+
+static uint64_t close_deadline(void) {
+    uint64_t now = monotonic_milliseconds();
+    return now ? now + SESSION_CLOSE_GRACE_MILLISECONDS : 0;
+}
 
 static uint16_t read_u16(const unsigned char *value) {
     return (uint16_t)(((uint16_t)value[0] << 8) | value[1]);
@@ -403,7 +414,7 @@ static void handle_frame(uint16_t type, uint32_t session_id, const unsigned char
                 return;
             }
             session->close_requested = 1;
-            session->kill_deadline = time(NULL) + SESSION_CLOSE_GRACE_SECONDS;
+            session->kill_deadline_ms = close_deadline();
             session->input_len = 0;
             session->input_offset = 0;
             (void)visit_uid_processes(session->uid, SIGHUP);
@@ -455,7 +466,7 @@ static void reap_children(void) {
                 session->child_exited = 1;
                 session->wait_status = status;
                 session->close_requested = 1;
-                session->kill_deadline = time(NULL) + SESSION_CLOSE_GRACE_SECONDS;
+                session->kill_deadline_ms = close_deadline();
                 (void)visit_uid_processes(session->uid, SIGHUP);
                 break;
             }
@@ -505,10 +516,11 @@ static void service_session(struct GuestSession *session, short events) {
             break;
         }
     }
-    if (session->close_requested && time(NULL) >= session->kill_deadline) {
+    if (session->close_requested
+        && (!session->kill_deadline_ms || monotonic_milliseconds() >= session->kill_deadline_ms)) {
         (void)visit_uid_processes(session->uid, SIGKILL);
         if (!session->child_exited) (void)kill(-session->pid, SIGKILL);
-        session->kill_deadline = time(NULL) + SESSION_CLOSE_GRACE_SECONDS;
+        session->kill_deadline_ms = close_deadline();
         session->close_requested = 0;
     }
     if (session->child_exited && session->pty_eof && visit_uid_processes(session->uid, 0) == 0) {
@@ -589,7 +601,7 @@ int main(void) {
             }
         }
         for (size_t index = 0; index < MAX_SESSIONS; index++) {
-            if (by_index[index]->master_fd >= 0 && descriptors[index + 1].revents) {
+            if (by_index[index]->master_fd >= 0) {
                 service_session(by_index[index], descriptors[index + 1].revents);
             }
         }

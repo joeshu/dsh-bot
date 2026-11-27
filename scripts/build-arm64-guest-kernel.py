@@ -34,6 +34,12 @@ SOURCES = {
 }
 
 BUILTIN_OPTIONS = (
+    "EXPERT",
+    "BLOCK",
+    "BLK_DEV",
+    "VIRTIO_MENU",
+    "TTY",
+    "SHMEM",
     "BLK_DEV_INITRD",
     "RD_GZIP",
     "BINFMT_ELF",
@@ -46,6 +52,7 @@ BUILTIN_OPTIONS = (
     "SERIAL_AMBA_PL011_CONSOLE",
     "DEVTMPFS",
     "DEVTMPFS_MOUNT",
+    "TMPFS",
     "PROC_FS",
     "SYSFS",
     "SMP",
@@ -248,7 +255,7 @@ def main() -> None:
             "distributionPatchSeriesApplied": False,
             "distributionPatchPolicy": (
                 "Alpine's kernel package patches and broad virt config are not applied. The kernel uses upstream "
-                "ARM64 tinyconfig plus only the built-in boot, virtio block, ext4, serial console, and PTY options "
+                "ARM64 tinyconfig plus only the built-in boot, virtio block, ext4, tmpfs, serial console, and PTY options "
                 "required by this guest."
             ),
             "license": "GPL-2.0-only",

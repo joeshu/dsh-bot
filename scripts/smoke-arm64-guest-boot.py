@@ -84,16 +84,23 @@ class SerialLink:
 
 
 def output_until_marker(link: SerialLink, session_id: int, marker: bytes, timeout: int) -> bytes:
+    return output_until_markers(link, session_id, (marker,), timeout)
+
+
+def output_until_markers(
+    link: SerialLink, session_id: int, markers: tuple[bytes, ...], timeout: int
+) -> bytes:
     deadline = time.monotonic() + timeout
     output = bytearray()
-    while marker not in output:
+    while not any(marker in output for marker in markers):
         frame_type, frame_session, payload = link.receive_frame(deadline)
         if frame_type == FRAME_ERROR:
             raise RuntimeError(f"Guest PTY agent error: {payload.decode('utf-8', 'replace')}")
         if frame_session != session_id:
             continue
         if frame_type == FRAME_EXIT:
-            raise RuntimeError(f"Guest shell exited before emitting {marker.decode('ascii')}")
+            labels = ", ".join(marker.decode("ascii") for marker in markers)
+            raise RuntimeError(f"Guest shell exited before emitting {labels}")
         if frame_type == FRAME_OUTPUT:
             output.extend(payload)
     return bytes(output)
@@ -109,12 +116,25 @@ def wait_for_frame(link: SerialLink, frame_type_expected: int, session_id: int, 
             return payload
 
 
+def shell_marker(marker: bytes) -> bytes:
+    text = marker.decode("ascii")
+    split = len(text) // 2
+    # PTY input is echoed. Adjacent quoted words make the shell print the
+    # marker only after execution, while the echoed source contains a quote
+    # between its halves and cannot satisfy the smoke check.
+    return b"'" + text[:split].encode("ascii") + b"''" + text[split:].encode("ascii") + b"'"
+
+
+def marker_command(marker: bytes) -> bytes:
+    return b"printf '%s\\n' " + shell_marker(marker) + b"\n"
+
+
 def smoke_serial_shell(link: SerialLink, timeout: int) -> None:
     link.wait_for_text(SHELL_BOOT_MARKER, time.monotonic() + timeout)
-    link.connection.sendall(b"echo DS_BOT_SERIAL_SHELL_INPUT_OK\n")
+    serial_marker = b"DS_BOT_SERIAL_SHELL_INPUT_OK"
+    link.connection.sendall(marker_command(serial_marker))
     deadline = time.monotonic() + timeout
-    marker = b"DS_BOT_SERIAL_SHELL_INPUT_OK"
-    while marker not in link.raw:
+    while serial_marker not in link.raw:
         link._receive(deadline)
     print("ARM64 guest reached its serial shell and accepted an interactive command.")
 
@@ -127,21 +147,26 @@ def smoke_guest_pty(link: SerialLink, timeout: int) -> None:
     wait_for_frame(link, FRAME_READY, session_id, timeout)
 
     input_marker = b"DS_BOT_GUEST_PTY_INPUT_OK"
-    link.send_frame(FRAME_INPUT, session_id, b"echo DS_BOT_GUEST_PTY_INPUT_OK\n")
+    link.send_frame(FRAME_INPUT, session_id, marker_command(input_marker))
     output_until_marker(link, session_id, input_marker, timeout)
 
     job_control_marker = b"DS_BOT_GUEST_PTY_JOB_CONTROL_OK"
+    job_control_failure = b"DS_BOT_GUEST_PTY_JOB_CONTROL_FAIL"
     job_control_command = (
         b"if set -o | grep -Eq '^monitor[[:space:]]+on$'; then "
-        b"echo DS_BOT_GUEST_PTY_JOB_CONTROL_OK; else "
-        b"echo DS_BOT_GUEST_PTY_JOB_CONTROL_FAIL; fi\n"
+        b"printf '%s\\n' " + shell_marker(job_control_marker) + b"; else "
+        b"printf '%s\\n' " + shell_marker(job_control_failure) + b"; fi\n"
     )
     link.send_frame(FRAME_INPUT, session_id, job_control_command)
-    output_until_marker(link, session_id, job_control_marker, timeout)
+    job_control_output = output_until_markers(
+        link, session_id, (job_control_marker, job_control_failure), timeout
+    )
+    if job_control_marker not in job_control_output:
+        raise RuntimeError("Guest shell did not enable PTY job control")
 
     link.send_frame(FRAME_RESIZE, session_id, struct.pack(">HH", 42, 100))
     resize_marker = b"DS_BOT_GUEST_PTY_RESIZE_OK"
-    link.send_frame(FRAME_INPUT, session_id, b"stty size; echo DS_BOT_GUEST_PTY_RESIZE_OK\n")
+    link.send_frame(FRAME_INPUT, session_id, b"stty size; " + marker_command(resize_marker))
     resize_output = output_until_marker(link, session_id, resize_marker, timeout)
     if b"42 100" not in resize_output:
         raise RuntimeError("Guest PTY did not apply the requested terminal size")
@@ -150,7 +175,7 @@ def smoke_guest_pty(link: SerialLink, timeout: int) -> None:
     time.sleep(0.35)
     link.send_frame(FRAME_INPUT, session_id, b"\x03")
     cancel_marker = b"DS_BOT_GUEST_PTY_CANCEL_OK"
-    link.send_frame(FRAME_INPUT, session_id, b"echo DS_BOT_GUEST_PTY_CANCEL_OK\n")
+    link.send_frame(FRAME_INPUT, session_id, marker_command(cancel_marker))
     output_until_marker(link, session_id, cancel_marker, timeout)
 
     link.send_frame(FRAME_CLOSE, session_id)
@@ -158,6 +183,53 @@ def smoke_guest_pty(link: SerialLink, timeout: int) -> None:
     if len(payload) != 4:
         raise RuntimeError("Guest PTY agent returned an invalid exit status frame")
     print("ARM64 guest PTY passed input/output, job control, resize, interrupt, and close checks.")
+
+
+def smoke_guest_pty_isolation(link: SerialLink, timeout: int) -> None:
+    first_session = 0xD5B07001
+    second_session = 0xD5B07002
+    for session_id in (first_session, second_session):
+        link.send_frame(FRAME_CREATE, session_id, struct.pack(">HH", 24, 80))
+        wait_for_frame(link, FRAME_READY, session_id, timeout)
+
+    secret = b"DS_BOT_GUEST_PTY_PRIVATE_FILE_SECRET"
+    first_directory = f"/home/dsbot/.sessions/{first_session:08x}".encode("ascii")
+    created_marker = b"DS_BOT_GUEST_PTY_PRIVATE_FILE_CREATED"
+    first_command = (
+        b"printf '%s\\n' " + shell_marker(secret) + b" > private.txt; "
+        + marker_command(created_marker)
+    )
+    link.send_frame(FRAME_INPUT, first_session, first_command)
+    output_until_marker(link, first_session, created_marker, timeout)
+
+    isolation_marker = b"DS_BOT_GUEST_PTY_ISOLATION_OK"
+    isolation_failure = b"DS_BOT_GUEST_PTY_ISOLATION_FAIL"
+    second_command = (
+        b"if cat " + first_directory + b"/private.txt 2>/dev/null; then "
+        b"printf '%s\\n' " + shell_marker(isolation_failure) + b"; else "
+        b"printf '%s\\n' " + shell_marker(isolation_marker) + b"; fi\n"
+    )
+    link.send_frame(FRAME_INPUT, second_session, second_command)
+    second_output = output_until_markers(
+        link, second_session, (isolation_marker, isolation_failure), timeout
+    )
+    if secret in second_output or isolation_failure in second_output:
+        raise RuntimeError("One guest PTY session could read another session's private workspace")
+    if isolation_marker not in second_output:
+        raise RuntimeError("Guest PTY workspace isolation check did not finish")
+
+    quota_marker = b"DS_BOT_GUEST_PTY_WORKSPACE_QUOTA_OK"
+    link.send_frame(FRAME_INPUT, second_session, b"df -k /home/dsbot/.sessions; " + marker_command(quota_marker))
+    quota_output = output_until_marker(link, second_session, quota_marker, timeout)
+    if b"131072" not in quota_output:
+        raise RuntimeError("Guest PTY workspaces are missing the configured 128 MiB tmpfs quota")
+
+    for session_id in (second_session, first_session):
+        link.send_frame(FRAME_CLOSE, session_id)
+        payload = wait_for_frame(link, FRAME_EXIT, session_id, timeout)
+        if len(payload) != 4:
+            raise RuntimeError("Guest PTY agent returned an invalid isolation-session exit status")
+    print("ARM64 guest PTY isolated two concurrent shell workspaces.")
 
 
 def main() -> None:
@@ -223,6 +295,7 @@ def main() -> None:
             link.wait_for_text(marker, deadline)
             if has_pty_agent:
                 smoke_guest_pty(link, args.timeout)
+                smoke_guest_pty_isolation(link, args.timeout)
             else:
                 smoke_serial_shell(link, args.timeout)
         finally:
