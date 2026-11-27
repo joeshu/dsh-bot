@@ -19,7 +19,7 @@ import urllib.request
 
 APORTS_COMMIT = "942251c9a4cb77b6d34ecbce4c293f96abfecce5"
 KERNEL_VERSION = "6.18.60"
-APORTS_RAW = f"https://gitlab.alpinelinux.org/alpine/aports/-/raw/{APORTS_COMMIT}/main/linux-lts"
+APORTS_RAW = f"https://raw.githubusercontent.com/alpinelinux/aports/{APORTS_COMMIT}/main/linux-lts"
 KERNEL_BASE_URL = "https://cdn.kernel.org/pub/linux/kernel/v6.x"
 MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024
 
@@ -118,7 +118,7 @@ def download(name: str, spec: dict[str, str], cache: pathlib.Path) -> pathlib.Pa
         return path
     path.unlink(missing_ok=True)
     requested = urllib.parse.urlparse(spec["url"])
-    allowed_hosts = {"cdn.kernel.org", "gitlab.alpinelinux.org"}
+    allowed_hosts = {"cdn.kernel.org", "raw.githubusercontent.com"}
     if requested.scheme != "https" or requested.hostname not in allowed_hosts:
         raise RuntimeError(f"Refusing untrusted source URL for {name}")
     cache.mkdir(parents=True, exist_ok=True)
