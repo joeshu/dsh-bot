@@ -131,7 +131,10 @@ class QEMUControlConnection:
             request["arguments"] = arguments
         self.connection.sendall(json.dumps(request).encode("utf-8") + b"\r\n")
         while True:
-            response = json.loads(self.reader.readline())
+            line = self.reader.readline()
+            if not line:
+                raise ConnectionError("QMP closed before returning a command response")
+            response = json.loads(line)
             if response.get("id") != self.next_id:
                 continue
             if "error" in response:
@@ -139,12 +142,15 @@ class QEMUControlConnection:
             return response.get("return")
 
     def diagnostics(self) -> str:
-        result = {
-            "status": self.execute("query-status"),
-            "registers": self.execute(
-                "human-monitor-command", {"command-line": "info registers"}
-            ),
-        }
+        def query(name: str, command: str, arguments: dict[str, str] | None = None) -> dict[str, object]:
+            try:
+                return {name: self.execute(command, arguments)}
+            except Exception as error:
+                return {name: {"error": f"{type(error).__name__}: {error}"}}
+
+        result: dict[str, object] = {}
+        result.update(query("status", "query-status"))
+        result.update(query("registers", "human-monitor-command", {"command-line": "info registers"}))
         return json.dumps(result, ensure_ascii=True)
 
     def close(self) -> None:
@@ -365,14 +371,16 @@ def main() -> None:
             "-kernel", str(kernel),
             "-initrd", str(initrd),
             "-append",
-            "earlycon=pl011,mmio32,0x09000000 console=ttyAMA0,115200 loglevel=8 ignore_loglevel rdinit=/init panic=10",
+            "earlycon=pl011,mmio32,0x09000000 console=ttyAMA0,115200 loglevel=8 ignore_loglevel rdinit=/init panic=0",
             "-display", "none",
             "-monitor", "none",
             "-qmp", f"unix:{qmp_socket_path},server=on,wait=off",
             "-serial", f"unix:{socket_path},server=on,wait=off",
             "-d", "guest_errors,cpu_reset",
             "-D", str(qemu_debug_path),
-            "-no-reboot",
+            # Keep QEMU/QMP alive when the guest panics, reboots, or requests
+            # shutdown so the failed guest state remains available to inspect.
+            "-no-shutdown",
         ]
         qemu_output = qemu_output_path.open("wb")
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=qemu_output, stderr=qemu_output, bufsize=0)
@@ -407,14 +415,14 @@ def main() -> None:
             detail = qemu_output_path.read_text(encoding="utf-8", errors="replace")[-4096:]
             print("QEMU output:")
             print(detail if detail else "<empty>")
+            qemu_debug = qemu_debug_path.read_text(encoding="utf-8", errors="replace")[-4096:]
+            print("QEMU guest debug log:")
+            print(qemu_debug if qemu_debug else "<empty>")
             print("QEMU guest status and CPU registers:")
             if qmp:
                 print(qmp.diagnostics())
             else:
                 print(f"QMP connection was not established: {qmp_startup_error or 'unknown reason'}")
-            qemu_debug = qemu_debug_path.read_text(encoding="utf-8", errors="replace")[-4096:]
-            print("QEMU guest debug log:")
-            print(qemu_debug if qemu_debug else "<empty>")
             raise
         finally:
             if connection is not None:
