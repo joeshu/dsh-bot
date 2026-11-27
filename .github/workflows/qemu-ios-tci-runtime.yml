@@ -2,6 +2,19 @@ name: ARM64 iOS TCI Runtime
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/qemu-ios-tci-runtime.yml
+      - scripts/arm64-guest-pty-agent.c
+      - scripts/build-arm64-guest-kernel.py
+      - scripts/package-qemu-ios-tci.py
+      - scripts/patch-utm-qemu-ios-tci.py
+      - scripts/prepare-arm64-guest.py
+      - scripts/qemu-ios-tci-host-requirements.txt
+      - scripts/qemu-ios-tci-sources.sha256
+      - scripts/smoke-arm64-guest-boot.py
 
 permissions:
   contents: read
