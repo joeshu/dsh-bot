@@ -26,7 +26,7 @@ jobs:
             bc bison flex gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
             libelf-dev libssl-dev make patch perl python3 tar xz-utils
 
-      - name: Build Alpine ARM64 kernel with built-in terminal and disk drivers
+      - name: Build ARM64 kernel with pinned Alpine virt config and built-in guest drivers
         shell: bash
         run: |
           set -euo pipefail
@@ -136,7 +136,7 @@ jobs:
           python3 "$GITHUB_WORKSPACE/scripts/smoke-arm64-guest-boot.py" \
             --guest-dir "$GUEST_DIR" \
             --kernel "$RUNNER_TEMP/dsbot-arm64-kernel/vmlinuz-dsbot-arm64"
-          echo "- Custom Alpine ARM64 kernel reached the serial shell under host QEMU TCG." >> "$GITHUB_STEP_SUMMARY"
+          echo "- Custom ARM64 kernel built from pinned Linux stable sources with the pinned Alpine virt config reached the serial shell under host QEMU TCG." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Stage stripped frameworks, source and license report
         shell: bash

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the pinned Alpine ARM64 guest kernel with terminal and disk drivers built in."""
+"""Build ARM64 Linux stable with the pinned Alpine virt configuration."""
 
 from __future__ import annotations
 
@@ -32,57 +32,15 @@ SOURCES = {
         "url": f"{KERNEL_BASE_URL}/patch-6.18.60.xz",
         "sha512": "fce959c563635d4374cba148b7f1b8b64a143e5b42bd8e86afee7dfdc76b9d887afb5a032249ac16518ee95e73b3c1a459f15926a035780493c5b3b9fbd3b51b",
     },
-    "0001-powerpc-boot-wrapper-Add-z-notext-flag-for-ppc64le.patch": {
-        "url": f"{APORTS_RAW}/0001-powerpc-boot-wrapper-Add-z-notext-flag-for-ppc64le.patch",
-        "sha512": "b296717ef0cd63978142b4d47b3bc49faa04daf77e115e702ba611cc254a6e782cdab7d5639e724cd5f029cfb6a3dc33c3036f346d681d1fdfe0df723c7e0321",
-    },
-    "0002-x86-Compress-vmlinux-with-zstd-19-instead-of-22.patch": {
-        "url": f"{APORTS_RAW}/0002-x86-Compress-vmlinux-with-zstd-19-instead-of-22.patch",
-        "sha512": "055e10e7b3e00bb3621389315d5206a8feb5022a1f0dc51c3aa107facfe83d191da05a502a0c62488be7299677a63c1da84f87c42cbf3125788c56db67e810ee",
-    },
-    "0003-kexec-add-kexec_load_disabled-boot-option.patch": {
-        "url": f"{APORTS_RAW}/0003-kexec-add-kexec_load_disabled-boot-option.patch",
-        "sha512": "e1d2d5358f5b8189236108973395f00eafce8db6d5baaf55025b1360f08ab7cffc930d3818719f220b98e7e8541cc8a7f056611b6e290f224a102c1addbe34ac",
-    },
-    "0004-objtool-respect-AWK-setting.patch": {
-        "url": f"{APORTS_RAW}/0004-objtool-respect-AWK-setting.patch",
-        "sha512": "28c83be4c97152001381cd5e3a8acb8552a42d9dac9aaec8f096e3762b7944035aa5a4363fb4602f9bb427c4f72cfd2f996a0a725f7f9e07ab250317985aff9e",
-    },
-    "0005-powerpc-config-defang-gcc-check-for-stack-protector-.patch": {
-        "url": f"{APORTS_RAW}/0005-powerpc-config-defang-gcc-check-for-stack-protector-.patch",
-        "sha512": "5ce79416f8f111c36393718656e3eeb4cb0adccd117dcf661876d1564010e5c58b6351cc4116d187d0a9a838bcca0fecc236d81ac71afb940b89ccb14f21e179",
-    },
-    "0001-x86-CPU-AMD-avoid-printing-reset-reasons-on-Xen-domU.patch": {
-        "url": f"{APORTS_RAW}/0001-x86-CPU-AMD-avoid-printing-reset-reasons-on-Xen-domU.patch",
-        "sha512": "4e72af8e77a555d2a850837b64a525a51d5d118048584dc3ea0d0e8620bb56bf56b69a94aa67dac879b841c9ba033e33d94610da0028fde7b6602ad2fe63f02f",
-    },
-    "sophgo-fixes.patch": {
-        "url": f"{APORTS_RAW}/sophgo-fixes.patch",
-        "sha512": "855522b816bbb2b0738251cf24714c2566c7aacad39aaf6adcebd0a256d11f64ff2762ecdace0ab1bac38db87fd579863f852f799356a368f057c166e4deb03c",
-    },
     "virt.aarch64.config": {
         "url": f"{APORTS_RAW}/virt.aarch64.config",
         "sha512": "ffbe61069184a46baf90cbffeba5512df7e0d0b11c2404f629ad698bdfb6199269618013abdc2895a9bc960bb5e0425ee4f8a928fca08aae5b5ff97e49023e3f",
     },
 }
 
-ALPINE_PATCHES = [
-    "0001-powerpc-boot-wrapper-Add-z-notext-flag-for-ppc64le.patch",
-    "0002-x86-Compress-vmlinux-with-zstd-19-instead-of-22.patch",
-    "0003-kexec-add-kexec_load_disabled-boot-option.patch",
-    "0005-powerpc-config-defang-gcc-check-for-stack-protector-.patch",
-    "0001-x86-CPU-AMD-avoid-printing-reset-reasons-on-Xen-domU.patch",
-    "sophgo-fixes.patch",
-]
-OMITTED_ALPINE_PATCHES = {
-    "0004-objtool-respect-AWK-setting.patch": (
-        "Host-side objtool AWK build workaround; its Makefile hunk does not match the pinned stable source, "
-        "and it does not affect the ARM64 guest kernel runtime."
-    ),
-}
-
 BUILTIN_OPTIONS = (
     "VIRTIO_PCI",
+    "VIRTIO_MMIO",
     "VIRTIO_CONSOLE",
     "VIRTIO_BLK",
     "EXT4_FS",
@@ -199,9 +157,6 @@ def main() -> None:
             check=True,
         )
         apply_patch_file(source, downloaded["patch-6.18.60.patch.xz"], xz_compressed=True)
-        for name in ALPINE_PATCHES:
-            apply_patch_file(source, downloaded[name])
-
         build = work / "build"
         build.mkdir()
         shutil.copyfile(downloaded["virt.aarch64.config"], build / ".config")
@@ -224,7 +179,7 @@ def main() -> None:
             "KBUILD_BUILD_USER": "dsbot",
             "KBUILD_BUILD_HOST": "guest-kernel-builder",
             "KBUILD_BUILD_TIMESTAMP": "2026-10-30 19:05:20 UTC",
-            "KBUILD_BUILD_VERSION": "1-Alpine",
+            "KBUILD_BUILD_VERSION": "1-DSBot",
             "SOURCE_DATE_EPOCH": "1793387120",
         }
         make_base = ["make", "-C", str(source), f"O={build}", f"-j{max(1, args.jobs)}", "LOCALVERSION=-0-virt"]
@@ -249,7 +204,13 @@ def main() -> None:
             "format": 1,
             "guestArchitecture": "aarch64",
             "kernelVersion": kernel_release,
-            "distributionConfig": "Alpine Linux virt flavor",
+            "distributionConfig": "Alpine Linux virt flavor, pinned at the recorded aports commit",
+            "distributionPatchSeriesApplied": False,
+            "distributionPatchPolicy": (
+                "Alpine package patches are not applied: the package series includes architecture-specific "
+                "and packaging changes unnecessary for this ARM64 virt guest. The kernel is built from the "
+                "pinned upstream stable sources with the pinned Alpine virt config and explicit built-in drivers."
+            ),
             "alpineAportsCommit": APORTS_COMMIT,
             "license": "GPL-2.0-only",
             "bootImage": {
@@ -272,15 +233,14 @@ def main() -> None:
                 {"filename": name, "url": SOURCES[name]["url"], "sha512": SOURCES[name]["sha512"]}
                 for name in SOURCES
             ],
-            "alpinePatchesApplied": list(ALPINE_PATCHES),
-            "alpinePatchesOmitted": OMITTED_ALPINE_PATCHES,
         }
         (output / "kernel-build-manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         (output / "THIRD-PARTY-NOTICES.txt").write_text(
             "DS Bot ARM64 guest kernel\n"
             f"Linux {kernel_release}, GPL-2.0-only.\n"
-            f"Built from kernel.org Linux 6.18.60 and the Alpine aports linux-lts source at {APORTS_COMMIT}.\n"
-            "Source URLs and SHA-512 values are recorded in kernel-build-manifest.json; the non-runtime Alpine objtool AWK workaround is verified but intentionally omitted.\n"
+            f"Built from kernel.org Linux 6.18.60 with the Alpine ARM64 virt config from aports commit {APORTS_COMMIT}.\n"
+            "Alpine's package patch series is not applied; ARM64 virt runtime drivers are enabled in the recorded config.\n"
+            "Source URLs and SHA-512 values are recorded in kernel-build-manifest.json.\n"
             "Build and configuration scripts are in the repository.\n"
         )
         checksums = []
