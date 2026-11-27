@@ -325,7 +325,7 @@ def main() -> None:
     serial_log = guest_dir / "serial-smoke.log"
     serial_log.unlink(missing_ok=True)
     with tempfile.TemporaryDirectory(prefix="dsbot-uart-") as temporary:
-        qemu_stderr_path = pathlib.Path(temporary) / "qemu-stderr.log"
+        qemu_output_path = pathlib.Path(temporary) / "qemu-output.log"
         command = [
             qemu,
             "-machine", "virt,gic-version=2",
@@ -341,13 +341,13 @@ def main() -> None:
             "-serial", "pty",
             "-no-reboot",
         ]
-        qemu_stderr = qemu_stderr_path.open("wb")
-        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=qemu_stderr, bufsize=0)
+        qemu_output = qemu_output_path.open("wb")
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=qemu_output, stderr=qemu_output, bufsize=0)
         connection: ProcessSerialConnection | None = None
         link: SerialLink | None = None
         deadline = time.monotonic() + max(1, args.timeout)
         try:
-            descriptor = wait_for_serial_pty(process, qemu_stderr_path, args.timeout)
+            descriptor = wait_for_serial_pty(process, qemu_output_path, args.timeout)
             connection = ProcessSerialConnection(process, descriptor)
             link = SerialLink(connection)
             link.wait_for_text(marker, deadline)
@@ -365,9 +365,9 @@ def main() -> None:
                 print("QEMU was still running when the serial channel closed.")
             else:
                 print(f"QEMU exited with status {qemu_status}.")
-            qemu_stderr.flush()
-            detail = qemu_stderr_path.read_text(encoding="utf-8", errors="replace")[-4096:]
-            print("QEMU stderr:")
+            qemu_output.flush()
+            detail = qemu_output_path.read_text(encoding="utf-8", errors="replace")[-4096:]
+            print("QEMU output:")
             print(detail if detail else "<empty>")
             raise
         finally:
@@ -380,7 +380,7 @@ def main() -> None:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=5)
-            qemu_stderr.close()
+            qemu_output.close()
             serial_log.write_bytes(link.raw if link else b"")
 
     raw = serial_log.read_bytes()
