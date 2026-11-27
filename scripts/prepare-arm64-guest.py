@@ -85,7 +85,7 @@ mount -t proc -o nosuid,nodev,noexec proc /proc 2>/dev/null || {
 }
 mount -t sysfs -o nosuid,nodev,noexec,ro sysfs /sys 2>/dev/null || echo 'DS Bot guest boot warning: could not mount /sys.'
 mount -t devtmpfs -o nosuid devtmpfs /dev 2>/dev/null || true
-mount -t devpts -o nosuid,noexec,mode=0620 devpts /dev/pts 2>/dev/null || {
+mount -t devpts -o nosuid,noexec,mode=0620 devpts /dev/pts || {
     echo 'DS Bot guest boot error: could not mount /dev/pts.'
     exit 1
 }
