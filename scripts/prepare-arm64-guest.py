@@ -55,10 +55,11 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/root
 export TERM=${TERM:-vt100}
 export PS1='dsbot# '
-mkdir -p /proc /sys /dev /dev/pts /run /tmp /root
+mkdir -p /proc /sys /dev /run /tmp /root
 mount -t proc -o nosuid,nodev,noexec proc /proc 2>/dev/null || true
 mount -t sysfs -o nosuid,nodev,noexec sysfs /sys 2>/dev/null || true
 mount -t devtmpfs -o nosuid devtmpfs /dev 2>/dev/null || true
+mkdir -p /dev/pts
 mount -t devpts -o nosuid,noexec,mode=0620 devpts /dev/pts 2>/dev/null || true
 chmod 1777 /tmp
 echo dsbot-arm64 > /proc/sys/kernel/hostname 2>/dev/null || true
@@ -71,11 +72,7 @@ exec /bin/ash -i
 PTY_AGENT_INIT = b"""#!/bin/sh
 set -u
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-if [ -c /dev/ttyAMA0 ]; then
-    exec >/dev/ttyAMA0 2>&1
-fi
-echo 'DS Bot ARM64 Linux guest PTY agent booting.'
-mkdir -p /proc /sys /dev /dev/pts /run /tmp /root /home/dsbot || {
+mkdir -p /proc /sys /dev /run /tmp /root /home/dsbot || {
     echo 'DS Bot guest boot error: could not create runtime directories.'
     exit 1
 }
@@ -85,6 +82,14 @@ mount -t proc -o nosuid,nodev,noexec proc /proc 2>/dev/null || {
 }
 mount -t sysfs -o nosuid,nodev,noexec,ro sysfs /sys 2>/dev/null || echo 'DS Bot guest boot warning: could not mount /sys.'
 mount -t devtmpfs -o nosuid devtmpfs /dev 2>/dev/null || true
+mkdir -p /dev/pts || {
+    echo 'DS Bot guest boot error: could not create /dev/pts after devtmpfs mount.'
+    exit 1
+}
+if [ -c /dev/ttyAMA0 ]; then
+    exec >/dev/ttyAMA0 2>&1
+fi
+echo 'DS Bot ARM64 Linux guest PTY agent booting.'
 mount -t devpts -o nosuid,noexec,mode=0620 devpts /dev/pts || {
     echo 'DS Bot guest boot error: could not mount /dev/pts.'
     exit 1
