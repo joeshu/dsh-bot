@@ -87,6 +87,16 @@ jobs:
           path: ${{ runner.temp }}/qemu-ios-tci-build
           key: qemu-ios-tci-${{ runner.os }}-${{ runner.arch }}-macos26-xcode26.6-utm3d4b8d8-${{ hashFiles('scripts/qemu-ios-tci-sources.sha256', 'scripts/patch-utm-qemu-ios-tci.py', 'scripts/qemu-ios-tci-host-requirements.txt') }}
 
+      - name: Boot the ARM64 guest to its serial shell
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install --quiet qemu
+          GUEST_DIR="$RUNNER_TEMP/dsbot-arm64-guest"
+          python3 "$GITHUB_WORKSPACE/scripts/prepare-arm64-guest.py" --output "$GUEST_DIR"
+          python3 "$GITHUB_WORKSPACE/scripts/smoke-arm64-guest-boot.py" --guest-dir "$GUEST_DIR"
+          echo "- Alpine ARM64 guest reached the serial shell under host QEMU TCG." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Stage stripped frameworks, source and license report
         shell: bash
         run: |
