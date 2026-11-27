@@ -4,18 +4,14 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
-import os
 import pathlib
-import select
 import shutil
+import socket
 import struct
 import subprocess
 import tempfile
-import termios
 import time
-import tty
 
 
 MAGIC = b"DSBP"
@@ -36,7 +32,7 @@ PTY_BOOT_MARKER = b"DS Bot ARM64 Linux guest PTY agent protocol v1."
 
 
 class SerialLink:
-    def __init__(self, connection) -> None:
+    def __init__(self, connection: socket.socket) -> None:
         self.connection = connection
         self.raw = bytearray()
         self.buffer = bytearray()
@@ -87,68 +83,33 @@ class SerialLink:
             self._receive(deadline)
 
 
-class ProcessSerialConnection:
-    """Expose QEMU's PTY-backed serial port with the SerialLink interface."""
-
-    def __init__(self, process: subprocess.Popen[bytes], descriptor: int) -> None:
-        self.process = process
-        self.descriptor = descriptor
-        self.timeout = 0.25
-        self.closed = False
-        tty.setraw(descriptor, termios.TCSANOW)
-        flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
-        fcntl.fcntl(descriptor, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-
-    def settimeout(self, seconds: float) -> None:
-        self.timeout = seconds
-
-    def recv(self, size: int) -> bytes:
-        if self.closed:
-            return b""
-        readable, _, _ = select.select([self.descriptor], [], [], self.timeout)
-        if not readable:
-            raise TimeoutError
-        try:
-            return os.read(self.descriptor, size)
-        except BlockingIOError:
-            raise TimeoutError
-
-    def sendall(self, data: bytes) -> None:
-        if self.closed:
-            raise RuntimeError("QEMU stdio serial channel is closed")
-        offset = 0
-        while offset < len(data):
-            _, writable, _ = select.select([], [self.descriptor], [], self.timeout)
-            if not writable:
-                raise TimeoutError("QEMU stdio serial write timed out")
-            try:
-                offset += os.write(self.descriptor, data[offset:])
-            except BlockingIOError:
-                continue
-
-    def close(self) -> None:
-        if self.closed:
-            return
-        self.closed = True
-        os.close(self.descriptor)
-
-
-def wait_for_serial_pty(process: subprocess.Popen[bytes], stderr_path: pathlib.Path, timeout: int) -> int:
-    """Read QEMU's announced PTY path without coupling guest I/O to stdio pipes."""
+def wait_for_serial_socket(
+    process: subprocess.Popen[bytes], socket_path: pathlib.Path, stderr_path: pathlib.Path, timeout: int
+) -> socket.socket:
+    """Connect to QEMU's local serial socket with bounded startup diagnostics."""
     deadline = time.monotonic() + max(1, timeout)
+    last_error = "QEMU has not created the serial socket yet"
     while time.monotonic() < deadline:
-        detail = stderr_path.read_text(encoding="utf-8", errors="replace")
-        for line in detail.splitlines():
-            if "char device redirected to " not in line:
-                continue
-            path = line.split("char device redirected to ", 1)[1].split(" (label ", 1)[0].strip()
-            if path.startswith("/"):
-                return os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            connection.settimeout(min(0.25, max(0.01, deadline - time.monotonic())))
+            connection.connect(str(socket_path))
+            return connection
+        except OSError as error:
+            last_error = str(error)
+            connection.close()
         if process.poll() is not None:
-            raise RuntimeError(f"QEMU exited before creating its serial PTY (status {process.returncode})")
+            detail = stderr_path.read_text(encoding="utf-8", errors="replace")[-4096:]
+            raise RuntimeError(
+                f"QEMU exited before opening its serial socket (status {process.returncode}): "
+                f"{detail or '<empty QEMU output>'}; last connection error: {last_error}"
+            )
         time.sleep(0.05)
     detail = stderr_path.read_text(encoding="utf-8", errors="replace")[-4096:]
-    raise TimeoutError(f"QEMU did not announce its serial PTY within {timeout}s: {detail or '<empty stderr>'}")
+    raise TimeoutError(
+        f"QEMU did not open its serial socket within {timeout}s: "
+        f"{detail or '<empty QEMU output>'}; last connection error: {last_error}"
+    )
 
 
 def output_until_marker(link: SerialLink, session_id: int, marker: bytes, timeout: int) -> bytes:
@@ -325,6 +286,7 @@ def main() -> None:
     serial_log = guest_dir / "serial-smoke.log"
     serial_log.unlink(missing_ok=True)
     with tempfile.TemporaryDirectory(prefix="dsbot-uart-") as temporary:
+        socket_path = pathlib.Path(temporary) / "serial.sock"
         qemu_output_path = pathlib.Path(temporary) / "qemu-output.log"
         command = [
             qemu,
@@ -335,20 +297,20 @@ def main() -> None:
             "-accel", "tcg,thread=single",
             "-kernel", str(kernel),
             "-initrd", str(initrd),
-            "-append", "console=ttyAMA0,115200 rdinit=/init panic=10",
+            "-append",
+            "earlycon=pl011,mmio32,0x09000000 console=ttyAMA0,115200 loglevel=8 ignore_loglevel rdinit=/init panic=10",
             "-display", "none",
             "-monitor", "none",
-            "-serial", "pty",
+            "-serial", f"unix:{socket_path},server=on,wait=off",
             "-no-reboot",
         ]
         qemu_output = qemu_output_path.open("wb")
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=qemu_output, stderr=qemu_output, bufsize=0)
-        connection: ProcessSerialConnection | None = None
+        connection: socket.socket | None = None
         link: SerialLink | None = None
         deadline = time.monotonic() + max(1, args.timeout)
         try:
-            descriptor = wait_for_serial_pty(process, qemu_output_path, args.timeout)
-            connection = ProcessSerialConnection(process, descriptor)
+            connection = wait_for_serial_socket(process, socket_path, qemu_output_path, args.timeout)
             link = SerialLink(connection)
             link.wait_for_text(marker, deadline)
             if has_pty_agent:
@@ -362,7 +324,7 @@ def main() -> None:
             print(boot_text[-8192:].decode("utf-8", "replace") if boot_text else "<no guest serial bytes>")
             qemu_status = process.poll()
             if qemu_status is None:
-                print("QEMU was still running when the serial channel closed.")
+                print("QEMU was still running after the smoke failure.")
             else:
                 print(f"QEMU exited with status {qemu_status}.")
             qemu_output.flush()

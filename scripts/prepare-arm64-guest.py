@@ -348,7 +348,7 @@ def write_guest(
             "cpu": "max",
             "memoryMiB": 512,
             "network": "disabled",
-            "kernelArguments": "console=ttyAMA0,115200 rdinit=/init panic=10",
+            "kernelArguments": "earlycon=pl011,mmio32,0x09000000 console=ttyAMA0,115200 loglevel=8 ignore_loglevel rdinit=/init panic=10",
             "serial": "PL011 UART, 115200 8N1",
         },
         "scope": (
