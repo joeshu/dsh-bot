@@ -28,7 +28,7 @@ FRAME_ERROR = 0x83
 FRAME_READY = 0x84
 
 SHELL_BOOT_MARKER = b"DS Bot ARM64 Linux guest (Alpine Linux, BusyBox ash)."
-PTY_BOOT_MARKER = b"DS Bot ARM64 Linux guest PTY agent protocol v1."
+PTY_BOOT_MARKER = b"DS Bot ARM64 Linux guest PTY agent booting."
 
 
 class SerialLink:

@@ -69,19 +69,41 @@ exec /bin/ash -i
 """
 
 PTY_AGENT_INIT = b"""#!/bin/sh
-set -eu
+set -u
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-mkdir -p /proc /sys /dev /dev/pts /run /tmp /root /home/dsbot
-mount -t proc -o nosuid,nodev,noexec,hidepid=2 proc /proc 2>/dev/null || true
-mount -t sysfs -o nosuid,nodev,noexec,ro sysfs /sys 2>/dev/null || true
+if [ -c /dev/ttyAMA0 ]; then
+    exec >/dev/ttyAMA0 2>&1
+fi
+echo 'DS Bot ARM64 Linux guest PTY agent booting.'
+mkdir -p /proc /sys /dev /dev/pts /run /tmp /root /home/dsbot || {
+    echo 'DS Bot guest boot error: could not create runtime directories.'
+    exit 1
+}
+mount -t proc -o nosuid,nodev,noexec proc /proc 2>/dev/null || {
+    echo 'DS Bot guest boot error: could not mount /proc.'
+    exit 1
+}
+mount -t sysfs -o nosuid,nodev,noexec,ro sysfs /sys 2>/dev/null || echo 'DS Bot guest boot warning: could not mount /sys.'
 mount -t devtmpfs -o nosuid devtmpfs /dev 2>/dev/null || true
-mount -t devpts -o nosuid,noexec,mode=0620 devpts /dev/pts 2>/dev/null || true
-chmod 0755 /tmp
-mkdir -p /home/dsbot/.sessions
-mount -t tmpfs -o nosuid,nodev,size=128m,nr_inodes=16384,mode=0755 tmpfs /home/dsbot/.sessions
+mount -t devpts -o nosuid,noexec,mode=0620 devpts /dev/pts 2>/dev/null || {
+    echo 'DS Bot guest boot error: could not mount /dev/pts.'
+    exit 1
+}
+chmod 0755 /tmp || {
+    echo 'DS Bot guest boot error: could not set /tmp permissions.'
+    exit 1
+}
+mkdir -p /home/dsbot/.sessions || {
+    echo 'DS Bot guest boot error: could not create the session workspace.'
+    exit 1
+}
+mount -t tmpfs -o nosuid,nodev,size=128m,nr_inodes=16384,mode=0755 tmpfs /home/dsbot/.sessions || {
+    echo 'DS Bot guest boot error: could not mount the 128 MiB session workspace.'
+    exit 1
+}
 echo dsbot-arm64 > /proc/sys/kernel/hostname 2>/dev/null || true
-echo 'DS Bot ARM64 Linux guest PTY agent protocol v1.'
 echo 'Guest workspaces are volatile and capped at 128 MiB; network is disabled.'
+echo 'DS Bot ARM64 Linux guest PTY agent protocol v1.'
 exec /usr/sbin/dsbot-guest-pty-agent
 """
 
