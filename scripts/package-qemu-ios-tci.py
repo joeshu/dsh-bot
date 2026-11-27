@@ -155,13 +155,20 @@ def dynamic_dependencies(binary: Path, frameworks: Path) -> list[str]:
     return dependencies
 
 
-def exported_symbols(binary: Path) -> set[str]:
-    output = run(["xcrun", "--sdk", "iphoneos", "nm", "-gU", str(binary)])
+def exported_symbols_for_sdk(binary: Path, sdk: str) -> set[str]:
+    output = run(["xcrun", "--sdk", sdk, "nm", "-gU", str(binary)])
     return {
         line.split()[-1].removeprefix("_")
         for line in output.splitlines()
         if line.split()
     }
+
+
+def verify_platform(binary: Path, sdk: str) -> None:
+    output = run(["xcrun", "vtool", "-show-build", str(binary)])
+    expected = "IOSSIMULATOR" if sdk == "iphonesimulator" else "IOS"
+    if not re.search(rf"(?m)^\s*platform\s+{expected}\s*$", output):
+        raise SystemExit(f"Unexpected Mach-O platform for {binary}: expected {expected}")
 
 
 def runtime_dependency_audit(
@@ -337,6 +344,12 @@ def main() -> None:
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--sysroot", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--sdk", choices=("iphoneos", "iphonesimulator"), default="iphoneos")
+    parser.add_argument(
+        "--source-reference",
+        type=Path,
+        help="Reuse matching source provenance and notices from an already packaged device build.",
+    )
     args = parser.parse_args()
 
     repo = args.repo.resolve()
@@ -344,20 +357,42 @@ def main() -> None:
     build_dir = args.build_dir.resolve()
     sysroot = args.sysroot.resolve()
     output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
     qemu_source_dir = build_dir / "qemu-10.0.12-utm"
     qemu_build_dir = qemu_source_dir / "build"
     frameworks_src = sysroot / "Frameworks"
     if not frameworks_src.is_dir():
         raise SystemExit(f"iOS Frameworks output is missing: {frameworks_src}")
 
-    source_records = stage_sources(
-        repo=repo,
-        upstream=upstream,
-        build_dir=build_dir,
-        qemu_dir=qemu_source_dir,
-        output=output,
-        lock_path=repo / "scripts" / "qemu-ios-tci-sources.sha256",
-    )
+    if args.source_reference:
+        reference = args.source_reference.resolve()
+        reference_report = json.loads((reference / "build-report.json").read_text(encoding="utf-8"))
+        source_records = reference_report.get("source")
+        if not isinstance(source_records, dict) or not source_records:
+            raise SystemExit("Source reference build report has no pinned source record")
+        notice = (reference / "THIRD-PARTY-NOTICES.md").read_text(encoding="utf-8")
+        notice = notice.replace(
+            "This is a separate research build artifact. It is not yet linked into the app.",
+            "This iOS Simulator artifact is paired with the iOS device QEMU artifact for testing.",
+        ).replace(
+            "this artifact's `source/` directory",
+            "the paired `qemu-ios-tci-aarch64` artifact's `source/` directory",
+        )
+        (output / "THIRD-PARTY-NOTICES.md").write_text(notice, encoding="utf-8")
+        (output / "SOURCE-ARTIFACT.txt").write_text(
+            "Matching QEMU source archives and UTM patches are published in the paired "
+            "qemu-ios-tci-aarch64 artifact.\n",
+            encoding="utf-8",
+        )
+    else:
+        source_records = stage_sources(
+            repo=repo,
+            upstream=upstream,
+            build_dir=build_dir,
+            qemu_dir=qemu_source_dir,
+            output=output,
+            lock_path=repo / "scripts" / "qemu-ios-tci-sources.sha256",
+        )
     runtime_frameworks = output / "runtime" / "Frameworks"
     runtime_frameworks.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(frameworks_src, runtime_frameworks, dirs_exist_ok=True, symlinks=True)
@@ -404,10 +439,11 @@ def main() -> None:
     core_found = False
     for framework in frameworks:
         binary = find_framework_binary(framework)
-        run(["xcrun", "--sdk", "iphoneos", "strip", "-S", "-x", str(binary)])
-        architectures = run(["xcrun", "--sdk", "iphoneos", "lipo", "-archs", str(binary)]).split()
+        run(["xcrun", "--sdk", args.sdk, "strip", "-S", "-x", str(binary)])
+        architectures = run(["xcrun", "--sdk", args.sdk, "lipo", "-archs", str(binary)]).split()
         if architectures != ["arm64"]:
             raise SystemExit(f"Unexpected framework architecture in {framework.name}: {architectures}")
+        verify_platform(binary, args.sdk)
         name = framework.stem
         if "aarch64-softmmu" in name:
             core_found = True
@@ -429,7 +465,7 @@ def main() -> None:
     qemu_record = next(item for item in framework_records if "aarch64-softmmu" in str(item["name"]))
     qemu_binary = output / str(qemu_record["path"])
     required_symbols = {"qemu_init", "qemu_main_loop", "qemu_cleanup"}
-    qemu_exported_symbols = exported_symbols(qemu_binary)
+    qemu_exported_symbols = exported_symbols_for_sdk(qemu_binary, args.sdk)
     missing_symbols = required_symbols - qemu_exported_symbols
     if missing_symbols:
         raise SystemExit(f"QEMU in-process entry points are not exported: {', '.join(sorted(missing_symbols))}")
@@ -440,7 +476,7 @@ def main() -> None:
     if sha256(qemu_tar) != QEMU_TARBALL_SHA256:
         raise SystemExit("QEMU source archive no longer matches its pinned SHA-256")
     xcode = run(["xcodebuild", "-version"])
-    sdk_version = run(["xcrun", "--sdk", "iphoneos", "--show-sdk-version"])
+    sdk_version = run(["xcrun", "--sdk", args.sdk, "--show-sdk-version"])
     patch_files = [
         repo / "scripts" / "patch-utm-qemu-ios-tci.py",
         upstream / "patches" / "glib-2.83.0.patch",
@@ -462,7 +498,8 @@ def main() -> None:
         "source": source_records,
         "toolchain": {
             "xcode": xcode,
-            "iphoneosSdk": sdk_version,
+            "sdk": args.sdk,
+            "sdkVersion": sdk_version,
             "minimumIos": "15.0",
             "meson": run(["meson", "--version"]),
             "ninja": run(["ninja", "--version"]),
@@ -483,6 +520,7 @@ def main() -> None:
             "virtio9p": False,
             "options": required_options,
         },
+        "platform": "iOS Simulator" if args.sdk == "iphonesimulator" else "iOS device",
         "frameworks": framework_records,
         "inProcessEntryPoints": {
             "required": sorted(required_symbols),
@@ -496,7 +534,7 @@ def main() -> None:
         "sizes": {
             "strippedFrameworkMachOBytes": sum(item["strippedBytes"] for item in framework_records),
             "frameworkPayloadBytes": regular_file_bytes(runtime_frameworks),
-            "sourcePayloadBytes": regular_file_bytes(output / "source"),
+            "sourcePayloadBytes": regular_file_bytes(output / "source") if (output / "source").exists() else 0,
         },
         "licenses": LICENSES,
     }
@@ -505,7 +543,7 @@ def main() -> None:
         "# ARM64 iOS TCI/QEMU build report",
         "",
         f"- QEMU: `{report['qemu']['version']}`; guest target `{report['qemu']['guestTarget']}`; HVF disabled.",
-        f"- Toolchain: {sdk_version}, {xcode.splitlines()[0]}, Meson {report['toolchain']['meson']}, Ninja {report['toolchain']['ninja']}.",
+        f"- Platform: {report['platform']}; toolchain: {sdk_version}, {xcode.splitlines()[0]}, Meson {report['toolchain']['meson']}, Ninja {report['toolchain']['ninja']}.",
         f"- Frameworks: {len(framework_records)}; stripped Mach-O total {report['sizes']['strippedFrameworkMachOBytes']:,} bytes ({report['sizes']['strippedFrameworkMachOBytes'] / 1024 / 1024:.2f} MiB).",
         f"- Framework payload: {report['sizes']['frameworkPayloadBytes']:,} bytes ({report['sizes']['frameworkPayloadBytes'] / 1024 / 1024:.2f} MiB).",
         f"- Source and notices: {report['sizes']['sourcePayloadBytes']:,} bytes ({report['sizes']['sourcePayloadBytes'] / 1024 / 1024:.2f} MiB).",

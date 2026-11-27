@@ -38,6 +38,8 @@ public actor ARM64GuestPTYBroker {
     private let transport: ARM64GuestSerialTransport
     private let directory: ARM64GuestPTYSessionDirectory
     private var decoder = ARM64GuestPTYDecoder()
+    private var receiveContinuation: AsyncStream<Data>.Continuation?
+    private var receiveTask: Task<Void, Never>?
     private var sessions: [UInt32: SessionRecord] = [:]
     private var started = false
     private var isClosed = false
@@ -57,8 +59,26 @@ public actor ARM64GuestPTYBroker {
     public func start() {
         guard !started, !isClosed else { return }
         started = true
+        let incoming = AsyncStream<Data>.makeStream(bufferingPolicy: .bufferingOldest(128))
+        receiveContinuation = incoming.continuation
+        receiveTask = Task { [weak self] in
+            for await bytes in incoming.stream {
+                guard let self else { return }
+                await self.receive(bytes)
+            }
+        }
         transport.setReceiveHandler { [weak self] bytes in
-            Task { await self?.receive(bytes) }
+            guard let self else { return }
+            switch incoming.continuation.yield(bytes) {
+            case .enqueued:
+                break
+            case .dropped:
+                Task { await self.receiveOverflow() }
+            case .terminated:
+                break
+            @unknown default:
+                Task { await self.receiveOverflow() }
+            }
         }
         transport.setCloseHandler { [weak self] in
             Task { await self?.transportDidClose() }
@@ -260,6 +280,10 @@ public actor ARM64GuestPTYBroker {
         }
     }
 
+    private func receiveOverflow() async {
+        await terminate(with: ARM64GuestPTYProtocolError.outputBackpressure)
+    }
+
     private func handle(_ frame: ARM64GuestPTYFrame) async {
         if frame.sessionID == 0 {
             switch frame.type {
@@ -404,6 +428,10 @@ public actor ARM64GuestPTYBroker {
     private func terminate(with error: Error) async {
         guard !isClosed else { return }
         isClosed = true
+        receiveContinuation?.finish()
+        receiveContinuation = nil
+        receiveTask?.cancel()
+        receiveTask = nil
         guestReady = false
         failReadiness(error)
         transport.setReceiveHandler(nil)

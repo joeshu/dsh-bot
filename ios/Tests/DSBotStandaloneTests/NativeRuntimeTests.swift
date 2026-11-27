@@ -178,6 +178,66 @@ final class NativeRuntimeTests: XCTestCase {
         XCTAssertEqual(activeSessionCount, 0)
     }
 
+    func testEmbeddedQEMUGuestRunsShellOverRealPTYInSimulator() async throws {
+        let appBundle = Bundle(identifier: "io.github.dsbot.ios.standalone") ?? .main
+        let runtimeRoot = appBundle.bundleURL.appendingPathComponent("DSBotGuestRuntime", isDirectory: true)
+        let qemuBinary = appBundle.bundleURL
+            .appendingPathComponent("Frameworks/qemu-aarch64-softmmu.framework/qemu-aarch64-softmmu")
+        guard FileManager.default.fileExists(atPath: runtimeRoot.appendingPathComponent("vmlinuz-virt").path),
+              FileManager.default.fileExists(atPath: qemuBinary.path) else {
+            throw XCTSkip("This build does not include the optional ARM64 QEMU guest runtime.")
+        }
+
+        let runtime = ARM64GuestQEMURuntime(bundle: appBundle)
+        do {
+            let broker = try await runtime.start()
+            let owner = try XCTUnwrap(ARM64GuestPTYOwner(
+                kind: .native,
+                sessionID: "simulator-\(UUID().uuidString.lowercased())"
+            ))
+            let stream = try await broker.open(owner: owner, rows: 24, columns: 80, timeoutSeconds: 30)
+            try await broker.sendInput(
+                Data("printf '%s\\n' 'DSBOT_IOS_GUEST_PTY_OK'; exit\n".utf8),
+                from: owner
+            )
+
+            let result = try await withThrowingTaskGroup(of: (Bool, Int32?).self) { group in
+                group.addTask {
+                    var output = Data()
+                    var sawMarker = false
+                    var iterator = stream.makeAsyncIterator()
+                    while let event = try await iterator.next() {
+                        switch event {
+                        case .output(let bytes):
+                            output.append(bytes)
+                            if output.suffix(65_536).range(of: Data("DSBOT_IOS_GUEST_PTY_OK".utf8)) != nil {
+                                sawMarker = true
+                            }
+                        case .exited(let status):
+                            return (sawMarker, status)
+                        }
+                    }
+                    return (sawMarker, nil)
+                }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: 120_000_000_000)
+                    throw ARM64GuestPTYProtocolError.timeout("iOS Simulator guest shell")
+                }
+                guard let first = try await group.next() else {
+                    throw ARM64GuestPTYProtocolError.transportClosed
+                }
+                group.cancelAll()
+                return first
+            }
+            XCTAssertTrue(result.0, "The guest shell did not return the requested marker.")
+            XCTAssertEqual(result.1, 0)
+            await runtime.stop()
+        } catch {
+            await runtime.stop()
+            throw error
+        }
+    }
+
     func testModelSelectionAndEndpointBinding() throws {
         let official = try ModelProvider("https://API.DeepSeek.COM:443/v1/")
         let custom = try ModelProvider("https://example.test/gateway/v1/")

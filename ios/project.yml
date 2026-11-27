@@ -35,6 +35,35 @@ targets:
         type: folder
         buildPhase: resources
       - path: Vendor/QuickJS/quickjs-amalgam.c
+    preBuildScripts:
+      - name: Embed optional ARM64 Linux guest runtime
+        basedOnDependencyAnalysis: false
+        script: |
+          set -euo pipefail
+          if [[ -z "${DSBOT_GUEST_RUNTIME_DIR:-}" ]]; then
+            exit 0
+          fi
+          case "$PLATFORM_NAME" in
+            iphoneos) runtime_sdk="iphoneos" ;;
+            iphonesimulator) runtime_sdk="iphonesimulator" ;;
+            *) echo "Unsupported guest runtime SDK: $PLATFORM_NAME" >&2; exit 1 ;;
+          esac
+          source_frameworks="$DSBOT_GUEST_RUNTIME_DIR/Frameworks/$runtime_sdk"
+          source_guest="$DSBOT_GUEST_RUNTIME_DIR/DSBotGuestRuntime"
+          test -d "$source_frameworks"
+          test -f "$source_guest/runtime-manifest.json"
+          app_frameworks="$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH"
+          app_guest="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/DSBotGuestRuntime"
+          mkdir -p "$app_frameworks" "$(dirname "$app_guest")"
+          for framework in "$source_frameworks"/*.framework; do
+            test -d "$framework" || continue
+            /usr/bin/ditto "$framework" "$app_frameworks/$(basename "$framework")"
+            if [[ "${CODE_SIGNING_ALLOWED:-NO}" == "YES" && -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ]]; then
+              /usr/bin/codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" --timestamp=none \
+                "$app_frameworks/$(basename "$framework")"
+            fi
+          done
+          /usr/bin/ditto "$source_guest" "$app_guest"
     settings:
       base:
         PRODUCT_NAME: DSBotStandalone
@@ -49,6 +78,7 @@ targets:
         SWIFT_OBJC_BRIDGING_HEADER: Sources/JavaScript/JavaScriptInterpreter.h
         HEADER_SEARCH_PATHS: "$(SRCROOT)/Vendor/QuickJS"
         CLANG_C_LANGUAGE_STANDARD: gnu17
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
     dependencies:
       - framework: Vendor/NodeMobile.xcframework
         embed: true
