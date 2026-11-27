@@ -22,6 +22,7 @@ jobs:
 
       - id: qemu-cache-restore
         uses: actions/cache/restore@v4
+        continue-on-error: true
         with:
           path: ${{ runner.temp }}/qemu-ios-tci-build
           key: qemu-ios-tci-${{ runner.os }}-${{ runner.arch }}-macos26-xcode26.6-utm3d4b8d8-${{ hashFiles('scripts/qemu-ios-tci-sources.sha256', 'scripts/patch-utm-qemu-ios-tci.py', 'scripts/qemu-ios-tci-host-requirements.txt') }}
@@ -65,19 +66,23 @@ jobs:
           UTM_SOURCE="$RUNNER_TEMP/utm-qemu-source"
           mkdir -p "$BUILD_ROOT"
           cd "$BUILD_ROOT"
-          REBUILD_ARGS=()
           if [[ "${{ steps.qemu-cache-restore.outputs.cache-hit }}" == "true" && -f "$BUILD_ROOT/build-iOS-TCI-arm64/BUILD_SUCCESS" ]]; then
-            REBUILD_ARGS=(-r)
             echo "Reusing the successful pinned QEMU build cache."
+            MINIMAL_TCI=1 \
+            SOURCE_HASH_LOCK="$GITHUB_WORKSPACE/scripts/qemu-ios-tci-sources.sha256" \
+            NCPU=4 RETRY_ATTEMPTS=5 RETRY_DELAY=10 \
+              bash "$UTM_SOURCE/scripts/build_dependencies.sh" -r -p ios-tci -a arm64
+          else
+            MINIMAL_TCI=1 \
+            SOURCE_HASH_LOCK="$GITHUB_WORKSPACE/scripts/qemu-ios-tci-sources.sha256" \
+            NCPU=4 RETRY_ATTEMPTS=5 RETRY_DELAY=10 \
+              bash "$UTM_SOURCE/scripts/build_dependencies.sh" -p ios-tci -a arm64
           fi
-          MINIMAL_TCI=1 \
-          SOURCE_HASH_LOCK="$GITHUB_WORKSPACE/scripts/qemu-ios-tci-sources.sha256" \
-          NCPU=4 RETRY_ATTEMPTS=5 RETRY_DELAY=10 \
-            bash "$UTM_SOURCE/scripts/build_dependencies.sh" "${REBUILD_ARGS[@]}" -p ios-tci -a arm64
 
       - name: Save successful pinned QEMU build cache
         if: steps.qemu-build.outcome == 'success'
         uses: actions/cache/save@v4
+        continue-on-error: true
         with:
           path: ${{ runner.temp }}/qemu-ios-tci-build
           key: qemu-ios-tci-${{ runner.os }}-${{ runner.arch }}-macos26-xcode26.6-utm3d4b8d8-${{ hashFiles('scripts/qemu-ios-tci-sources.sha256', 'scripts/patch-utm-qemu-ios-tci.py', 'scripts/qemu-ios-tci-host-requirements.txt') }}
