@@ -48,11 +48,11 @@ BUILTIN_OPTIONS = (
     "VIRTIO_MMIO",
     "VIRTIO_BLK",
     "EXT4_FS",
+    # fs/devpts is built from this symbol in modern kernels.
     "UNIX98_PTYS",
     "SERIAL_AMBA_PL011",
     "SERIAL_AMBA_PL011_CONSOLE",
     "SERIAL_EARLYCON",
-    "DEVPTS_FS",
     "DEVTMPFS",
     "DEVTMPFS_MOUNT",
     "TMPFS",
