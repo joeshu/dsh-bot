@@ -16,6 +16,71 @@ final class NativeRuntimeTests: XCTestCase {
         XCTAssertEqual(decoder.pendingBytes, 0)
     }
 
+    func testARM64GuestPTYCodecHandlesFragmentedCoalescedAndNoisySerialFrames() throws {
+        let first = ARM64GuestPTYFrame(type: .input, sessionID: 0xD5B07001, payload: Data([0x61, 0x0a]))
+        let second = ARM64GuestPTYFrame(type: .output, sessionID: 0xD5B07002, payload: Data(repeating: 0x7f, count: 257))
+        let firstBytes = try ARM64GuestPTYCodec.encode(first)
+        XCTAssertEqual(Array(firstBytes.prefix(16)), [
+            0x44, 0x53, 0x42, 0x50, 0x00, 0x01, 0x00, 0x02,
+            0xd5, 0xb0, 0x70, 0x01, 0x00, 0x00, 0x00, 0x02,
+        ])
+
+        var wire = Data([0xaa, 0xbb, 0x44]) // noise ending in a partial magic prefix
+        wire.append(firstBytes.dropFirst(1))
+        wire.append(try ARM64GuestPTYCodec.encode(second))
+        var decoder = ARM64GuestPTYDecoder()
+        var decoded: [ARM64GuestPTYFrame] = []
+        for offset in stride(from: 0, to: wire.count, by: 7) {
+            decoded += try decoder.push(wire.subdata(in: offset..<min(offset + 7, wire.count)))
+        }
+
+        XCTAssertEqual(decoded, [first, second])
+        XCTAssertEqual(decoder.pendingBytes, 0)
+    }
+
+    func testARM64GuestPTYCodecRejectsUnboundedAndUnknownFrames() throws {
+        let oversized = ARM64GuestPTYFrame(type: .input, sessionID: 1, payload: Data(repeating: 0, count: 65_537))
+        XCTAssertThrowsError(try ARM64GuestPTYCodec.encode(oversized)) { error in
+            XCTAssertEqual(error as? ARM64GuestPTYProtocolError, .frameTooLarge(65_537))
+        }
+
+        var unknown = try ARM64GuestPTYCodec.encode(ARM64GuestPTYFrame(type: .ready, sessionID: 0))
+        unknown[6] = 0x7f
+        unknown[7] = 0xff
+        var decoder = ARM64GuestPTYDecoder()
+        XCTAssertThrowsError(try decoder.push(unknown)) { error in
+            XCTAssertEqual(error as? ARM64GuestPTYProtocolError, .unsupportedFrameType(0x7fff))
+        }
+
+        var wrongVersion = try ARM64GuestPTYCodec.encode(ARM64GuestPTYFrame(type: .ready, sessionID: 0))
+        wrongVersion[5] = 0x02
+        XCTAssertThrowsError(try decoder.push(wrongVersion)) { error in
+            XCTAssertEqual(error as? ARM64GuestPTYProtocolError, .unsupportedVersion(2))
+        }
+    }
+
+    func testARM64GuestPTYSessionDirectoryBindsIDsToOneOwner() async throws {
+        let bot = try XCTUnwrap(ARM64GuestPTYOwner(kind: .bot, sessionID: "ios:main:thread-1"))
+        let web = try XCTUnwrap(ARM64GuestPTYOwner(kind: .web, sessionID: "ios:main:thread-1"))
+        XCTAssertNil(ARM64GuestPTYOwner(kind: .bot, sessionID: "main\nforged"))
+
+        let directory = ARM64GuestPTYSessionDirectory()
+        let botID = try await directory.sessionID(for: bot)
+        let sameBotID = try await directory.sessionID(for: bot)
+        let webID = try await directory.sessionID(for: web)
+        XCTAssertNotEqual(botID, 0)
+        XCTAssertEqual(botID, sameBotID)
+        XCTAssertNotEqual(botID, webID)
+        let botAuthorized = await directory.authorize(guestSessionID: botID, for: bot)
+        let crossOwnerDenied = await directory.authorize(guestSessionID: botID, for: web)
+        XCTAssertTrue(botAuthorized)
+        XCTAssertFalse(crossOwnerDenied)
+
+        await directory.revoke(owner: bot)
+        let revoked = await directory.authorize(guestSessionID: botID, for: bot)
+        XCTAssertFalse(revoked)
+    }
+
     func testModelSelectionAndEndpointBinding() throws {
         let official = try ModelProvider("https://API.DeepSeek.COM:443/v1/")
         let custom = try ModelProvider("https://example.test/gateway/v1/")

@@ -275,7 +275,7 @@ def main() -> None:
             "-append", "console=ttyAMA0,115200 rdinit=/init panic=10",
             "-display", "none",
             "-monitor", "none",
-            "-serial", f"unix:{socket_path},server=off,wait=off",
+            "-serial", f"unix:{socket_path},server=off",
             "-no-reboot",
         ]
         qemu_stderr = qemu_stderr_path.open("wb")
