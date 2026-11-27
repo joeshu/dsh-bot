@@ -372,8 +372,11 @@ public final class LocalAgentHost: ObservableObject {
         do {
             let result = try await channel.request("runtime.restart", timeoutSeconds: 115)
             await refreshPluginState(on: channel)
+            let bootErr = (result["bootError"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             if result["safeMode"] as? Bool == true {
-                return "DSH 已进入恢复模式，第三方插件未加载。"
+                return bootErr.isEmpty
+                    ? "DSH 已进入恢复模式，第三方插件未加载。"
+                    : "DSH 已进入恢复模式（\(bootErr)），第三方插件未加载。"
             }
             do {
                 try await syncLiveRuntimeConfig(on: channel)
@@ -382,7 +385,9 @@ public final class LocalAgentHost: ObservableObject {
                 return "DSH 已重启；运行时设置同步失败，请重新保存设置。"
             }
             if result["rolledBack"] as? Bool == true {
-                return "DSH 已重启，但回滚了异常插件变更。"
+                return bootErr.isEmpty
+                    ? "DSH 已重启，但回滚了异常插件变更。"
+                    : "插件启动失败已自动回滚：\(bootErr)"
             }
             return "DSH 引擎已重启就绪。"
         } catch {
@@ -2179,9 +2184,12 @@ public final class LocalAgentHost: ObservableObject {
         defer { runtimeRestartInProgress = false }
         effectiveWebSearchSendOriginalQuestion = false
         let result = try await channel.request("runtime.restart", timeoutSeconds: 115)
+        let bootErr = (result["bootError"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if result["safeMode"] as? Bool == true {
             await refreshPluginState(on: channel)
-            return "DSH 已进入恢复模式，第三方插件未加载。"
+            return bootErr.isEmpty
+                ? "DSH 已进入恢复模式，第三方插件未加载。"
+                : "DSH 已进入恢复模式（\(bootErr)），第三方插件未加载。"
         }
         do {
             try await syncLiveRuntimeConfig(on: channel)
@@ -2190,7 +2198,11 @@ public final class LocalAgentHost: ObservableObject {
             return "插件已重启，但运行时设置同步失败：\(error.localizedDescription)"
         }
         await refreshPluginState(on: channel)
-        if result["rolledBack"] as? Bool == true { return "插件未能启动，已恢复上次可用配置。" }
+        if result["rolledBack"] as? Bool == true {
+            return bootErr.isEmpty
+                ? "插件未能启动，已恢复上次可用配置。"
+                : "插件未能启动已自动回滚：\(bootErr)"
+        }
         return applied
     }
 

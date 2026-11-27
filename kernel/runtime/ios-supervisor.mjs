@@ -70,10 +70,11 @@ function launch() {
         clearTimeout(startupTimer)
         ready = true
         unexpectedCrashCount = 0
-        if (!safeMode) lastBootError = ''
+        const reportedBootError = (safeMode || recoveringRevision) ? lastBootError : ''
+        if (!safeMode && !recoveringRevision) lastBootError = ''
         send(message)
         if (restart !== undefined) {
-          send({ jsonrpc: '2.0', id: restart, result: { restarted: true, safeMode, rolledBack: recoveringRevision, bootError: safeMode ? lastBootError : '' } })
+          send({ jsonrpc: '2.0', id: restart, result: { restarted: true, safeMode, rolledBack: recoveringRevision, bootError: reportedBootError } })
           restart = undefined
         }
         recoveringRevision = false

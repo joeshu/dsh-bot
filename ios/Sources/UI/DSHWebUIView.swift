@@ -48,6 +48,7 @@ public struct DSHWebUIView: View {
     @State private var webIsDark: Bool?
     @State private var showAgentBrowser = false
     @State private var importBanner: String?
+    @State private var webDiag: String = ""
     @AppStorage("dsbot.web.viewportMode") private var viewportModeRaw: String = DSHWebViewportMode.responsive.rawValue
     @AppStorage("dsbot.web.textScale") private var textScaleRaw: Int = DSHWebTextScale.standard.rawValue
     private let initialSessionId: String?
@@ -85,6 +86,11 @@ public struct DSHWebUIView: View {
                     if let importBanner {
                         Text(importBanner)
                             .font(.caption.weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    } else if !webDiag.isEmpty && (loadProgress < 1.0 || errorMessage != nil) {
+                        Text(webDiag)
+                            .font(.caption2.monospaced())
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
@@ -343,6 +349,7 @@ public struct DSHWebUIView: View {
         let now = Date()
         recoveryTimestamps = recoveryTimestamps.filter { now.timeIntervalSince($0) < 15 }
         recoveryTimestamps.append(now)
+        webDiag = "恢复#\(recoveryTimestamps.count): \(reason)"
         if recoveryTimestamps.count <= 2 {
             isRecovering = true
             Task {
@@ -440,6 +447,7 @@ public struct DSHWebUIView: View {
             errorMessage = nil
             allowedPort = port
             authCookies = exchanged.cookies
+            webDiag = "P:\(port) C:\(exchanged.cookies.count) \(exchanged.url.query == nil ? "clean" : "tok")"
             launchURL = exchanged.url
         } catch {
             guard !Task.isCancelled, generation == host.runtimeGeneration else { return }

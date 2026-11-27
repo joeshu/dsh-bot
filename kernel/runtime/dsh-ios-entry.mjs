@@ -4465,6 +4465,10 @@ wire.once('close', () => {
 try {
   await boot()
 } catch (error) {
-  rpc.notify('runtime.failed', { message: error instanceof Error ? error.message : String(error) })
+  const baseMsg = error instanceof Error ? error.message : String(error)
+  const causeMsg = error instanceof Error && error.cause
+    ? ` :: ${error.cause instanceof Error ? error.cause.message : String(error.cause)}`
+    : ''
+  rpc.notify('runtime.failed', { message: `${baseMsg}${causeMsg}` })
   throw error
 }
