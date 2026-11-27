@@ -16,10 +16,12 @@ from pathlib import Path
 
 QEMU_TARBALL_SHA256 = "7c9605290b34152debb842e965a55d2e4fbba4793e536ab677b4027e5dc0ba1a"
 LIBUCONTEXT_COMMIT = "9b1d8f01a6e99166f9808c79966abe10786de8b6"
+PROXY_LIBINTL_COMMIT = "33934de09af6a6627eb44e310a8079df009abdbb"
 UTM_COMMIT = "3d4b8d8cb1ce93a8b1a9610695c12487685f0c15"
 LICENSES = {
     "qemu": "GPL-2.0-or-later",
     "glib": "LGPL-2.1-or-later",
+    "proxy-libintl": "LGPL-2.0-or-later",
     "ffi": "MIT",
     "iconv": "LGPL-2.1-or-later",
     "pixman": "MIT",
@@ -89,15 +91,15 @@ def parse_source_lock(lock_path: Path) -> list[tuple[str, str]]:
     return sources
 
 
-def meson_options(qemu_dir: Path) -> dict[str, object]:
-    path = qemu_dir / "meson-info" / "intro-buildoptions.json"
+def meson_options(qemu_build_dir: Path) -> dict[str, object]:
+    path = qemu_build_dir / "meson-info" / "intro-buildoptions.json"
     if not path.is_file():
         raise SystemExit(f"QEMU Meson build options are missing: {path}")
     return {item["name"]: item.get("value") for item in json.loads(path.read_text())}
 
 
-def find_tcg_config(qemu_dir: Path) -> Path:
-    candidates = list(qemu_dir.rglob("config-host.h"))
+def find_tcg_config(qemu_build_dir: Path) -> Path:
+    candidates = list(qemu_build_dir.rglob("config-host.h"))
     for candidate in candidates:
         contents = candidate.read_text(errors="ignore")
         if "CONFIG_TCG_THREADED_INTERPRETER" in contents:
@@ -119,8 +121,12 @@ def framework_license(name: str) -> str:
     lowered = name.lower()
     if "qemu" in lowered:
         return LICENSES["qemu"]
-    if lowered.startswith(("glib-", "gobject-", "gio-", "gmodule-", "gthread-")):
+    if lowered.startswith(("glib-", "gobject-", "gio-", "gmodule-", "gthread-", "girepository-")):
         return LICENSES["glib"]
+    if "charset" in lowered:
+        return LICENSES["iconv"]
+    if "intl" in lowered:
+        return LICENSES["proxy-libintl"]
     for component in ("ffi", "iconv", "pixman", "slirp", "pcre2"):
         if component in lowered:
             return LICENSES[component]
@@ -212,6 +218,14 @@ def stage_sources(
     if not pcre2_source.is_dir() or not (pcre2_source / "LICENCE").is_file():
         raise SystemExit("GLib did not resolve and stage its pinned PCRE2 source and license")
     shutil.copytree(pcre2_source, source_root / "pcre2-10.44", dirs_exist_ok=True)
+    proxy_intl_source = glib_dir / "subprojects" / "proxy-libintl"
+    if not proxy_intl_source.is_dir() or not (proxy_intl_source / ".git").exists():
+        raise SystemExit("GLib did not resolve its pinned proxy-libintl Meson subproject")
+    proxy_intl_commit = run(["git", "-C", str(proxy_intl_source), "rev-parse", "HEAD"])
+    if proxy_intl_commit != PROXY_LIBINTL_COMMIT:
+        raise SystemExit(f"Unexpected proxy-libintl revision: {proxy_intl_commit}")
+    proxy_intl_out = source_root / "proxy-libintl"
+    shutil.copytree(proxy_intl_source, proxy_intl_out, ignore=shutil.ignore_patterns(".git"))
 
     notices = """# Third-party notices for the ARM64 iOS TCI/QEMU artifact
 
@@ -229,6 +243,7 @@ are in this artifact's `source/` directory.
 | libslirp 4.9.1 | BSD-3-Clause | `source/archives/libslirp-v4.9.1.tar.gz` |
 | libucontext | ISC | `source/libucontext/LICENSE`; source revision is pinned by QEMU's `subprojects/libucontext.wrap` |
 | PCRE2 10.44 (GLib fallback) | BSD-3-Clause | `source/pcre2-10.44/LICENCE`; GLib's pinned Meson wrap is in its source archive |
+| proxy-libintl 1 (GLib fallback) | LGPL-2.0-or-later | `source/proxy-libintl/COPYING`; source revision is pinned by GLib's `subprojects/proxy-libintl.wrap` |
 | UTM build helpers and patches | Apache-2.0 | `source/UTM-LICENSE` |
 
 `pkg-config` is built as a host-only build tool and is not included in the
@@ -251,6 +266,11 @@ before any app redistribution.
                 "name": "PCRE2 10.44",
                 "sourceTreeSha256": tree_sha256(source_root / "pcre2-10.44"),
             },
+            {
+                "name": "proxy-libintl",
+                "commit": proxy_intl_commit,
+                "sourceTreeSha256": tree_sha256(proxy_intl_out),
+            },
         ],
     }
 
@@ -269,7 +289,8 @@ def main() -> None:
     build_dir = args.build_dir.resolve()
     sysroot = args.sysroot.resolve()
     output = args.output.resolve()
-    qemu_dir = build_dir / "qemu-10.0.12-utm"
+    qemu_source_dir = build_dir / "qemu-10.0.12-utm"
+    qemu_build_dir = qemu_source_dir / "build"
     frameworks_src = sysroot / "Frameworks"
     if not frameworks_src.is_dir():
         raise SystemExit(f"iOS Frameworks output is missing: {frameworks_src}")
@@ -278,7 +299,7 @@ def main() -> None:
         repo=repo,
         upstream=upstream,
         build_dir=build_dir,
-        qemu_dir=qemu_dir,
+        qemu_dir=qemu_source_dir,
         output=output,
         lock_path=repo / "scripts" / "qemu-ios-tci-sources.sha256",
     )
@@ -286,7 +307,7 @@ def main() -> None:
     runtime_frameworks.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(frameworks_src, runtime_frameworks, dirs_exist_ok=True, symlinks=True)
 
-    options = meson_options(qemu_dir)
+    options = meson_options(qemu_build_dir)
     required_options = {
         "shared_lib": True,
         "hvf": "disabled",
@@ -309,11 +330,13 @@ def main() -> None:
         if options.get(name) != expected:
             raise SystemExit(f"Unexpected QEMU Meson option {name}: {options.get(name)!r}; expected {expected!r}")
 
-    config_mak = qemu_dir / "config-host.mak"
+    config_mak = qemu_build_dir / "config-host.mak"
+    if not config_mak.is_file():
+        raise SystemExit(f"QEMU host configuration is missing: {config_mak}")
     config_text = config_mak.read_text()
     if not re.search(r"(?m)^TARGET_DIRS=aarch64-softmmu$", config_text):
         raise SystemExit("QEMU target list is not restricted to aarch64-softmmu")
-    target_config = find_tcg_config(qemu_dir).read_text(errors="ignore")
+    target_config = find_tcg_config(qemu_build_dir).read_text(errors="ignore")
     if not re.search(r"(?m)^#define CONFIG_TCG_THREADED_INTERPRETER 1$", target_config):
         raise SystemExit("The ARM64 target was not built with the TCG threaded interpreter")
 
