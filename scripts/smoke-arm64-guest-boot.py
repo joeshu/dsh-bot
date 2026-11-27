@@ -235,7 +235,12 @@ def output_until_markers(
             continue
         if frame_type == FRAME_EXIT:
             labels = ", ".join(marker.decode("ascii") for marker in markers)
-            raise RuntimeError(f"Guest shell exited before emitting {labels}")
+            status = struct.unpack(">I", payload)[0] if len(payload) == 4 else "invalid"
+            output_tail = bytes(output[-2048:]).decode("utf-8", "replace")
+            raise RuntimeError(
+                f"Guest shell exited with status {status} before emitting {labels}; "
+                f"PTY output tail: {output_tail!r}"
+            )
         if frame_type == FRAME_OUTPUT:
             output.extend(payload)
     return bytes(output)

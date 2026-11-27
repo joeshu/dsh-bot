@@ -250,6 +250,11 @@ static int set_limit(int resource, rlim_t value) {
     return setrlimit(resource, &limit);
 }
 
+static void child_setup_failure(int status, const char *operation, int error_number) {
+    (void)dprintf(STDERR_FILENO, "DS Bot guest shell setup failed at %s (errno %d).\n", operation, error_number);
+    _exit(status);
+}
+
 static void initialize_pty_termios(struct termios *attributes) {
     memset(attributes, 0, sizeof(*attributes));
     cfmakeraw(attributes);
@@ -347,7 +352,10 @@ static int create_session(uint32_t id, const unsigned char *payload, size_t leng
         (void)set_limit(RLIMIT_NPROC, 8);
         (void)set_limit(RLIMIT_AS, 128u * 1024u * 1024u);
         umask(0077);
-        if (setgroups(0, NULL) != 0 || setgid(uid) != 0 || setuid(uid) != 0 || chdir(directory) != 0) _exit(126);
+        if (setgroups(0, NULL) != 0) child_setup_failure(126, "setgroups", errno);
+        if (setgid(uid) != 0) child_setup_failure(126, "setgid", errno);
+        if (setuid(uid) != 0) child_setup_failure(126, "setuid", errno);
+        if (chdir(directory) != 0) child_setup_failure(126, "chdir", errno);
         (void)prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
         clearenv();
         (void)setenv("HOME", directory, 1);
@@ -361,7 +369,7 @@ static int create_session(uint32_t id, const unsigned char *payload, size_t leng
         (void)setenv("TERM", "vt100", 1);
         (void)setenv("PS1", "dsbot$ ", 1);
         execl("/bin/sh", "sh", "-i", (char *)NULL);
-        _exit(127);
+        child_setup_failure(127, "exec /bin/sh", errno);
     }
 
     int flags = fcntl(master, F_GETFL, 0);
