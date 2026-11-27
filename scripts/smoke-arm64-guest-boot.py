@@ -112,36 +112,69 @@ def wait_for_serial_socket(
     )
 
 
-def query_qemu_status(socket_path: pathlib.Path) -> str:
-    """Return QMP VM status and CPU registers when serial startup fails."""
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(1)
+class QEMUControlConnection:
+    """Keep QMP attached across guest resets so failed boot state remains queryable."""
+
+    def __init__(self, connection: socket.socket) -> None:
+        self.connection = connection
+        self.reader = connection.makefile("rb")
+        self.next_id = 0
+        greeting = json.loads(self.reader.readline())
+        if "QMP" not in greeting:
+            raise RuntimeError(f"unexpected QMP greeting: {greeting!r}")
+        self.execute("qmp_capabilities")
+
+    def execute(self, command: str, arguments: dict[str, str] | None = None) -> object:
+        self.next_id += 1
+        request: dict[str, object] = {"execute": command, "id": self.next_id}
+        if arguments is not None:
+            request["arguments"] = arguments
+        self.connection.sendall(json.dumps(request).encode("utf-8") + b"\r\n")
+        while True:
+            response = json.loads(self.reader.readline())
+            if response.get("id") != self.next_id:
+                continue
+            if "error" in response:
+                return {"error": response["error"]}
+            return response.get("return")
+
+    def diagnostics(self) -> str:
+        result = {
+            "status": self.execute("query-status"),
+            "registers": self.execute(
+                "human-monitor-command", {"command-line": "info registers"}
+            ),
+        }
+        return json.dumps(result, ensure_ascii=True)
+
+    def close(self) -> None:
+        self.reader.close()
+        self.connection.close()
+
+
+def wait_for_qmp_connection(
+    process: subprocess.Popen[bytes], socket_path: pathlib.Path, stderr_path: pathlib.Path, timeout: int = 5
+) -> QEMUControlConnection:
+    """Attach before guest boot so the monitor survives a kernel panic/reset."""
+    deadline = time.monotonic() + max(1, timeout)
+    last_error = "QEMU has not created its QMP socket yet"
+    while time.monotonic() < deadline:
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            connection.settimeout(min(1, max(0.01, deadline - time.monotonic())))
             connection.connect(str(socket_path))
-            with connection.makefile("rb") as reader:
-                greeting = json.loads(reader.readline())
-                if "QMP" not in greeting:
-                    return f"unexpected QMP greeting: {greeting!r}"
-                connection.sendall(b'{"execute":"qmp_capabilities","id":1}\r\n')
-                while True:
-                    response = json.loads(reader.readline())
-                    if response.get("id") == 1:
-                        break
-                connection.sendall(b'{"execute":"query-status","id":2}\r\n')
-                while True:
-                    status = json.loads(reader.readline())
-                    if status.get("id") == 2:
-                        break
-                connection.sendall(
-                    b'{"execute":"human-monitor-command","arguments":{"command-line":"info registers"},"id":3}\r\n'
-                )
-                while True:
-                    registers = json.loads(reader.readline())
-                    if registers.get("id") == 3:
-                        break
-        return json.dumps({"status": status.get("return"), "registers": registers.get("return")}, ensure_ascii=True)
-    except Exception as error:
-        return f"QMP diagnostics unavailable: {error}"
+            return QEMUControlConnection(connection)
+        except Exception as error:
+            last_error = str(error)
+            connection.close()
+        if process.poll() is not None:
+            detail = stderr_path.read_text(encoding="utf-8", errors="replace")[-4096:]
+            raise RuntimeError(
+                f"QEMU exited before opening QMP (status {process.returncode}): "
+                f"{detail or '<empty QEMU output>'}; last connection error: {last_error}"
+            )
+        time.sleep(0.05)
+    raise TimeoutError(f"QEMU did not open QMP within {timeout}s: {last_error}")
 
 
 def output_until_marker(link: SerialLink, session_id: int, marker: bytes, timeout: int) -> bytes:
@@ -343,10 +376,16 @@ def main() -> None:
         ]
         qemu_output = qemu_output_path.open("wb")
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=qemu_output, stderr=qemu_output, bufsize=0)
+        qmp: QEMUControlConnection | None = None
+        qmp_startup_error: str | None = None
         connection: socket.socket | None = None
         link: SerialLink | None = None
         deadline = time.monotonic() + max(1, args.timeout)
         try:
+            try:
+                qmp = wait_for_qmp_connection(process, qmp_socket_path, qemu_output_path)
+            except Exception as error:
+                qmp_startup_error = str(error)
             connection = wait_for_serial_socket(process, socket_path, qemu_output_path, args.timeout)
             link = SerialLink(connection)
             link.wait_for_text(marker, deadline)
@@ -369,7 +408,10 @@ def main() -> None:
             print("QEMU output:")
             print(detail if detail else "<empty>")
             print("QEMU guest status and CPU registers:")
-            print(query_qemu_status(qmp_socket_path))
+            if qmp:
+                print(qmp.diagnostics())
+            else:
+                print(f"QMP connection was not established: {qmp_startup_error or 'unknown reason'}")
             qemu_debug = qemu_debug_path.read_text(encoding="utf-8", errors="replace")[-4096:]
             print("QEMU guest debug log:")
             print(qemu_debug if qemu_debug else "<empty>")
@@ -377,6 +419,8 @@ def main() -> None:
         finally:
             if connection is not None:
                 connection.close()
+            if qmp is not None:
+                qmp.close()
             if process.poll() is None:
                 process.terminate()
                 try:
