@@ -134,6 +134,50 @@ final class NativeRuntimeTests: XCTestCase {
         XCTAssertEqual(activeSessions, 0)
     }
 
+    func testARM64GuestPTYBrokerRetainsCancelledSessionUntilGuestCleanup() async throws {
+        let transport = FakeGuestSerialTransport()
+        let broker = ARM64GuestPTYBroker(transport: transport)
+        await broker.start()
+
+        let readiness = Task { try await broker.waitUntilReady(timeoutSeconds: 5) }
+        let ping = try await transport.waitForFrame(.ping)
+        transport.deliver(ARM64GuestPTYFrame(type: .pong, sessionID: 0, payload: ping.payload))
+        try await readiness.value
+
+        let owner = try XCTUnwrap(ARM64GuestPTYOwner(kind: .native, sessionID: "ios:main:cancelled-terminal"))
+        let opening = Task { try await broker.open(owner: owner) }
+        let create = try await transport.waitForFrame(.create)
+        transport.deliver(ARM64GuestPTYFrame(type: .ready, sessionID: create.sessionID))
+        let output = try await opening.value
+
+        let consumer = Task {
+            var iterator = output.makeAsyncIterator()
+            do {
+                _ = try await iterator.next()
+            } catch {
+                // Cancellation closes the stream and should request guest cleanup.
+            }
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        consumer.cancel()
+        _ = try await transport.waitForFrame(.close)
+
+        let closingSessionCount = await broker.activeSessionCount()
+        XCTAssertEqual(closingSessionCount, 1, "The guest slot must remain reserved during PTY cleanup")
+
+        var exitPayload = Data()
+        exitPayload.append(contentsOf: [0, 0, 0, 0])
+        transport.deliver(ARM64GuestPTYFrame(type: .exit, sessionID: create.sessionID, payload: exitPayload))
+        await consumer.value
+
+        let deadline = Date().addingTimeInterval(1)
+        while await broker.activeSessionCount() != 0 && Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let activeSessionCount = await broker.activeSessionCount()
+        XCTAssertEqual(activeSessionCount, 0)
+    }
+
     func testModelSelectionAndEndpointBinding() throws {
         let official = try ModelProvider("https://API.DeepSeek.COM:443/v1/")
         let custom = try ModelProvider("https://example.test/gateway/v1/")

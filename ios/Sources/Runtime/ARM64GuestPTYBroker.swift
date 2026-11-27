@@ -137,6 +137,10 @@ public actor ARM64GuestPTYBroker {
                 let stream = AsyncThrowingStream<ARM64GuestPTYEvent, Error>(bufferingPolicy: .bufferingOldest(64)) {
                     streamContinuation = $0
                 }
+                streamContinuation.onTermination = { [weak self] termination in
+                    guard case .cancelled = termination else { return }
+                    Task { await self?.cancelSession(for: owner) }
+                }
                 var record = SessionRecord(
                     owner: owner,
                     sessionID: sessionID,
@@ -287,11 +291,9 @@ public actor ARM64GuestPTYBroker {
             case .enqueued:
                 break
             case .dropped:
-                try? transmit(ARM64GuestPTYFrame(type: .close, sessionID: frame.sessionID))
-                await finishSession(frame.sessionID, error: ARM64GuestPTYProtocolError.outputBackpressure)
+                await requestSessionClose(frame.sessionID, error: ARM64GuestPTYProtocolError.outputBackpressure)
             case .terminated:
-                try? transmit(ARM64GuestPTYFrame(type: .close, sessionID: frame.sessionID))
-                await finishSession(frame.sessionID, error: CancellationError())
+                await requestSessionClose(frame.sessionID, error: CancellationError())
             @unknown default:
                 await finishSession(frame.sessionID, error: ARM64GuestPTYProtocolError.invalidFrame)
             }
@@ -305,7 +307,12 @@ public actor ARM64GuestPTYBroker {
             await finishSession(frame.sessionID, exitStatus: exitStatus)
         case .error:
             let message = String(data: frame.payload, encoding: .utf8) ?? "Guest PTY agent error."
-            await finishSession(frame.sessionID, error: ARM64GuestPTYProtocolError.guestRejected(message))
+            let error = ARM64GuestPTYProtocolError.guestRejected(message)
+            if record.state == .closing {
+                await finishSession(frame.sessionID, error: error)
+            } else {
+                await requestSessionClose(frame.sessionID, error: error)
+            }
         default:
             break
         }
@@ -333,18 +340,51 @@ public actor ARM64GuestPTYBroker {
     private func expireSession(_ sessionID: UInt32, state expectedState: SessionState, operation: String) async {
         guard sessions[sessionID]?.state == expectedState else { return }
         if expectedState == .opening {
-            try? transmit(ARM64GuestPTYFrame(type: .close, sessionID: sessionID))
+            await requestSessionClose(sessionID, error: ARM64GuestPTYProtocolError.timeout(operation))
+        } else {
+            await finishSession(sessionID, error: ARM64GuestPTYProtocolError.timeout(operation))
         }
-        await finishSession(sessionID, error: ARM64GuestPTYProtocolError.timeout(operation))
     }
 
     private func cancelSession(for owner: ARM64GuestPTYOwner) async {
         guard let sessionID = await directory.existingSessionID(for: owner),
               let record = sessions[sessionID], record.owner == owner else { return }
-        if record.state != .closing {
-            try? transmit(ARM64GuestPTYFrame(type: .close, sessionID: sessionID))
+        guard record.state != .closing else { return }
+        await requestSessionClose(sessionID, error: CancellationError())
+    }
+
+    /// Close the guest PTY while keeping its slot reserved until EXIT or a bounded
+    /// cleanup timeout. Dropping the host record immediately can overbook the guest
+    /// while it is still terminating descendants under the session UID.
+    private func requestSessionClose(_ sessionID: UInt32, error: Error) async {
+        guard var record = sessions[sessionID] else { return }
+        guard record.state != .closing else { return }
+
+        record.state = .closing
+        record.watchdog?.cancel()
+        record.watchdog = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: Self.closeTimeoutSeconds * 1_000_000_000)
+            } catch {
+                return
+            }
+            await self?.expireSession(sessionID, state: .closing, operation: "shell cleanup")
         }
-        await finishSession(sessionID, error: CancellationError())
+        let openContinuation = record.openContinuation
+        record.openContinuation = nil
+        let closeContinuation = record.closeContinuation
+        record.closeContinuation = nil
+        sessions[sessionID] = record
+
+        record.streamContinuation.finish(throwing: error)
+        openContinuation?.resume(throwing: error)
+        closeContinuation?.resume(throwing: error)
+
+        do {
+            try transmit(ARM64GuestPTYFrame(type: .close, sessionID: sessionID))
+        } catch {
+            await finishSession(sessionID, error: error)
+        }
     }
 
     private func finishSession(_ sessionID: UInt32, error: Error? = nil, exitStatus: Int32? = nil) async {
