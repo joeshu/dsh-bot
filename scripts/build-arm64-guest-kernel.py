@@ -10,6 +10,7 @@ import json
 import os
 import pathlib
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,8 @@ BUILTIN_OPTIONS = (
     "EXT4_FS",
     "FUSE_FS",
     "UNIX98_PTYS",
+    "SERIAL_AMBA_PL011",
+    "SERIAL_AMBA_PL011_CONSOLE",
     "DEVTMPFS",
     "DEVTMPFS_MOUNT",
 )
@@ -72,6 +75,21 @@ def sha256_file(path: pathlib.Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def verify_static_aarch64_elf(path: pathlib.Path) -> None:
+    data = path.read_bytes()
+    if len(data) < 64 or data[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", data, 18)[0] != 183:
+        raise SystemExit("Guest PTY agent is not a little-endian AArch64 ELF64 executable")
+    program_offset = struct.unpack_from("<Q", data, 32)[0]
+    program_entry_size = struct.unpack_from("<H", data, 54)[0]
+    program_count = struct.unpack_from("<H", data, 56)[0]
+    if program_entry_size < 4 or program_offset + program_entry_size * program_count > len(data):
+        raise SystemExit("Guest PTY agent has an invalid ELF program header table")
+    for index in range(program_count):
+        entry = program_offset + index * program_entry_size
+        if struct.unpack_from("<I", data, entry)[0] == 3:  # PT_INTERP
+            raise SystemExit("Guest PTY agent must be statically linked for Alpine musl")
 
 
 def download(name: str, spec: dict[str, str], cache: pathlib.Path) -> pathlib.Path:
@@ -194,6 +212,31 @@ def main() -> None:
         kernel_release = run([*make_base, "-s", "kernelrelease"], env=make_env)
         config_output = output / f"config-{kernel_release}"
         shutil.copyfile(build / ".config", config_output)
+        agent_source = pathlib.Path(__file__).resolve().with_name("arm64-guest-pty-agent.c")
+        agent_output = output / "dsbot-guest-pty-agent"
+        agent_env = {**os.environ, "SOURCE_DATE_EPOCH": make_env["SOURCE_DATE_EPOCH"]}
+        subprocess.run(
+            [
+                f"{cross}gcc",
+                "-std=gnu11",
+                "-Os",
+                "-fstack-protector-strong",
+                "-D_FORTIFY_SOURCE=2",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-static",
+                "-s",
+                "-Wl,--build-id=none",
+                str(agent_source),
+                "-lutil",
+                "-o",
+                str(agent_output),
+            ],
+            env=agent_env,
+            check=True,
+        )
+        verify_static_aarch64_elf(agent_output)
         compressed = output / "vmlinuz-dsbot-arm64"
         with kernel.open("rb") as source_image, compressed.open("wb") as destination:
             with gzip.GzipFile(filename="", mode="wb", compresslevel=9, fileobj=destination, mtime=0) as zipped:
@@ -224,6 +267,16 @@ def main() -> None:
                 "builtInOptions": list(BUILTIN_OPTIONS),
                 "disabledOptions": list(DISABLED_OPTIONS),
             },
+            "guestPtyAgent": {
+                "filename": agent_output.name,
+                "bytes": agent_output.stat().st_size,
+                "sha256": sha256_file(agent_output),
+                "sourceFilename": agent_source.name,
+                "sourceSha256": sha256_file(agent_source),
+                "license": "MIT",
+                "protocolVersion": 1,
+                "staticAarch64Elf": True,
+            },
             "toolchain": {
                 "compiler": run([f"{cross}gcc", "--version"]).splitlines()[0],
                 "make": run(["make", "--version"]).splitlines()[0],
@@ -240,6 +293,7 @@ def main() -> None:
             f"Built from kernel.org Linux 6.18.60 with the Alpine ARM64 virt config from aports commit {APORTS_COMMIT}.\n"
             "Alpine's package patch series is not applied; ARM64 virt runtime drivers are enabled in the recorded config.\n"
             "Source URLs and SHA-512 values are recorded in kernel-build-manifest.json.\n"
+            "The bundled guest PTY agent is original DS Bot code under MIT; its source hash is recorded in the manifest.\n"
             "Build and configuration scripts are in the repository.\n"
         )
         checksums = []
