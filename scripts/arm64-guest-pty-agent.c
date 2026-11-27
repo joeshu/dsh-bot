@@ -122,7 +122,8 @@ static void log_message(const char *format, ...) {
     if (count <= 0) return;
     size_t length = (size_t)count;
     if (length >= sizeof(message)) length = sizeof(message) - 1;
-    (void)write(kernel_log_fd, message, length);
+    ssize_t written = write(kernel_log_fd, message, length);
+    (void)written;
 }
 
 static int append_serial_bytes(const unsigned char *bytes, size_t length) {
