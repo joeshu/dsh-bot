@@ -418,9 +418,9 @@ function apply(context) {
     }),
     defineTool({
       ...common, name: 'terminal_exec',
-      description: 'Run a command inside the persistent iOS Sandboxed Virtual Terminal (PTY) rooted at the workspace files/ directory. Retains cwd, env, and command history across calls. Supports pwd, cd, ls, ll, cat, head, tail, mkdir, touch, cp, mv, rm, find, grep, wc, echo, env, export, date, uname, whoami, node -e, python -c, and git status/diff/log.',
+      description: 'Run one command in the persistent iOS sandboxed virtual command interpreter rooted at files/. This is not a Linux shell or PTY. Retains cwd, env, and command history. Supports only pwd, cd, ls, ll, cat, head, tail, mkdir, touch, cp, mv, rm, find, grep, wc, echo, env, export, date, uname, whoami, node -e, python -c, and git status/diff/log. Every Bot command requires its own user approval, including in autoReview mode.',
       parameters: {
-        command: { type: 'string', required: true, description: 'Shell command to execute inside the sandboxed virtual terminal.' },
+        command: { type: 'string', required: true, description: 'One command for the limited sandboxed virtual command interpreter. It is not a shell command and requires one-time user approval.' },
       },
       timeoutMs: 70_000,
       async execute(args, exec) {

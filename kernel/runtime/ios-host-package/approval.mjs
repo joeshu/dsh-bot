@@ -136,7 +136,7 @@ function apply(ctx) {
       const approvalId = `dsh_${Date.now()}_${Math.random().toString(36).slice(2)}`
       const display = request.displayReason
       const localized = typeof display === 'string' ? display : display?.zh ?? display?.en
-      const maxSummary = toolName === 'run_code' ? 20_000 : 4_000
+      const maxSummary = toolName === 'run_code' ? 20_000 : toolName === 'terminal_exec' ? 8_500 : 4_000
       const summary = String(localized ?? request.reason ?? `DSH 需要执行 ${toolName || 'DSH 工具'}。`).slice(0, maxSummary)
       let settle
       const answer = new Promise((resolveAnswer) => { settle = resolveAnswer })

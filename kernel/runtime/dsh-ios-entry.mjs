@@ -22,7 +22,7 @@ import { SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persis
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { IPCRpcEndpoint } from './ipc-protocol.mjs'
 import { installCustomEndpointCompatFetch } from './ios-openai-compat-adapter.mjs'
-import { isMutatingVirtualTerminalCommand, parseEchoRedirection, splitTerminalSegments, tokenizeShellWords } from './ios-host-package/virtual-terminal-policy.mjs'
+import { parseEchoRedirection, splitTerminalSegments, tokenizeShellWords } from './ios-host-package/virtual-terminal-policy.mjs'
 
 const IPC_FD = Number(process.argv.find((arg) => arg.startsWith('--ipc-fd='))?.slice('--ipc-fd='.length))
 const WORKSPACE = process.argv.find((arg) => arg.startsWith('--workspace='))?.slice('--workspace='.length)
@@ -3515,7 +3515,7 @@ rpc.handle('side.cancel', async (params = {}) => {
   }
 })
 
-// ── iOS Experimental Desktop Capabilities: Sandboxed Virtual Terminal (PTY), Git Worktree & PR Tracker, and Cordis/Node DevTools Inspector ──
+// ── iOS Experimental Capabilities: Sandboxed Virtual Command Interpreter, Git Worktree & PR Tracker, and Cordis/Node DevTools Inspector ──
 
 import { copyFileSync, lstatSync, readFileSync, realpathSync, renameSync, rmSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
@@ -3817,7 +3817,7 @@ async function runSingleVirtualCommand(term, rawSegment) {
   switch (cmd) {
     case 'help':
       return [
-        'DS Bot iOS 沙盒持久终端 (Virtual PTY) 支持命令：',
+        'DS Bot iOS 沙盒虚拟命令解释器（不是 Shell/PTY）支持命令：',
         '  pwd, cd <dir>, ls [-la] [dir], cat <file>, head [-n N] <file>, tail [-n N] <file>',
         '  mkdir <dir>, touch <file>, cp <src> <dst>, mv <src> <dst>, rm [-r] <path>',
         '  find [dir] [-name pat], grep <pattern> [file/dir], wc <file>, echo <text>',
@@ -4147,7 +4147,7 @@ async function runSingleVirtualCommand(term, rawSegment) {
     }
 
     default:
-      throw new Error(`${cmd}: 未找到命令（输入 help 查看 iOS 沙盒持久终端支持的命令）`)
+      throw new Error(`${cmd}: 未找到命令（输入 help 查看 iOS 沙盒虚拟命令解释器支持的命令）`)
   }
 }
 
@@ -4185,36 +4185,38 @@ runtime.executeVirtualTerminal = async (args, exec) => {
   const sessionId = exec?.agent?.session?.id ?? 'default'
   const command = String(args?.command ?? '').trim()
   if (!command) throw new Error('terminal_exec requires a non-empty command')
-  const active = runtime.activeTurns.get(sessionId)
-  const isMutating = isMutatingVirtualTerminalCommand(command)
-  if (active) {
-    if (active.permissionMode === 'readOnly' && isMutating) {
-      throw new Error(`只读保护模式已拦截终端命令：${command}`)
-    }
-    // autoReview (沙盒免打扰): auto-allow all sandbox terminal commands without manual interruption
-    if (active.permissionMode !== 'autoReview' && isMutating) {
-      const outcome = await ctx.approval.request({
-        agent: exec.agent,
-        toolName: 'terminal_exec',
-        ...(exec.callId ? { callId: exec.callId } : {}),
-        reason: `Execute sandboxed virtual terminal command: ${command}`,
-        displayReason: `允许在 iOS 沙盒持久终端执行命令？\n$ ${command}`,
-        signal: exec.signal,
-      })
-      if (outcome !== 'allowed-once') throw new Error('User did not approve terminal_exec command')
-    }
-  } else if (isMutating && ctx.approval?.request) {
-    // Web UI session: request browser approval for mutating / python / rm commands
-    const outcome = await ctx.approval.request({
-      agent: exec.agent,
-      toolName: 'terminal_exec',
-      ...(exec.callId ? { callId: exec.callId } : {}),
-      reason: `Execute sandboxed virtual terminal command: ${command}`,
-      displayReason: `允许在 iOS 沙盒持久终端执行命令？\n$ ${command}`,
-      signal: exec.signal,
-    })
-    if (outcome !== 'allowed-once') throw new Error('User did not approve terminal_exec command')
+  if (command.length > 8_000 || Buffer.byteLength(command, 'utf8') > 32_000) {
+    throw new Error('terminal_exec command is too long to review safely (maximum 8,000 characters / 32 KiB UTF-8).')
   }
+  if (/[\x00-\x08\x09\x0b-\x1f\x7f]/.test(command)) {
+    throw new Error('terminal_exec commands may not contain invisible control characters or tabs.')
+  }
+  if (/[\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/u.test(command)) {
+    throw new Error('terminal_exec commands may not contain invisible or bidirectional Unicode controls.')
+  }
+  if (!exec?.callId) {
+    throw new Error('terminal_exec requires a tool-call ID so the command approval can be audited.')
+  }
+  const active = runtime.activeTurns.get(sessionId)
+  if (active?.done) throw new Error('The Bot turn is already closed.')
+  if (active?.permissionMode === 'readOnly') {
+    throw new Error('只读保护模式已禁用终端命令；请使用受限的只读工作区工具。')
+  }
+  if (typeof ctx.approval?.request !== 'function') {
+    throw new Error('terminal_exec is disabled because a user approval surface is unavailable.')
+  }
+  // Every model-generated command requires a separate, one-time human decision.
+  // This deliberately ignores autoReview: full-shell syntax cannot be classified
+  // safely by parsing command strings, and approval must bind to this exact call.
+  const outcome = await ctx.approval.request({
+    agent: exec.agent,
+    toolName: 'terminal_exec',
+    callId: exec.callId,
+    reason: `Execute sandboxed virtual command: ${command}`,
+    displayReason: `每条 Bot 命令都必须单独审批。将执行以下完整命令：\n${command}`,
+    signal: exec.signal,
+  })
+  if (outcome !== 'allowed-once') throw new Error('User did not approve terminal_exec command')
   const res = await executeVirtualTerminalCommand(sessionId, command)
   return { output: `[cwd: ${res.cwd}] (exit ${res.exitCode})\n${res.output || '(done)'}` }
 }

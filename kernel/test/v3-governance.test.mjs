@@ -192,7 +192,7 @@ test('v3 security: web_fetch blocks IPv4/IPv6/mapped-IPv6/CGNAT/link-local SSRF,
   }
 })
 
-test('v3 security: recursive symlink jail, terminal_exec 3-tier policy, plugin binary/SSRF/audit hardening, and WKDownloadDelegate', () => {
+test('v3 security: recursive symlink jail, per-command terminal approval, plugin binary/SSRF/audit hardening, and WKDownloadDelegate', () => {
   for (const rel of [
     'ios-host-package/sandbox-fs.mjs',
     'ios-host-package/ios-directory-picker-browse.mjs',
@@ -204,8 +204,9 @@ test('v3 security: recursive symlink jail, terminal_exec 3-tier policy, plugin b
     assert.match(src, /suffix\.unshift\(basename\(current\)\)/, `${rel} must recursively canonicalize nonexistent symlink ancestors`)
   }
   const entry = readFileSync(join(runtimeDir, 'dsh-ios-entry.mjs'), 'utf8')
-  assert.match(entry, /if \(active\.permissionMode !== 'autoReview' && isMutating\)/)
-  assert.match(entry, /else if \(isMutating && ctx\.approval\?\.request\)/)
+  assert.match(entry, /Every model-generated command requires a separate, one-time human decision/)
+  assert.match(entry, /active\?\.permissionMode === 'readOnly'/)
+  assert.match(entry, /typeof ctx\.approval\?\.request !== 'function'/)
   const pm = readFileSync(join(runtimeDir, 'ios-plugin-manager.mjs'), 'utf8')
   assert.match(pm, /isBlockedPluginHost/)
   assert.match(pm, /\['\.node', '\.dylib', '\.so', '\.dll', '\.exe'\]/)

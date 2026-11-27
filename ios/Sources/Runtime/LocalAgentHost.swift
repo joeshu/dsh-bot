@@ -3370,7 +3370,7 @@ public final class LocalAgentHost: ObservableObject {
             return
         }
 
-        if botMode == "autoReview" {
+        if botMode == "autoReview" && lowerTool != "terminal_exec" {
             autoReviewLog.insert("[\(Date().formatted(date: .omitted, time: .shortened))] 沙盒免打扰放行：\(tool)", at: 0)
             if autoReviewLog.count > 40 { autoReviewLog = Array(autoReviewLog.prefix(40)) }
             Task { await respondToApproval(id: id, approved: true) }
@@ -3386,12 +3386,12 @@ public final class LocalAgentHost: ObservableObject {
     }
 
     public func approveAndSwitchToAutoReview(id: String) async {
-        if let approval = pendingApprovals.first(where: { $0.id == id }) {
-            let rootBotId = resolveAddress(approval.sessionId)?.botID ?? approval.sessionId
-            if let index = bots.firstIndex(where: { $0.id == rootBotId }) {
-                bots[index].permissionMode = "autoReview"
-                persistWorkspace()
-            }
+        guard let approval = pendingApprovals.first(where: { $0.id == id }),
+              approval.tool.lowercased() != "terminal_exec" else { return }
+        let rootBotId = resolveAddress(approval.sessionId)?.botID ?? approval.sessionId
+        if let index = bots.firstIndex(where: { $0.id == rootBotId }) {
+            bots[index].permissionMode = "autoReview"
+            persistWorkspace()
         }
         await respondToApproval(id: id, approved: true)
     }

@@ -334,8 +334,8 @@ public struct ToolsHubTabView: View {
                         toolRow(
                             icon: "terminal.fill",
                             color: .teal,
-                            title: "沙盒虚拟终端 (PTY)",
-                            subtitle: "在 /workspace 安全执行 shell、node、python 与目录巡检"
+                            title: "沙盒虚拟命令台",
+                            subtitle: "在 /workspace 使用受限解释器运行 Node、Python 和目录命令；当前不是 Linux shell/PTY"
                         )
                     }
 

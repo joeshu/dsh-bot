@@ -602,7 +602,7 @@ public struct DSHPendingApprovalCard: View {
     }
 
     private var canUpgradeToSandboxAuto: Bool {
-        true
+        approval.tool.lowercased() != "terminal_exec"
     }
 
     private var riskBadge: (label: String, color: Color) {
@@ -633,7 +633,21 @@ public struct DSHPendingApprovalCard: View {
                 Spacer()
                 DSStatusBadge(riskBadge.label, color: riskBadge.color)
             }
-            if approval.tool == "run_code" || approval.tool == "python_job_start" {
+            if approval.tool.lowercased() == "terminal_exec" {
+                Text("Bot 生成的每条命令都需单独批准；「沙盒免打扰」不会跳过终端审批。请完整检查下方命令。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                ScrollView(.vertical) {
+                    Text(approval.summary)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 280)
+                .padding(8)
+                .background(DSTheme.surfacePrimary.opacity(0.75))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            } else if approval.tool == "run_code" || approval.tool == "python_job_start" {
                 Text(approval.tool == "run_code"
                      ? "本次运行将在本机隔离 Python Worker 中执行；嵌套文件修改、联网等工具仍会按各自规则审批。"
                      : "本次运行将在本机隔离 Python Worker 中执行，作为后台任务最多运行 120 秒，不会访问应用文件、网络、进程、MCP 或 DSH 工具。App 切到后台后是否继续运行由 iOS 决定。")

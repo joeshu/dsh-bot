@@ -92,10 +92,10 @@ public struct ExperimentalFeaturesView: View {
                     featureRow(
                         icon: "terminal.fill",
                         color: .green,
-                        title: "持久终端 (沙盒 PTY)",
-                        subtitle: "iOS 进程内持久虚拟终端，保留 cwd 与环境变量，支持文件指令、Node VM、离线 Python 与 Git 状态。",
-                        badge: "iOS 适配",
-                        status: "打开终端"
+                        title: "持久虚拟命令台",
+                        subtitle: "受限命令解释器；不是 Linux Shell/PTY。保留 cwd 与环境变量，支持工作区命令、Node、离线 Python 与 Git 状态。",
+                        badge: "虚拟解释器",
+                        status: "打开命令台"
                     )
                 }
 
@@ -181,7 +181,7 @@ public struct VirtualTerminalFeatureView: View {
     @State private var lines: [TerminalLineEntry] = [
         TerminalLineEntry(
             isCommand: false,
-            text: "DS Bot iOS Sandboxed Virtual PTY (Node + Pyodide 3.13 + Virtual Git)\n输入 help 查看支持命令，所有文件操作均限制在沙盒工作区 /workspace (files/) 内。",
+            text: "DS Bot iOS 沙盒虚拟命令台（Node + Pyodide 3.13 + Virtual Git）\n这不是 Linux Shell/PTY；只支持 help 列出的命令，文件操作限制在 /workspace (files/) 内。Bot 每条命令都需单独审批。",
             isError: false
         )
     ]
@@ -271,7 +271,7 @@ public struct VirtualTerminalFeatureView: View {
             .padding(.vertical, 10)
             .background(Color(.secondarySystemBackground))
         }
-        .navigationTitle("持久终端 (沙盒 PTY)")
+        .navigationTitle("虚拟命令台")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {

@@ -31,7 +31,7 @@
 - **前台 Schedule**：`schedule_create`、`schedule_list`、`schedule_view`、`schedule_history`、`schedule_edit` 只挂在原生标准/创造 Bot 的 Agent scope；任务目标固定为当前 Bot，按 `involvedSessionIds` 限定读写，私密任务不会出现在其他 Bot 的列表。创建、编辑、暂停、恢复和删除只按用户明确要求执行。原生任务页支持编辑标题/提醒内容/RRULE，并分页展示 DSH 保存的投递回执。任务持久化在 DSH SQLite storage-domain；Host 前台运行时按 recurrence 投递，重启后使用官方 catch-up。iOS 挂起或终止时不保证准点执行。轻量模式与 Web preset 不挂这些工具。
 - **网络资料**：`web_search`、`web_fetch` 按当前设置和审批策略查询资料。
 
-当前仍没有终端、Git 命令、构建器、调试器或任意 shell。离线本机 Python/NumPy 同时用于独立 `python_exec` 与 DSH PTC `run_code`；两者共用进程级单 Worker 槽，独立工具执行 45 秒，PTC 执行最多 120 秒。取消/挂起/运行时关闭会终止 Worker。工作区读写由独立的沙箱工具承担，Python 本身不直接访问 App 文件和网络。
+当前命令台是受限的 JavaScript 命令解释器，可执行少量工作区命令及离线 Python/Node 调用；它不是 POSIX shell、Linux 用户空间或 PTY，不能运行任意 ELF 程序。Bot 生成的每条 `terminal_exec` 命令显示完整内容并逐条等待用户批准，即使 Bot 处于 `autoReview` 也不跳过；只读模式禁用 Bot 终端工具。原生 UI 用户手动输入仍视作直接用户操作。Python/NumPy 独立工具和 DSH PTC `run_code` 共用进程级单 Worker 槽，独立工具执行 45 秒，PTC 执行最多 120 秒。取消/挂起/运行时关闭会终止 Worker。工作区读写由独立的沙箱工具承担，Python 本身不直接访问 App 文件和网络。
 
 ## dsh-purge-safe iOS 适配与权限
 
@@ -57,7 +57,7 @@ iOS 没有 shell、PTY、桌面进程或可写 App 安装目录。因此 `/purge
 | 后台 Jobs | `dsh-jobs` 是注册表契约；`dsh-jobs-local` 保存进程内任务与有界输出，`dsh-tool-jobs` 提供 `job_list`、`job_output`、`job_kill`、owner 隔离和完成通知。生产方通过 `JobSpec.run()` 注册任务；官方 desktop 常见 shell/bun 生产方不适用于 iOS。 | 已挂官方 Jobs registry/control 插件。标准/创造模式只注册 `python_job_start`：完整 Python 源码逐次审批，独立离线 Python/NumPy Worker，最多 120 秒、每 Bot 并发 1、全 App 同时最多运行 1 个 Python Worker、输出 128 KiB；无 App 文件、网络、进程、MCP 或 DSH 工具权限。Bot 菜单提供 owner-scoped 任务列表、输出读取与取消。私密 Bot 不启用，转为私密时终止该会话任务。DSH 注册和完成事件进入会话日志，但 registry 与输出 ring 是进程内状态，Host 退出或 Bot 被释放时取消；原生 Bot 将 Jobs 完成通知留在收件箱并由下一次用户输入带入，避免未关联原生流式 turn 的后台模型请求；嵌入 Web 保留 DSH 默认唤醒行为。App 切后台时保留有 Jobs 记录的 owner，并把原生 DSH followup 转为不唤醒的收件箱注入；iOS 仍可挂起或终止 Host，故执行仅为尽力而为且不跨重启恢复。 |
 | Schedule / 定时 Agent 指令 | `dsh-schedule` 将任务保存到 storage domain（可用 SQLite），运行时以 `setTimeout` 驱动；Host 必须运行才能投递，重启后重复任务只投递最近一次错过的发生。官方 `dsh-tool-schedule` 会列出 Host 全部任务，并可按 ID 编辑任意任务。 | 已挂官方持久服务并提供 iOS 专用 Bot 工具适配层，不使用全 Host 的官方工具。自定义工具按任务 involved Session 限权，轻量模式与 Web preset 不挂载；Web Remote API 和自动化页仍封锁，因为 Remote Schedule 没有 task-level resource。只承诺 Host 前台运行及恢复后的官方 catch-up，不承诺 iOS 后台准点执行。 |
 | Web 插件写管理 | 官方 `dsh-plugin-manager` 写 profile/lockfile，调用 pnpm 并运行依赖安装脚本；受 Host 平台能力和包管理器约束。 | Web 的插件 inventory 保持只读。将来若做 Web 管理，只能把请求送到 Swift 宿主管理器，复用原生包校验、受保护插件规则、profile 原子改写、运行时重启/回滚及逐项审批；禁止 Web 直接写 profile 或启用桌面 pnpm 管理器。 |
-| 终端 / PTY | 桌面 Host 的 shell 进程、终端和工作目录语义 | 不支持本地终端。远程开发环境可通过受信 Remote MCP 暴露窄化的 Git、测试或构建工具，并在连接器级授权。 |
+| 终端 / PTY | 独立 shell 进程、PTY 生命周期、工作目录、交互输入输出及取消 | 当前仅有受限虚拟解释器。ARM64 Linux 目标采用 iOS TCI QEMU（不依赖 JIT/HVF），headless 串口终端加 guest PTY agent；Bot 与 Web 共用带 owner/session 认证的流。每条模型命令必须逐次审批；命令文本不能用于静态推断只读。iOS 挂起后记录 guest 状态，恢复时重连，App 终止后恢复磁盘并重建 PTY 会话。 |
 
 ### 私密会话隔离实现依据
 
@@ -75,7 +75,15 @@ DSH `dsh-api-remote-access` 只约束 Typert Gateway Remote API。它能在 `ses
 4. **P1 Schedule 后台体验**：原生 Bot 前台 Schedule、规则编辑、投递回执和任务级隔离已接通。剩余是可取消且有截止时间的 best-effort `BGTask` 唤醒/通知设计，以及更明确的漏投与恢复诊断。上游 Schedule 是 Host-wide 单计时器；在后台唤醒前还要让它跳过已锁定的私密 Session，避免设备锁定时自动执行私密任务。BGTask 仍不能承诺准点。
 5. **P2 Jobs 持久执行**：基础 DSH Jobs 已接入并提供离线 Python 生产方、原生管理页与完整 owner 隔离。若产品需要 Host 重启后恢复或系统挂起时持续运行，需要另行实现 Swift 持久 task broker 与 iOS BackgroundTasks/通知适配，并保留目前无 shell 的生产方边界；iOS 系统调度不承诺准点。
 6. **P2 Web 插件写管理**：Web 页面保持只读，直到原生宿主授权/审查/回滚接口闭环。
-7. **P1 ARM64 Linux 终端**：已落地可复现的 Alpine ARM64 serial-shell bootstrap 镜像构建，内核与根文件系统按 SHA-256 固定，并为 Alpine 包记录 SPDX license 与源码仓库版本；该产物目前只作为独立 CI artifact。后续必须依序完成：精简到仅 aarch64-softmmu 的 iOS TCI/QEMU 后端与 GPL 源码义务审查；可恢复的持久 guest 磁盘；Bot/Web 与原生 UI 共用的受认证 PTY 流及取消/后台恢复；将既有 files/ 工作区安全共享进 guest；主机侧联网拉取并验证签名 APK、guest 离线安装、工具目录选择 UI；最后再将产物纳入 IPA 并做设备验收。终端 Bot 调用在可证明策略前必须逐条显示完整命令并经用户批准，不能依赖 shell 字符串静态分析推断只读。
+7. **P1 ARM64 Linux 终端**：已落地可复现的 Alpine ARM64 serial-shell bootstrap 镜像构建，内核与根文件系统按 SHA-256 固定；该产物目前只作为独立 CI artifact。Bot 命令现已要求逐条人工审批，避免 `autoReview` 绕过命令审查。下一步依序完成：仅编译 `aarch64-softmmu` 的 iOS TCI/QEMU、最小动态依赖与 GPL 源码/许可证发布；构建将 virtio-blk/ext4 等所需驱动内置的 guest kernel（当前 Alpine virt kernel 配置把这些驱动编为模块，而 bootstrap 没有模块目录）；建立原子写入且有空间配额的持久 guest 磁盘；以 guest PTY agent 提供真实 PTY、输出回压、取消和 app 恢复语义；通过受认证的宿主文件代理映射 `files/`（当前 QEMU 的 9P/virtfs 在 iOS host 构建中不可用，不能直接假设桌面共享方案可移植）；给 Bot、Web 和原生 UI 提供同一受 owner/session 限制的实时流；实现签名 APK 的主机侧按需下载与 guest 离线安装、工具选择目录和卸载回滚；最后才纳入 IPA 并做物理设备验收。
+
+### ARM64 终端体积与工具策略估算
+
+- **已测引导产物**：kernel、配置与 rootfs 合计 14,605,280 bytes（13.93 MiB），独立于 IPA。它没有 QEMU，也不是可持久安装工具的系统盘。
+- **规划预算**：只保留一个 aarch64 TCI 目标、serial/PTY 和最小 GLib/pixman/ucontext 运行依赖，预计给 IPA 增加约 **35–80 MiB**（含 14 MiB guest payload；构建前估值，必须以首个精简 iOS framework 构建的 strip 后大小和 IPA 差值替换）。对照：UTM SE v5.0.9 的公开 IPA 为 237,418,770 bytes，包含通用虚拟机 UI、多架构及图形相关功能，只作宽配置参考，不能视为本项目大小。
+- **设备数据空间**：guest 系统盘默认规划 256 MiB，按需扩至 2 GiB；这部分在 App Documents 中增长，不计入 IPA。工具本身下载至签名 APK 缓存后离线安装，安装占用由目录按 APK 下载大小和包内 `Installed-size` 展示。工具组合和构建器依赖可使占用从数 MiB 增至数百 MiB，因此不预装完整开发套件。
+- **首批工具目录**：基础 BusyBox/APK；Shell（Bash、coreutils、findutils、grep、sed）；文件/JSON（jq、tree）；网络诊断（curl、wget、bind-tools，默认 guest 网络仍关闭）；Git/SSH；Python；编译器与 `make`。选择工具前显示依赖闭包、下载总量、磁盘增量、版本和签名状态；“需要时安装”与手动勾选共用同一 package plan。没有用户选择时不下载可选工具。
+- **估算不确定项**：精简 QEMU 的真实 IPA 增量、iOS 上 TCI 吞吐/内存，以及 Alpine 内核模块体积都尚未实测。CI 的下一道门应先报告 QEMU framework 的架构、动态依赖、strip 后字节数和许可清单；达不到启动/内存/尺寸目标时不要把后端塞入正式 IPA。
 
 ## 代码位置
 
