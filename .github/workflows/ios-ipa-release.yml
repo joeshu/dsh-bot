@@ -100,9 +100,17 @@ jobs:
               echo "Tag $TAG already exists." >&2
               exit 1
             fi
+            if jq -e '.releaseEligible == true and .runtime.node.releaseEligible == true' candidate/ipa-report.json > /dev/null; then
+              printf '%s\n' '内嵌 Node.js + DSH 0.2.2-rc.5 iOS 预发布候选。NodeMobile 已达到报告中的安全版本门槛。该 IPA 尚未签名；正式发布前仍需重新签名，并在 iOS 16.4 与当前 iOS 真机完成安装/升级、离线启动、流式对话、取消/后台恢复、会话与 Keychain 恢复、工具批准/拒绝及插件正常/故障恢复验收，再提交对应签名 IPA 的 SHA-256 和设备报告。' \
+                > "$RUNNER_TEMP/release-notes.md"
+            else
+              BLOCKER="$(jq -r '.runtime.node.releaseBlocker // "NodeMobile release security gate is not satisfied."' candidate/ipa-report.json)"
+              printf '内嵌 Node.js + DSH 0.2.2-rc.5 iOS 预发布候选。NodeMobile 尚未达到报告中的安全版本门槛：%s。只供审核和真机探测；达到门槛并通过真机验收后才能正式发布。\n' "$BLOCKER" \
+                > "$RUNNER_TEMP/release-notes.md"
+            fi
             gh release create "$TAG" "$IPA" candidate/ipa-report.json candidate/SHA256SUMS.txt candidate/source.json \
               --target "$CANDIDATE_COMMIT" --title "DS Bot iOS $TAG" --prerelease --latest=false \
-              --notes "内嵌 Node.js + DSH 0.2.2-rc.5 预览候选。当前 NodeMobile 版本尚未达到公开发布安全门槛，只供审核和真机探测。"
+              --notes-file "$RUNNER_TEMP/release-notes.md"
           else
             jq -e '.releaseEligible == true and .runtime.node.releaseEligible == true' candidate/ipa-report.json > /dev/null || {
               echo "Candidate runtime has not passed the current Node security release gate." >&2
