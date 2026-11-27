@@ -22,6 +22,7 @@ import { SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persis
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { IPCRpcEndpoint } from './ipc-protocol.mjs'
 import { installCustomEndpointCompatFetch } from './ios-openai-compat-adapter.mjs'
+import { isMutatingVirtualTerminalCommand, parseEchoRedirection, splitTerminalSegments, tokenizeShellWords } from './ios-host-package/virtual-terminal-policy.mjs'
 
 const IPC_FD = Number(process.argv.find((arg) => arg.startsWith('--ipc-fd='))?.slice('--ipc-fd='.length))
 const WORKSPACE = process.argv.find((arg) => arg.startsWith('--workspace='))?.slice('--workspace='.length)
@@ -2386,8 +2387,7 @@ rpc.handle('runtime.health', async () => {
 })
 
 rpc.handle('session.list', async () => {
-  const sessions = (await runtime.persistence.list())
-    .filter((item) => item.header.id.startsWith('ios:'))
+  const sessions = (await runtime.persistence.list({ scope: 'ios', orderBy: 'activity' }))
     .map((item) => {
       const botId = botIdFromSession(item.header.id)
       return {
@@ -2404,24 +2404,13 @@ rpc.handle('session.list', async () => {
 })
 
 rpc.handle('web.sessions.list', async () => {
-  const all = await runtime.persistence.list()
-  const byId = new Map(all.map((item) => [item.header.id, item]))
-  const hasPrivateAncestor = (sessionId) => {
-    let cursor = sessionId
-    const seen = new Set()
-    for (let depth = 0; cursor && depth < 32 && !seen.has(cursor); depth += 1) {
-      seen.add(cursor)
-      if (cursor.startsWith('ios:') && isPrivateBotOrThread(botIdFromSession(cursor))) return true
-      if (isPrivateBotOrThread(cursor)) return true
-      cursor = byId.get(cursor)?.header?.parentSession ?? ''
-    }
-    return false
-  }
-  const sessions = all
-    .filter((item) => !item.header.id.startsWith('ios:') && (item.eventCount ?? 0) > 0)
-    .filter((item) => !item.header.parentSession && item.header.origin !== 'subagent')
-    .filter((item) => !hasPrivateAncestor(item.header.id))
-    .map((item) => ({
+  const all = await runtime.persistence.list({
+    scope: 'web-root',
+    orderBy: 'activity',
+    limit: 80,
+    excludeRootIds: [...runtime.privateBotIds],
+  })
+  const sessions = all.map((item) => ({
       sessionId: item.header.id,
       title: item.title ?? '',
       createdAt: item.header.createdAt,
@@ -2429,8 +2418,6 @@ rpc.handle('web.sessions.list', async () => {
       lastActivityAt: item.lastActivityAt ?? item.header.createdAt,
       lastMessagePreview: item.lastMessagePreview ?? '',
     }))
-    .sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0))
-    .slice(0, 80)
   return { sessions }
 })
 
@@ -3615,28 +3602,6 @@ function resolveInsideWorkspaceFiles(virtualCwd, targetPath = '.') {
   }
 }
 
-function tokenizeShellWords(input) {
-  const tokens = []
-  let current = ''
-  let quote = null
-  for (let i = 0; i < input.length; i++) {
-    const ch = input[i]
-    if (quote) {
-      if (ch === quote) quote = null
-      else if (ch === '\\' && quote === '"' && i + 1 < input.length) current += input[++i]
-      else current += ch
-    } else if (ch === '"' || ch === "'") {
-      quote = ch
-    } else if (/\s/.test(ch)) {
-      if (current) { tokens.push(current); current = '' }
-    } else {
-      current += ch
-    }
-  }
-  if (current) tokens.push(current)
-  return tokens
-}
-
 function walkWorkspaceTree(dirAbs, baseAbs = resolve(WORKSPACE_FILES), out = [], opts = {}, depth = 0) {
   const includeContent = opts.includeContent !== false
   if (depth > MAX_WALK_DEPTH || out.length >= MAX_WALK_FILES) return out
@@ -4041,13 +4006,12 @@ async function runSingleVirtualCommand(term, rawSegment) {
     }
 
     case 'echo': {
-      const redirectIdx = args.findIndex((a) => a === '>' || a === '>>')
-      if (redirectIdx >= 0 && args[redirectIdx + 1]) {
-        const op = args[redirectIdx]
-        const text = args.slice(0, redirectIdx).join(' ') + '\n'
-        const target = resolveInsideWorkspaceFiles(term.cwd, args[redirectIdx + 1])
+      const redirection = parseEchoRedirection(line)
+      if (redirection) {
+        const text = redirection.content + '\n'
+        const target = resolveInsideWorkspaceFiles(term.cwd, redirection.path)
         mkdirSync(dirname(target.abs), { recursive: true })
-        const existing = op === '>>' && existsSync(target.abs) ? readFileSync(target.abs, 'utf8') : ''
+        const existing = redirection.append && existsSync(target.abs) ? readFileSync(target.abs, 'utf8') : ''
         writeFileSync(target.abs, existing + text, 'utf8')
         return ''
       }
@@ -4107,6 +4071,9 @@ async function runSingleVirtualCommand(term, rawSegment) {
 
     case 'node':
     case 'js': {
+      if (cmd === 'node' && (args[0] === '--test' || args[0]?.startsWith('--test-'))) {
+        throw new Error('node --test is disabled: iOS has no isolated Node test runner.')
+      }
       let code = ''
       if (cmd === 'node' && (args[0] === '-e' || args[0] === '-p')) {
         code = args.slice(1).join(' ')
@@ -4124,17 +4091,7 @@ async function runSingleVirtualCommand(term, rawSegment) {
         if (res?.ok === false) throw new Error(String(res.error || 'JavaScript 执行失败'))
         return String(res?.output ?? '')
       }
-      const logs = []
-      const sandboxCtx = vm.createContext(Object.create(null), { codeGeneration: { strings: false, wasm: false } })
-      sandboxCtx.__emit = (line) => { if (logs.length < 200) logs.push(String(line).slice(0, 2000)) }
-      vm.runInContext(
-        'globalThis.console = Object.freeze({ log: (...a) => __emit(a.map(String).join(" ")), error: (...a) => __emit(a.map(String).join(" ")) });',
-        sandboxCtx,
-        { timeout: 500 }
-      )
-      const result = vm.runInContext(code, sandboxCtx, { timeout: 3_000 })
-      if (result !== undefined) logs.push(typeof result === 'string' ? result : JSON.stringify(result, null, 2))
-      return logs.join('\n')
+      throw new Error('Native QuickJS bridge is unavailable; JavaScript execution failed closed.')
     }
 
     case 'python':
@@ -4194,31 +4151,6 @@ async function runSingleVirtualCommand(term, rawSegment) {
   }
 }
 
-function splitTerminalSegments(line) {
-  const segments = []
-  let current = ''
-  let quote = ''
-  for (let i = 0; i < line.length; i += 1) {
-    const ch = line[i]
-    if (quote) {
-      current += ch
-      if (ch === '\\' && quote === '"' && i + 1 < line.length) { current += line[++i]; continue }
-      if (ch === quote) quote = ''
-      continue
-    }
-    if (ch === '"' || ch === "'") { quote = ch; current += ch; continue }
-    if (ch === ';' || (ch === '&' && line[i + 1] === '&')) {
-      if (ch === '&') i += 1
-      if (current.trim()) segments.push(current.trim())
-      current = ''
-      continue
-    }
-    current += ch
-  }
-  if (current.trim()) segments.push(current.trim())
-  return segments
-}
-
 async function executeVirtualTerminalCommand(sessionId, commandLine) {
   const term = getVirtualTerminalSession(sessionId)
   const raw = String(commandLine ?? '').trim()
@@ -4254,7 +4186,7 @@ runtime.executeVirtualTerminal = async (args, exec) => {
   const command = String(args?.command ?? '').trim()
   if (!command) throw new Error('terminal_exec requires a non-empty command')
   const active = runtime.activeTurns.get(sessionId)
-  const isMutating = /\b(rm|mv|cp|mkdir|touch|export|commit|node|js|python|python3)\b|>/.test(command)
+  const isMutating = isMutatingVirtualTerminalCommand(command)
   if (active) {
     if (active.permissionMode === 'readOnly' && isMutating) {
       throw new Error(`只读保护模式已拦截终端命令：${command}`)

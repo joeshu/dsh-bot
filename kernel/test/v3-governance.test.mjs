@@ -680,7 +680,9 @@ test('v3 governance: phase 3/4 hardening (abortable python, bounded gunzip, cach
   assert.match(sqlite, /stmt\(sql\)/)
   assert.doesNotMatch(sqlite, /owner\.db\.prepare\(/)
   const entry = readFileSync(join(runtimeDir, 'dsh-ios-entry.mjs'), 'utf8')
-  assert.match(entry, /function splitTerminalSegments/)
+  assert.match(entry, /splitTerminalSegments/)
+  const terminalPolicy = readFileSync(join(runtimeDir, 'ios-host-package', 'virtual-terminal-policy.mjs'), 'utf8')
+  assert.match(terminalPolicy, /function splitTerminalSegments/)
   assert.match(entry, /Avoid reading every file into memory/)
 })
 

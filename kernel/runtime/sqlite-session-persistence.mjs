@@ -280,6 +280,7 @@ export class SQLiteSessionPersistence extends SessionPersistence {
       if (!sessionColumns.has('last_activity_at')) db.exec('ALTER TABLE sessions ADD COLUMN last_activity_at INTEGER')
       if (!sessionColumns.has('last_message_preview')) db.exec('ALTER TABLE sessions ADD COLUMN last_message_preview TEXT')
       if (!sessionColumns.has('title')) db.exec('ALTER TABLE sessions ADD COLUMN title TEXT')
+      db.exec('CREATE INDEX IF NOT EXISTS session_activity_order_idx ON sessions(COALESCE(last_activity_at, created_at) DESC, id ASC)')
       this.backfillSessionSummaries()
       this.backfillSessionTitles()
       this.backfillSessionAttachments()
@@ -467,8 +468,53 @@ export class SQLiteSessionPersistence extends SessionPersistence {
 
   async list(options = {}) {
     abortIfRequested(options.signal)
-    return this.db.prepare(`SELECT id, header_json, next_seq, revision,
-      last_activity_at, last_message_preview, title FROM sessions ORDER BY created_at DESC, id`).all()
+    const where = []
+    const params = []
+    if (options.scope === 'ios') {
+      where.push("id GLOB 'ios:*'")
+    } else if (options.scope === 'web-root') {
+      where.push("id NOT GLOB 'ios:*'")
+      where.push('next_seq > 0')
+      where.push("(json_extract(header_json, '$.parentSession') IS NULL OR json_extract(header_json, '$.parentSession') = '')")
+      where.push("COALESCE(json_extract(header_json, '$.origin'), '') <> 'subagent'")
+    } else if (options.scope !== undefined && options.scope !== 'all') {
+      throw new TypeError('Invalid session list scope')
+    }
+    if (options.excludeRootIds !== undefined) {
+      if (!Array.isArray(options.excludeRootIds) || options.excludeRootIds.length > 200
+          || options.excludeRootIds.some((id) => typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,80}$/.test(id))) {
+        throw new TypeError('Invalid private root session IDs')
+      }
+      for (const id of options.excludeRootIds) {
+        where.push('id <> ? AND id NOT GLOB ?')
+        params.push(id, id + ':*')
+      }
+    }
+    if (options.before !== undefined) {
+      const { activityAt, id } = options.before ?? {}
+      if (options.orderBy !== 'activity' || !Number.isSafeInteger(activityAt) || activityAt < 0
+          || typeof id !== 'string' || !id || id.length > 200) {
+        throw new TypeError('Invalid activity cursor')
+      }
+      where.push('(COALESCE(last_activity_at, created_at) < ? OR (COALESCE(last_activity_at, created_at) = ? AND id > ?))')
+      params.push(activityAt, activityAt, id)
+    }
+    let limitSql = ''
+    if (options.limit !== undefined) {
+      if (!Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 5_000) {
+        throw new RangeError('Session list limit must be between 1 and 5,000')
+      }
+      limitSql = ' LIMIT ?'
+      params.push(options.limit)
+    }
+    let order
+    if (options.orderBy === 'activity') order = 'COALESCE(last_activity_at, created_at) DESC, id ASC'
+    else if (options.orderBy === undefined || options.orderBy === 'created') order = 'created_at DESC, id ASC'
+    else throw new TypeError('Invalid session list ordering')
+    const query = 'SELECT id, header_json, next_seq, revision, last_activity_at, last_message_preview, title FROM sessions '
+      + (where.length ? 'WHERE ' + where.join(' AND ') + ' ' : '')
+      + 'ORDER BY ' + order + limitSql
+    return this.stmt(query).all(...params)
       .map((row) => snapshot(row))
   }
 

@@ -597,6 +597,24 @@ export async function settlePluginRevision(profileDir, rollback) {
       await rm(backupPath, { recursive: true, force: true }).catch(() => {})
     }
   }
+  const configBackup = revision.configBackup && typeof revision.configBackup === 'object'
+    ? revision.configBackup : undefined
+  if (configBackup) {
+    const configPath = resolve(profileDir, 'ios-plugin-configs.json')
+    const backupPath = resolve(String(configBackup.path ?? ''))
+    const targetPath = resolve(String(configBackup.target ?? ''))
+    assertInside(profileDir, backupPath)
+    if (targetPath !== configPath) throw new Error('插件配置恢复目标无效')
+    if (rollback) {
+      if (configBackup.existed === true) {
+        await rename(backupPath, targetPath)
+      } else {
+        await rm(targetPath, { force: true })
+      }
+    } else {
+      await rm(backupPath, { force: true }).catch(() => {})
+    }
+  }
   if (rollback) {
     await writeManifest(profileDir, revision.previous)
     if (packageName(revision.added)) {
@@ -1446,13 +1464,20 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
     try {
       const parsed = JSON.parse(await readFile(pluginConfigPath, 'utf8'))
       return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
-    } catch {
-      return {}
+    } catch (error) {
+      if (error?.code === 'ENOENT') return {}
+      throw error
     }
   }
 
   async function writePluginConfigs(configs) {
-    await writeFile(pluginConfigPath, `${JSON.stringify(configs, null, 2)}\n`, { mode: 0o600 })
+    const temp = `${pluginConfigPath}.${randomUUID()}.tmp`
+    try {
+      await writeFile(temp, `${JSON.stringify(configs, null, 2)}\n`, { mode: 0o600, flush: true })
+      await rename(temp, pluginConfigPath)
+    } finally {
+      await rm(temp, { force: true })
+    }
   }
 
   async function installLocalPath(resolved) {
@@ -1501,7 +1526,8 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
     const pkgName = String(name ?? '')
     validatePackageName(pkgName)
     const configs = await readPluginConfigs()
-    const config = configs[pkgName] && typeof configs[pkgName] === 'object' ? configs[pkgName] : {}
+    const config = Object.hasOwn(configs, pkgName) && configs[pkgName] && typeof configs[pkgName] === 'object'
+      ? configs[pkgName] : {}
     return { name: pkgName, config }
   })
   async function resolvePluginCordisEntryId(pkgName) {
@@ -1515,28 +1541,47 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
         assertInside(pkgDir, patchAbs)
         const patchText = await readFile(patchAbs, 'utf8')
         const idMatch = patchText.match(/^\s*-?\s*id:\s*['"]?([A-Za-z0-9._/@:-]+)['"]?\s*$/m)
-        if (idMatch?.[1]) return idMatch[1]
+        if (idMatch?.[1] && /^[A-Za-z0-9._/@:-]{1,200}$/.test(idMatch[1])) return idMatch[1]
       }
     } catch { /* fallback to package name */ }
     return pkgName
   }
 
-  rpc.handle('plugins.config.set', async ({ name, config }) => {
+  rpc.handle('plugins.config.set', async ({ name, config }) => mutateProfile(async () => {
     const pkgName = String(name ?? '')
     validatePackageName(pkgName)
     if (!config || typeof config !== 'object' || Array.isArray(config)) {
       throw new Error('插件配置必须是 JSON 对象（例如 {}）')
     }
     const serialized = JSON.stringify(config)
-    if (serialized.length > 32 * 1024) throw new Error('插件配置不能超过 32 KB')
+    if (Buffer.byteLength(serialized, 'utf8') > 32 * 1024) throw new Error('插件配置不能超过 32 KB')
     const entryId = await resolvePluginCordisEntryId(pkgName)
-    const configs = await readPluginConfigs()
+    const configs = Object.assign(Object.create(null), await readPluginConfigs())
     configs[pkgName] = config
     if (entryId !== pkgName) configs[entryId] = config
-    await writePluginConfigs(configs)
+    await mkdir(profileDir, { recursive: true })
+    let previousConfig
+    try {
+      previousConfig = await readFile(pluginConfigPath)
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error
+    }
+    const backupPath = join(profileDir, `.ios-plugin-config-backup-${randomUUID()}.json`)
+    if (previousConfig) await writeFile(backupPath, previousConfig, { mode: 0o600, flag: 'wx', flush: true })
+    try {
+      await writeRevision(profileDir, {
+        previous: readProfileManifest('dsh', profileDir),
+        configBackup: { path: backupPath, target: pluginConfigPath, existed: Boolean(previousConfig) },
+      })
+      await writePluginConfigs(configs)
+    } catch (error) {
+      await settlePluginRevision(profileDir, true).catch(() => {})
+      await rm(backupPath, { force: true }).catch(() => {})
+      throw error
+    }
     runtime.profileRestartRequired = true
     return { name: pkgName, entryId, saved: true, restartRequired: true }
-  })
+  }))
   rpc.handle('plugins.disableAll', async () => mutateProfile(async () => {
     const before = readProfileManifest('dsh', profileDir)
     const embedded = await embeddedPackages()

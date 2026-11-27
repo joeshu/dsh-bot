@@ -17,6 +17,7 @@ FILES = {
     "ios-plugin-manager.mjs": SOURCE / "ios-plugin-manager.mjs",
     "ios-openai-compat-adapter.mjs": SOURCE / "ios-openai-compat-adapter.mjs",
     "sqlite-session-persistence.mjs": SOURCE / "sqlite-session-persistence.mjs",
+    "ios-host-package/virtual-terminal-policy.mjs": SOURCE / "ios-host-package" / "virtual-terminal-policy.mjs",
     "ipc-protocol.mjs": ROOT / "kernel" / "runtime" / "ipc-protocol.mjs",
 }
 UPSTREAM_COMMIT = "9c2670d3bce5275e0d1610272958121af87787bb"
@@ -84,7 +85,9 @@ def main():
     shutil.rmtree(DESTINATION, ignore_errors=True)
     DESTINATION.mkdir(parents=True)
     for name, source in FILES.items():
-        shutil.copy2(source, DESTINATION / name)
+        destination = DESTINATION / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
     shutil.copytree(
         node_modules,
         DESTINATION / "node_modules",

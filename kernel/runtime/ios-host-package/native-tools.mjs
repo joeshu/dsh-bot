@@ -2,7 +2,6 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSyn
 import { lookup as dnsLookup } from 'node:dns/promises'
 import { isIP } from 'node:net'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import vm from 'node:vm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { iosHost } from './index.mjs'
 
@@ -181,24 +180,12 @@ function resolveSandboxedWorkspacePath(workspace, rawPath = '') {
 }
 
 async function runHardenedQuickJS(rpc, script, timeoutMs = 2_000, signal) {
-  if (rpc && typeof rpc.request === 'function') {
-    const res = await rpc.request('sandbox.js_eval', { script, timeoutMs }, Math.max(5_000, timeoutMs + 3_000), signal)
-    if (res?.ok === false) throw new Error(String(res.error || 'JavaScript evaluation failed'))
-    return { output: String(res?.output ?? '') }
+  if (!rpc || typeof rpc.request !== 'function') {
+    throw new Error('Native QuickJS bridge is unavailable; JavaScript execution failed closed.')
   }
-  // Strict fallback only when native QuickJS RPC is unavailable (headless tests):
-  // null-prototype context + disabled string codegen, zero host intrinsics passed in.
-  const logs = []
-  const ctx = vm.createContext(Object.create(null), { codeGeneration: { strings: false, wasm: false } })
-  ctx.__emit = (line) => { if (logs.length < 200) logs.push(String(line).slice(0, 2000)) }
-  vm.runInContext(
-    'globalThis.console = Object.freeze({ log: (...a) => __emit(a.map(String).join(" ")), error: (...a) => __emit(a.map(String).join(" ")) });',
-    ctx,
-    { timeout: 500 }
-  )
-  const result = vm.runInContext(script, ctx, { timeout: timeoutMs })
-  if (result !== undefined) logs.push(typeof result === 'string' ? result : JSON.stringify(result, null, 2))
-  return { output: logs.join('\n') }
+  const res = await rpc.request('sandbox.js_eval', { script, timeoutMs }, Math.max(5_000, timeoutMs + 3_000), signal)
+  if (res?.ok === false) throw new Error(String(res.error || 'JavaScript evaluation failed'))
+  return { output: String(res?.output ?? '') }
 }
 
 async function executeWebFallbackTool(context, name, args, exec) {

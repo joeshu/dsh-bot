@@ -21,6 +21,8 @@ let safeMode = args.includes('--safe-mode')
 let restart
 let stopTimer
 let startupTimer
+let stableReadyTimer
+const stableReadyWindowMs = 60_000
 
 function send(message) {
   if (!closed) socket.write(encodeFrame(message))
@@ -69,7 +71,10 @@ function launch() {
       if (message.method === 'runtime.ready') {
         clearTimeout(startupTimer)
         ready = true
-        unexpectedCrashCount = 0
+        clearTimeout(stableReadyTimer)
+        stableReadyTimer = setTimeout(() => {
+          if (thread === worker && ready) unexpectedCrashCount = 0
+        }, stableReadyWindowMs).unref()
         const reportedBootError = (safeMode || recoveringRevision) ? lastBootError : ''
         if (!safeMode && !recoveringRevision) lastBootError = ''
         send(message)
@@ -96,6 +101,7 @@ function launch() {
   thread.on('exit', () => {
     clearTimeout(startupTimer)
     clearTimeout(stopTimer)
+    clearTimeout(stableReadyTimer)
     if (closed) return
     if (bootError) lastBootError = String(bootError)
     for (const id of pending.keys()) fail(id, 'DSH engine stopped before completing the request')
