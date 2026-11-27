@@ -44,6 +44,7 @@ BUILTIN_OPTIONS = (
     "RD_GZIP",
     "BINFMT_ELF",
     "BINFMT_SCRIPT",
+    "PRINTK",
     "VIRTIO_MMIO",
     "VIRTIO_BLK",
     "EXT4_FS",
@@ -217,6 +218,11 @@ def main() -> None:
         kernel_release = run([*make_base, "-s", "kernelrelease"], env=make_env)
         config_output = output / f"config-{kernel_release}"
         shutil.copyfile(build / ".config", config_output)
+        system_map = build / "System.map"
+        if not system_map.is_file():
+            raise SystemExit("The ARM64 kernel System.map was not produced")
+        symbol_map_output = output / "System.map"
+        shutil.copyfile(system_map, symbol_map_output)
         agent_source = pathlib.Path(__file__).resolve().with_name("arm64-guest-pty-agent.c")
         agent_output = output / "dsbot-guest-pty-agent"
         agent_env = {**os.environ, "SOURCE_DATE_EPOCH": make_env["SOURCE_DATE_EPOCH"]}
@@ -271,6 +277,11 @@ def main() -> None:
                 "sha256": sha256_file(config_output),
                 "builtInOptions": list(BUILTIN_OPTIONS),
                 "disabledOptions": list(DISABLED_OPTIONS),
+            },
+            "symbolMap": {
+                "filename": symbol_map_output.name,
+                "bytes": symbol_map_output.stat().st_size,
+                "sha256": sha256_file(symbol_map_output),
             },
             "guestPtyAgent": {
                 "filename": agent_output.name,

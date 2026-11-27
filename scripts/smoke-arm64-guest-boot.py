@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import pathlib
+import re
 import shutil
 import socket
 import struct
@@ -141,7 +143,7 @@ class QEMUControlConnection:
                 return {"error": response["error"]}
             return response.get("return")
 
-    def diagnostics(self) -> str:
+    def diagnostics(self, symbol_map: pathlib.Path | None = None) -> str:
         def query(name: str, command: str, arguments: dict[str, str] | None = None) -> dict[str, object]:
             try:
                 return {name: self.execute(command, arguments)}
@@ -151,11 +153,44 @@ class QEMUControlConnection:
         result: dict[str, object] = {}
         result.update(query("status", "query-status"))
         result.update(query("registers", "human-monitor-command", {"command-line": "info registers"}))
+        registers = result.get("registers")
+        if symbol_map is not None and isinstance(registers, str):
+            try:
+                result["programCounterSymbol"] = symbolize_program_counter(registers, symbol_map)
+            except Exception as error:
+                result["programCounterSymbol"] = {"error": f"{type(error).__name__}: {error}"}
         return json.dumps(result, ensure_ascii=True)
 
     def close(self) -> None:
         self.reader.close()
         self.connection.close()
+
+
+def symbolize_program_counter(register_dump: str, symbol_map: pathlib.Path) -> str:
+    """Resolve the guest PC to its nearest linked kernel symbol when available."""
+    match = re.search(r"\bPC=([0-9a-fA-F]+)", register_dump)
+    if match is None:
+        return "No program counter was present in QMP register output."
+    program_counter = int(match.group(1), 16)
+    addresses: list[int] = []
+    names: list[str] = []
+    for line in symbol_map.read_text(encoding="utf-8", errors="replace").splitlines():
+        fields = line.split(maxsplit=2)
+        if len(fields) != 3:
+            continue
+        try:
+            address = int(fields[0], 16)
+        except ValueError:
+            continue
+        addresses.append(address)
+        names.append(fields[2])
+    order = sorted(range(len(addresses)), key=addresses.__getitem__)
+    sorted_addresses = [addresses[index] for index in order]
+    sorted_names = [names[index] for index in order]
+    index = bisect.bisect_right(sorted_addresses, program_counter) - 1
+    if index < 0:
+        return f"PC=0x{program_counter:x} is below the first kernel symbol."
+    return f"PC=0x{program_counter:x} is {sorted_names[index]}+0x{program_counter - sorted_addresses[index]:x}."
 
 
 def wait_for_qmp_connection(
@@ -336,6 +371,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--guest-dir", type=pathlib.Path, required=True)
     parser.add_argument("--kernel", type=pathlib.Path)
+    parser.add_argument("--kernel-symbol-map", type=pathlib.Path)
     parser.add_argument("--timeout", type=int, default=90)
     args = parser.parse_args()
 
@@ -420,7 +456,7 @@ def main() -> None:
             print(qemu_debug if qemu_debug else "<empty>")
             print("QEMU guest status and CPU registers:")
             if qmp:
-                print(qmp.diagnostics())
+                print(qmp.diagnostics(args.kernel_symbol_map))
             else:
                 print(f"QMP connection was not established: {qmp_startup_error or 'unknown reason'}")
             raise
