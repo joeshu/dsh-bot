@@ -70,11 +70,16 @@ ALPINE_PATCHES = [
     "0001-powerpc-boot-wrapper-Add-z-notext-flag-for-ppc64le.patch",
     "0002-x86-Compress-vmlinux-with-zstd-19-instead-of-22.patch",
     "0003-kexec-add-kexec_load_disabled-boot-option.patch",
-    "0004-objtool-respect-AWK-setting.patch",
     "0005-powerpc-config-defang-gcc-check-for-stack-protector-.patch",
     "0001-x86-CPU-AMD-avoid-printing-reset-reasons-on-Xen-domU.patch",
     "sophgo-fixes.patch",
 ]
+OMITTED_ALPINE_PATCHES = {
+    "0004-objtool-respect-AWK-setting.patch": (
+        "Host-side objtool AWK build workaround; its Makefile hunk does not match the pinned stable source, "
+        "and it does not affect the ARM64 guest kernel runtime."
+    ),
+}
 
 BUILTIN_OPTIONS = (
     "VIRTIO_PCI",
@@ -267,13 +272,16 @@ def main() -> None:
                 {"filename": name, "url": SOURCES[name]["url"], "sha512": SOURCES[name]["sha512"]}
                 for name in SOURCES
             ],
+            "alpinePatchesApplied": list(ALPINE_PATCHES),
+            "alpinePatchesOmitted": OMITTED_ALPINE_PATCHES,
         }
         (output / "kernel-build-manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         (output / "THIRD-PARTY-NOTICES.txt").write_text(
             "DS Bot ARM64 guest kernel\n"
             f"Linux {kernel_release}, GPL-2.0-only.\n"
             f"Built from kernel.org Linux 6.18.60 and the Alpine aports linux-lts source at {APORTS_COMMIT}.\n"
-            "Source URLs and SHA-512 values are recorded in kernel-build-manifest.json; build and configuration scripts are in the repository.\n"
+            "Source URLs and SHA-512 values are recorded in kernel-build-manifest.json; the non-runtime Alpine objtool AWK workaround is verified but intentionally omitted.\n"
+            "Build and configuration scripts are in the repository.\n"
         )
         checksums = []
         for path in sorted(output.iterdir()):
