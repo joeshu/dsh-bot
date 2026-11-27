@@ -41,6 +41,8 @@ public struct DSHWebUIView: View {
     @State private var errorMessage: String?
     @State private var loadProgress: Double = 0
     @State private var reloadToken = UUID()
+    @State private var recoveryTimestamps: [Date] = []
+    @State private var isRecovering = false
     @State private var webBackgroundColor: Color?
     @State private var webIsDark: Bool?
     @State private var showAgentBrowser = false
@@ -296,15 +298,13 @@ public struct DSHWebUIView: View {
                     }
                 },
                 onDisconnect: { reason in
+                    guard !isRecovering else { return }
                     launchURL = nil
                     loadProgress = 0
                     errorMessage = reason
                 },
-                onProcessTerminate: {
-                    Task {
-                        reloadToken = UUID()
-                        await loadWebUIInfo()
-                    }
+                onProcessTerminate: { reason in
+                    handleBoundedRecovery(reason: reason)
                 }
             )
             .ignoresSafeArea(edges: .bottom)
@@ -318,6 +318,7 @@ public struct DSHWebUIView: View {
                     .multilineTextAlignment(.center)
                     .foregroundStyle(.secondary)
                 Button("重试加载") {
+                    recoveryTimestamps.removeAll()
                     Task { await loadWebUIInfo() }
                 }
                 .buttonStyle(.borderedProminent)
@@ -332,6 +333,76 @@ public struct DSHWebUIView: View {
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private func handleBoundedRecovery(reason: String) {
+        guard !isRecovering else { return }
+        let now = Date()
+        recoveryTimestamps = recoveryTimestamps.filter { now.timeIntervalSince($0) < 15 }
+        recoveryTimestamps.append(now)
+        if recoveryTimestamps.count <= 2 {
+            isRecovering = true
+            Task {
+                defer { isRecovering = false }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                reloadToken = UUID()
+                await loadWebUIInfo()
+            }
+        } else {
+            launchURL = nil
+            loadProgress = 0
+            errorMessage = reason
+        }
+    }
+
+    /// Exchanges the one-shot `?token=` URL via URLSession (without following the 303 redirect),
+    /// writes the resulting signed HttpOnly session cookie directly into `WKWebsiteDataStore.default().httpCookieStore`,
+    /// and returns the clean loopback root URL so `WKWebView` never hits iOS WebKit's 303 + `SameSite=Strict` cookie-drop race.
+    private static func exchangeTokenCookie(from authURL: URL, cleanBaseURL: URL) async -> URL {
+        final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate {
+            func urlSession(
+                _ session: URLSession,
+                task: URLSessionTask,
+                willPerformHTTPRedirection response: HTTPURLResponse,
+                newRequest request: URLRequest,
+                completionHandler: @escaping (URLRequest?) -> Void
+            ) {
+                completionHandler(nil)
+            }
+        }
+        let config = URLSessionConfiguration.ephemeral
+        config.httpShouldSetCookies = false
+        config.httpCookieAcceptPolicy = .never
+        config.timeoutIntervalForRequest = 8
+        let delegate = NoRedirectDelegate()
+        let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
+        do {
+            var req = URLRequest(url: authURL)
+            req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+            let (_, response) = try await session.data(for: req)
+            guard let http = response as? HTTPURLResponse,
+                  (200...399).contains(http.statusCode) else {
+                return authURL
+            }
+            var stringHeaders: [String: String] = [:]
+            for (k, v) in http.allHeaderFields {
+                if let ks = k as? String, let vs = v as? String {
+                    stringHeaders[ks] = vs
+                }
+            }
+            let cookies = HTTPCookie.cookies(withResponseHeaderFields: stringHeaders, for: cleanBaseURL)
+            guard !cookies.isEmpty else {
+                return http.statusCode == 200 ? cleanBaseURL : authURL
+            }
+            let cookieStore = WKWebsiteDataStore.default().httpCookieStore
+            for cookie in cookies {
+                await cookieStore.setCookie(cookie)
+            }
+            return cleanBaseURL
+        } catch {
+            return authURL
         }
     }
 
@@ -361,12 +432,14 @@ public struct DSHWebUIView: View {
             if preserveIfSamePort && allowedPort == port && launchURL != nil {
                 return
             }
+            let cleanBaseURL = (info["baseUrl"] as? String).flatMap(URL.init(string:))
+                ?? URL(string: "http://127.0.0.1:\(port)/")
+                ?? parsed
+            let targetURL = await Self.exchangeTokenCookie(from: parsed, cleanBaseURL: cleanBaseURL)
+            guard !Task.isCancelled, generation == host.runtimeGeneration else { return }
             errorMessage = nil
             allowedPort = port
-            // Always load the exact root `/?token=...` URL from `web.ui.info`:
-            // `BrowserAuth.authorizeIndex` strictly requires `url.pathname === "/"` when `?token=` is present.
-            // Target session deep-linking is seeded into `localStorage['dsh.sessions.current']` at document start.
-            launchURL = parsed
+            launchURL = targetURL
         } catch {
             guard !Task.isCancelled, generation == host.runtimeGeneration else { return }
             launchURL = nil
@@ -394,7 +467,7 @@ private struct LoopbackWebView: UIViewRepresentable {
     let onThemeChanged: (Color, Bool) -> Void
     let onNativeAction: (String) -> Void
     let onDisconnect: (String) -> Void
-    let onProcessTerminate: () -> Void
+    let onProcessTerminate: (String) -> Void
 
     private static func sessionSeedScript(sessionId: String?) -> String? {
         guard let raw = sessionId?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -671,10 +744,9 @@ private struct LoopbackWebView: UIViewRepresentable {
         var onThemeChanged: (Color, Bool) -> Void
         var onNativeAction: (String) -> Void
         var onDisconnect: (String) -> Void
-        var onProcessTerminate: () -> Void
+        var onProcessTerminate: (String) -> Void
         private var progressObservation: NSKeyValueObservation?
         private var memoryTrimObserver: NSObjectProtocol?
-        private var recentCrashTimestamps: [Date] = []
         private var activeDownloadDestinations: [ObjectIdentifier: URL] = [:]
 
         init(
@@ -685,7 +757,7 @@ private struct LoopbackWebView: UIViewRepresentable {
             onThemeChanged: @escaping (Color, Bool) -> Void,
             onNativeAction: @escaping (String) -> Void,
             onDisconnect: @escaping (String) -> Void,
-            onProcessTerminate: @escaping () -> Void
+            onProcessTerminate: @escaping (String) -> Void
         ) {
             self.allowedPort = allowedPort
             self.viewportMode = viewportMode
@@ -780,19 +852,15 @@ private struct LoopbackWebView: UIViewRepresentable {
         }
 
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-            let now = Date()
-            recentCrashTimestamps = recentCrashTimestamps.filter { now.timeIntervalSince($0) < 15 }
-            recentCrashTimestamps.append(now)
-            if recentCrashTimestamps.count <= 2 {
-                // Re-fetch fresh tokenized URL instead of stale webView.reload() which can 401 or hit a dead port.
-                onProcessTerminate()
-            } else {
-                onDisconnect("Web 渲染进程多次因系统内存紧张中断，请点击重试加载。")
-            }
+            // Re-fetch fresh tokenized URL and exchange cookie via DSHWebUIView's bounded recovery state.
+            onProcessTerminate("Web 渲染进程多次因系统内存紧张中断，请点击重试加载。")
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-            guard (error as NSError).code != NSURLErrorCancelled else { return }
+            let nsError = error as NSError
+            if nsError.code == NSURLErrorCancelled { return }
+            // Ignore WKErrorFrameLoadInterruptedByPolicyChange (102) triggered by decidePolicyFor(.cancel / .download)
+            if nsError.domain == "WebKitErrorDomain" && nsError.code == 102 { return }
             onDisconnect("本机 Web 连接已断开（\(error.localizedDescription)），请重试加载。")
         }
 
@@ -926,14 +994,7 @@ private struct LoopbackWebView: UIViewRepresentable {
             if let http = navigationResponse.response as? HTTPURLResponse {
                 if navigationResponse.isForMainFrame && http.statusCode == 401 {
                     decisionHandler(.cancel)
-                    let now = Date()
-                    recentCrashTimestamps = recentCrashTimestamps.filter { now.timeIntervalSince($0) < 15 }
-                    recentCrashTimestamps.append(now)
-                    if recentCrashTimestamps.count <= 2 {
-                        onProcessTerminate()
-                    } else {
-                        onDisconnect("本机 Web 工作台认证未通过（HTTP 401），请点击重试加载。")
-                    }
+                    onProcessTerminate("本机 Web 工作台认证未通过（HTTP 401），请点击重试加载。")
                     return
                 }
                 if let disposition = http.value(forHTTPHeaderField: "Content-Disposition")?.lowercased(),

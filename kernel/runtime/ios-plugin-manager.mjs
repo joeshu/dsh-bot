@@ -164,8 +164,8 @@ function replaceCompatibilityAnchor(source, before, after, label) {
 
 const IOS_CORE_WRITABLE_MARKER = 'DSBOT_IOS_WRITABLE_AI_BASE_V1'
 
-async function stageWritablePurgeSafeAiBase(pluginRoot) {
-  const dshHome = process.env.DSH_HOME || resolve(pluginRoot, '..', '..', '..', '..')
+async function stageWritablePurgeSafeAiBase(pluginRoot, dshHomeFallback = '') {
+  const dshHome = process.env.DSH_HOME || dshHomeFallback || resolve(pluginRoot, '..', '..', '..', '..')
   const bundledNodeModules = fileURLToPath(new URL('./node_modules', import.meta.url))
   const bundledAiBase = join(bundledNodeModules, '@deepseek-ai')
   const writableRoot = join(dshHome, 'dsh-purge-safe', 'writable-host', 'node_modules')
@@ -280,9 +280,9 @@ async function adaptPurgeSafeCoreForIOS(pluginRoot) {
 }
 
 /** Apply host-only routing/privacy changes without altering the upstream plugin on disk. */
-export async function ensurePurgeSafeIOSCompatibility(pluginRoot) {
+export async function ensurePurgeSafeIOSCompatibility(pluginRoot, dshHomeFallback = '') {
   await adaptPurgeSafeCoreForIOS(pluginRoot)
-  const writableAiBase = await stageWritablePurgeSafeAiBase(pluginRoot)
+  const writableAiBase = await stageWritablePurgeSafeAiBase(pluginRoot, dshHomeFallback)
   const uiPath = resolve(pluginRoot, 'lib', 'redteam', 'ui.js')
   let source
   try { source = await readFile(uiPath, 'utf8') } catch (error) {
@@ -1070,7 +1070,7 @@ export function createIOSPluginManager({ rpc, runtime, workspace, profileDir, in
         }
       }
       const { manifest } = await inspectPackage(staged, expectedName, expectedVersion)
-      if (manifest.name === 'dsh-purge-safe') await ensurePurgeSafeIOSCompatibility(staged)
+      if (manifest.name === 'dsh-purge-safe') await ensurePurgeSafeIOSCompatibility(staged, dirname(profileDir))
       if (DESKTOP_ONLY_BUNDLES.has(manifest.name)) throw new Error('这个完整桌面 bundle 不允许安装到 iOS profile')
       const available = await assertDependenciesAvailable(manifest, staged)
       if (available.has(manifest.name)) throw new Error('插件名称与已经内嵌的 DSH runtime 包冲突')

@@ -31,6 +31,7 @@ public struct PluginManagerView: View {
     @State private var isInstalling = false
     @State private var pendingInstall: PendingPluginInstall?
     @State private var pendingRemoval: DSHInstalledPlugin?
+    @State private var showWebWorkbench = false
 
     public init(host: LocalAgentHost) {
         self.host = host
@@ -157,6 +158,9 @@ public struct PluginManagerView: View {
                !host.isLoadingPlugins {
                 Task { await host.discoverPlugins(query: searchText) }
             }
+        }
+        .fullScreenCover(isPresented: $showWebWorkbench) {
+            DSHWebUIView(host: host)
         }
         .alert(item: $pendingInstall) { target in
             Alert(
@@ -302,8 +306,8 @@ public struct PluginManagerView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
-                    NavigationLink {
-                        DSHWebUIView(host: host)
+                    Button {
+                        showWebWorkbench = true
                     } label: {
                         Label("打开 Web 演练台（含 RedTeam Dock 与预设）", systemImage: "shield.lefthalf.filled")
                             .font(.subheadline)
@@ -577,6 +581,7 @@ public struct PluginDetailView: View {
     @State private var configSaving = false
     @State private var configStatus: String = ""
     @State private var configRestartNeeded = false
+    @State private var showWebWorkbench = false
 
     public init(host: LocalAgentHost, pluginId: String) {
         self.host = host
@@ -668,8 +673,8 @@ public struct PluginDetailView: View {
 
                 Section("实时运行能力与快捷使用") {
                     if plugin.enabled {
-                        NavigationLink {
-                            DSHWebUIView(host: host)
+                        Button {
+                            showWebWorkbench = true
                         } label: {
                             Label("在 DSH Web 工作台打开并使用", systemImage: "globe")
                         }
@@ -827,6 +832,9 @@ public struct PluginDetailView: View {
                     }
                 }
             }
+        }
+        .fullScreenCover(isPresented: $showWebWorkbench) {
+            DSHWebUIView(host: host)
         }
         .confirmationDialog("确定卸载插件「\(plugin?.name ?? "")」？", isPresented: $confirmUninstall, titleVisibility: .visible) {
             Button("卸载", role: .destructive) {
