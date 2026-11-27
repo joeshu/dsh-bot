@@ -105,6 +105,17 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
+          name: qemu-ios-tci-report-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/qemu-ios-tci-artifact/build-report.json
+            ${{ runner.temp }}/qemu-ios-tci-artifact/build-report.md
+            ${{ runner.temp }}/qemu-ios-tci-artifact/THIRD-PARTY-NOTICES.md
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 9
+
+      - uses: actions/upload-artifact@v4
+        with:
           name: qemu-ios-tci-aarch64-${{ github.sha }}
           path: ${{ runner.temp }}/qemu-ios-tci-artifact/
           if-no-files-found: error

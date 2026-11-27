@@ -155,6 +155,52 @@ def dynamic_dependencies(binary: Path, frameworks: Path) -> list[str]:
     return dependencies
 
 
+def runtime_dependency_audit(
+    framework_records: list[dict[str, object]],
+    runtime_frameworks: Path,
+) -> dict[str, list[str]]:
+    """Find the QEMU framework's transitive Mach-O linkage and orphan candidates."""
+    framework_root = Path("runtime/Frameworks")
+    binary_paths = {
+        (runtime_frameworks / Path(str(item["path"])).relative_to(framework_root)).resolve(strict=True): str(item["name"])
+        for item in framework_records
+    }
+    roots = sorted(name for name in binary_paths.values() if "aarch64-softmmu" in name)
+    if not roots:
+        raise SystemExit("Cannot calculate runtime dependency closure without the QEMU ARM64 framework")
+
+    dependencies_by_name: dict[str, set[str]] = {name: set() for name in binary_paths.values()}
+    for item in framework_records:
+        name = str(item["name"])
+        binary_path = Path(str(item["path"])).relative_to(framework_root)
+        for dependency in item["dynamicDependencies"]:
+            if dependency.startswith("@rpath/"):
+                candidate = runtime_frameworks / dependency.removeprefix("@rpath/")
+            elif dependency.startswith("@loader_path/"):
+                binary = (runtime_frameworks / binary_path).resolve(strict=True)
+                candidate = binary.parent / dependency.removeprefix("@loader_path/")
+            else:
+                continue
+            target_name = binary_paths.get(candidate.resolve(strict=True))
+            if target_name:
+                dependencies_by_name[name].add(target_name)
+
+    reachable: set[str] = set()
+    pending = list(roots)
+    while pending:
+        current = pending.pop()
+        if current in reachable:
+            continue
+        reachable.add(current)
+        pending.extend(dependencies_by_name.get(current, set()) - reachable)
+
+    return {
+        "roots": roots,
+        "reachableFrameworks": sorted(reachable),
+        "unreferencedFrameworkCandidates": sorted(set(binary_paths.values()) - reachable),
+    }
+
+
 def stage_sources(
     *,
     repo: Path,
@@ -371,6 +417,8 @@ def main() -> None:
         names = ", ".join(item["name"] for item in framework_records)
         raise SystemExit(f"The QEMU ARM64 softmmu framework was not staged. Frameworks: {names}")
 
+    linkage_audit = runtime_dependency_audit(framework_records, runtime_frameworks)
+
     qemu_tar = build_dir / "qemu-10.0.12-utm.tar.xz"
     if sha256(qemu_tar) != QEMU_TARBALL_SHA256:
         raise SystemExit("QEMU source archive no longer matches its pinned SHA-256")
@@ -419,6 +467,11 @@ def main() -> None:
             "options": required_options,
         },
         "frameworks": framework_records,
+        "runtimeLinkageAudit": {
+            **linkage_audit,
+            "method": "Transitive Mach-O otool -L references from the QEMU framework.",
+            "caveat": "Unreferenced candidates may still be loaded dynamically; do not remove before runtime boot validation.",
+        },
         "sizes": {
             "strippedFrameworkMachOBytes": sum(item["strippedBytes"] for item in framework_records),
             "frameworkPayloadBytes": regular_file_bytes(runtime_frameworks),
@@ -436,13 +489,19 @@ def main() -> None:
         f"- Framework payload: {report['sizes']['frameworkPayloadBytes']:,} bytes ({report['sizes']['frameworkPayloadBytes'] / 1024 / 1024:.2f} MiB).",
         f"- Source and notices: {report['sizes']['sourcePayloadBytes']:,} bytes ({report['sizes']['sourcePayloadBytes'] / 1024 / 1024:.2f} MiB).",
         "",
-        "| Framework | Stripped bytes | License |",
-        "| --- | ---: | --- |",
+        "| Framework | Stripped bytes | License | Dynamic dependencies |",
+        "| --- | ---: | --- | --- |",
     ]
     summary.extend(
-        f"| `{item['name']}` | {item['strippedBytes']:,} | {item['license']} |"
+        f"| `{item['name']}` | {item['strippedBytes']:,} | {item['license']} | "
+        f"`{', '.join(item['dynamicDependencies']) or 'none'}` |"
         for item in framework_records
     )
+    summary.extend([
+        "",
+        f"- QEMU linkage closure: {', '.join(linkage_audit['reachableFrameworks'])}.",
+        f"- Unreferenced framework candidates (dynamic loading still needs runtime validation): {', '.join(linkage_audit['unreferencedFrameworkCandidates']) or 'none'}.",
+    ])
     (output / "build-report.md").write_text("\n".join(summary) + "\n")
 
     checksum_lines = []
