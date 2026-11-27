@@ -324,6 +324,8 @@ def main() -> None:
         "cocoa": "disabled",
         "sdl": "disabled",
         "coreaudio": "disabled",
+        "tcg_interpreter": False,
+        "tcg_threaded_interpreter": True,
         "coroutine_backend": "libucontext",
     }
     for name, expected in required_options.items():
@@ -337,7 +339,7 @@ def main() -> None:
     if not re.search(r"(?m)^TARGET_DIRS=aarch64-softmmu$", config_text):
         raise SystemExit("QEMU target list is not restricted to aarch64-softmmu")
     target_config = find_tcg_config(qemu_build_dir).read_text(errors="ignore")
-    if not re.search(r"(?m)^#define CONFIG_TCG_THREADED_INTERPRETER 1$", target_config):
+    if not re.search(r"(?m)^#define CONFIG_TCG_THREADED_INTERPRETER(?:\s+1)?$", target_config):
         raise SystemExit("The ARM64 target was not built with the TCG threaded interpreter")
 
     frameworks = sorted(path for path in runtime_frameworks.glob("*.framework") if path.is_dir())
