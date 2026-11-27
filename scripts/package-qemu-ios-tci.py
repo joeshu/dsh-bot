@@ -155,6 +155,15 @@ def dynamic_dependencies(binary: Path, frameworks: Path) -> list[str]:
     return dependencies
 
 
+def exported_symbols(binary: Path) -> set[str]:
+    output = run(["xcrun", "--sdk", "iphoneos", "nm", "-gU", str(binary)])
+    return {
+        line.split()[-1].removeprefix("_")
+        for line in output.splitlines()
+        if line.split()
+    }
+
+
 def runtime_dependency_audit(
     framework_records: list[dict[str, object]],
     runtime_frameworks: Path,
@@ -417,6 +426,14 @@ def main() -> None:
         names = ", ".join(item["name"] for item in framework_records)
         raise SystemExit(f"The QEMU ARM64 softmmu framework was not staged. Frameworks: {names}")
 
+    qemu_record = next(item for item in framework_records if "aarch64-softmmu" in str(item["name"]))
+    qemu_binary = output / str(qemu_record["path"])
+    required_symbols = {"qemu_init", "qemu_main_loop", "qemu_cleanup"}
+    qemu_exported_symbols = exported_symbols(qemu_binary)
+    missing_symbols = required_symbols - qemu_exported_symbols
+    if missing_symbols:
+        raise SystemExit(f"QEMU in-process entry points are not exported: {', '.join(sorted(missing_symbols))}")
+
     linkage_audit = runtime_dependency_audit(framework_records, runtime_frameworks)
 
     qemu_tar = build_dir / "qemu-10.0.12-utm.tar.xz"
@@ -467,6 +484,10 @@ def main() -> None:
             "options": required_options,
         },
         "frameworks": framework_records,
+        "inProcessEntryPoints": {
+            "required": sorted(required_symbols),
+            "verified": sorted(required_symbols & qemu_exported_symbols),
+        },
         "runtimeLinkageAudit": {
             **linkage_audit,
             "method": "Transitive Mach-O otool -L references from the QEMU framework.",
@@ -488,6 +509,7 @@ def main() -> None:
         f"- Frameworks: {len(framework_records)}; stripped Mach-O total {report['sizes']['strippedFrameworkMachOBytes']:,} bytes ({report['sizes']['strippedFrameworkMachOBytes'] / 1024 / 1024:.2f} MiB).",
         f"- Framework payload: {report['sizes']['frameworkPayloadBytes']:,} bytes ({report['sizes']['frameworkPayloadBytes'] / 1024 / 1024:.2f} MiB).",
         f"- Source and notices: {report['sizes']['sourcePayloadBytes']:,} bytes ({report['sizes']['sourcePayloadBytes'] / 1024 / 1024:.2f} MiB).",
+        f"- In-process QEMU entry points exported: {', '.join(report['inProcessEntryPoints']['verified'])}.",
         "",
         "| Framework | Stripped bytes | License | Dynamic dependencies |",
         "| --- | ---: | --- | --- |",
