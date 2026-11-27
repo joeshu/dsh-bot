@@ -35,6 +35,7 @@ SOURCES = {
 
 BUILTIN_OPTIONS = (
     "EXPERT",
+    "MULTIUSER",
     "BLOCK",
     "BLK_DEV",
     "VIRTIO_MENU",
