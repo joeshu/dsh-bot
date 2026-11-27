@@ -17,10 +17,6 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
       UTM_UPSTREAM_COMMIT: 3d4b8d8cb1ce93a8b1a9610695c12487685f0c15
-      LIBUCONTEXT_COMMIT: 9b1d8f01a6e99166f9808c79966abe10786de8b6
-      BUILD_ROOT: ${{ runner.temp }}/qemu-ios-tci-build
-      UTM_SOURCE: ${{ runner.temp }}/utm-qemu-source
-      ARTIFACT_DIR: ${{ runner.temp }}/qemu-ios-tci-artifact
     steps:
       - uses: actions/checkout@v4
 
@@ -45,6 +41,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          UTM_SOURCE="$RUNNER_TEMP/utm-qemu-source"
           mkdir -p "$UTM_SOURCE"
           git -C "$UTM_SOURCE" init --quiet
           git -C "$UTM_SOURCE" remote add origin https://github.com/utmapp/UTM.git
@@ -57,6 +54,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          BUILD_ROOT="$RUNNER_TEMP/qemu-ios-tci-build"
+          UTM_SOURCE="$RUNNER_TEMP/utm-qemu-source"
           mkdir -p "$BUILD_ROOT"
           cd "$BUILD_ROOT"
           MINIMAL_TCI=1 \
@@ -68,6 +67,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          BUILD_ROOT="$RUNNER_TEMP/qemu-ios-tci-build"
+          UTM_SOURCE="$RUNNER_TEMP/utm-qemu-source"
+          ARTIFACT_DIR="$RUNNER_TEMP/qemu-ios-tci-artifact"
           python3 "$GITHUB_WORKSPACE/scripts/package-qemu-ios-tci.py" \
             --repo "$GITHUB_WORKSPACE" \
             --upstream "$UTM_SOURCE" \
