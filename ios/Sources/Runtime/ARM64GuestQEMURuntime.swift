@@ -222,8 +222,8 @@ public actor ARM64GuestQEMURuntime {
                 argvStrings.forEach { free($0) }
                 envStrings.forEach { free($0) }
             }
-            let argv = argvStrings.map { UnsafePointer<CChar>($0) } + [nil]
-            let envp = envStrings.map { UnsafePointer<CChar>($0) } + [nil]
+            let argv: [UnsafePointer<CChar>?] = argvStrings.map { UnsafePointer($0) } + [nil]
+            let envp: [UnsafePointer<CChar>?] = envStrings.map { UnsafePointer($0) } + [nil]
             let status = argv.withUnsafeBufferPointer { argvBuffer in
                 envp.withUnsafeBufferPointer { envBuffer in
                     qemu.initialize(Int32(argvStrings.count), argvBuffer.baseAddress, envBuffer.baseAddress)
@@ -469,7 +469,10 @@ public final class ARM64GuestUnixSocketTransport: ARM64GuestSerialTransport, @un
             let available = !isClosed && descriptor >= 0
             stateLock.unlock()
             guard available else { return }
-            let count = Darwin.recv(descriptor, &buffer, buffer.count, 0)
+            let count = buffer.withUnsafeMutableBufferPointer { bytes -> Int in
+                guard let base = bytes.baseAddress else { return 0 }
+                return Darwin.recv(descriptor, base, bytes.count, 0)
+            }
             if count > 0 {
                 let data = Data(buffer.prefix(count))
                 stateLock.lock()
