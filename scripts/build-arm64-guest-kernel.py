@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build ARM64 Linux stable with the pinned Alpine virt configuration."""
+"""Build a minimal ARM64 Linux guest kernel and a statically linked PTY agent."""
 
 from __future__ import annotations
 
@@ -18,9 +18,7 @@ import urllib.parse
 import urllib.request
 
 
-APORTS_COMMIT = "942251c9a4cb77b6d34ecbce4c293f96abfecce5"
 KERNEL_VERSION = "6.18.60"
-APORTS_RAW = f"https://raw.githubusercontent.com/alpinelinux/aports/{APORTS_COMMIT}/main/linux-lts"
 KERNEL_BASE_URL = "https://cdn.kernel.org/pub/linux/kernel/v6.x"
 MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024
 
@@ -33,24 +31,24 @@ SOURCES = {
         "url": f"{KERNEL_BASE_URL}/patch-6.18.60.xz",
         "sha512": "fce959c563635d4374cba148b7f1b8b64a143e5b42bd8e86afee7dfdc76b9d887afb5a032249ac16518ee95e73b3c1a459f15926a035780493c5b3b9fbd3b51b",
     },
-    "virt.aarch64.config": {
-        "url": f"{APORTS_RAW}/virt.aarch64.config",
-        "sha512": "ffbe61069184a46baf90cbffeba5512df7e0d0b11c2404f629ad698bdfb6199269618013abdc2895a9bc960bb5e0425ee4f8a928fca08aae5b5ff97e49023e3f",
-    },
 }
 
 BUILTIN_OPTIONS = (
-    "VIRTIO_PCI",
+    "BLK_DEV_INITRD",
+    "RD_GZIP",
+    "BINFMT_ELF",
+    "BINFMT_SCRIPT",
     "VIRTIO_MMIO",
-    "VIRTIO_CONSOLE",
     "VIRTIO_BLK",
     "EXT4_FS",
-    "FUSE_FS",
     "UNIX98_PTYS",
     "SERIAL_AMBA_PL011",
     "SERIAL_AMBA_PL011_CONSOLE",
     "DEVTMPFS",
     "DEVTMPFS_MOUNT",
+    "PROC_FS",
+    "SYSFS",
+    "SMP",
 )
 DISABLED_OPTIONS = (
     "DEBUG_INFO",
@@ -176,18 +174,6 @@ def main() -> None:
         apply_patch_file(source, downloaded["patch-6.18.60.patch.xz"], xz_compressed=True)
         build = work / "build"
         build.mkdir()
-        shutil.copyfile(downloaded["virt.aarch64.config"], build / ".config")
-        run(
-            [
-                str(source / "scripts" / "config"),
-                "--file",
-                str(build / ".config"),
-                *[argument for option in BUILTIN_OPTIONS for argument in ("--enable", option)],
-                *[argument for option in DISABLED_OPTIONS for argument in ("--disable", option)],
-            ],
-            cwd=source,
-        )
-
         cross = "aarch64-linux-gnu-"
         make_env = {
             **os.environ,
@@ -200,6 +186,17 @@ def main() -> None:
             "SOURCE_DATE_EPOCH": "1793387120",
         }
         make_base = ["make", "-C", str(source), f"O={build}", f"-j{max(1, args.jobs)}", "LOCALVERSION=-0-virt"]
+        run([*make_base, "tinyconfig"], env=make_env)
+        run(
+            [
+                str(source / "scripts" / "config"),
+                "--file",
+                str(build / ".config"),
+                *[argument for option in BUILTIN_OPTIONS for argument in ("--enable", option)],
+                *[argument for option in DISABLED_OPTIONS for argument in ("--disable", option)],
+            ],
+            cwd=source,
+        )
         run([*make_base, "olddefconfig"], env=make_env)
         config_text = (build / ".config").read_text(encoding="utf-8")
         missing = [option for option in BUILTIN_OPTIONS if f"CONFIG_{option}=y" not in config_text]
@@ -246,14 +243,14 @@ def main() -> None:
             "format": 1,
             "guestArchitecture": "aarch64",
             "kernelVersion": kernel_release,
-            "distributionConfig": "Alpine Linux virt flavor, pinned at the recorded aports commit",
+            "baseConfig": "upstream arm64 tinyconfig",
+            "guestUserland": "Alpine Linux 3.23.8 minirootfs",
             "distributionPatchSeriesApplied": False,
             "distributionPatchPolicy": (
-                "Alpine package patches are not applied: the package series includes architecture-specific "
-                "and packaging changes unnecessary for this ARM64 virt guest. The kernel is built from the "
-                "pinned upstream stable sources with the pinned Alpine virt config and explicit built-in drivers."
+                "Alpine's kernel package patches and broad virt config are not applied. The kernel uses upstream "
+                "ARM64 tinyconfig plus only the built-in boot, virtio block, ext4, serial console, and PTY options "
+                "required by this guest."
             ),
-            "alpineAportsCommit": APORTS_COMMIT,
             "license": "GPL-2.0-only",
             "bootImage": {
                 "filename": compressed.name,
@@ -281,6 +278,7 @@ def main() -> None:
                 "compiler": run([f"{cross}gcc", "--version"]).splitlines()[0],
                 "make": run(["make", "--version"]).splitlines()[0],
             },
+            "configGenerator": "Linux kernel make tinyconfig plus scripts/config and olddefconfig",
             "sources": [
                 {"filename": name, "url": SOURCES[name]["url"], "sha512": SOURCES[name]["sha512"]}
                 for name in SOURCES
@@ -290,8 +288,8 @@ def main() -> None:
         (output / "THIRD-PARTY-NOTICES.txt").write_text(
             "DS Bot ARM64 guest kernel\n"
             f"Linux {kernel_release}, GPL-2.0-only.\n"
-            f"Built from kernel.org Linux 6.18.60 with the Alpine ARM64 virt config from aports commit {APORTS_COMMIT}.\n"
-            "Alpine's package patch series is not applied; ARM64 virt runtime drivers are enabled in the recorded config.\n"
+            "Built from pinned kernel.org Linux 6.18.60 sources with upstream arm64 tinyconfig and a minimal recorded driver set.\n"
+            "The guest userland is Alpine Linux; Alpine's kernel package patches and broad virt config are not applied.\n"
             "Source URLs and SHA-512 values are recorded in kernel-build-manifest.json.\n"
             "The bundled guest PTY agent is original DS Bot code under MIT; its source hash is recorded in the manifest.\n"
             "Build and configuration scripts are in the repository.\n"

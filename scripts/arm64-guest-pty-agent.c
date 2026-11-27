@@ -287,7 +287,7 @@ static int create_session(uint32_t id, const unsigned char *payload, size_t leng
         return -1;
     }
 
-    uid_t uid = (uid_t)(20000u + (id % 40000u));
+    uid_t uid = (uid_t)(50000u + (id % 10000u));
     for (size_t index = 0; index < MAX_SESSIONS; index++) {
         if (sessions[index].master_fd >= 0 && sessions[index].uid == uid) {
             send_error(id, "session id collides with an active guest uid; retry with a new id");
@@ -297,12 +297,17 @@ static int create_session(uint32_t id, const unsigned char *payload, size_t leng
 
     const char *base = "/home/dsbot/.sessions";
     char directory[PATH_MAX];
+    char temporary_directory[PATH_MAX];
     if (ensure_directory("/home/dsbot", 0755) != 0
         || ensure_directory(base, 0755) != 0
         || snprintf(directory, sizeof(directory), "%s/%08x", base, id) >= (int)sizeof(directory)
         || ensure_directory(directory, 0700) != 0
         || chown(directory, uid, uid) != 0
-        || chmod(directory, 0700) != 0) {
+        || chmod(directory, 0700) != 0
+        || snprintf(temporary_directory, sizeof(temporary_directory), "%s/tmp", directory) >= (int)sizeof(temporary_directory)
+        || ensure_directory(temporary_directory, 0700) != 0
+        || chown(temporary_directory, uid, uid) != 0
+        || chmod(temporary_directory, 0700) != 0) {
         send_error(id, "could not prepare the isolated guest workspace");
         return -1;
     }
@@ -337,6 +342,10 @@ static int create_session(uint32_t id, const unsigned char *payload, size_t leng
         (void)setenv("USER", "dsbot", 1);
         (void)setenv("LOGNAME", "dsbot", 1);
         (void)setenv("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin", 1);
+        (void)setenv("TMPDIR", temporary_directory, 1);
+        (void)setenv("TMP", temporary_directory, 1);
+        (void)setenv("TEMP", temporary_directory, 1);
+        (void)setenv("XDG_RUNTIME_DIR", temporary_directory, 1);
         (void)setenv("TERM", "vt100", 1);
         (void)setenv("PS1", "dsbot$ ", 1);
         execl("/bin/sh", "sh", "-i", (char *)NULL);

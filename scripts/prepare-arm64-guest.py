@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create a small, reproducible Alpine ARM64 serial-shell guest image.
+"""Create a reproducible Alpine ARM64 guest image with an optional PTY agent.
 
 This is a guest-image build step only. It does not embed a hypervisor or make
 the iOS app claim to support a Linux terminal; the app still needs a native
@@ -16,6 +16,7 @@ import os
 import pathlib
 import shutil
 import stat
+import struct
 import sys
 import tarfile
 import tempfile
@@ -67,6 +68,21 @@ echo 'Type exit to close the guest shell.'
 exec /bin/ash -i
 """
 
+PTY_AGENT_INIT = b"""#!/bin/sh
+set -eu
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+mkdir -p /proc /sys /dev /dev/pts /run /tmp /root /home/dsbot
+mount -t proc -o nosuid,nodev,noexec,hidepid=2 proc /proc 2>/dev/null || true
+mount -t sysfs -o nosuid,nodev,noexec,ro sysfs /sys 2>/dev/null || true
+mount -t devtmpfs -o nosuid devtmpfs /dev 2>/dev/null || true
+mount -t devpts -o nosuid,noexec,mode=0620 devpts /dev/pts 2>/dev/null || true
+chmod 0755 /tmp
+echo dsbot-arm64 > /proc/sys/kernel/hostname 2>/dev/null || true
+echo 'DS Bot ARM64 Linux guest PTY agent protocol v1.'
+echo 'Guest workspaces are volatile in this bootstrap image; network is disabled.'
+exec /usr/sbin/dsbot-guest-pty-agent
+"""
+
 
 def sha256_file(path: pathlib.Path) -> str:
     digest = hashlib.sha256()
@@ -74,6 +90,24 @@ def sha256_file(path: pathlib.Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def verify_static_aarch64_elf(path: pathlib.Path) -> bytes:
+    data = path.read_bytes()
+    if len(data) > 16 * 1024 * 1024 or len(data) < 64:
+        raise RuntimeError("The guest PTY agent has an unreasonable size or an invalid ELF header")
+    if data[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", data, 18)[0] != 183:
+        raise RuntimeError("The guest PTY agent must be a little-endian AArch64 ELF64 executable")
+    program_offset = struct.unpack_from("<Q", data, 32)[0]
+    program_entry_size = struct.unpack_from("<H", data, 54)[0]
+    program_count = struct.unpack_from("<H", data, 56)[0]
+    if program_entry_size < 4 or program_offset + program_entry_size * program_count > len(data):
+        raise RuntimeError("The guest PTY agent has an invalid ELF program header table")
+    for index in range(program_count):
+        offset = program_offset + index * program_entry_size
+        if struct.unpack_from("<I", data, offset)[0] == 3:
+            raise RuntimeError("The guest PTY agent must be statically linked for Alpine musl")
+    return data
 
 
 def download_artifact(name: str, cache_dir: pathlib.Path) -> pathlib.Path:
@@ -173,7 +207,9 @@ def cpio_newc(entries: list[tuple[str, int, bytes]]) -> bytes:
     return bytes(output)
 
 
-def rootfs_entries(minirootfs: pathlib.Path) -> tuple[list[tuple[str, int, bytes]], list[dict[str, str]]]:
+def rootfs_entries(
+    minirootfs: pathlib.Path, pty_agent: pathlib.Path | None = None
+) -> tuple[list[tuple[str, int, bytes]], list[dict[str, str]]]:
     items: dict[str, tuple[int, bytes]] = {}
     with tarfile.open(minirootfs, mode="r:gz") as archive:
         members = archive.getmembers()
@@ -219,7 +255,12 @@ def rootfs_entries(minirootfs: pathlib.Path) -> tuple[list[tuple[str, int, bytes
                 raise RuntimeError(f"Unsupported file type in Alpine root archive: {name}")
             items[name] = (mode, data)
 
-    items["init"] = (stat.S_IFREG | 0o755, INIT)
+    items["init"] = (stat.S_IFREG | 0o755, PTY_AGENT_INIT if pty_agent else INIT)
+    if pty_agent:
+        agent_bytes = verify_static_aarch64_elf(pty_agent)
+        items["usr"] = (stat.S_IFDIR | 0o755, b"")
+        items["usr/sbin"] = (stat.S_IFDIR | 0o755, b"")
+        items["usr/sbin/dsbot-guest-pty-agent"] = (stat.S_IFREG | 0o755, agent_bytes)
     for directory in ("dev", "dev/pts", "proc", "sys", "run", "tmp", "root"):
         items[directory] = (stat.S_IFDIR | (0o1777 if directory == "tmp" else 0o755), b"")
     entries = [(name, mode, data) for name, (mode, data) in sorted(items.items())]
@@ -253,33 +294,53 @@ def rootfs_entries(minirootfs: pathlib.Path) -> tuple[list[tuple[str, int, bytes
 
 
 def write_guest(
-    rootfs: pathlib.Path, kernel: pathlib.Path, kernel_config: pathlib.Path, output: pathlib.Path
+    rootfs: pathlib.Path,
+    kernel: pathlib.Path,
+    kernel_config: pathlib.Path,
+    output: pathlib.Path,
+    pty_agent: pathlib.Path | None = None,
+    kernel_manifest: dict[str, object] | None = None,
 ) -> dict[str, object]:
     output.mkdir(parents=True, exist_ok=True)
     kernel_output = output / "vmlinuz-virt"
-    config_output = output / f"config-{KERNEL_VERSION}"
+    config_output = output / kernel_config.name
     rootfs_output = output / "rootfs.cpio.gz"
     shutil.copyfile(kernel, kernel_output)
     shutil.copyfile(kernel_config, config_output)
-    entries, packages = rootfs_entries(rootfs)
+    entries, packages = rootfs_entries(rootfs, pty_agent)
     cpio = cpio_newc(entries)
     with rootfs_output.open("wb") as stream:
         with gzip.GzipFile(filename="", mode="wb", compresslevel=9, fileobj=stream, mtime=0) as zipped:
             zipped.write(cpio)
-    manifest: dict[str, object] = {
-        "format": 1,
-        "guestArchitecture": "aarch64",
-        "distribution": "Alpine Linux",
-        "alpineVersion": ALPINE_VERSION,
-        "kernelVersion": KERNEL_VERSION,
-        "kernelLicense": "GPL-2.0-only",
-        "kernelSource": {
+    kernel_version = str((kernel_manifest or {}).get("kernelVersion", KERNEL_VERSION))
+    kernel_source: dict[str, object] = (
+        {
+            "kind": "pinned upstream Linux stable build",
+            "license": (kernel_manifest or {}).get("license", "GPL-2.0-only"),
+            "baseConfig": (kernel_manifest or {}).get("baseConfig", "unspecified"),
+            "sources": (kernel_manifest or {}).get("sources", []),
+            "buildManifest": kernel_manifest,
+        }
+        if kernel_manifest
+        else {
             "alpineAportsCommit": KERNEL_APORTS_COMMIT,
             "sourceArchive": (
                 "https://gitlab.alpinelinux.org/alpine/aports/"
                 f"-/archive/{KERNEL_APORTS_COMMIT}/aports-{KERNEL_APORTS_COMMIT}.tar.gz"
             ),
-        },
+        }
+    )
+    upstream = {"minirootfs": ARTIFACTS["minirootfs"]}
+    if not kernel_manifest:
+        upstream.update({name: ARTIFACTS[name] for name in ("kernel", "kernelConfig")})
+    manifest: dict[str, object] = {
+        "format": 1,
+        "guestArchitecture": "aarch64",
+        "distribution": "Alpine Linux",
+        "alpineVersion": ALPINE_VERSION,
+        "kernelVersion": kernel_version,
+        "kernelLicense": "GPL-2.0-only",
+        "kernelSource": kernel_source,
         "boot": {
             "machine": "virt",
             "cpu": "max",
@@ -288,13 +349,17 @@ def write_guest(
             "kernelArguments": "console=ttyAMA0,115200 rdinit=/init panic=10",
             "serial": "PL011 UART, 115200 8N1",
         },
-        "scope": "serial shell bootstrap image; no persistent block disk or QEMU runtime",
+        "scope": (
+            "guest PTY agent bootstrap; volatile workspaces; no persistent block disk or QEMU runtime"
+            if pty_agent
+            else "serial shell bootstrap image; no persistent block disk or QEMU runtime"
+        ),
         "upstream": {
             name: {
                 "url": spec["url"],
                 "sha256": spec["sha256"],
             }
-            for name, spec in ARTIFACTS.items()
+            for name, spec in upstream.items()
         },
         "files": {
             kernel_output.name: {
@@ -315,18 +380,38 @@ def write_guest(
             {"name": package.get("P", ""), "version": package.get("V", ""), "license": package.get("L", "")}
             for package in packages
         ],
-        "notices": "Alpine Linux packages are identified in basePackages; source is Alpine v3.23.8 minirootfs.",
+        "notices": (
+            "Alpine Linux packages are identified in basePackages; the original guest PTY agent is MIT licensed."
+            if pty_agent
+            else "Alpine Linux packages are identified in basePackages; source is Alpine v3.23.8 minirootfs."
+        ),
     }
+    if pty_agent:
+        manifest["files"]["dsbot-guest-pty-agent"] = {
+            "bytes": pty_agent.stat().st_size,
+            "sha256": sha256_file(pty_agent),
+        }
+        manifest["guestPTYAgent"] = {
+            "protocol": "DSBP/1",
+            "guestPath": "/usr/sbin/dsbot-guest-pty-agent",
+            "license": "MIT",
+            "staticAarch64ELF": True,
+        }
     manifest_path = output / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     notice_lines = [
         "DS Bot ARM64 guest bootstrap image — third-party notices",
         "",
-        f"Alpine Linux {ALPINE_VERSION} aarch64 minirootfs and Linux kernel {KERNEL_VERSION}.",
+        f"Alpine Linux {ALPINE_VERSION} aarch64 minirootfs and Linux kernel {kernel_version}.",
         "Upstream files are pinned by SHA-256 in manifest.json.",
         "Package metadata below comes from the installed-package database inside the SHA-256-pinned minirootfs.",
         "sourceURL points to the package's exact Alpine aports commit archive; its APKBUILD records upstream source URLs and hashes.",
-        "The kernel is GPL-2.0-only; its pinned Alpine packaging source archive is listed in manifest.json.",
+        (
+            "The kernel is GPL-2.0-only; pinned stable source hashes and Alpine config provenance are recorded in manifest.json."
+            if kernel_manifest
+            else "The kernel is GPL-2.0-only; its pinned Alpine packaging source archive is listed in manifest.json."
+        ),
+        *(["The bundled DS Bot guest PTY agent is original MIT-licensed code; its SHA-256 is recorded in manifest.json."] if pty_agent else []),
         "",
         "Package | Version | SPDX license | Alpine aports source archive",
     ]
@@ -365,6 +450,14 @@ def parse_args() -> argparse.Namespace:
         default=pathlib.Path.home() / ".cache" / "dsbot-arm64-guest",
         help="Upstream download cache",
     )
+    parser.add_argument(
+        "--pty-agent",
+        type=pathlib.Path,
+        help="Optional statically linked AArch64 guest PTY broker to embed in the initramfs",
+    )
+    parser.add_argument("--kernel", type=pathlib.Path, help="Optional custom guest kernel image")
+    parser.add_argument("--kernel-config", type=pathlib.Path, help="Config matching --kernel")
+    parser.add_argument("--kernel-manifest", type=pathlib.Path, help="Build manifest matching --kernel")
     return parser.parse_args()
 
 
@@ -373,9 +466,28 @@ def main() -> int:
     cache = args.cache.resolve()
     output = args.output.resolve()
     minirootfs = download_artifact("minirootfs", cache)
-    kernel = download_artifact("kernel", cache)
-    kernel_config = download_artifact("kernelConfig", cache)
-    manifest = write_guest(minirootfs, kernel, kernel_config, output)
+    custom_kernel_inputs = any((args.kernel, args.kernel_config, args.kernel_manifest))
+    if custom_kernel_inputs and not all((args.kernel, args.kernel_config, args.kernel_manifest)):
+        raise RuntimeError("--kernel, --kernel-config, and --kernel-manifest must be provided together")
+    if custom_kernel_inputs:
+        kernel = args.kernel.resolve()
+        kernel_config = args.kernel_config.resolve()
+        kernel_manifest_path = args.kernel_manifest.resolve()
+        kernel_manifest = json.loads(kernel_manifest_path.read_text(encoding="utf-8"))
+        if sha256_file(kernel) != (kernel_manifest.get("bootImage") or {}).get("sha256"):
+            raise RuntimeError("Custom guest kernel does not match its pinned kernel build manifest")
+        if sha256_file(kernel_config) != (kernel_manifest.get("config") or {}).get("sha256"):
+            raise RuntimeError("Custom guest config does not match its pinned kernel build manifest")
+    else:
+        kernel = download_artifact("kernel", cache)
+        kernel_config = download_artifact("kernelConfig", cache)
+        kernel_manifest = None
+    pty_agent = args.pty_agent.resolve() if args.pty_agent else None
+    if pty_agent and kernel_manifest:
+        expected_agent = (kernel_manifest.get("guestPtyAgent") or {}).get("sha256")
+        if not expected_agent or sha256_file(pty_agent) != expected_agent:
+            raise RuntimeError("Guest PTY agent does not match the pinned kernel build manifest")
+    manifest = write_guest(minirootfs, kernel, kernel_config, output, pty_agent, kernel_manifest)
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
     return 0
 

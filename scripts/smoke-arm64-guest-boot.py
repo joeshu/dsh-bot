@@ -1,22 +1,169 @@
 #!/usr/bin/env python3
-"""Boot the pinned ARM64 guest to its serial shell using host QEMU TCG."""
+"""Boot the ARM64 guest and exercise either its serial shell or real guest PTY."""
 
 from __future__ import annotations
 
 import argparse
+import json
+import pathlib
 import shutil
+import socket
+import struct
 import subprocess
+import tempfile
 import time
-from pathlib import Path
 
 
-BOOT_MARKER = b"DS Bot ARM64 Linux guest"
+MAGIC = b"DSBP"
+PROTOCOL_VERSION = 1
+HEADER_BYTES = 16
+MAX_FRAME_BYTES = 64 * 1024
+FRAME_CREATE = 1
+FRAME_INPUT = 2
+FRAME_RESIZE = 3
+FRAME_CLOSE = 4
+FRAME_OUTPUT = 0x81
+FRAME_EXIT = 0x82
+FRAME_ERROR = 0x83
+FRAME_READY = 0x84
+
+SHELL_BOOT_MARKER = b"DS Bot ARM64 Linux guest (Alpine Linux, BusyBox ash)."
+PTY_BOOT_MARKER = b"DS Bot ARM64 Linux guest PTY agent protocol v1."
+
+
+class SerialLink:
+    def __init__(self, connection: socket.socket) -> None:
+        self.connection = connection
+        self.raw = bytearray()
+        self.buffer = bytearray()
+
+    def _receive(self, deadline: float) -> None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("ARM64 guest serial interaction timed out")
+        self.connection.settimeout(min(0.25, remaining))
+        try:
+            chunk = self.connection.recv(64 * 1024)
+        except TimeoutError:
+            return
+        if not chunk:
+            raise RuntimeError("QEMU closed the ARM64 guest serial channel")
+        self.raw.extend(chunk)
+        self.buffer.extend(chunk)
+
+    def wait_for_text(self, marker: bytes, deadline: float) -> None:
+        while marker not in self.raw:
+            self._receive(deadline)
+
+    def send_frame(self, frame_type: int, session_id: int, payload: bytes = b"") -> None:
+        if len(payload) > MAX_FRAME_BYTES:
+            raise RuntimeError("Refusing an oversized guest PTY protocol frame")
+        self.connection.sendall(
+            struct.pack(">4sHHII", MAGIC, PROTOCOL_VERSION, frame_type, session_id, len(payload)) + payload
+        )
+
+    def receive_frame(self, deadline: float) -> tuple[int, int, bytes]:
+        while True:
+            offset = self.buffer.find(MAGIC)
+            if offset < 0:
+                if len(self.buffer) > len(MAGIC) - 1:
+                    del self.buffer[:-(len(MAGIC) - 1)]
+            elif offset:
+                del self.buffer[:offset]
+            if len(self.buffer) >= HEADER_BYTES:
+                magic, version, frame_type, session_id, length = struct.unpack_from(">4sHHII", self.buffer)
+                if magic != MAGIC or version != PROTOCOL_VERSION or length > MAX_FRAME_BYTES:
+                    del self.buffer[0]
+                    continue
+                total = HEADER_BYTES + length
+                if len(self.buffer) >= total:
+                    payload = bytes(self.buffer[HEADER_BYTES:total])
+                    del self.buffer[:total]
+                    return frame_type, session_id, payload
+            self._receive(deadline)
+
+
+def output_until_marker(link: SerialLink, session_id: int, marker: bytes, timeout: int) -> bytes:
+    deadline = time.monotonic() + timeout
+    output = bytearray()
+    while marker not in output:
+        frame_type, frame_session, payload = link.receive_frame(deadline)
+        if frame_type == FRAME_ERROR:
+            raise RuntimeError(f"Guest PTY agent error: {payload.decode('utf-8', 'replace')}")
+        if frame_session != session_id:
+            continue
+        if frame_type == FRAME_EXIT:
+            raise RuntimeError(f"Guest shell exited before emitting {marker.decode('ascii')}")
+        if frame_type == FRAME_OUTPUT:
+            output.extend(payload)
+    return bytes(output)
+
+
+def wait_for_frame(link: SerialLink, frame_type_expected: int, session_id: int, timeout: int) -> bytes:
+    deadline = time.monotonic() + timeout
+    while True:
+        frame_type, frame_session, payload = link.receive_frame(deadline)
+        if frame_type == FRAME_ERROR:
+            raise RuntimeError(f"Guest PTY agent error: {payload.decode('utf-8', 'replace')}")
+        if frame_type == frame_type_expected and frame_session == session_id:
+            return payload
+
+
+def smoke_serial_shell(link: SerialLink, timeout: int) -> None:
+    link.wait_for_text(SHELL_BOOT_MARKER, time.monotonic() + timeout)
+    link.connection.sendall(b"echo DS_BOT_SERIAL_SHELL_INPUT_OK\n")
+    deadline = time.monotonic() + timeout
+    marker = b"DS_BOT_SERIAL_SHELL_INPUT_OK"
+    while marker not in link.raw:
+        link._receive(deadline)
+    print("ARM64 guest reached its serial shell and accepted an interactive command.")
+
+
+def smoke_guest_pty(link: SerialLink, timeout: int) -> None:
+    link.wait_for_text(PTY_BOOT_MARKER, time.monotonic() + timeout)
+    wait_for_frame(link, FRAME_READY, 0, timeout)
+    session_id = 0xD5B07001
+    link.send_frame(FRAME_CREATE, session_id, struct.pack(">HH", 24, 80))
+    wait_for_frame(link, FRAME_READY, session_id, timeout)
+
+    input_marker = b"DS_BOT_GUEST_PTY_INPUT_OK"
+    link.send_frame(FRAME_INPUT, session_id, b"echo DS_BOT_GUEST_PTY_INPUT_OK\n")
+    output_until_marker(link, session_id, input_marker, timeout)
+
+    job_control_marker = b"DS_BOT_GUEST_PTY_JOB_CONTROL_OK"
+    job_control_command = (
+        b"if set -o | grep -Eq '^monitor[[:space:]]+on$'; then "
+        b"echo DS_BOT_GUEST_PTY_JOB_CONTROL_OK; else "
+        b"echo DS_BOT_GUEST_PTY_JOB_CONTROL_FAIL; fi\n"
+    )
+    link.send_frame(FRAME_INPUT, session_id, job_control_command)
+    output_until_marker(link, session_id, job_control_marker, timeout)
+
+    link.send_frame(FRAME_RESIZE, session_id, struct.pack(">HH", 42, 100))
+    resize_marker = b"DS_BOT_GUEST_PTY_RESIZE_OK"
+    link.send_frame(FRAME_INPUT, session_id, b"stty size; echo DS_BOT_GUEST_PTY_RESIZE_OK\n")
+    resize_output = output_until_marker(link, session_id, resize_marker, timeout)
+    if b"42 100" not in resize_output:
+        raise RuntimeError("Guest PTY did not apply the requested terminal size")
+
+    link.send_frame(FRAME_INPUT, session_id, b"sleep 20\n")
+    time.sleep(0.35)
+    link.send_frame(FRAME_INPUT, session_id, b"\x03")
+    cancel_marker = b"DS_BOT_GUEST_PTY_CANCEL_OK"
+    link.send_frame(FRAME_INPUT, session_id, b"echo DS_BOT_GUEST_PTY_CANCEL_OK\n")
+    output_until_marker(link, session_id, cancel_marker, timeout)
+
+    link.send_frame(FRAME_CLOSE, session_id)
+    payload = wait_for_frame(link, FRAME_EXIT, session_id, timeout)
+    if len(payload) != 4:
+        raise RuntimeError("Guest PTY agent returned an invalid exit status frame")
+    print("ARM64 guest PTY passed input/output, job control, resize, interrupt, and close checks.")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--guest-dir", type=Path, required=True)
-    parser.add_argument("--kernel", type=Path)
+    parser.add_argument("--guest-dir", type=pathlib.Path, required=True)
+    parser.add_argument("--kernel", type=pathlib.Path)
     parser.add_argument("--timeout", type=int, default=90)
     args = parser.parse_args()
 
@@ -27,51 +174,75 @@ def main() -> None:
         raise SystemExit("qemu-system-aarch64 is not installed")
     if not kernel.is_file():
         raise SystemExit(f"Guest kernel is missing: {kernel}")
-    if not (guest_dir / "rootfs.cpio.gz").is_file():
-        raise SystemExit(f"Guest boot input is missing: {guest_dir / 'rootfs.cpio.gz'}")
+    initrd = guest_dir / "rootfs.cpio.gz"
+    if not initrd.is_file():
+        raise SystemExit(f"Guest boot input is missing: {initrd}")
+    manifest_path = guest_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
+    has_pty_agent = isinstance(manifest.get("guestPTYAgent"), dict)
+    marker = PTY_BOOT_MARKER if has_pty_agent else SHELL_BOOT_MARKER
 
     serial_log = guest_dir / "serial-smoke.log"
     serial_log.unlink(missing_ok=True)
-    command = [
-        qemu,
-        "-machine", "virt,gic-version=2",
-        "-cpu", "max",
-        "-m", "512M",
-        "-smp", "2",
-        "-accel", "tcg,thread=single",
-        "-kernel", str(kernel),
-        "-initrd", str(guest_dir / "rootfs.cpio.gz"),
-        "-append", "console=ttyAMA0,115200 rdinit=/init panic=10",
-        "-display", "none",
-        "-monitor", "none",
-        "-serial", f"file:{serial_log}",
-        "-no-reboot",
-    ]
-    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    deadline = time.monotonic() + max(1, args.timeout)
-    booted = False
-    try:
-        while time.monotonic() < deadline:
-            if serial_log.is_file() and BOOT_MARKER in serial_log.read_bytes():
-                booted = True
-                break
-            if process.poll() is not None:
-                break
-            time.sleep(0.25)
-    finally:
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+    with tempfile.TemporaryDirectory(prefix="dsbot-uart-") as temporary:
+        socket_path = pathlib.Path(temporary) / "serial.sock"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(socket_path))
+        server.listen(1)
+        server.settimeout(0.25)
+        command = [
+            qemu,
+            "-machine", "virt,gic-version=2",
+            "-cpu", "max",
+            "-m", "512M",
+            "-smp", "2",
+            "-accel", "tcg,thread=single",
+            "-kernel", str(kernel),
+            "-initrd", str(initrd),
+            "-append", "console=ttyAMA0,115200 rdinit=/init panic=10",
+            "-display", "none",
+            "-monitor", "none",
+            "-serial", f"unix:{socket_path},server=off,wait=off",
+            "-no-reboot",
+        ]
+        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        connection: socket.socket | None = None
+        link: SerialLink | None = None
+        deadline = time.monotonic() + max(1, args.timeout)
+        try:
+            while connection is None and time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise RuntimeError(f"QEMU exited before opening the guest serial channel (status {process.returncode})")
+                try:
+                    connection, _ = server.accept()
+                except TimeoutError:
+                    continue
+            if connection is None:
+                raise TimeoutError("QEMU did not connect its serial device to the smoke harness")
+            link = SerialLink(connection)
+            link.wait_for_text(marker, deadline)
+            if has_pty_agent:
+                smoke_guest_pty(link, args.timeout)
+            else:
+                smoke_serial_shell(link, args.timeout)
+        finally:
+            if connection:
+                connection.close()
+            server.close()
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            serial_log.write_bytes(link.raw if link else b"")
 
-    output = serial_log.read_bytes() if serial_log.is_file() else b""
-    print(output[-8192:].decode("utf-8", "replace"), end="")
-    if not booted:
-        raise SystemExit(f"ARM64 guest did not reach its serial shell marker within {args.timeout}s")
-    print("ARM64 guest reached the serial shell boot marker.")
+    raw = serial_log.read_bytes()
+    boot_text = raw.split(MAGIC, 1)[0] if has_pty_agent else raw
+    print(boot_text[-8192:].decode("utf-8", "replace"), end="")
+    if marker not in raw:
+        raise SystemExit(f"ARM64 guest did not reach its boot marker within {args.timeout}s")
 
 
 if __name__ == "__main__":
