@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""Build the pinned Alpine ARM64 guest kernel with terminal and disk drivers built in."""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+import urllib.request
+
+
+APORTS_COMMIT = "942251c9a4cb77b6d34ecbce4c293f96abfecce5"
+KERNEL_VERSION = "6.18.60"
+APORTS_RAW = f"https://gitlab.alpinelinux.org/alpine/aports/-/raw/{APORTS_COMMIT}/main/linux-lts"
+KERNEL_BASE_URL = "https://cdn.kernel.org/pub/linux/kernel/v6.x"
+MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024
+
+SOURCES = {
+    "linux-6.18.tar.xz": {
+        "url": f"{KERNEL_BASE_URL}/linux-6.18.tar.xz",
+        "sha512": "88599ffdec96d150c1feb9b261ba93bb0301a9d0e1ad6bef7aeab1f5372cbfc57d8b43c7e902bd8f76921d1dbd8189663c142ea869e51d0e2b483b150ee00fe0",
+    },
+    "patch-6.18.60.patch.xz": {
+        "url": f"{KERNEL_BASE_URL}/patch-6.18.60.patch.xz",
+        "sha512": "fce959c563635d4374cba148b7f1b8b64a143e5b42bd8e86afee7dfdc76b9d887afb5a032249ac16518ee95e73b3c1a459f15926a035780493c5b3b9fbd3b51b",
+    },
+    "0001-powerpc-boot-wrapper-Add-z-notext-flag-for-ppc64le.patch": {
+        "url": f"{APORTS_RAW}/0001-powerpc-boot-wrapper-Add-z-notext-flag-for-ppc64le.patch",
+        "sha512": "b296717ef0cd63978142b4d47b3bc49faa04daf77e115e702ba611cc254a6e782cdab7d5639e724cd5f029cfb6a3dc33c3036f346d681d1fdfe0df723c7e0321",
+    },
+    "0002-x86-Compress-vmlinux-with-zstd-19-instead-of-22.patch": {
+        "url": f"{APORTS_RAW}/0002-x86-Compress-vmlinux-with-zstd-19-instead-of-22.patch",
+        "sha512": "055e10e7b3e00bb3621389315d5206a8feb5022a1f0dc51c3aa107facfe83d191da05a502a0c62488be7299677a63c1da84f87c42cbf3125788c56db67e810ee",
+    },
+    "0003-kexec-add-kexec_load_disabled-boot-option.patch": {
+        "url": f"{APORTS_RAW}/0003-kexec-add-kexec_load_disabled-boot-option.patch",
+        "sha512": "e1d2d5358f5b8189236108973395f00eafce8db6d5baaf55025b1360f08ab7cffc930d3818719f220b98e7e8541cc8a7f056611b6e290f224a102c1addbe34ac",
+    },
+    "0004-objtool-respect-AWK-setting.patch": {
+        "url": f"{APORTS_RAW}/0004-objtool-respect-AWK-setting.patch",
+        "sha512": "28c83be4c97152001381cd5e3a8acb8552a42d9dac9aaec8f096e3762b7944035aa5a4363fb4602f9bb427c4f72cfd2f996a0a725f7f9e07ab250317985aff9e",
+    },
+    "0005-powerpc-config-defang-gcc-check-for-stack-protector-.patch": {
+        "url": f"{APORTS_RAW}/0005-powerpc-config-defang-gcc-check-for-stack-protector-.patch",
+        "sha512": "5ce79416f8f111c36393718656e3eeb4cb0adccd117dcf661876d1564010e5c58b6351cc4116d187d0a9a838bcca0fecc236d81ac71afb940b89ccb14f21e179",
+    },
+    "0001-x86-CPU-AMD-avoid-printing-reset-reasons-on-Xen-domU.patch": {
+        "url": f"{APORTS_RAW}/0001-x86-CPU-AMD-avoid-printing-reset-reasons-on-Xen-domU.patch",
+        "sha512": "4e72af8e77a555d2a850837b64a525a51d5d118048584dc3ea0d0e8620bb56bf56b69a94aa67dac879b841c9ba033e33d94610da0028fde7b6602ad2fe63f02f",
+    },
+    "sophgo-fixes.patch": {
+        "url": f"{APORTS_RAW}/sophgo-fixes.patch",
+        "sha512": "855522b816bbb2b0738251cf24714c2566c7aacad39aaf6adcebd0a256d11f64ff2762ecdace0ab1bac38db87fd579863f852f799356a368f057c166e4deb03c",
+    },
+    "virt.aarch64.config": {
+        "url": f"{APORTS_RAW}/virt.aarch64.config",
+        "sha512": "ffbe61069184a46baf90cbffeba5512df7e0d0b11c2404f629ad698bdfb6199269618013abdc2895a9bc960bb5e0425ee4f8a928fca08aae5b5ff97e49023e3f",
+    },
+}
+
+ALPINE_PATCHES = [
+    "0001-powerpc-boot-wrapper-Add-z-notext-flag-for-ppc64le.patch",
+    "0002-x86-Compress-vmlinux-with-zstd-19-instead-of-22.patch",
+    "0003-kexec-add-kexec_load_disabled-boot-option.patch",
+    "0004-objtool-respect-AWK-setting.patch",
+    "0005-powerpc-config-defang-gcc-check-for-stack-protector-.patch",
+    "0001-x86-CPU-AMD-avoid-printing-reset-reasons-on-Xen-domU.patch",
+    "sophgo-fixes.patch",
+]
+
+BUILTIN_OPTIONS = (
+    "VIRTIO_PCI",
+    "VIRTIO_CONSOLE",
+    "VIRTIO_BLK",
+    "EXT4_FS",
+    "FUSE_FS",
+    "DEVPTS_FS",
+    "UNIX98_PTYS",
+    "DEVTMPFS",
+    "DEVTMPFS_MOUNT",
+)
+DISABLED_OPTIONS = (
+    "DEBUG_INFO",
+    "DEBUG_INFO_BTF",
+    "DEBUG_INFO_DWARF5",
+    "GCC_PLUGIN_LATENT_ENTROPY",
+    "MODULES",
+)
+
+
+def sha512_file(path: pathlib.Path) -> str:
+    digest = hashlib.sha512()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sha256_file(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def download(name: str, spec: dict[str, str], cache: pathlib.Path) -> pathlib.Path:
+    path = cache / name
+    if path.is_file() and sha512_file(path) == spec["sha512"]:
+        return path
+    path.unlink(missing_ok=True)
+    requested = urllib.parse.urlparse(spec["url"])
+    allowed_hosts = {"cdn.kernel.org", "gitlab.alpinelinux.org"}
+    if requested.scheme != "https" or requested.hostname not in allowed_hosts:
+        raise RuntimeError(f"Refusing untrusted source URL for {name}")
+    cache.mkdir(parents=True, exist_ok=True)
+    request = urllib.request.Request(spec["url"], headers={"User-Agent": "DSBot-ARM64-kernel-builder/1"})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        final = urllib.parse.urlparse(response.geturl())
+        if final.scheme != "https" or final.hostname not in allowed_hosts:
+            raise RuntimeError(f"Refusing redirected source URL for {name}")
+        fd, temporary_name = tempfile.mkstemp(prefix=f".{name}.", dir=cache)
+        temporary = pathlib.Path(temporary_name)
+        digest = hashlib.sha512()
+        total = 0
+        try:
+            with os.fdopen(fd, "wb") as output:
+                while chunk := response.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > MAX_DOWNLOAD_BYTES:
+                        raise RuntimeError(f"{name} exceeded the {MAX_DOWNLOAD_BYTES} byte download limit")
+                    digest.update(chunk)
+                    output.write(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+            if digest.hexdigest() != spec["sha512"]:
+                raise RuntimeError(f"SHA-512 mismatch for {name}")
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return path
+
+
+def run(command: list[str], *, cwd: pathlib.Path | None = None, env: dict[str, str] | None = None) -> str:
+    result = subprocess.run(command, cwd=cwd, env=env, check=True, text=True, stdout=subprocess.PIPE)
+    return result.stdout.strip()
+
+
+def apply_patch_file(source: pathlib.Path, patch_path: pathlib.Path, *, xz_compressed: bool = False) -> None:
+    command = ["patch", "-p1", "--batch", "--fuzz=0"]
+    if xz_compressed:
+        decompressor = subprocess.Popen(["xz", "-dc", str(patch_path)], stdout=subprocess.PIPE)
+        assert decompressor.stdout is not None
+        try:
+            subprocess.run(command, cwd=source, stdin=decompressor.stdout, check=True)
+        finally:
+            decompressor.stdout.close()
+        if decompressor.wait() != 0:
+            raise RuntimeError(f"Could not decompress pinned kernel patch {patch_path.name}")
+        return
+    with patch_path.open("rb") as patch_stream:
+        subprocess.run(command, cwd=source, stdin=patch_stream, check=True)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=pathlib.Path, required=True)
+    parser.add_argument("--cache", type=pathlib.Path, default=pathlib.Path.home() / ".cache" / "dsbot-arm64-kernel")
+    parser.add_argument("--jobs", type=int, default=2)
+    args = parser.parse_args()
+    output = args.output.resolve()
+    cache = args.cache.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    downloaded = {name: download(name, spec, cache) for name, spec in SOURCES.items()}
+
+    with tempfile.TemporaryDirectory(prefix="dsbot-arm64-kernel-") as temporary:
+        work = pathlib.Path(temporary)
+        source = work / f"linux-{KERNEL_VERSION}"
+        source.mkdir()
+        subprocess.run(
+            ["tar", "-xJf", str(downloaded["linux-6.18.tar.xz"]), "--strip-components=1", "-C", str(source)],
+            check=True,
+        )
+        apply_patch_file(source, downloaded["patch-6.18.60.patch.xz"], xz_compressed=True)
+        for name in ALPINE_PATCHES:
+            apply_patch_file(source, downloaded[name])
+
+        build = work / "build"
+        build.mkdir()
+        shutil.copyfile(downloaded["virt.aarch64.config"], build / ".config")
+        run(
+            [
+                str(source / "scripts" / "config"),
+                "--file",
+                str(build / ".config"),
+                *[argument for option in BUILTIN_OPTIONS for argument in ("--enable", option)],
+                *[argument for option in DISABLED_OPTIONS for argument in ("--disable", option)],
+            ],
+            cwd=source,
+        )
+
+        cross = "aarch64-linux-gnu-"
+        make_env = {
+            **os.environ,
+            "ARCH": "arm64",
+            "CROSS_COMPILE": cross,
+            "KBUILD_BUILD_USER": "dsbot",
+            "KBUILD_BUILD_HOST": "guest-kernel-builder",
+            "KBUILD_BUILD_TIMESTAMP": "2026-10-30 19:05:20 UTC",
+            "KBUILD_BUILD_VERSION": "1-Alpine",
+            "SOURCE_DATE_EPOCH": "1793387120",
+        }
+        make_base = ["make", "-C", str(source), f"O={build}", f"-j{max(1, args.jobs)}", "LOCALVERSION=-0-virt"]
+        run([*make_base, "olddefconfig"], env=make_env)
+        config_text = (build / ".config").read_text(encoding="utf-8")
+        missing = [option for option in BUILTIN_OPTIONS if f"CONFIG_{option}=y" not in config_text]
+        if missing:
+            raise SystemExit(f"Required built-in kernel options were disabled by Kconfig: {', '.join(missing)}")
+        subprocess.run([*make_base, "Image"], env=make_env, check=True)
+        kernel = build / "arch" / "arm64" / "boot" / "Image"
+        if not kernel.is_file():
+            raise SystemExit("The ARM64 kernel Image was not produced")
+        kernel_release = run([*make_base, "-s", "kernelrelease"], env=make_env)
+        config_output = output / f"config-{kernel_release}"
+        shutil.copyfile(build / ".config", config_output)
+        compressed = output / "vmlinuz-dsbot-arm64"
+        with kernel.open("rb") as source_image, compressed.open("wb") as destination:
+            with gzip.GzipFile(filename="", mode="wb", compresslevel=9, fileobj=destination, mtime=0) as zipped:
+                shutil.copyfileobj(source_image, zipped)
+
+        manifest = {
+            "format": 1,
+            "guestArchitecture": "aarch64",
+            "kernelVersion": kernel_release,
+            "distributionConfig": "Alpine Linux virt flavor",
+            "alpineAportsCommit": APORTS_COMMIT,
+            "license": "GPL-2.0-only",
+            "bootImage": {
+                "filename": compressed.name,
+                "bytes": compressed.stat().st_size,
+                "sha256": sha256_file(compressed),
+            },
+            "config": {
+                "filename": config_output.name,
+                "bytes": config_output.stat().st_size,
+                "sha256": sha256_file(config_output),
+                "builtInOptions": list(BUILTIN_OPTIONS),
+                "disabledOptions": list(DISABLED_OPTIONS),
+            },
+            "toolchain": {
+                "compiler": run([f"{cross}gcc", "--version"]).splitlines()[0],
+                "make": run(["make", "--version"]).splitlines()[0],
+            },
+            "sources": [
+                {"filename": name, "url": SOURCES[name]["url"], "sha512": SOURCES[name]["sha512"]}
+                for name in SOURCES
+            ],
+        }
+        (output / "kernel-build-manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        (output / "THIRD-PARTY-NOTICES.txt").write_text(
+            "DS Bot ARM64 guest kernel\n"
+            f"Linux {kernel_release}, GPL-2.0-only.\n"
+            f"Built from kernel.org Linux 6.18.60 and the Alpine aports linux-lts source at {APORTS_COMMIT}.\n"
+            "Source URLs and SHA-512 values are recorded in kernel-build-manifest.json; build and configuration scripts are in the repository.\n"
+        )
+        checksums = []
+        for path in sorted(output.iterdir()):
+            if path.is_file() and path.name != "SHA256SUMS.txt":
+                checksums.append(f"{sha256_file(path)}  {path.name}")
+        (output / "SHA256SUMS.txt").write_text("\n".join(checksums) + "\n")
+        print(json.dumps(manifest, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(f"ARM64 guest kernel build failed: {error}", file=sys.stderr)
+        raise SystemExit(1)

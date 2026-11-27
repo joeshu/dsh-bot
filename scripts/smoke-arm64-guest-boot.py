@@ -16,16 +16,19 @@ BOOT_MARKER = b"DS Bot ARM64 Linux guest"
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--guest-dir", type=Path, required=True)
+    parser.add_argument("--kernel", type=Path)
     parser.add_argument("--timeout", type=int, default=90)
     args = parser.parse_args()
 
     guest_dir = args.guest_dir.resolve()
+    kernel = args.kernel.resolve() if args.kernel else guest_dir / "vmlinuz-virt"
     qemu = shutil.which("qemu-system-aarch64")
     if not qemu:
         raise SystemExit("qemu-system-aarch64 is not installed")
-    for name in ("vmlinuz-virt", "rootfs.cpio.gz"):
-        if not (guest_dir / name).is_file():
-            raise SystemExit(f"Guest boot input is missing: {guest_dir / name}")
+    if not kernel.is_file():
+        raise SystemExit(f"Guest kernel is missing: {kernel}")
+    if not (guest_dir / "rootfs.cpio.gz").is_file():
+        raise SystemExit(f"Guest boot input is missing: {guest_dir / 'rootfs.cpio.gz'}")
 
     serial_log = guest_dir / "serial-smoke.log"
     serial_log.unlink(missing_ok=True)
@@ -36,7 +39,7 @@ def main() -> None:
         "-m", "512M",
         "-smp", "2",
         "-accel", "tcg,thread=single",
-        "-kernel", str(guest_dir / "vmlinuz-virt"),
+        "-kernel", str(kernel),
         "-initrd", str(guest_dir / "rootfs.cpio.gz"),
         "-append", "console=ttyAMA0,115200 rdinit=/init panic=10",
         "-display", "none",

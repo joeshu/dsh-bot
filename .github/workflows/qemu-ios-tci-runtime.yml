@@ -11,7 +11,41 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  build-guest-kernel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned target kernel build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            bc bison flex gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libelf-dev libssl-dev make patch perl python3 tar xz-utils
+
+      - name: Build Alpine ARM64 kernel with built-in terminal and disk drivers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/build-arm64-guest-kernel.py \
+            --output "$RUNNER_TEMP/dsbot-arm64-kernel" \
+            --cache "$RUNNER_TEMP/dsbot-arm64-kernel-source-cache" \
+            --jobs 2
+          (cd "$RUNNER_TEMP/dsbot-arm64-kernel" && sha256sum -c SHA256SUMS.txt)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsbot-arm64-linux-guest-kernel-${{ github.sha }}
+          path: ${{ runner.temp }}/dsbot-arm64-kernel/
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
   build:
+    needs: build-guest-kernel
     runs-on: macos-26
     timeout-minutes: 240
     env:
@@ -19,6 +53,11 @@ jobs:
       UTM_UPSTREAM_COMMIT: 3d4b8d8cb1ce93a8b1a9610695c12487685f0c15
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dsbot-arm64-linux-guest-kernel-${{ github.sha }}
+          path: ${{ runner.temp }}/dsbot-arm64-kernel
 
       - id: qemu-cache-restore
         uses: actions/cache/restore@v4
@@ -94,8 +133,10 @@ jobs:
           brew install --quiet qemu
           GUEST_DIR="$RUNNER_TEMP/dsbot-arm64-guest"
           python3 "$GITHUB_WORKSPACE/scripts/prepare-arm64-guest.py" --output "$GUEST_DIR"
-          python3 "$GITHUB_WORKSPACE/scripts/smoke-arm64-guest-boot.py" --guest-dir "$GUEST_DIR"
-          echo "- Alpine ARM64 guest reached the serial shell under host QEMU TCG." >> "$GITHUB_STEP_SUMMARY"
+          python3 "$GITHUB_WORKSPACE/scripts/smoke-arm64-guest-boot.py" \
+            --guest-dir "$GUEST_DIR" \
+            --kernel "$RUNNER_TEMP/dsbot-arm64-kernel/vmlinuz-dsbot-arm64"
+          echo "- Custom Alpine ARM64 kernel reached the serial shell under host QEMU TCG." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Stage stripped frameworks, source and license report
         shell: bash
