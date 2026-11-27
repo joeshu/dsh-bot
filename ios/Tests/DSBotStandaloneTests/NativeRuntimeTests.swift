@@ -81,6 +81,59 @@ final class NativeRuntimeTests: XCTestCase {
         XCTAssertFalse(revoked)
     }
 
+    func testARM64GuestPTYBrokerAuthenticatesAndMultiplexesSessionFrames() async throws {
+        let transport = FakeGuestSerialTransport()
+        let broker = ARM64GuestPTYBroker(transport: transport)
+        await broker.start()
+
+        let readiness = Task { try await broker.waitUntilReady(timeoutSeconds: 5) }
+        let ping = try await transport.waitForFrame(.ping)
+        transport.deliver(ARM64GuestPTYFrame(type: .pong, sessionID: 0, payload: ping.payload))
+        try await readiness.value
+
+        let owner = try XCTUnwrap(ARM64GuestPTYOwner(kind: .bot, sessionID: "ios:main:thread-1"))
+        let otherOwner = try XCTUnwrap(ARM64GuestPTYOwner(kind: .web, sessionID: "ios:main:thread-1"))
+        let opening = Task { try await broker.open(owner: owner, rows: 42, columns: 100) }
+        let create = try await transport.waitForFrame(.create)
+        XCTAssertEqual(Array(create.payload), [0, 42, 0, 100])
+        transport.deliver(ARM64GuestPTYFrame(type: .ready, sessionID: create.sessionID))
+        let output = try await opening.value
+
+        do {
+            try await broker.sendInput(Data("should-not-cross".utf8), from: otherOwner)
+            XCTFail("A different owner must not write to this PTY")
+        } catch let error as ARM64GuestPTYProtocolError {
+            XCTAssertEqual(error, .ownerNotAuthorized)
+        }
+
+        try await broker.sendInput(Data([0x61, 0x0a]), from: owner)
+        try await broker.resize(owner: owner, rows: 42, columns: 100)
+        let input = try await transport.waitForFrame(.input)
+        let resize = try await transport.waitForFrame(.resize)
+        XCTAssertEqual(input.sessionID, create.sessionID)
+        XCTAssertEqual(resize.sessionID, create.sessionID)
+
+        let payload = Data("shell output".utf8)
+        transport.deliver(ARM64GuestPTYFrame(type: .output, sessionID: create.sessionID, payload: payload))
+        var iterator = output.makeAsyncIterator()
+        let outputEvent = try await iterator.next()
+        XCTAssertEqual(outputEvent, .output(payload))
+
+        let closing = Task { try await broker.close(owner: owner) }
+        _ = try await transport.waitForFrame(.close)
+        var exitPayload = Data()
+        exitPayload.append(contentsOf: [0, 0, 0, 7])
+        transport.deliver(ARM64GuestPTYFrame(type: .exit, sessionID: create.sessionID, payload: exitPayload))
+        let exitStatus = try await closing.value
+        XCTAssertEqual(exitStatus, Optional(Int32(7)))
+        let exitEvent = try await iterator.next()
+        XCTAssertEqual(exitEvent, .exited(7))
+        let streamEnd = try await iterator.next()
+        XCTAssertNil(streamEnd)
+        let activeSessions = await broker.activeSessionCount()
+        XCTAssertEqual(activeSessions, 0)
+    }
+
     func testModelSelectionAndEndpointBinding() throws {
         let official = try ModelProvider("https://API.DeepSeek.COM:443/v1/")
         let custom = try ModelProvider("https://example.test/gateway/v1/")
@@ -328,5 +381,62 @@ final class NativeRuntimeTests: XCTestCase {
 
         let approval = AppActionCatalog.descriptor(for: .resolveApproval)
         XCTAssertTrue(approval.isAvailable(isPrivate: true, isStreaming: true))
+    }
+}
+
+private final class FakeGuestSerialTransport: ARM64GuestSerialTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private var sent: [Data] = []
+    private var receiveHandler: (@Sendable (Data) -> Void)?
+    private var closeHandler: (@Sendable () -> Void)?
+
+    func setReceiveHandler(_ handler: (@Sendable (Data) -> Void)?) {
+        lock.lock()
+        receiveHandler = handler
+        lock.unlock()
+    }
+
+    func setCloseHandler(_ handler: (@Sendable () -> Void)?) {
+        lock.lock()
+        closeHandler = handler
+        lock.unlock()
+    }
+
+    func send(_ bytes: Data) throws {
+        lock.lock()
+        sent.append(bytes)
+        lock.unlock()
+    }
+
+    func close() {
+        lock.lock()
+        let handler = closeHandler
+        lock.unlock()
+        handler?()
+    }
+
+    func deliver(_ frame: ARM64GuestPTYFrame) {
+        let data = try! ARM64GuestPTYCodec.encode(frame)
+        lock.lock()
+        let handler = receiveHandler
+        lock.unlock()
+        handler?(data)
+    }
+
+    func sentFrames() throws -> [ARM64GuestPTYFrame] {
+        lock.lock()
+        let data = sent
+        lock.unlock()
+        var decoder = ARM64GuestPTYDecoder()
+        return try data.flatMap { try decoder.push($0) }
+    }
+
+    func waitForFrame(_ type: ARM64GuestPTYFrameType) async throws -> ARM64GuestPTYFrame {
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            if let frame = try sentFrames().first(where: { $0.type == type }) { return frame }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        throw ARM64GuestPTYProtocolError.timeout("test transport frame")
     }
 }

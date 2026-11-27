@@ -30,7 +30,17 @@ public enum ARM64GuestPTYProtocolError: Error, Equatable, LocalizedError {
     case unsupportedVersion(UInt16)
     case unsupportedFrameType(UInt16)
     case invalidOwner
+    case invalidDimensions
     case sessionIDSpaceExhausted
+    case guestNotReady
+    case ownerNotAuthorized
+    case sessionLimitReached
+    case sessionNotOpen
+    case timeout(String)
+    case transportClosed
+    case outputBackpressure
+    case guestRejected(String)
+    case invalidFrame
 
     public var errorDescription: String? {
         switch self {
@@ -38,7 +48,17 @@ public enum ARM64GuestPTYProtocolError: Error, Equatable, LocalizedError {
         case .unsupportedVersion(let version): return "Unsupported guest PTY protocol version: \(version)."
         case .unsupportedFrameType(let type): return "Unsupported guest PTY frame type: \(type)."
         case .invalidOwner: return "Guest PTY owner identity is invalid."
+        case .invalidDimensions: return "Guest PTY terminal dimensions are invalid."
         case .sessionIDSpaceExhausted: return "No guest PTY session identifiers are available."
+        case .guestNotReady: return "The ARM64 Linux guest PTY agent is not ready."
+        case .ownerNotAuthorized: return "This caller does not own the guest PTY session."
+        case .sessionLimitReached: return "The guest PTY session limit has been reached."
+        case .sessionNotOpen: return "The guest PTY session is not open."
+        case .timeout(let operation): return "Guest PTY \(operation) timed out."
+        case .transportClosed: return "The guest serial connection is closed."
+        case .outputBackpressure: return "The guest PTY output consumer is too slow; the session was closed."
+        case .guestRejected(let message): return message
+        case .invalidFrame: return "The guest PTY agent returned a malformed frame."
         }
     }
 }
@@ -211,6 +231,10 @@ public actor ARM64GuestPTYSessionDirectory {
 
     public func authorize(guestSessionID: UInt32, for owner: ARM64GuestPTYOwner) -> Bool {
         ownersByGuestID[guestSessionID] == owner
+    }
+
+    public func existingSessionID(for owner: ARM64GuestPTYOwner) -> UInt32? {
+        guestIDsByOwner[owner]
     }
 
     public func revoke(owner: ARM64GuestPTYOwner) {

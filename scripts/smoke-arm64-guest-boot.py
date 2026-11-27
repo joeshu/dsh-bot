@@ -312,10 +312,18 @@ def main() -> None:
             else:
                 smoke_serial_shell(link, args.timeout)
         except Exception:
-            if link and link.raw:
-                boot_text = link.raw.split(MAGIC, 1)[0]
-                print("Guest serial output before smoke failure:")
-                print(boot_text[-8192:].decode("utf-8", "replace"), end="")
+            boot_text = link.raw.split(MAGIC, 1)[0] if link else b""
+            print("Guest serial output before smoke failure:")
+            print(boot_text[-8192:].decode("utf-8", "replace") if boot_text else "<no guest serial bytes>")
+            qemu_status = process.poll()
+            if qemu_status is None:
+                print("QEMU was still running when the serial channel closed.")
+            else:
+                qemu_stderr.flush()
+                detail = qemu_stderr_path.read_text(encoding="utf-8", errors="replace")[-4096:]
+                print(f"QEMU exited with status {qemu_status}.")
+                print("QEMU stderr:")
+                print(detail if detail else "<empty>")
             raise
         finally:
             if connection:
