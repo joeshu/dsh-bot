@@ -59,7 +59,7 @@ public final class NodeRuntimeTransport: IPCByteTransport, @unchecked Sendable {
             .replacingOccurrences(of: "=", with: "")
         let oldSpaceMB = MemoryGovernor.recommendedNodeOldSpaceMB()
         var args = [
-            "node", "--no-warnings", "--expose-internals", "--max-old-space-size=48", entry.path,
+            "node", "--no-warnings", "--expose-internals", "--max-old-space-size=128", entry.path,
             "--ipc-fd=\(nodeFD)",
             "--workspace=\(workspace.path)",
             "--database=\(database.path)",

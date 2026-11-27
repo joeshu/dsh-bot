@@ -710,7 +710,7 @@ test('v3 governance: phase 3/4 full closure (SQLite attachment index, GitHub cat
 
   const repoRoot = join(__dirname, '..', '..')
   const transport = readFileSync(join(repoRoot, 'ios/Sources/Runtime/NodeRuntimeTransport.swift'), 'utf8')
-  assert.match(transport, /--max-old-space-size=48/)
+  assert.match(transport, /--max-old-space-size=128/)
   const ipc = readFileSync(join(repoRoot, 'ios/Sources/Runtime/IPCChannel.swift'), 'utf8')
   assert.match(ipc, /private var readOffset = 0/)
   const cost = readFileSync(join(repoRoot, 'ios/Sources/Runtime/CostAndBudgetGovernor.swift'), 'utf8')

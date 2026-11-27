@@ -37,9 +37,9 @@ function stopWorker() {
 }
 
 const parsedWorkerHeapMB = Number(option('worker-heap-mb'))
-const workerHeapMB = Number.isFinite(parsedWorkerHeapMB) && parsedWorkerHeapMB >= 128 && parsedWorkerHeapMB <= 1024
+const workerHeapMB = Number.isFinite(parsedWorkerHeapMB) && parsedWorkerHeapMB >= 256 && parsedWorkerHeapMB <= 1536
   ? Math.floor(parsedWorkerHeapMB)
-  : 320
+  : 512
 
 let lastBootError = ''
 
@@ -51,7 +51,7 @@ function launch() {
     workerData: { supervised: true, safeMode, recoveringRevision, lastBootError: safeMode ? lastBootError : '' },
     resourceLimits: {
       maxOldGenerationSizeMb: workerHeapMB,
-      maxYoungGenerationSizeMb: 32,
+      maxYoungGenerationSizeMb: 128,
     },
   })
   worker = thread

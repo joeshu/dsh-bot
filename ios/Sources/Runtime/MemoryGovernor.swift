@@ -113,11 +113,11 @@ public final class MemoryGovernor: ObservableObject {
     ) -> Int {
         let gib = Double(physicalMemoryBytes) / 1_073_741_824.0
         if gib <= 4.5 {
-            return 192
-        } else if gib <= 6.5 {
-            return 320
-        } else {
             return 512
+        } else if gib <= 6.5 {
+            return 768
+        } else {
+            return 1024
         }
     }
 
