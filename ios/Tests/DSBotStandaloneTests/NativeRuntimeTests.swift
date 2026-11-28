@@ -242,7 +242,9 @@ final class NativeRuntimeTests: XCTestCase {
             )
             var webOutput = Data()
             var webExitCode: Int?
-            for _ in 0..<100 {
+            let webMarker = Data("DSBOT_WEB_INTERACTIVE_PTY_OK".utf8)
+            let webOutputDeadline = Date().addingTimeInterval(10)
+            while webOutput.range(of: webMarker) == nil && webExitCode == nil && Date() < webOutputDeadline {
                 let chunk = try await webTerminal.read(sessionID: webSession)
                 if let encoded = chunk["output"] as? String, let bytes = Data(base64Encoded: encoded) {
                     webOutput.append(bytes)
@@ -256,7 +258,8 @@ final class NativeRuntimeTests: XCTestCase {
             XCTAssertTrue(String(decoding: webOutput, as: UTF8.self).contains("DSBOT_WEB_INTERACTIVE_PTY_OK"))
             XCTAssertEqual(webExitCode, nil, "The interactive shell should remain open after a command.")
             try await webTerminal.write("exit\n", sessionID: webSession)
-            for _ in 0..<100 {
+            let webExitDeadline = Date().addingTimeInterval(10)
+            while webExitCode == nil && Date() < webExitDeadline {
                 let chunk = try await webTerminal.read(sessionID: webSession)
                 if let encoded = chunk["output"] as? String, let bytes = Data(base64Encoded: encoded) {
                     webOutput.append(bytes)
@@ -321,6 +324,7 @@ final class NativeRuntimeTests: XCTestCase {
     }
 
 #if DSBOT_ISH_RUNTIME_ENABLED
+    @MainActor
     func testEmbeddedISHGuestRunsShellOverRealPTYInSimulator() async throws {
         let appBundle = try XCTUnwrap(Bundle(identifier: "io.github.dsbot.ios.standalone"))
         let rootfsArchive = appBundle.bundleURL
@@ -441,6 +445,43 @@ final class NativeRuntimeTests: XCTestCase {
             XCTAssertTrue(String(decoding: verifierResult.0, as: UTF8.self).contains("DSBOT_ISH_BACKGROUND_REAPED"))
             XCTAssertEqual(verifierResult.1, 0)
             await runtime.closePTY(owner: verifierOwner)
+
+            let host = LocalAgentHost.shared
+            if host.state == .idle { await host.boot() }
+            let hostDeadline = Date().addingTimeInterval(60)
+            while host.state == .starting && Date() < hostDeadline {
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+            guard host.state == .ready, let channel = host.rpc() else {
+                throw IPCFrameError.remoteError(
+                    code: -32000,
+                    message: "The DSH NodeMobile runtime did not stay ready alongside the iSH guest."
+                )
+            }
+            let agentInfo = try await channel.request("agent.info", timeoutSeconds: 30)
+            _ = try await channel.request("session.list", timeoutSeconds: 30)
+            XCTAssertEqual(agentInfo["engine"] as? String, "node+dsh")
+            XCTAssertNotNil(agentInfo["nodeVersion"] as? String)
+            print("DSBOT_ISH_TEST_STAGE dsh-runtime-coexists")
+
+            let coexistOwner = try XCTUnwrap(ARM64GuestPTYOwner(
+                kind: .native,
+                sessionID: "ish-node-coexist-\(UUID().uuidString.lowercased())"
+            ))
+            let coexistStream = try await runtime.openPTY(owner: coexistOwner)
+            try await runtime.sendInput(
+                Data("stty -echo\nprintf '%s%s\\n' DSBOT_ISH_NODE_ COEXISTS\nexit\n".utf8),
+                owner: coexistOwner
+            )
+            let coexistResult = try await Self.collectISHPTY(coexistStream, timeoutSeconds: 30)
+            let coexistOutput = String(decoding: coexistResult.0, as: UTF8.self)
+            XCTAssertTrue(coexistOutput.contains("DSBOT_ISH_NODE_COEXISTS"))
+            XCTAssertEqual(coexistResult.1, 0)
+            await runtime.closePTY(owner: coexistOwner)
+            let postISHInfo = try await channel.request("agent.info", timeoutSeconds: 30)
+            _ = try await channel.request("session.list", timeoutSeconds: 30)
+            XCTAssertEqual(postISHInfo["engine"] as? String, "node+dsh")
+            print("DSBOT_ISH_TEST_STAGE iSH-pty-coexists-with-dsh-node")
             await runtime.stop()
         } catch {
             await runtime.closePTY(owner: owner)
