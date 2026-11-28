@@ -96,7 +96,7 @@ public actor ARM64GuestPTYCommandRunner {
         do {
             return try await withTaskCancellationHandler {
                 try await broker.sendInput(input, from: owner)
-                try await withTaskGroup(of: RaceResult.self) { group in
+                try await withThrowingTaskGroup(of: RaceResult.self) { group in
                     let outputLimit = maxOutputBytes
                     group.addTask {
                         do {
@@ -113,7 +113,7 @@ public actor ARM64GuestPTYCommandRunner {
                             return .timeout
                         }
                     }
-                    let first = await group.next() ?? .timeout
+                    let first = try await group.next() ?? .timeout
                     group.cancelAll()
                     if Task.isCancelled {
                         try? await broker.close(owner: owner)
