@@ -150,11 +150,14 @@ def main():
         f"- Engine commit: `{lock['engine']['commit']}`",
         f"- Build definition commit: `{lock['distribution']['commit']}`",
         "- Artifact status: static libraries only; DSH/NodeMobile runtime wiring and app-size impact are not included.",
-        f"- Device library bytes: {component_sizes['deviceLibraries']['uncompressedBytes']}",
-        f"- Simulator library bytes: {component_sizes['simulatorLibraries']['uncompressedBytes']}",
         "- Corresponding source archives and iSH license files are included.",
         "",
     ]
+    for label, key in (("Device", "deviceLibraries"), ("Simulator", "simulatorLibraries")):
+        details = component_sizes[key]
+        report.append(f"## {label} — {details['uncompressedBytes']} uncompressed library bytes")
+        report.extend(f"- `{item['path']}`: {item['bytes']} bytes" for item in details["files"])
+        report.append("")
     (output / "build-report.md").write_text("\n".join(report), encoding="utf-8")
     files = []
     for path in sorted(output.rglob("*")):
