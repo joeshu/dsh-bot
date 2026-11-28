@@ -331,19 +331,65 @@ final class NativeRuntimeTests: XCTestCase {
         ))
         do {
             try await runtime.validateBundledResources()
+            let projectDirectory = LocalAgentTransport.defaultWorkspace
+                .appendingPathComponent("files", isDirectory: true)
+            try FileManager.default.createDirectory(at: projectDirectory, withIntermediateDirectories: true)
+            let privateSentinel = LocalAgentTransport.defaultWorkspace
+                .appendingPathComponent("dsbot-private-\(UUID().uuidString.lowercased())")
+            try Data("private app state".utf8).write(to: privateSentinel, options: .atomic)
+            defer { try? FileManager.default.removeItem(at: privateSentinel) }
+            let forgedLink = projectDirectory.appendingPathComponent("dsbot-test-\(UUID().uuidString.lowercased())")
+            let privateRootfs = FileManager.default.urls(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask
+            )[0]
+                .appendingPathComponent("DSBot", isDirectory: true)
+                .appendingPathComponent("ISH", isDirectory: true)
+                .appendingPathComponent("AlpineRootfs", isDirectory: true)
+                .appendingPathComponent("meta.db")
+            try FileManager.default.createSymbolicLink(at: forgedLink, withDestinationURL: privateRootfs)
+            do {
+                let unexpectedStream = try await runtime.openPTY(owner: owner, timeoutSeconds: 60)
+                _ = unexpectedStream
+                await runtime.closePTY(owner: owner)
+                XCTFail("The iSH runtime must reject a host symlink from the project to private app data.")
+            } catch let error as ARM64GuestPTYProtocolError {
+                guard case .guestRejected(let message) = error else { throw error }
+                XCTAssertTrue(message.contains("symbolic link"))
+            }
+            try FileManager.default.removeItem(at: forgedLink)
+
             let stream = try await runtime.openPTY(
                 owner: owner,
                 rows: 24,
                 columns: 80,
                 timeoutSeconds: 60
             )
+            let workspaceProbe = "dsbot-project-\(UUID().uuidString.lowercased())"
+            let workspaceScript = """
+            stty -echo
+            printf '%s\\n' 'shared project file' > '/workspace/\(workspaceProbe)'
+            if [ -e '/workspace/\(privateSentinel.lastPathComponent)' ]; then echo DSBOT_PRIVATE_DATA_EXPOSED; exit 1; fi
+            if ln -s /Library/Application\\ Support/DSBot /workspace/DSBOT_SYMLINK_ESCAPE 2>/dev/null; then
+              echo DSBOT_SYMLINK_ESCAPE_ALLOWED
+              exit 1
+            fi
+            rm -f '/workspace/\(workspaceProbe)'
+            printf '%s\\n' 'DSBOT_ISH_WORKSPACE_SAFE'
+            printf '%s\\n' 'DSBOT_ISH_ARM64_PTY_OK'
+            exit
+            """
             try await runtime.sendInput(
-                Data("stty -echo\nprintf '%s\\n' 'DSBOT_ISH_ARM64_PTY_OK'\nexit\n".utf8),
+                Data(workspaceScript.utf8),
                 owner: owner
             )
 
             let result = try await Self.collectISHPTY(stream, timeoutSeconds: 60)
             XCTAssertTrue(String(decoding: result.0, as: UTF8.self).contains("DSBOT_ISH_ARM64_PTY_OK"))
+            let workspaceOutput = String(decoding: result.0, as: UTF8.self)
+            XCTAssertTrue(workspaceOutput.contains("DSBOT_ISH_WORKSPACE_SAFE"))
+            XCTAssertFalse(workspaceOutput.contains("DSBOT_PRIVATE_DATA_EXPOSED"))
+            XCTAssertFalse(workspaceOutput.contains("DSBOT_SYMLINK_ESCAPE_ALLOWED"))
             XCTAssertEqual(result.1, 0)
             await runtime.closePTY(owner: owner)
 

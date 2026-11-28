@@ -18,6 +18,7 @@ if [[ "$(uname -s)" != Darwin ]]; then
   exit 2
 fi
 command -v git >/dev/null
+command -v patch >/dev/null
 command -v python3 >/dev/null
 command -v meson >/dev/null
 command -v ninja >/dev/null
@@ -27,6 +28,7 @@ xcode-select -p >/dev/null
 mkdir -p "$BUILD_ROOT" "$OUT"
 python3 - "$LOCK" "$BUILD_ROOT" <<'PY'
 import json
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -58,8 +60,22 @@ for path, expected in lock["engine"]["submodules"].items():
     actual = subprocess.check_output(["git", "-C", str(engine / path), "rev-parse", "HEAD"], text=True).strip()
     if actual != expected:
         raise SystemExit(f"iSH dependency pin mismatch for {path}: {actual}")
+integration_patches = lock.get("hostIntegrationPatches", [])
+if not integration_patches:
+    raise SystemExit("The pinned iSH host integration patches are missing")
+for record in integration_patches:
+    patch_path = Path(sys.argv[1]).resolve().parent / record["path"]
+    patch_bytes = patch_path.read_bytes()
+    actual = hashlib.sha256(patch_bytes).hexdigest()
+    if actual != record["sha256"]:
+        raise SystemExit(f"iSH integration patch hash mismatch: {record['path']}")
+    subprocess.run(
+        ["patch", "--batch", "--forward", "-p1", "-d", str(engine)],
+        input=patch_bytes,
+        check=True,
+    )
+    print(f"Applied pinned iSH host integration patch {record['path']} ({actual})")
 script = checkout / lock["distribution"]["buildScript"]
-import hashlib
 digest = hashlib.sha256(script.read_bytes()).hexdigest()
 if digest != lock["distribution"]["buildScriptSha256"]:
     raise SystemExit(f"OpenMinis build script changed: sha256={digest}")

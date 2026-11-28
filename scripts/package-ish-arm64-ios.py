@@ -315,12 +315,27 @@ def main():
     build_script_hash = sha256(source_dir / "OpenMinis-build_ish.sh")
     if build_script_hash != lock["distribution"]["buildScriptSha256"]:
         raise SystemExit("Packaged build script hash does not match source lock")
+    integration_patch_records = []
+    for record in lock.get("hostIntegrationPatches", []):
+        relative = PurePosixPath(record["path"])
+        if relative.is_absolute() or ".." in relative.parts:
+            raise SystemExit(f"Unsafe iSH integration patch path: {record['path']}")
+        patch_source = args.lock.resolve().parent.joinpath(*relative.parts)
+        if not patch_source.is_file() or sha256(patch_source) != record["sha256"]:
+            raise SystemExit(f"iSH integration patch hash mismatch: {record['path']}")
+        patch_destination = source_dir / relative.name
+        copy_required(patch_source, patch_destination)
+        integration_patch_records.append({
+            "path": str(patch_destination.relative_to(output)),
+            "sha256": sha256(patch_destination),
+            "purpose": record["purpose"],
+        })
 
     rootfs_manifest = package_fakefs_rootfs(
         args.guest_minirootfs.resolve(), args.fakefsify.resolve(), output
     )
 
-    notices = """iSH ARM64 engine source notice\n\nThis artifact contains static libraries built from OpenMinis/ish-arm64 and a pinned Alpine ARM64 fakefs rootfs.\nThe iSH core is licensed under GPLv3, with later contributions also GPLv2;\nLICENSE.IOS applies to iOS builds.\nThe exact source revisions and corresponding source archives are included in\nsource/. The OpenMinis build script is included with its pinned source hash.\nThe Alpine package inventory and notices are under rootfs/. This is a build\ncandidate, not an app-linked or release-cleared runtime bundle.\n"""
+    notices = """iSH ARM64 engine source notice\n\nThis artifact contains static libraries built from OpenMinis/ish-arm64 and a pinned Alpine ARM64 fakefs rootfs.\nThe iSH core is licensed under GPLv3, with later contributions also GPLv2;\nLICENSE.IOS applies to iOS builds.\nThe exact source revisions and corresponding source archives are included in\nsource/. The OpenMinis build script and DSH integration patches are included\nwith their pinned source hashes. The Alpine package inventory and notices are\nunder rootfs/. This is a build candidate, not an app-linked or release-cleared\nruntime bundle.\n"""
     (output / "THIRD-PARTY-NOTICES.txt").write_text(notices, encoding="utf-8")
 
     component_sizes = {}
@@ -342,6 +357,7 @@ def main():
             "engineRepository": lock["engine"]["repository"],
             "engineCommit": lock["engine"]["commit"],
             "buildScriptSha256": build_script_hash,
+            "integrationPatches": integration_patch_records,
             "submodules": lock["engine"]["submodules"],
             "archives": source_records,
         },
@@ -364,6 +380,7 @@ def main():
         "",
         f"- Engine commit: `{lock['engine']['commit']}`",
         f"- Build definition commit: `{lock['distribution']['commit']}`",
+        f"- Host integration patches: {len(integration_patch_records)} hash-verified patch(es).",
         "- Artifact status: static libraries and pinned Alpine fakefs ZIP; DSH/NodeMobile runtime wiring and app-size impact are not included.",
         f"- Alpine {ALPINE_VERSION} fakefs ZIP: {rootfs_manifest['image']['bytes']} bytes; expanded fakefs files: {rootfs_manifest['image']['expandedFakefsBytes']} bytes; packages: {rootfs_manifest['image']['basePackageCount']}.",
         "- The rootfs has not been linked into the app and remains a CI build artifact.",

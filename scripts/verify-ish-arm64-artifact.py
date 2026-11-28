@@ -51,6 +51,25 @@ def main():
     require(source.get("submodules") == lock["engine"]["submodules"], "iSH submodule source pins mismatch")
     require(manifest.get("license") == lock["license"], "iSH license terms differ from the source lock")
 
+    locked_patches = lock.get("hostIntegrationPatches", [])
+    packaged_patches = source.get("integrationPatches", [])
+    require(len(locked_patches) > 0 and len(packaged_patches) == len(locked_patches),
+            "The artifact does not include every locked host integration patch")
+    packaged_by_path = {record.get("path"): record for record in packaged_patches}
+    for record in locked_patches:
+        relative = PurePosixPath(record.get("path", ""))
+        require(not relative.is_absolute() and ".." not in relative.parts,
+                f"Unsafe host integration patch path: {record.get('path')}")
+        artifact_relative = f"source/{relative.name}"
+        patch_record = packaged_by_path.get(artifact_relative)
+        patch_path = root / artifact_relative
+        require(patch_record is not None and patch_path.is_file() and not patch_path.is_symlink(),
+                f"Missing host integration patch: {artifact_relative}")
+        require(patch_record.get("sha256") == record.get("sha256") == sha256(patch_path),
+                f"Host integration patch hash mismatch: {artifact_relative}")
+        require(patch_record.get("purpose") == record.get("purpose"),
+                f"Host integration patch purpose mismatch: {artifact_relative}")
+
     rootfs = manifest.get("baseRootfs", {})
     rootfs_manifest_path = root / "rootfs/rootfs-manifest.json"
     require(rootfs_manifest_path.is_file(), "Missing iSH fakefs rootfs manifest")

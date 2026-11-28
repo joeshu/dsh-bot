@@ -1,0 +1,18 @@
+--- a/fs/fake.c
++++ b/fs/fake.c
+@@ -691,6 +691,15 @@
+     struct fakefs_db *fs = &mount->fakefs;
+     if (is_under_readonly_bind_mount(link))
+         return _EROFS;
++    /*
++     * Bind-mounted app workspaces are opened through direct host paths. A
++     * symlink there could redirect a guest lookup outside the project and
++     * expose unrelated files in the app container. Keep these mounts
++     * symlink-free until their host resolver can perform descriptor-relative
++     * no-follow traversal.
++     */
++    if (is_under_bind_mount(link))
++        return _EPERM;
+     /* fakefs's symlink model stores the target in a regular file plus an
+      * S_IFLNK mode bit in meta.db. Hook-routed paths bypass meta.db, so
+      * that representation can't round-trip. Reject the request rather

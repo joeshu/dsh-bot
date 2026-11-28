@@ -15,6 +15,13 @@
       "deps/linux": "8ec9bf17f89c6dba818f3ed2427de4223e78644a"
     }
   },
+  "hostIntegrationPatches": [
+    {
+      "path": "ish-safe-workspace.patch",
+      "sha256": "c888c5bbc94d295561bfc278e30ec49296df09c3cd7340cfc5d6cd84a5b85005",
+      "purpose": "Reject guest-created symlinks in host bind mounts"
+    }
+  ],
   "license": {
     "terms": "GPLv3; later contributions also GPLv2; see LICENSE.md and LICENSE.IOS",
     "requiredFiles": ["LICENSE.md", "LICENSE.IOS"],

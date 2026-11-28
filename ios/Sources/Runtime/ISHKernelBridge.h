@@ -14,7 +14,8 @@ typedef void (^DSBotISHExitHandler)(int32_t status);
 
 - (nullable NSError *)bootWithRootPath:(NSString *)rootPath
                          workspacePath:(NSString *)workspacePath
-    NS_SWIFT_NAME(boot(rootPath:workspacePath:));
+                        timeoutSeconds:(NSTimeInterval)timeoutSeconds
+    NS_SWIFT_NAME(boot(rootPath:workspacePath:timeoutSeconds:));
 
 - (nullable NSError *)openSessionWithID:(NSString *)sessionID
                                    rows:(NSUInteger)rows

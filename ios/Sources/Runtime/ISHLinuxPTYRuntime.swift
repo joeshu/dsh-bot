@@ -34,7 +34,6 @@ public actor ISHLinuxPTYRuntime: LinuxPTYRuntime {
         columns: UInt16 = 80,
         timeoutSeconds: UInt64 = 120
     ) async throws -> AsyncThrowingStream<ARM64GuestPTYEvent, Error> {
-        _ = timeoutSeconds
         guard !stopInProgress else { throw ARM64GuestPTYProtocolError.guestNotReady }
         guard rows >= 2, rows <= 300, columns >= 2, columns <= 500 else {
             throw ARM64GuestPTYProtocolError.invalidDimensions
@@ -44,7 +43,7 @@ public actor ISHLinuxPTYRuntime: LinuxPTYRuntime {
         }
         defer { openingOwners.remove(owner) }
         try Task.checkCancellation()
-        try await ensureBooted()
+        try await ensureBooted(timeoutSeconds: timeoutSeconds)
         try Task.checkCancellation()
         guard !stopInProgress else { throw ARM64GuestPTYProtocolError.guestNotReady }
 
@@ -162,7 +161,7 @@ public actor ISHLinuxPTYRuntime: LinuxPTYRuntime {
         lease.continuation.finish()
     }
 
-    private func ensureBooted() async throws {
+    private func ensureBooted(timeoutSeconds: UInt64) async throws {
         guard !booted else { return }
         let task: Task<Void, Error>
         if let bootTask {
@@ -170,7 +169,7 @@ public actor ISHLinuxPTYRuntime: LinuxPTYRuntime {
         } else {
             task = Task { [weak self] in
                 guard let self else { throw CancellationError() }
-                try await self.bootEngine()
+                try await self.bootEngine(timeoutSeconds: timeoutSeconds)
             }
             bootTask = task
         }
@@ -184,7 +183,7 @@ public actor ISHLinuxPTYRuntime: LinuxPTYRuntime {
         }
     }
 
-    private func bootEngine() async throws {
+    private func bootEngine(timeoutSeconds: UInt64) async throws {
         let root: URL
         if let installedRootfsURL {
             root = installedRootfsURL
@@ -192,15 +191,47 @@ public actor ISHLinuxPTYRuntime: LinuxPTYRuntime {
             root = try await ISHRootfsStore.shared.installIfNeeded()
             installedRootfsURL = root
         }
+        // Expose only user project files. The DSH home directory also holds
+        // SQLite state and runtime metadata that a shell must never see.
         let workspace = LocalAgentTransport.defaultWorkspace
+            .appendingPathComponent("files", isDirectory: true)
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        try Self.validateWorkspaceContainsNoSymbolicLinks(workspace)
         let bridge = self.bridge
         let error = await withCheckedContinuation { (continuation: CheckedContinuation<Error?, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
-                continuation.resume(returning: bridge.boot(rootPath: root.path, workspacePath: workspace.path))
+                continuation.resume(returning: bridge.boot(
+                    rootPath: root.path,
+                    workspacePath: workspace.path,
+                    timeoutSeconds: TimeInterval(timeoutSeconds)
+                ))
             }
         }
         if let error { throw error }
+    }
+
+    private static func validateWorkspaceContainsNoSymbolicLinks(_ workspace: URL) throws {
+        let fileManager = FileManager.default
+        let attributes = try fileManager.attributesOfItem(atPath: workspace.path)
+        guard (attributes[.type] as? FileAttributeType) == .typeDirectory else {
+            throw ARM64GuestPTYProtocolError.guestRejected("The DSH project root is not a directory.")
+        }
+        var pending = [workspace]
+        while let entry = pending.popLast() {
+            let values = try entry.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            guard values.isSymbolicLink != true else {
+                throw ARM64GuestPTYProtocolError.guestRejected(
+                    "The DSH project contains a symbolic link; remove it before opening the iSH terminal."
+                )
+            }
+            if values.isDirectory == true {
+                pending.append(contentsOf: try fileManager.contentsOfDirectory(
+                    at: entry,
+                    includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+                    options: []
+                ))
+            }
+        }
     }
 }
 #endif

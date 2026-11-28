@@ -1482,6 +1482,27 @@ public final class LocalAgentHost: ObservableObject {
         .plainText, .text, .utf8PlainText, .sourceCode, .pdf, .image, .audio, .movie, .archive
     ]
 
+#if DSBOT_ISH_RUNTIME_ENABLED
+    private static func validateImportContainsNoSymbolicLinks(at root: URL) throws {
+        var pending = [root]
+        while let url = pending.popLast() {
+            let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            guard values.isSymbolicLink != true else {
+                throw IPCFrameError.remoteError(
+                    code: -32602,
+                    message: "导入内容包含符号链接。iSH 项目目录暂不接受符号链接。"
+                )
+            }
+            guard values.isDirectory == true else { continue }
+            pending.append(contentsOf: try FileManager.default.contentsOfDirectory(
+                at: url,
+                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+                options: []
+            ))
+        }
+    }
+#endif
+
     public func importFileToWorkspace(from sourceURL: URL) throws -> AttachedWorkspaceFile {
         let accessed = sourceURL.startAccessingSecurityScopedResource()
         defer { if accessed { sourceURL.stopAccessingSecurityScopedResource() } }
@@ -1493,6 +1514,9 @@ public final class LocalAgentHost: ObservableObject {
 
         func performImport(from readableURL: URL) throws -> AttachedWorkspaceFile {
             let values = try? readableURL.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey, .fileSizeKey])
+#if DSBOT_ISH_RUNTIME_ENABLED
+            try Self.validateImportContainsNoSymbolicLinks(at: readableURL)
+#endif
             let isDir = values?.isDirectory == true
             let rawSize = values?.fileSize ?? 0
 

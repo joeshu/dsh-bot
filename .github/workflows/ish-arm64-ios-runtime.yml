@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - 'scripts/ish-arm64-sources.lock.json'
+      - 'scripts/ish-safe-workspace.patch'
       - 'scripts/build-ish-arm64-ios.sh'
       - 'scripts/package-ish-arm64-ios.py'
       - 'scripts/verify-ish-arm64-artifact.py'
@@ -21,6 +22,7 @@ on:
   pull_request:
     paths:
       - 'scripts/ish-arm64-sources.lock.json'
+      - 'scripts/ish-safe-workspace.patch'
       - 'scripts/build-ish-arm64-ios.sh'
       - 'scripts/package-ish-arm64-ios.py'
       - 'scripts/verify-ish-arm64-artifact.py'
@@ -187,7 +189,8 @@ jobs:
           xcodebuild test -project DSBotStandalone.xcodeproj -scheme DSBotStandalone \
             -destination "platform=iOS Simulator,id=$SIM_ID,arch=arm64" \
             -only-testing:DSBotStandaloneTests/NativeRuntimeTests/testEmbeddedISHGuestRunsShellOverRealPTYInSimulator \
-            -parallel-testing-enabled NO -resultBundlePath "$RUNNER_TEMP/DSBotISHRuntimeTests.xcresult" \
+            -parallel-testing-enabled NO -maximum-test-execution-time-allowance 300 \
+            -resultBundlePath "$RUNNER_TEMP/DSBotISHRuntimeTests.xcresult" \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO ENABLE_USER_SCRIPT_SANDBOXING=NO \
             DSBOT_ISH_RUNTIME_ENABLED=1 \
             DSBOT_ISH_SWIFT_CONDITIONS=DSBOT_ISH_RUNTIME_ENABLED \
@@ -195,6 +198,18 @@ jobs:
             DSBOT_ISH_INTERNAL_INCLUDE_DIR="$RUNNER_TEMP/ish-arm64-ios/include/ish" \
             DSBOT_ISH_LIBRARY_DIR="$RUNNER_TEMP/ish-arm64-ios/libraries/simulator" \
             DSBOT_ISH_LINK_FLAGS="-lish_emu -lish -lfakefs -force_load $RUNNER_TEMP/ish-arm64-ios/libraries/simulator/libish_aot.a"
+      - name: Report iSH Simulator test diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          RESULT="$RUNNER_TEMP/DSBotISHRuntimeTests.xcresult"
+          if [[ -d "$RESULT" ]]; then
+            xcrun xcresulttool get test-results summary --path "$RESULT" --format json
+            xcrun xcresulttool get test-results tests --path "$RESULT" --format json
+          else
+            echo "No iSH Simulator result bundle was produced."
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:

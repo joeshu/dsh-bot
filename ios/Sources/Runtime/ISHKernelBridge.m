@@ -19,6 +19,7 @@
 #import <ish/kernel/task.h>
 
 #import <pthread.h>
+#import <pthread/qos.h>
 #import <errno.h>
 #import <signal.h>
 #import <stdlib.h>
@@ -91,8 +92,10 @@ static BOOL DSBotISHCanBindUnixSocketAtPrefix(NSString *prefix) {
 
 static void *DSBotISHBootThread(void *context) {
     ISHKernelBridge *bridge = (__bridge_transfer ISHKernelBridge *)context;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
     NSError *error = nil;
     @autoreleasepool {
+        NSLog(@"[DSBot iSH boot] starting kernel thread");
         [bridge bootKernelOnCurrentThread:&error];
     }
     [bridge.condition lock];
@@ -100,6 +103,7 @@ static void *DSBotISHBootThread(void *context) {
     bridge.state = error == nil ? 2 : 3;
     [bridge.condition broadcast];
     [bridge.condition unlock];
+    NSLog(@"[DSBot iSH boot] kernel initialization %@", error == nil ? @"completed" : @"failed");
 
     // iSH's init task records this thread and uses thread-local `current`.
     // Keep that host thread alive for the lifetime of the in-process engine.
@@ -230,7 +234,7 @@ static void DSBotISHTerminateProcessSession(int processSessionID) {
     return self;
 }
 
-- (NSError *)bootWithRootPath:(NSString *)rootPath workspacePath:(NSString *)workspacePath {
+- (NSError *)bootWithRootPath:(NSString *)rootPath workspacePath:(NSString *)workspacePath timeoutSeconds:(NSTimeInterval)timeoutSeconds {
     [self.condition lock];
     if (self.state == 2) {
         BOOL sameRoot = [self.rootPath isEqualToString:rootPath] && [self.workspacePath isEqualToString:workspacePath];
@@ -256,15 +260,17 @@ static void DSBotISHTerminateProcessSession(int processSessionID) {
         }
         pthread_detach(thread);
     }
-    NSDate *bootDeadline = [NSDate dateWithTimeIntervalSinceNow:120.0];
+    NSTimeInterval boundedTimeout = MIN(MAX(timeoutSeconds, 1.0), 120.0);
+    NSDate *bootDeadline = [NSDate dateWithTimeIntervalSinceNow:boundedTimeout];
     while (self.state == 1 && [self.condition waitUntilDate:bootDeadline]) {}
     BOOL ready = self.state == 2;
-    NSError *failure = ready ? nil : (self.bootError ?: [self error:19 message:@"The iSH engine boot exceeded 120 seconds."]);
+    NSError *failure = ready ? nil : (self.bootError ?: [self error:19 message:[NSString stringWithFormat:@"The iSH engine boot exceeded %.0f seconds.", boundedTimeout]]);
     [self.condition unlock];
     return failure;
 }
 
 - (void)bootKernelOnCurrentThread:(NSError **)error {
+    NSLog(@"[DSBot iSH boot] initialize TTY drivers");
     dsbot_ish_tty_ops = (struct tty_driver_ops){
         .init = DSBotISHTTYInit,
         .write = DSBotISHTTYWrite,
@@ -288,6 +294,7 @@ static void DSBotISHTerminateProcessSession(int processSessionID) {
         if (error) *error = [self error:4 message:@"Could not mount the persistent iSH fakefs root."];
         return;
     }
+    NSLog(@"[DSBot iSH boot] persistent fakefs mounted");
     char canonicalDataPath[PATH_MAX];
     if (realpath(dataPath.fileSystemRepresentation, canonicalDataPath) != NULL) {
         fakefs_set_rootfs_data_path(canonicalDataPath);
@@ -305,6 +312,7 @@ static void DSBotISHTerminateProcessSession(int processSessionID) {
         if (error) *error = [self error:5 message:[NSString stringWithFormat:@"iSH init creation failed (%d).", result]];
         return;
     }
+    NSLog(@"[DSBot iSH boot] PID 1 host task created");
     long hostPageSize = getpagesize();
     if (hostPageSize <= 0) {
         if (error) *error = [self error:23 message:@"Could not determine the host page size for the iSH memory limit."];
@@ -335,6 +343,7 @@ static void DSBotISHTerminateProcessSession(int processSessionID) {
         if (error) *error = [self error:6 message:@"Could not mount iSH procfs/devpts."];
         return;
     }
+    NSLog(@"[DSBot iSH boot] procfs and devpts mounted");
     tty_drivers[TTY_CONSOLE_MAJOR] = &dsbot_ish_console_driver;
     set_console_device(TTY_CONSOLE_MAJOR, 1);
     if (create_stdio("/dev/console", TTY_CONSOLE_MAJOR, 1) < 0) {
@@ -345,6 +354,7 @@ static void DSBotISHTerminateProcessSession(int processSessionID) {
         if (error) *error = [self error:8 message:@"Could not bind the authorized DSH workspace into iSH."];
         return;
     }
+    NSLog(@"[DSBot iSH boot] authorized project workspace mounted");
 #if TARGET_OS_SIMULATOR
     // Simulator container paths contain the host, CoreSimulator device, and
     // app UUIDs; they can exceed sockaddr_un.sun_path before iSH appends its
@@ -373,6 +383,7 @@ static void DSBotISHTerminateProcessSession(int processSessionID) {
         if (error) *error = [self error:22 message:@"Could not reserve the iSH Unix-domain socket path."];
         return;
     }
+    NSLog(@"[DSBot iSH boot] Unix socket prefix ready");
     exit_hook = DSBotISHProcessExit;
 
     // Alpine's init is PID 1 and reaps PTY shells and their descendants.
@@ -387,11 +398,13 @@ static void DSBotISHTerminateProcessSession(int processSessionID) {
         if (error) *error = [self error:24 message:[NSString stringWithFormat:@"Could not start Alpine init as the iSH reaper (%d).", result]];
         return;
     }
+    NSLog(@"[DSBot iSH boot] Alpine init image loaded");
     result = task_start(current);
     if (result < 0) {
         if (error) *error = [self error:25 message:[NSString stringWithFormat:@"Could not start the iSH init task (%d).", result]];
         return;
     }
+    NSLog(@"[DSBot iSH boot] Alpine init task started");
 }
 
 - (NSError *)openSessionWithID:(NSString *)sessionID rows:(NSUInteger)rows columns:(NSUInteger)columns
@@ -683,8 +696,8 @@ static void DSBotISHTerminateProcessSession(int processSessionID) {
     return bridge;
 }
 
-- (NSError *)bootWithRootPath:(NSString *)rootPath workspacePath:(NSString *)workspacePath {
-    (void)rootPath; (void)workspacePath;
+- (NSError *)bootWithRootPath:(NSString *)rootPath workspacePath:(NSString *)workspacePath timeoutSeconds:(NSTimeInterval)timeoutSeconds {
+    (void)rootPath; (void)workspacePath; (void)timeoutSeconds;
     return [NSError errorWithDomain:@"io.github.dsbot.ish-runtime" code:1
         userInfo:@{NSLocalizedDescriptionKey: @"This build does not include the pinned iSH ARM64 engine."}];
 }
