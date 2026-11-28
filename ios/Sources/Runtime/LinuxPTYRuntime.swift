@@ -20,7 +20,11 @@ public protocol LinuxPTYRuntime: Sendable {
 /// Single selection point for process and terminal callers. Keep QEMU selected
 /// until the iSH bridge passes the same runtime contract and acceptance gates.
 public enum LinuxPTYRuntimeRegistry {
+#if DSBOT_ISH_RUNTIME_ENABLED
+    public static let shared: any LinuxPTYRuntime = ISHLinuxPTYRuntime.shared
+#else
     public static let shared: any LinuxPTYRuntime = QEMULinuxPTYRuntime.shared
+#endif
 }
 
 /// Adapts the existing authenticated QEMU serial broker to the common PTY

@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <NodeMobile/NodeMobile.h>
 #include "../Runtime/ISHRawDeflate.h"
+#import "../Runtime/ISHKernelBridge.h"
 
 typedef struct {
     char *value;

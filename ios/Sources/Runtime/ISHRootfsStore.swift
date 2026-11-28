@@ -212,7 +212,7 @@ public actor ISHRootfsStore {
         }
         let metadataURL = root.appendingPathComponent("meta.db")
         let metadata = try Data(contentsOf: metadataURL, options: [.mappedIfSafe])
-        guard metadata.starts(with: Data([0x53, 0x51, 0x4c, 0x69, 0x74, 0x65, 0x20, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x33, 0x00]),
+        guard metadata.starts(with: Data([0x53, 0x51, 0x4c, 0x69, 0x74, 0x65, 0x20, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x33, 0x00])),
               !verifyBaseMetadata || metadata.count == manifest.image.metaDatabaseBytes else {
             throw ISHRootfsStoreError.metadataDatabaseInvalid
         }

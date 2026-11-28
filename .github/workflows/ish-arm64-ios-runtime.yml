@@ -52,6 +52,57 @@ jobs:
         run: python3 scripts/verify-ish-arm64-artifact.py "$RUNNER_TEMP/ish-arm64-ios"
       - name: Publish component sizes to the workflow summary
         run: tee -a "$GITHUB_STEP_SUMMARY" < "$RUNNER_TEMP/ish-arm64-ios/build-report.md"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.3
+      - name: Pin npm for the iOS runtime lockfile
+        run: npm install --global npm@11.9.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare locked DSH, NodeMobile, Python, and QuickJS app resources
+        run: |
+          set -euo pipefail
+          npm --prefix kernel/runtime ci --ignore-scripts --omit=optional --no-audit --no-fund
+          python3 scripts/prepare-dsh-runtime.py
+          python3 scripts/prepare-python-runtime.py
+          python3 scripts/prepare-node-mobile-ios.py
+          python3 scripts/prepare-quickjs.py
+      - name: Install pinned XcodeGen 2.46.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl --fail --location --retry 3 -o xcodegen.zip https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip
+          echo '4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806  xcodegen.zip' | shasum -a 256 -c
+          mkdir -p "$RUNNER_TEMP/xcodegen"
+          unzip -q xcodegen.zip -d "$RUNNER_TEMP/xcodegen"
+          XCODEGEN="$(find "$RUNNER_TEMP/xcodegen" -type f -path '*/bin/xcodegen' -print -quit)"
+          test -n "$XCODEGEN"
+          echo "DSBOT_XCODEGEN=$XCODEGEN" >> "$GITHUB_ENV"
+      - name: Generate the optional iSH-linked app project
+        working-directory: ios
+        run: "$DSBOT_XCODEGEN" generate --spec project.yml
+      - name: Compile and link DSBotStandalone with iSH ARM64 on Simulator
+        working-directory: ios
+        env:
+          DSBOT_ISH_ROOTFS_DIR: ${{ runner.temp }}/ish-arm64-ios/rootfs
+          DSBOT_ISH_INCLUDE_DIR: ${{ runner.temp }}/ish-arm64-ios/include
+          DSBOT_ISH_LIBRARY_DIR: ${{ runner.temp }}/ish-arm64-ios/libraries/simulator
+          DSBOT_ISH_LINK_FLAGS: "-lish_emu -lish -lfakefs -force_load ${{ runner.temp }}/ish-arm64-ios/libraries/simulator/libish_aot.a"
+          DSBOT_ISH_RUNTIME_ENABLED: "1"
+          DSBOT_ISH_SWIFT_CONDITIONS: DSBOT_ISH_RUNTIME_ENABLED
+        run: |
+          set -euo pipefail
+          xcodebuild build -project DSBotStandalone.xcodeproj -scheme DSBotStandalone \
+            -destination 'generic/platform=iOS Simulator' \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+            ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            DSBOT_ISH_RUNTIME_ENABLED=1 \
+            DSBOT_ISH_SWIFT_CONDITIONS=DSBOT_ISH_RUNTIME_ENABLED \
+            DSBOT_ISH_INCLUDE_DIR="$RUNNER_TEMP/ish-arm64-ios/include" \
+            DSBOT_ISH_LIBRARY_DIR="$RUNNER_TEMP/ish-arm64-ios/libraries/simulator" \
+            DSBOT_ISH_LINK_FLAGS="-lish_emu -lish -lfakefs -force_load $RUNNER_TEMP/ish-arm64-ios/libraries/simulator/libish_aot.a"
       - uses: actions/upload-artifact@v4
         with:
           name: dsbot-ish-arm64-ios-${{ github.sha }}
