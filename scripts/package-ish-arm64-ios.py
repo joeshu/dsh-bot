@@ -14,7 +14,7 @@ import tarfile
 import tempfile
 import zipfile
 
-from prepare_arm64_guest import ALPINE_VERSION, ARTIFACTS, safe_archive_path
+from arm64_guest_common import ALPINE_VERSION, MINIROOTFS_ARTIFACT, safe_archive_path
 
 
 LIBRARIES = ("libish.a", "libish_emu.a", "libfakefs.a", "libish_aot.a")
@@ -141,7 +141,7 @@ def write_fakefs_zip(fakefs_root, archive_path):
 
 
 def package_fakefs_rootfs(minirootfs, fakefsify, output):
-    expected = ARTIFACTS["minirootfs"]["sha256"]
+    expected = MINIROOTFS_ARTIFACT["sha256"]
     if sha256(minirootfs) != expected:
         raise RuntimeError("Alpine minirootfs does not match the pinned upstream SHA-256")
     packages = read_alpine_packages(minirootfs)
@@ -218,7 +218,7 @@ def package_fakefs_rootfs(minirootfs, fakefsify, output):
         "distributionVersion": ALPINE_VERSION,
         "architecture": "aarch64",
         "source": {
-            "url": ARTIFACTS["minirootfs"]["url"],
+            "url": MINIROOTFS_ARTIFACT["url"],
             "sha256": expected,
             "bytes": minirootfs.stat().st_size,
         },

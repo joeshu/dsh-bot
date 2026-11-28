@@ -12,7 +12,7 @@ import sys
 import tempfile
 import zipfile
 
-from prepare_arm64_guest import ALPINE_VERSION, ARTIFACTS
+from arm64_guest_common import ALPINE_VERSION, MINIROOTFS_ARTIFACT
 
 
 LIBRARIES = ("libish.a", "libish_emu.a", "libfakefs.a", "libish_aot.a")
@@ -61,8 +61,8 @@ def main():
     require(rootfs_detail.get("distributionVersion") == ALPINE_VERSION, "Unexpected Alpine rootfs version")
     require(rootfs_detail.get("architecture") == "aarch64", "Alpine rootfs is not ARM64")
     source_detail = rootfs_detail.get("source", {})
-    require(source_detail.get("url") == ARTIFACTS["minirootfs"]["url"], "Alpine source URL is not pinned")
-    require(source_detail.get("sha256") == ARTIFACTS["minirootfs"]["sha256"], "Alpine source hash is not pinned")
+    require(source_detail.get("url") == MINIROOTFS_ARTIFACT["url"], "Alpine source URL is not pinned")
+    require(source_detail.get("sha256") == MINIROOTFS_ARTIFACT["sha256"], "Alpine source hash is not pinned")
     require(isinstance(source_detail.get("bytes"), int) and source_detail["bytes"] > 0,
             "Alpine source size is missing")
     image_detail = rootfs_detail.get("image", {})

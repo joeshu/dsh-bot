@@ -8,6 +8,7 @@ on:
       - 'scripts/package-ish-arm64-ios.py'
       - 'scripts/verify-ish-arm64-artifact.py'
       - 'scripts/prepare-arm64-guest.py'
+      - 'scripts/arm64_guest_common.py'
       - 'docs/architecture/dsh-nodemobile-ish-arm64-implementation.md'
       - '.github/workflows/ish-arm64-ios-runtime.yml'
   pull_request:
@@ -17,6 +18,7 @@ on:
       - 'scripts/package-ish-arm64-ios.py'
       - 'scripts/verify-ish-arm64-artifact.py'
       - 'scripts/prepare-arm64-guest.py'
+      - 'scripts/arm64_guest_common.py'
       - 'docs/architecture/dsh-nodemobile-ish-arm64-implementation.md'
       - '.github/workflows/ish-arm64-ios-runtime.yml'
   workflow_dispatch:
