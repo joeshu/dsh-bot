@@ -55,6 +55,7 @@ static const NSUInteger DSBOT_ISH_MAX_SESSIONS = 4;
 @interface ISHKernelBridge ()
 @property(nonatomic, strong) NSCondition *condition;
 @property(nonatomic, strong) dispatch_queue_t setupQueue;
+@property(nonatomic, strong) dispatch_queue_t callbackQueue;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, DSBOTISHSession *> *sessionsByID;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *, DSBOTISHSession *> *sessionsByTTY;
 @property(nonatomic, assign) NSInteger state;
@@ -234,6 +235,15 @@ static void DSBotISHTerminateProcessSession(int processSessionID) {
         _setupQueue = dispatch_queue_create(
             "io.github.dsbot.ish.session-setup",
             setupQueueAttributes
+        );
+        dispatch_queue_attr_t callbackQueueAttributes = dispatch_queue_attr_make_with_qos_class(
+            DISPATCH_QUEUE_SERIAL,
+            QOS_CLASS_USER_INITIATED,
+            0
+        );
+        _callbackQueue = dispatch_queue_create(
+            "io.github.dsbot.ish.callbacks",
+            callbackQueueAttributes
         );
         _sessionsByID = [NSMutableDictionary dictionary];
         _sessionsByTTY = [NSMutableDictionary dictionary];
@@ -645,7 +655,10 @@ static void DSBotISHTerminateProcessSession(int processSessionID) {
     DSBOTISHSession *session = self.sessionsByTTY[@(ttyNumber)];
     DSBotISHOutputHandler handler = session.outputHandler;
     [self.condition unlock];
-    if (handler != nil) handler(data);
+    if (handler != nil) {
+        NSData *eventData = [data copy];
+        dispatch_async(self.callbackQueue, ^{ handler(eventData); });
+    }
 }
 
 - (void)processExited:(int)processID status:(int)status {
@@ -662,7 +675,9 @@ static void DSBotISHTerminateProcessSession(int processSessionID) {
         [self.condition broadcast];
         BOOL shouldFinalize = session.closing && session.activeOperations == 0;
         [self.condition unlock];
-        if (handler != nil) handler((int32_t)status);
+        if (handler != nil) {
+            dispatch_async(self.callbackQueue, ^{ handler((int32_t)status); });
+        }
         // The shell can exit while leaving background jobs behind. At this
         // point iSH has reparented them to PID 1, so the original parent-chain
         // check no longer finds them. Each PTY shell owns a new Linux session;
