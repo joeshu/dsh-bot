@@ -484,7 +484,7 @@ def main() -> None:
 
     qemu_record = next(item for item in framework_records if "aarch64-softmmu" in str(item["name"]))
     qemu_binary = output / str(qemu_record["path"])
-    required_symbols = {"qemu_init", "qemu_main_loop", "qemu_cleanup"}
+    required_symbols = {"qemu_init", "qemu_main_loop", "qemu_cleanup", "qemu_system_shutdown_request"}
     qemu_exported_symbols = exported_symbols_for_sdk(qemu_binary, args.sdk)
     missing_symbols = required_symbols - qemu_exported_symbols
     if missing_symbols:

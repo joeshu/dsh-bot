@@ -81,7 +81,7 @@ public actor ARM64GuestPTYCommandRunner {
         let broker = try await runtime.acquirePTYLease()
         defer { Task { await runtime.releasePTYLease() } }
         guard !cancelledTurns.contains(key) else { throw CancellationError() }
-        let stream = try await broker.open(owner: owner, rows: 24, columns: 80, timeoutSeconds: 20)
+        let stream = try await broker.open(owner: owner, rows: 24, columns: 80, timeoutSeconds: 120)
         guard !cancelledTurns.contains(key) else {
             try? await broker.close(owner: owner)
             throw CancellationError()

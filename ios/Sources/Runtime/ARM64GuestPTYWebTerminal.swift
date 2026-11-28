@@ -164,7 +164,7 @@ public actor ARM64GuestPTYWebTerminal {
         do {
             try Task.checkCancellation()
             guard sessions[id] != nil else { throw CancellationError() }
-            let stream = try await broker.open(owner: owner, rows: rows, columns: columns, timeoutSeconds: 30)
+            let stream = try await broker.open(owner: owner, rows: rows, columns: columns, timeoutSeconds: 120)
             guard var session = sessions[id] else {
                 try? await broker.close(owner: owner)
                 throw CancellationError()

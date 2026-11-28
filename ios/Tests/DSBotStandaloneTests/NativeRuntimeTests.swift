@@ -264,7 +264,7 @@ final class NativeRuntimeTests: XCTestCase {
                 kind: .native,
                 sessionID: "simulator-\(UUID().uuidString.lowercased())"
             ))
-            let stream = try await broker.open(owner: owner, rows: 24, columns: 80, timeoutSeconds: 30)
+            let stream = try await broker.open(owner: owner, rows: 24, columns: 80, timeoutSeconds: 120)
             try await broker.sendInput(
                 Data("printf '%s\\n' 'DSBOT_IOS_GUEST_PTY_OK'; exit\n".utf8),
                 from: owner
