@@ -255,6 +255,29 @@ jobs:
             --guest-image "$RUNNER_TEMP/dsbot-arm64-guest" \
             --output "$RUNNER_TEMP/dsbot-ios-guest-runtime"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.3
+
+      - name: Pin npm for the iOS runtime lockfile
+        run: npm install --global npm@11.9.0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Prepare locked app resources before XcodeGen validates the project
+        shell: bash
+        env:
+          DSBOT_GUEST_RUNTIME_DIR: ${{ runner.temp }}/dsbot-ios-guest-runtime
+        run: |
+          set -euo pipefail
+          npm --prefix kernel/runtime ci --ignore-scripts --omit=optional --no-audit --no-fund
+          python3 scripts/prepare-dsh-runtime.py
+          python3 scripts/prepare-python-runtime.py
+          python3 scripts/prepare-node-mobile-ios.py
+          python3 scripts/prepare-quickjs.py
+
       - name: Install pinned XcodeGen 2.46.0
         shell: bash
         run: |
@@ -291,17 +314,6 @@ jobs:
             -parallel-testing-enabled NO -resultBundlePath "$RUNNER_TEMP/DSBotQEMUGuestTests.xcresult" \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO ENABLE_USER_SCRIPT_SANDBOXING=NO \
             DSBOT_GUEST_RUNTIME_DIR="$RUNNER_TEMP/dsbot-ios-guest-runtime"
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24.22.3
-
-      - name: Pin npm for the iOS runtime lockfile
-        run: npm install --global npm@11.9.0
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
 
       - name: Build and verify the terminal-capable unsigned IPA
         shell: bash
