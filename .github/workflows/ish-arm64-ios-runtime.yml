@@ -89,6 +89,7 @@ jobs:
         env:
           DSBOT_ISH_ROOTFS_DIR: ${{ runner.temp }}/ish-arm64-ios/rootfs
           DSBOT_ISH_INCLUDE_DIR: ${{ runner.temp }}/ish-arm64-ios/include
+          DSBOT_ISH_INTERNAL_INCLUDE_DIR: ${{ runner.temp }}/ish-arm64-ios/include/ish
           DSBOT_ISH_LIBRARY_DIR: ${{ runner.temp }}/ish-arm64-ios/libraries/simulator
           DSBOT_ISH_LINK_FLAGS: "-lish_emu -lish -lfakefs -force_load ${{ runner.temp }}/ish-arm64-ios/libraries/simulator/libish_aot.a"
           DSBOT_ISH_RUNTIME_ENABLED: "1"
@@ -102,6 +103,7 @@ jobs:
             DSBOT_ISH_RUNTIME_ENABLED=1 \
             DSBOT_ISH_SWIFT_CONDITIONS=DSBOT_ISH_RUNTIME_ENABLED \
             DSBOT_ISH_INCLUDE_DIR="$RUNNER_TEMP/ish-arm64-ios/include" \
+            DSBOT_ISH_INTERNAL_INCLUDE_DIR="$RUNNER_TEMP/ish-arm64-ios/include/ish" \
             DSBOT_ISH_LIBRARY_DIR="$RUNNER_TEMP/ish-arm64-ios/libraries/simulator" \
             DSBOT_ISH_LINK_FLAGS="-lish_emu -lish -lfakefs -force_load $RUNNER_TEMP/ish-arm64-ios/libraries/simulator/libish_aot.a"
       - uses: actions/upload-artifact@v4
