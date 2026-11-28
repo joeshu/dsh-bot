@@ -41,6 +41,7 @@ The iSH process shares the app's address space. It does not sandbox malicious Ja
 - Locked OpenMinis and iSH revisions are in `scripts/ish-arm64-sources.lock.json`.
 - `scripts/build-ish-arm64-ios.sh` creates device and Simulator libraries from source.
 - `scripts/package-ish-arm64-ios.py` emits the source archives, notices, hashes, component sizes, and a report that explicitly says the artifact is not linked into the app.
+- `scripts/verify-ish-arm64-artifact.py` gates publication on locked commits, full source archives, required licenses, checksums, library byte totals, and ARM64 slices.
 - `.github/workflows/ish-arm64-ios-runtime.yml` performs the macOS build on relevant pushes and pull requests.
 
 ### 2. Native engine lifecycle — next
