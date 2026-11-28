@@ -87,6 +87,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24.22.3
+      - name: Pin npm for the iOS runtime lockfile
+        run: npm install --global npm@11.9.0
+      - name: Install the locked iOS runtime dependencies for contract tests
+        run: npm --prefix kernel/runtime ci --ignore-scripts --omit=optional --no-audit --no-fund
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
