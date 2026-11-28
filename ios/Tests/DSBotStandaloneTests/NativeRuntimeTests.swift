@@ -96,6 +96,10 @@ final class NativeRuntimeTests: XCTestCase {
         let broker = ARM64GuestPTYBroker(transport: transport)
         await broker.start()
 
+        transport.deliver(ARM64GuestPTYFrame(type: .ready, sessionID: 0))
+        try await Task.sleep(nanoseconds: 20_000_000)
+        let framesBeforeWaiter = try transport.sentFrames()
+        XCTAssertTrue(framesBeforeWaiter.isEmpty, "The broker must not inject bytes without a readiness challenge.")
         let readiness = Task { try await broker.waitUntilReady(timeoutSeconds: 5) }
         let ping = try await transport.waitForFrame(.ping)
         transport.deliver(ARM64GuestPTYFrame(type: .pong, sessionID: 0, payload: ping.payload))
@@ -150,6 +154,8 @@ final class NativeRuntimeTests: XCTestCase {
         await broker.start()
 
         let readiness = Task { try await broker.waitUntilReady(timeoutSeconds: 5) }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        transport.deliver(ARM64GuestPTYFrame(type: .ready, sessionID: 0))
         let ping = try await transport.waitForFrame(.ping)
         transport.deliver(ARM64GuestPTYFrame(type: .pong, sessionID: 0, payload: ping.payload))
         try await readiness.value

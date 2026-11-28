@@ -46,6 +46,7 @@ public actor ARM64GuestPTYBroker {
     private var sessions: [UInt32: SessionRecord] = [:]
     private var started = false
     private var isClosed = false
+    private var agentReady = false
     private var guestReady = false
     private var readyChallenge: Data?
     private var readyContinuation: CheckedContinuation<Void, Error>?
@@ -105,15 +106,7 @@ public actor ARM64GuestPTYBroker {
                 }
                 await self?.failReadiness(ARM64GuestPTYProtocolError.timeout("agent startup"))
             }
-            do {
-                try transmit(ARM64GuestPTYFrame(type: .ping, sessionID: 0, payload: challenge))
-            } catch {
-                readyWatchdog?.cancel()
-                readyWatchdog = nil
-                readyChallenge = nil
-                readyContinuation = nil
-                continuation.resume(throwing: error)
-            }
+            if agentReady { sendReadinessChallenge() }
         }
     }
 
@@ -296,17 +289,11 @@ public actor ARM64GuestPTYBroker {
         if frame.sessionID == 0 {
             switch frame.type {
             case .ready:
-                // The first PING can arrive while Linux is still booting and
-                // ttyAMA0 has not been opened by the agent yet. Retry only
-                // after READY so the matching PONG proves the guest consumed
-                // host-to-guest serial input before a PTY is created.
-                if let challenge = readyChallenge {
-                    do {
-                        try transmit(ARM64GuestPTYFrame(type: .ping, sessionID: 0, payload: challenge))
-                    } catch {
-                        failReadiness(error)
-                    }
-                }
+                // Do not send binary data while Linux is still using ttyAMA0
+                // as its boot console. The agent sends READY only after it has
+                // opened the UART and switched it to raw mode.
+                agentReady = true
+                sendReadinessChallenge()
             case .pong where frame.payload == readyChallenge:
                 markGuestReady()
             case .error:
@@ -372,6 +359,7 @@ public actor ARM64GuestPTYBroker {
     }
 
     private func markGuestReady() {
+        agentReady = true
         guestReady = true
         readyWatchdog?.cancel()
         readyWatchdog = nil
@@ -388,6 +376,15 @@ public actor ARM64GuestPTYBroker {
         let continuation = readyContinuation
         readyContinuation = nil
         continuation?.resume(throwing: error)
+    }
+
+    private func sendReadinessChallenge() {
+        guard let challenge = readyChallenge, readyContinuation != nil else { return }
+        do {
+            try transmit(ARM64GuestPTYFrame(type: .ping, sessionID: 0, payload: challenge))
+        } catch {
+            failReadiness(error)
+        }
     }
 
     private func expireSession(_ sessionID: UInt32, state expectedState: SessionState, operation: String) async {
@@ -468,6 +465,7 @@ public actor ARM64GuestPTYBroker {
         receiveContinuation = nil
         receiveTask?.cancel()
         receiveTask = nil
+        agentReady = false
         guestReady = false
         failReadiness(error)
         transport.setReceiveHandler(nil)
