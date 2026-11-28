@@ -53,7 +53,7 @@ INIT = b"""#!/bin/sh
 set -eu
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/root
-export TERM=${TERM:-vt100}
+export TERM=${TERM:-xterm-256color}
 export PS1='dsbot# '
 mkdir -p /proc /sys /dev /run /tmp /root
 mount -t proc -o nosuid,nodev,noexec proc /proc 2>/dev/null || true

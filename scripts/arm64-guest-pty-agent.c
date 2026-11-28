@@ -444,7 +444,7 @@ static int create_session(uint32_t id, const unsigned char *payload, size_t leng
         (void)setenv("TMP", temporary_directory, 1);
         (void)setenv("TEMP", temporary_directory, 1);
         (void)setenv("XDG_RUNTIME_DIR", temporary_directory, 1);
-        (void)setenv("TERM", "vt100", 1);
+        (void)setenv("TERM", "xterm-256color", 1);
         (void)setenv("PS1", "dsbot$ ", 1);
         execl("/bin/sh", "sh", "-i", (char *)NULL);
         child_setup_failure(127, "exec /bin/sh", errno);
