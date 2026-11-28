@@ -77,6 +77,16 @@
 +        // delivery via SIGUSR2 wakes kevent, but if the signal arrives
 --- a/kernel/task.c
 +++ b/kernel/task.c
-@@ -209 +209 @@
+@@ -3,0 +4,3 @@
++#ifdef __APPLE__
++#include <pthread/qos.h>
++#endif
+@@ -209 +212 @@
 -        // that were interrupted by SIGUSR1 from do_exit_group.
 +        // that were interrupted by SIGUSR2 from do_exit_group.
+@@ -236,0 +240,5 @@
++#ifdef __APPLE__
++    // Guest workers can be synchronously reaped by a user-initiated PTY close.
++    // Keep the worker responsive at the same QoS instead of inverting priority.
++    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
++#endif
