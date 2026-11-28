@@ -411,7 +411,7 @@ final class NativeRuntimeTests: XCTestCase {
             let backgroundStream = try await runtime.openPTY(owner: backgroundOwner)
             print("DSBOT_ISH_TEST_STAGE background-pty-opened")
             try await runtime.sendInput(
-                Data("stty -echo\ntrap '' HUP\nsleep 60 &\nprintf '%s' DSBOT_ISH_BACKGROUND_; printf 'PID:%s\\n' \"$!\"\nexit\nexit\n".utf8),
+                Data("stty -echo\ntrap '' HUP\nsleep 60 &\nprintf '%s%s:%s\\n' DSBOT_ISH_BACKGROUND_ PID \"$!\"\nexit\nexit\n".utf8),
                 owner: backgroundOwner
             )
             print("DSBOT_ISH_TEST_STAGE background-script-sent")
@@ -419,10 +419,13 @@ final class NativeRuntimeTests: XCTestCase {
             print("DSBOT_ISH_TEST_STAGE background-script-exited-\(backgroundResult.1)")
             XCTAssertEqual(backgroundResult.1, 0)
             let backgroundText = String(decoding: backgroundResult.0, as: UTF8.self)
-            let pidLine = try XCTUnwrap(backgroundText.split(whereSeparator: \.isNewline)
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .first { $0.hasPrefix("DSBOT_ISH_BACKGROUND_PID:") })
-            let guestPID = try XCTUnwrap(Int(pidLine.dropFirst("DSBOT_ISH_BACKGROUND_PID:".count)))
+            let pidMarker = "DSBOT_ISH_BACKGROUND_PID:"
+            let pidMarkerRange = try XCTUnwrap(
+                backgroundText.range(of: pidMarker),
+                "The PTY output did not contain the background PID marker. Output tail: \(String(backgroundText.suffix(256)).debugDescription)"
+            )
+            let pidText = backgroundText[pidMarkerRange.upperBound...].prefix(while: \.isNumber)
+            let guestPID = try XCTUnwrap(Int(pidText), "The PTY background PID marker did not contain a decimal PID.")
             await runtime.closePTY(owner: backgroundOwner)
 
             let verifierOwner = try XCTUnwrap(ARM64GuestPTYOwner(
