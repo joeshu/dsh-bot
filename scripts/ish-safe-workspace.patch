@@ -90,3 +90,15 @@
 +    // Keep the worker responsive at the same QoS instead of inverting priority.
 +    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
 +#endif
+--- a/kernel/uname.c
++++ b/kernel/uname.c
+@@ -18,5 +18 @@ void do_uname(struct uname *uts) {
+-    struct utsname real_uname;
+-    uname(&real_uname);
+-    const char *hostname = real_uname.nodename;
+-    if (uname_hostname_override)
+-        hostname = uname_hostname_override;
++    const char *hostname = uname_hostname_override ? uname_hostname_override : "dsbot";
+@@ -26 +22 @@ void do_uname(struct uname *uts) {
+-    strcpy(uts->hostname, hostname);
++    snprintf(uts->hostname, sizeof(uts->hostname), "%s", hostname);

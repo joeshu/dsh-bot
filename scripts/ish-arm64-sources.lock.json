@@ -18,8 +18,8 @@
   "hostIntegrationPatches": [
     {
       "path": "ish-safe-workspace.patch",
-      "sha256": "d26ad53418594bdb78f98aa57d85c1f38baf019c239de914dad18385f88be129",
-      "purpose": "Reject bind-mounted workspace symlinks, route iSH host wakeups over SIGUSR2, and match guest worker QoS to PTY lifecycle QoS"
+      "sha256": "ac497eda459fe02f8105d14089c1362a3e02d891fef19c7455213ae5525d3dbb",
+      "purpose": "Bound guest uname hostname without exposing the host name, reject bind-mounted workspace symlinks, route iSH host wakeups over SIGUSR2, and match guest worker QoS to PTY lifecycle QoS"
     }
   ],
   "license": {
