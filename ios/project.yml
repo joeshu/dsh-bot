@@ -68,7 +68,7 @@ targets:
       base:
         PRODUCT_NAME: DSBotStandalone
         PRODUCT_BUNDLE_IDENTIFIER: io.github.dsbot.ios.standalone
-        MARKETING_VERSION: "2.6.7"
+        MARKETING_VERSION: "2.6.8"
         CURRENT_PROJECT_VERSION: "61"
         INFOPLIST_FILE: Resources/Info.plist
         GENERATE_INFOPLIST_FILE: NO
