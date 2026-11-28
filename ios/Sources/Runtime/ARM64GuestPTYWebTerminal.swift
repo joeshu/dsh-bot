@@ -20,6 +20,7 @@ public actor ARM64GuestPTYWebTerminal {
     private let maxSessions = 4
     private let maxBufferedOutputBytes = 256 * 1024
     private let maxReadBytes = 32 * 1024
+    private let maxPendingReadsPerSession = 8
     private var openingTasks: [String: Task<String, Error>] = [:]
     private var requestSessions: [String: String] = [:]
     private var sessions: [String: Session] = [:]
@@ -96,6 +97,9 @@ public actor ARM64GuestPTYWebTerminal {
             throw ARM64GuestPTYProtocolError.ownerNotAuthorized
         }
         if initial.output.isEmpty, initial.exitCode == nil, initial.error == nil {
+            guard initial.readWaiters.count < maxPendingReadsPerSession else {
+                throw ARM64GuestPTYProtocolError.outputBackpressure
+            }
             await withCheckedContinuation { continuation in
                 guard var current = sessions[sessionID], current.output.isEmpty,
                       current.exitCode == nil, current.error == nil else {

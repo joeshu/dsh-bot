@@ -2,7 +2,7 @@
 
 ## Current implementation status
 
-The repository now has a source-pinned iSH ARM64 library build and artifact report. The build checks the OpenMinis revision, the iSH ARM64 revision, all three iSH submodule revisions, and the upstream build script digest. It packages device and Simulator static libraries, headers, resources, license files, corresponding source archives, and SHA-256 sums.
+The repository now has a source-pinned iSH ARM64 library build and artifact report. The build checks the OpenMinis revision, the iSH ARM64 revision, all three iSH submodule revisions, and the upstream build script digest. It packages device and Simulator static libraries, headers, resources, iSH/OpenMinis license files, corresponding source archives, and SHA-256 sums. The iSH license bundle records GPLv3, GPLv2 for later contributions, and the iOS addendum.
 
 This artifact is a build foundation. It is not yet linked into `DSBotStandalone`; the application still uses its existing QEMU-backed guest route. Do not describe the iSH runtime as active until the native engine bridge and the acceptance gates below pass. The existing release gate remains in force during this migration.
 

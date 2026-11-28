@@ -16,7 +16,7 @@
     }
   },
   "license": {
-    "terms": "GPLv3; see LICENSE.IOS",
+    "terms": "GPLv3; later contributions also GPLv2; see LICENSE.md and LICENSE.IOS",
     "requiredFiles": ["LICENSE.md", "LICENSE.IOS"],
     "notice": "Include the corresponding source archives and build scripts with every redistributed binary derived from iSH."
   }

@@ -78,6 +78,8 @@ def main():
     copy_required(products / "resources", output / "resources")
     for filename in lock["license"]["requiredFiles"]:
         copy_required(engine / filename, output / "licenses" / filename)
+    for filename in ("LICENSE", "THIRD_PARTY_LICENSES.md"):
+        copy_required(distribution / filename, output / "licenses" / f"OpenMinis-{filename}")
 
     source_dir = output / "source"
     source_dir.mkdir()
@@ -106,7 +108,7 @@ def main():
     if build_script_hash != lock["distribution"]["buildScriptSha256"]:
         raise SystemExit("Packaged build script hash does not match source lock")
 
-    notices = """iSH ARM64 engine source notice\n\nThis artifact contains static libraries built from OpenMinis/ish-arm64.\nThe iSH engine is licensed under GPLv3; LICENSE.IOS applies to iOS builds.\nThe exact source revisions and corresponding source archives are included in\nsource/. The OpenMinis build script is included with its pinned source hash.\nReview each source tree for additional dependency notices before redistribution.\n"""
+    notices = """iSH ARM64 engine source notice\n\nThis artifact contains static libraries built from OpenMinis/ish-arm64.\nThe iSH core is licensed under GPLv3, with later contributions also GPLv2;\nLICENSE.IOS applies to iOS builds.\nThe exact source revisions and corresponding source archives are included in\nsource/. The OpenMinis build script is included with its pinned source hash.\nReview each source tree for additional dependency notices before redistribution.\n"""
     (output / "THIRD-PARTY-NOTICES.txt").write_text(notices, encoding="utf-8")
 
     component_sizes = {}
