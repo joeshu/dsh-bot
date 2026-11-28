@@ -55,12 +55,10 @@ jobs:
             and (.event == "push" or .event == "workflow_dispatch")
           ' <<<"$RUN" > /dev/null
           CANDIDATE_COMMIT="$(jq -r .head_sha <<<"$RUN")"
-          CANDIDATE_WORKFLOW_PATH="$(jq -r .path <<<"$RUN")"
           [[ "$CANDIDATE_COMMIT" =~ ^[a-f0-9]{40}$ ]]
           gh api "repos/$GITHUB_REPOSITORY/compare/$CANDIDATE_COMMIT...$GITHUB_SHA" \
             | jq -e '.status == "identical" or .status == "ahead"' > /dev/null
           echo "CANDIDATE_COMMIT=$CANDIDATE_COMMIT" >> "$GITHUB_ENV"
-          echo "CANDIDATE_WORKFLOW_PATH=$CANDIDATE_WORKFLOW_PATH" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
           name: dsbot-native-ios-candidate
@@ -77,10 +75,17 @@ jobs:
           IPA="${IPAS[0]}"
           python3 scripts/verify-unsigned-ipa.py "$IPA" > "$RUNNER_TEMP/current-report.json"
           jq -e --arg hash "$IPA_SHA256" '.sha256 == $hash' "$RUNNER_TEMP/current-report.json" > /dev/null
-          if [[ "$CANDIDATE_WORKFLOW_PATH" == ".github/workflows/qemu-ios-tci-runtime.yml" ]]; then
-            jq -e '.guestRuntime.architecture == "arm64" and .guestRuntime.guestTarget == "aarch64-softmmu"' \
-              "$RUNNER_TEMP/current-report.json" > /dev/null
-          fi
+          jq -e '
+            .guestRuntime.architecture == "arm64"
+            and .guestRuntime.guestTarget == "aarch64-softmmu"
+            and (.componentSizes.qemuFrameworks.uncompressedBytes // 0) > 0
+            and (.componentSizes.guestRuntime.uncompressedBytes // 0) > 0
+            and .runtime.guestTerminal.guestNetwork == false
+            and .runtime.guestTerminal.hostFilesystemMounted == false
+          ' "$RUNNER_TEMP/current-report.json" > /dev/null || {
+            echo "Candidate IPA must contain the isolated ARM64 QEMU guest runtime." >&2
+            exit 1
+          }
           jq -e --arg commit "$CANDIDATE_COMMIT" --slurpfile current "$RUNNER_TEMP/current-report.json" \
             '.commit == $commit and del(.commit) == $current[0]' candidate/ipa-report.json > /dev/null
           (cd candidate && sha256sum -c SHA256SUMS.txt)
