@@ -70,7 +70,7 @@ public struct ExperimentalFeaturesView: View {
                                 .font(.caption2)
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 2)
-                                .background(Color(.tertiarySystemFill))
+                                .background(SwiftUI.Color(.tertiarySystemFill))
                                 .clipShape(Capsule())
                         }
                         Text("推理模型输出时默认收起深度思考块，减少长思考占屏。")
@@ -131,7 +131,7 @@ public struct ExperimentalFeaturesView: View {
         .navigationBarTitleDisplayMode(.inline)
     }
 
-    private func featureRow(icon: String, color: Color, title: String, subtitle: String, badge: String?, status: String) -> some View {
+    private func featureRow(icon: String, color: SwiftUI.Color, title: String, subtitle: String, badge: String?, status: String) -> some View {
         HStack(spacing: 12) {
             ZStack {
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -150,7 +150,7 @@ public struct ExperimentalFeaturesView: View {
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
-                            .background(Color(.tertiarySystemFill))
+                            .background(SwiftUI.Color(.tertiarySystemFill))
                             .clipShape(Capsule())
                     }
                 }
@@ -224,7 +224,7 @@ private final class ARM64PTYTerminalChannel {
         lock.lock()
         let view = terminalView
         lock.unlock()
-        DispatchQueue.main.async { view?.becomeFirstResponder() }
+        DispatchQueue.main.async { _ = view?.becomeFirstResponder() }
     }
 }
 
@@ -409,7 +409,7 @@ public struct VirtualTerminalFeatureView: View {
                             .font(.caption2.monospaced())
                             .padding(.horizontal, 8)
                             .padding(.vertical, 5)
-                            .background(Color(.secondarySystemFill))
+                            .background(SwiftUI.Color(.secondarySystemFill))
                             .clipShape(Capsule())
                             .buttonStyle(.plain)
                             .disabled(!isConnected)
@@ -418,7 +418,7 @@ public struct VirtualTerminalFeatureView: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
             }
-            .background(Color(.secondarySystemBackground))
+            .background(SwiftUI.Color(.secondarySystemBackground))
 
             Divider()
 
@@ -427,7 +427,7 @@ public struct VirtualTerminalFeatureView: View {
                 onInput: { send($0) },
                 onResize: { newColumns, newRows in updateTerminalSize(columns: newColumns, rows: newRows) }
             )
-            .background(Color(red: 0.07, green: 0.08, blue: 0.10))
+            .background(SwiftUI.Color(red: 0.07, green: 0.08, blue: 0.10))
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             if !errorMessage.isEmpty {
@@ -473,7 +473,7 @@ public struct VirtualTerminalFeatureView: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
             }
-            .background(Color(.secondarySystemBackground))
+            .background(SwiftUI.Color(.secondarySystemBackground))
         }
         .navigationTitle("ARM64 Linux 终端")
         .navigationBarTitleDisplayMode(.inline)
@@ -505,7 +505,7 @@ public struct VirtualTerminalFeatureView: View {
         Button(label) { send(sequence) }
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
-            .background(Color(.tertiarySystemFill))
+            .background(SwiftUI.Color(.tertiarySystemFill))
             .clipShape(Capsule())
             .buttonStyle(.plain)
             .disabled(!isConnected)
@@ -990,7 +990,7 @@ struct AutoReviewDetailView: View {
                 HStack(spacing: 12) {
                     ZStack {
                         RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .fill(Color.blue.opacity(0.14))
+                            .fill(SwiftUI.Color.blue.opacity(0.14))
                             .frame(width: 48, height: 48)
                         Image(systemName: "checkmark.shield.fill")
                             .font(.title2)
@@ -999,8 +999,8 @@ struct AutoReviewDetailView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("自动授权审查").font(.headline)
                         HStack(spacing: 6) {
-                            Text("v0.2.2-rc.5").font(.caption2).padding(.horizontal, 6).padding(.vertical, 2).background(Color(.tertiarySystemFill)).clipShape(Capsule())
-                            Text("实验性").font(.caption2).padding(.horizontal, 6).padding(.vertical, 2).background(Color(.tertiarySystemFill)).clipShape(Capsule())
+                            Text("v0.2.2-rc.5").font(.caption2).padding(.horizontal, 6).padding(.vertical, 2).background(SwiftUI.Color(.tertiarySystemFill)).clipShape(Capsule())
+                            Text("实验性").font(.caption2).padding(.horizontal, 6).padding(.vertical, 2).background(SwiftUI.Color(.tertiarySystemFill)).clipShape(Capsule())
                         }
                     }
                     Spacer()
@@ -1017,7 +1017,7 @@ struct AutoReviewDetailView: View {
                         Text("自动授权审查策略引擎").font(.subheadline.weight(.semibold))
                         HStack(spacing: 4) {
                             Circle()
-                                .fill(host.autoReviewEnabled ? DSTheme.success : Color.secondary)
+                                .fill(host.autoReviewEnabled ? DSTheme.success : SwiftUI.Color.secondary)
                                 .frame(width: 7, height: 7)
                             Text(host.autoReviewEnabled ? "运行中" : "已关闭")
                                 .font(.caption)
@@ -1057,7 +1057,7 @@ struct DiagnosticsFeatureDetailView: View {
                 HStack(spacing: 12) {
                     ZStack {
                         RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .fill(Color.indigo.opacity(0.14))
+                            .fill(SwiftUI.Color.indigo.opacity(0.14))
                             .frame(width: 48, height: 48)
                         Image(systemName: "doc.text.magnifyingglass")
                             .font(.title2)
@@ -1066,8 +1066,8 @@ struct DiagnosticsFeatureDetailView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("会话数据诊断与统计").font(.headline)
                         HStack(spacing: 6) {
-                            Text("v0.2.2-rc.5").font(.caption2).padding(.horizontal, 6).padding(.vertical, 2).background(Color(.tertiarySystemFill)).clipShape(Capsule())
-                            Text("实验性").font(.caption2).padding(.horizontal, 6).padding(.vertical, 2).background(Color(.tertiarySystemFill)).clipShape(Capsule())
+                            Text("v0.2.2-rc.5").font(.caption2).padding(.horizontal, 6).padding(.vertical, 2).background(SwiftUI.Color(.tertiarySystemFill)).clipShape(Capsule())
+                            Text("实验性").font(.caption2).padding(.horizontal, 6).padding(.vertical, 2).background(SwiftUI.Color(.tertiarySystemFill)).clipShape(Capsule())
                         }
                     }
                     Spacer()
