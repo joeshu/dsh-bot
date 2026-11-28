@@ -39,6 +39,7 @@ static const NSUInteger DSBOT_ISH_MAX_SESSIONS = 4;
 @property(nonatomic, assign) struct tty *tty;
 @property(nonatomic, assign) int processID;
 @property(nonatomic, assign) int processGroupID;
+@property(nonatomic, assign) int processSessionID;
 @property(nonatomic, assign) BOOL exited;
 @property(nonatomic, assign) BOOL closing;
 @property(nonatomic, assign) int exitStatus;
@@ -141,14 +142,14 @@ static void DSBotISHSignalTree(int processID, int signal, struct task *expectedR
     unlock(&pids_lock);
 }
 
-static BOOL DSBotISHHasLiveProcessGroup(int processGroupID) {
-    if (processGroupID <= 1) return NO;
+static BOOL DSBotISHHasLiveProcessSession(int processSessionID) {
+    if (processSessionID <= 1) return NO;
     BOOL found = NO;
     lock(&pids_lock);
     for (int pid = 2; pid < MAX_PID; pid++) {
         struct task *task = pid_get_task((dword_t)pid);
         if (task != NULL && !task->exiting && !task->zombie &&
-            task->group != NULL && task->group->pgid == processGroupID) {
+            task->group != NULL && task->group->sid == processSessionID) {
             found = YES;
             break;
         }
@@ -157,29 +158,29 @@ static BOOL DSBotISHHasLiveProcessGroup(int processGroupID) {
     return found;
 }
 
-static void DSBotISHSignalProcessGroup(int processGroupID, int signal) {
-    if (processGroupID <= 1) return;
+static void DSBotISHSignalProcessSession(int processSessionID, int signal) {
+    if (processSessionID <= 1) return;
     struct siginfo_ info = SIGINFO_NIL;
     lock(&pids_lock);
     for (int pid = 2; pid < MAX_PID; pid++) {
         struct task *task = pid_get_task((dword_t)pid);
         if (task != NULL && !task->exiting && !task->zombie &&
-            task->group != NULL && task->group->pgid == processGroupID) {
+            task->group != NULL && task->group->sid == processSessionID) {
             send_signal(task, signal, info);
         }
     }
     unlock(&pids_lock);
 }
 
-static void DSBotISHTerminateProcessGroup(int processGroupID) {
-    DSBotISHSignalProcessGroup(processGroupID, SIGTERM_);
+static void DSBotISHTerminateProcessSession(int processSessionID) {
+    DSBotISHSignalProcessSession(processSessionID, SIGTERM_);
     for (int attempt = 0; attempt < 50; attempt++) {
-        if (!DSBotISHHasLiveProcessGroup(processGroupID)) return;
+        if (!DSBotISHHasLiveProcessSession(processSessionID)) return;
         usleep(10000);
     }
-    DSBotISHSignalProcessGroup(processGroupID, SIGKILL_);
+    DSBotISHSignalProcessSession(processSessionID, SIGKILL_);
     for (int attempt = 0; attempt < 100; attempt++) {
-        if (!DSBotISHHasLiveProcessGroup(processGroupID)) return;
+        if (!DSBotISHHasLiveProcessSession(processSessionID)) return;
         usleep(10000);
     }
 }
@@ -438,6 +439,7 @@ static void DSBotISHTerminateProcessGroup(int processGroupID) {
         }
         session.processID = current->pid;
         session.processGroupID = current->group->pgid;
+        session.processSessionID = current->group->sid;
         result = task_start(current);
         if (result < 0) {
             [self.condition lock];
@@ -587,7 +589,7 @@ static void DSBotISHTerminateProcessGroup(int processGroupID) {
     if (session != nil && !session.exited) {
         session.exited = YES;
         session.exitStatus = status;
-        int processGroupID = session.processGroupID;
+        int processSessionID = session.processSessionID;
         DSBotISHExitHandler handler = session.exitHandler;
         [self.condition broadcast];
         BOOL shouldFinalize = session.closing && session.activeOperations == 0;
@@ -595,13 +597,13 @@ static void DSBotISHTerminateProcessGroup(int processGroupID) {
         if (handler != nil) handler((int32_t)status);
         // The shell can exit while leaving background jobs behind. At this
         // point iSH has reparented them to PID 1, so the original parent-chain
-        // check no longer finds them. Each PTY shell owns a new session/group;
+        // check no longer finds them. Each PTY shell owns a new Linux session;
         // clean any remaining members without holding iSH's exit-hook lock.
         // The serial setup queue prevents a new PTY from reusing the exiting
-        // shell's process-group ID before cleanup finishes.
-        if (processGroupID > 1) {
+        // shell's Linux session ID before cleanup finishes.
+        if (processSessionID > 1) {
             dispatch_async(self.setupQueue, ^{
-                DSBotISHTerminateProcessGroup(processGroupID);
+                DSBotISHTerminateProcessSession(processSessionID);
             });
         }
         if (shouldFinalize) dispatch_async(self.setupQueue, ^{ [self finalizeSession:session]; });
