@@ -2,6 +2,13 @@
 
 #if DSBOT_ISH_RUNTIME_ENABLED && __has_include(<ish/ish.h>)
 
+// The public iSH headers default to the legacy x86 CPU structure when the
+// guest architecture is unspecified. This bridge is built only with the
+// pinned ARM64 guest libraries, so select the matching declarations here.
+#ifndef GUEST_ARM64
+#define GUEST_ARM64 1
+#endif
+
 #define ISH_INTERNAL 1
 #import <ish/ish.h>
 #undef ISH_INTERNAL
