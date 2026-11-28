@@ -13,12 +13,14 @@ The verified CI build reports a 4,129,738-byte fakefs ZIP that expands to 8,747,
 | Surface | Current backend and behavior |
 |---|---|
 | Bot `terminal_exec` | QEMU ARM64 Alpine PTY; shell text runs in a fresh owner-scoped session with timeout and output limits. |
-| Web terminal | QEMU ARM64 Alpine `ash` PTY; interactive input, resize, exit status, session cleanup, and bounded output. |
+| Web terminal | QEMU ARM64 Alpine `ash` PTY rendered by pinned SwiftTerm; raw VT output, interactive input, resize, exit status, session cleanup, and bounded buffers. |
 | DSH subprocess `spawnTerminal` | Only `/bin/sh` or `/bin/ash` is accepted, with the bundled Alpine shell profile. |
 | DSH subprocess `spawn(argv)` | Deliberately rejected with `SUBPROCESS_PTY_UNAVAILABLE`; ordinary pipe-backed child processes are not implemented on iOS yet. |
 | iSH ARM64 | Optional build embeds pinned rootfs and links the engine; Simulator boot is not yet accepted, and QEMU remains default. |
 
 The app bridge currently ports fakefs boot and a `/workspace` bind mount of only the user project directory `dsh-home/files`; the DSH session database and app metadata stay outside the guest mount. Startup rejects a project tree containing symlinks, and the pinned iSH integration patch rejects guest-created symlinks under host bind mounts. Alpine PID 1/reaping and bounded shell PTYs are implemented. The OpenMinis UI, native offload handlers, and argv-based pipe process API are not imported. DSH `spawn(argv)` still reports `SUBPROCESS_PTY_UNAVAILABLE`; its pipe-backed process contract remains a separate implementation step.
+
+The native Web terminal view uses SwiftTerm v1.18.0 at a fixed source revision. It passes PTY output bytes directly to the VT parser, uses a bounded 1,200-line scrollback and 512 KiB render queue, and batches keyboard input into ordered RPC writes with a 64 KiB cap. The soft-key row exposes common control, cursor, paging, and F1–F4 keys. OSC 52 clipboard reads and writes and terminal-originated link opens are denied; ordinary user keyboard input and the system keyboard remain available. This changes the terminal renderer and input path only; it does not change the runtime backend selection or make iSH the default.
 
 Run the build on macOS with Xcode and the iOS SDKs. It builds the iOS libraries and host `fakefsify`, fetches the pinned minirootfs, converts and packages the fakefs image, then verifies the combined artifact:
 

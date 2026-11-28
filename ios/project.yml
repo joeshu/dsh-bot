@@ -6,6 +6,11 @@ options:
   xcodeVersion: "26.6"
   createIntermediateGroups: true
 
+packages:
+  SwiftTerm:
+    url: https://github.com/migueldeicaza/SwiftTerm.git
+    revision: 7691f85b222a67a66b58499e1b2647443cf0dda7
+
 settings:
   base:
     SWIFT_VERSION: "5.9"
@@ -30,6 +35,8 @@ targets:
       - path: Resources/QuickJS-LICENSE.txt
         buildPhase: resources
       - path: Sources/Resources/NodeMobile-LICENSE.txt
+        buildPhase: resources
+      - path: Sources/Resources/SwiftTerm-LICENSE.txt
         buildPhase: resources
       - path: Sources/Resources/DSHRuntime
         type: folder
@@ -107,6 +114,8 @@ targets:
       - sdk: LocalAuthentication.framework
       - sdk: Security.framework
       - sdk: AVFoundation.framework
+      - package: SwiftTerm
+        product: SwiftTerm
 
   DSBotStandaloneTests:
     type: bundle.unit-test

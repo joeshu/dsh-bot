@@ -1,5 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import SwiftTerm
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -167,12 +168,226 @@ public struct ExperimentalFeaturesView: View {
     }
 }
 
+private final class ARM64PTYTerminalChannel {
+    private static let maxQueuedOutputBytes = 512 * 1024
+    private let lock = NSLock()
+    private let feedQueue = DispatchQueue(label: "io.github.dsbot.terminal.feed", qos: .userInitiated)
+    private weak var terminalView: TerminalView?
+    private var queuedOutputBytes = 0
+    private var outputWasDropped = false
+
+    func attach(_ view: TerminalView) {
+        lock.lock()
+        terminalView = view
+        lock.unlock()
+    }
+
+    func detach(_ view: TerminalView) {
+        lock.lock()
+        if terminalView === view { terminalView = nil }
+        lock.unlock()
+    }
+
+    func feed(_ bytes: Data) {
+        guard !bytes.isEmpty else { return }
+        let buffer = Array(bytes)
+        lock.lock()
+        guard let terminalView else { lock.unlock(); return }
+        let available = max(0, Self.maxQueuedOutputBytes - queuedOutputBytes)
+        let acceptedCount = min(buffer.count, available)
+        queuedOutputBytes += acceptedCount
+        if acceptedCount < buffer.count { outputWasDropped = true }
+        lock.unlock()
+        guard acceptedCount > 0 else { return }
+
+        let accepted = Array(buffer.prefix(acceptedCount))
+        feedQueue.async { [weak self, weak terminalView] in
+            terminalView?.feed(byteArray: accepted[...])
+            guard let self else { return }
+            self.lock.lock()
+            self.queuedOutputBytes = max(0, self.queuedOutputBytes - accepted.count)
+            let shouldReportDrop = self.outputWasDropped
+            self.outputWasDropped = false
+            self.lock.unlock()
+            if shouldReportDrop, let terminalView {
+                let warning = Array("\r\n[Terminal display fell behind; some output was omitted.]\r\n".utf8)
+                terminalView.feed(byteArray: warning[...])
+            }
+        }
+    }
+
+    func clearScreen() {
+        feed(Data("\u{001b}[2J\u{001b}[3J\u{001b}[H".utf8))
+    }
+
+    func focus() {
+        lock.lock()
+        let view = terminalView
+        lock.unlock()
+        DispatchQueue.main.async { view?.becomeFirstResponder() }
+    }
+}
+
+@MainActor
+private final class ARM64PTYInputQueue {
+    private var activeSessionID: String?
+    private var rpc: HostRPC?
+    private var pendingInput = Data()
+    private var flushTask: Task<Void, Never>?
+    private var onFailure: ((String) -> Void)?
+    private let maxPendingBytes = 64 * 1024
+    private var generation: UInt64 = 0
+
+    func enqueue(_ bytes: Data, sessionID: String, rpc: HostRPC, onFailure: @escaping (String) -> Void) {
+        guard !bytes.isEmpty else { return }
+        if activeSessionID != sessionID {
+            cancel()
+            activeSessionID = sessionID
+        }
+        self.rpc = rpc
+        self.onFailure = onFailure
+        let available = max(0, maxPendingBytes - pendingInput.count)
+        guard bytes.count <= available else {
+            onFailure("终端输入缓冲已满，请稍后重试。")
+            return
+        }
+        pendingInput.append(bytes)
+        guard flushTask == nil else { return }
+        scheduleFlush(generation: generation, delayNanoseconds: 8_000_000)
+    }
+
+    func cancel(sessionID: String? = nil) {
+        if let sessionID, activeSessionID != sessionID { return }
+        generation &+= 1
+        flushTask?.cancel()
+        flushTask = nil
+        activeSessionID = nil
+        rpc = nil
+        onFailure = nil
+        pendingInput.removeAll(keepingCapacity: false)
+    }
+
+    private func scheduleFlush(generation: UInt64, delayNanoseconds: UInt64) {
+        flushTask = Task { @MainActor [weak self] in
+            if delayNanoseconds > 0 {
+                do { try await Task.sleep(nanoseconds: delayNanoseconds) } catch { return }
+            }
+            guard let self, self.generation == generation else { return }
+            await self.drain(generation: generation)
+        }
+    }
+
+    private func drain(generation: UInt64) async {
+        guard let sessionID = activeSessionID, let rpc else { return }
+        while generation == self.generation, activeSessionID == sessionID, !pendingInput.isEmpty {
+            let bytes = pendingInput
+            pendingInput.removeAll(keepingCapacity: true)
+            let text = String(decoding: bytes, as: UTF8.self)
+            do {
+                _ = try await rpc.request("terminal.write", params: ["sessionId": sessionID, "text": text], timeoutSeconds: 10)
+            } catch {
+                guard generation == self.generation else { return }
+                pendingInput.removeAll(keepingCapacity: false)
+                flushTask = nil
+                onFailure?("输入未发送：\(error.localizedDescription)")
+                return
+            }
+        }
+        guard generation == self.generation else { return }
+        flushTask = nil
+        if !pendingInput.isEmpty {
+            scheduleFlush(generation: generation, delayNanoseconds: 0)
+        }
+    }
+}
+
+private struct ARM64PTYTerminalSurface: UIViewRepresentable {
+    let channel: ARM64PTYTerminalChannel
+    let onInput: (Data) -> Void
+    let onResize: (Int, Int) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(channel: channel, onInput: onInput, onResize: onResize)
+    }
+
+    func makeUIView(context: Context) -> TerminalView {
+        let options = TerminalOptions(
+            cols: 80,
+            rows: 24,
+            termName: "xterm-256color",
+            scrollback: 1_200,
+            enableSixelReported: false,
+            kittyImageCacheLimitBytes: 4 * 1024 * 1024,
+            maximumBidiParagraphRows: 128
+        )
+        let view = TerminalView(
+            frame: .zero,
+            font: .monospacedSystemFont(ofSize: 12, weight: .regular),
+            options: options
+        )
+        view.backgroundColor = UIColor(red: 0.07, green: 0.08, blue: 0.10, alpha: 1)
+        view.contentInsetAdjustmentBehavior = .never
+        view.autocapitalizationType = .none
+        view.autocorrectionType = .no
+        view.spellCheckingType = .no
+        view.terminalDelegate = context.coordinator
+        view.accessibilityIdentifier = "dsbot.arm64-pty-terminal"
+        context.coordinator.attach(view)
+        return view
+    }
+
+    func updateUIView(_ uiView: TerminalView, context: Context) {
+        context.coordinator.onInput = onInput
+        context.coordinator.onResize = onResize
+        context.coordinator.attach(uiView)
+    }
+
+    static func dismantleUIView(_ uiView: TerminalView, coordinator: Coordinator) {
+        uiView.terminalDelegate = nil
+        coordinator.channel.detach(uiView)
+    }
+
+    final class Coordinator: NSObject, TerminalViewDelegate {
+        let channel: ARM64PTYTerminalChannel
+        var onInput: (Data) -> Void
+        var onResize: (Int, Int) -> Void
+
+        init(channel: ARM64PTYTerminalChannel, onInput: @escaping (Data) -> Void, onResize: @escaping (Int, Int) -> Void) {
+            self.channel = channel
+            self.onInput = onInput
+            self.onResize = onResize
+        }
+
+        func attach(_ view: TerminalView) {
+            channel.attach(view)
+            view.terminalDelegate = self
+        }
+
+        func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {
+            DispatchQueue.main.async { [weak self] in self?.onResize(newCols, newRows) }
+        }
+
+        func setTerminalTitle(source: TerminalView, title: String) {}
+        func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
+        func send(source: TerminalView, data: ArraySlice<UInt8>) {
+            let input = Data(data)
+            DispatchQueue.main.async { [weak self] in self?.onInput(input) }
+        }
+        func scrolled(source: TerminalView, position: Double) {}
+        func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {}
+        func bell(source: TerminalView) {}
+        func clipboardCopy(source: TerminalView, content: Data) {}
+        func clipboardRead(source: TerminalView) -> Data? { nil }
+        func iTermContent(source: TerminalView, content: ArraySlice<UInt8>) {}
+        func rangeChanged(source: TerminalView, startY: Int, endY: Int) {}
+    }
+}
+
+@MainActor
 public struct VirtualTerminalFeatureView: View {
     @ObservedObject var host: LocalAgentHost
-    @State private var commandInput = ""
-    @State private var output = "ARM64 Alpine Linux shell · real PTY\nType help to see the BusyBox commands available in this offline guest.\n"
-    @State private var pendingOutput = ""
-    @State private var outputFlushTask: Task<Void, Never>?
+    @State private var terminalChannel = ARM64PTYTerminalChannel()
+    @State private var inputQueue = ARM64PTYInputQueue()
     @State private var sessionID: String?
     @State private var isConnecting = false
     @State private var isConnected = false
@@ -184,89 +399,88 @@ public struct VirtualTerminalFeatureView: View {
     private let quickCommands = ["help", "uname -a", "pwd", "ls -la", "env | sort"]
 
     public var body: some View {
-        GeometryReader { geometry in
-            VStack(spacing: 0) {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        DSStatusBadge("ARM64 Linux · PTY", color: DSTheme.success)
-                        DSStatusBadge(statusText, color: isConnected ? DSTheme.success : .orange)
-                        ForEach(quickCommands, id: \.self) { command in
-                            Button(command) { send(command + "\n") }
-                                .font(.caption2.monospaced())
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 5)
-                                .background(Color(.secondarySystemFill))
-                                .clipShape(Capsule())
-                                .buttonStyle(.plain)
-                                .disabled(!isConnected)
-                        }
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                }
-                .background(Color(.secondarySystemBackground))
-
-                Divider()
-
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        Text(output)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(Color.white.opacity(0.92))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(12)
-                            .id("terminal-output")
-                    }
-                    .background(Color(red: 0.07, green: 0.08, blue: 0.10))
-                    .onChange(of: output) { _ in
-                        proxy.scrollTo("terminal-output", anchor: .bottom)
-                    }
-                }
-
-                if !errorMessage.isEmpty {
-                    Text(errorMessage)
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                }
-
-                Divider()
-
+        VStack(spacing: 0) {
+            ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
-                    Text("$ ")
-                        .font(.system(.body, design: .monospaced).weight(.bold))
-                        .foregroundStyle(.green)
-                    TextField("Shell input (Enter sends; Ctrl-C interrupts)", text: $commandInput)
-                        .font(.system(.subheadline, design: .monospaced))
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .submitLabel(.send)
-                        .onSubmit { submitInput() }
-                    Button("Ctrl-C") { send("\u{03}") }
-                        .font(.caption.monospaced())
-                        .disabled(!isConnected)
-                    Button {
-                        submitInput()
-                    } label: {
-                        Image(systemName: "arrow.up.circle.fill").font(.title3)
+                    DSStatusBadge("ARM64 Linux · PTY", color: DSTheme.success)
+                    DSStatusBadge(statusText, color: isConnected ? DSTheme.success : .orange)
+                    ForEach(quickCommands, id: \.self) { command in
+                        Button(command) { send(command + "\n") }
+                            .font(.caption2.monospaced())
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(Color(.secondarySystemFill))
+                            .clipShape(Capsule())
+                            .buttonStyle(.plain)
+                            .disabled(!isConnected)
                     }
-                    .disabled(!isConnected || commandInput.isEmpty)
                 }
                 .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-                .background(Color(.secondarySystemBackground))
+                .padding(.vertical, 8)
             }
-            .onAppear { updateSize(geometry.size) }
-            .onChange(of: geometry.size) { newSize in updateSize(newSize) }
+            .background(Color(.secondarySystemBackground))
+
+            Divider()
+
+            ARM64PTYTerminalSurface(
+                channel: terminalChannel,
+                onInput: { send($0) },
+                onResize: { newColumns, newRows in updateTerminalSize(columns: newColumns, rows: newRows) }
+            )
+            .background(Color(red: 0.07, green: 0.08, blue: 0.10))
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            if !errorMessage.isEmpty {
+                Text(errorMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+            }
+
+            Divider()
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    terminalKey("Ctrl-C", sequence: "\u{03}")
+                    terminalKey("Ctrl-D", sequence: "\u{04}")
+                    terminalKey("Ctrl-Z", sequence: "\u{1a}")
+                    terminalKey("Ctrl-A", sequence: "\u{01}")
+                    terminalKey("Ctrl-E", sequence: "\u{05}")
+                    terminalKey("Ctrl-U", sequence: "\u{15}")
+                    terminalKey("Tab", sequence: "\t")
+                    terminalKey("Esc", sequence: "\u{1b}")
+                    terminalKey("↑", sequence: "\u{1b}[A")
+                    terminalKey("↓", sequence: "\u{1b}[B")
+                    terminalKey("←", sequence: "\u{1b}[D")
+                    terminalKey("→", sequence: "\u{1b}[C")
+                    terminalKey("Home", sequence: "\u{1b}[H")
+                    terminalKey("End", sequence: "\u{1b}[F")
+                    terminalKey("PgUp", sequence: "\u{1b}[5~")
+                    terminalKey("PgDn", sequence: "\u{1b}[6~")
+                    terminalKey("F1", sequence: "\u{1b}OP")
+                    terminalKey("F2", sequence: "\u{1b}OQ")
+                    terminalKey("F3", sequence: "\u{1b}OR")
+                    terminalKey("F4", sequence: "\u{1b}OS")
+                    Button { terminalChannel.focus() } label: {
+                        Image(systemName: "keyboard")
+                    }
+                    .accessibilityLabel("显示键盘")
+                    .disabled(!isConnected)
+                }
+                .font(.caption.monospaced())
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+            }
+            .background(Color(.secondarySystemBackground))
         }
         .navigationTitle("ARM64 Linux 终端")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
-                Button("清屏") { clearOutput() }
+                Button("清屏") { terminalChannel.clearScreen() }
+                    .disabled(!isConnected)
                 Button("重启 Shell") { Task { await restartTerminal() } }
             }
         }
@@ -275,9 +489,7 @@ public struct VirtualTerminalFeatureView: View {
             await readOutputLoop()
         }
         .onDisappear {
-            outputFlushTask?.cancel()
-            outputFlushTask = nil
-            pendingOutput.removeAll(keepingCapacity: false)
+            inputQueue.cancel()
             if let sessionID { Task { await closeTerminal(sessionID) } }
         }
     }
@@ -289,9 +501,19 @@ public struct VirtualTerminalFeatureView: View {
         return "未连接"
     }
 
-    private func updateSize(_ size: CGSize) {
-        let nextColumns = min(160, max(40, Int(size.width / 8)))
-        let nextRows = min(80, max(12, Int(size.height / 18)))
+    private func terminalKey(_ label: String, sequence: String) -> some View {
+        Button(label) { send(sequence) }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(Color(.tertiarySystemFill))
+            .clipShape(Capsule())
+            .buttonStyle(.plain)
+            .disabled(!isConnected)
+    }
+
+    private func updateTerminalSize(columns newColumns: Int, rows newRows: Int) {
+        let nextColumns = min(500, max(2, newColumns))
+        let nextRows = min(300, max(2, newRows))
         guard nextColumns != columns || nextRows != rows else { return }
         columns = nextColumns
         rows = nextRows
@@ -322,6 +544,8 @@ public struct VirtualTerminalFeatureView: View {
             isConnected = true
             isDone = false
             errorMessage = ""
+            terminalChannel.clearScreen()
+            terminalChannel.focus()
         } catch {
             errorMessage = "ARM64 guest 启动失败：\(error.localizedDescription)"
         }
@@ -335,15 +559,17 @@ public struct VirtualTerminalFeatureView: View {
                 guard sessionID == readerSessionID else { return }
                 if let encoded = result["output"] as? String,
                    let bytes = Data(base64Encoded: encoded), !bytes.isEmpty {
-                    appendOutput(String(decoding: bytes, as: UTF8.self))
+                    terminalChannel.feed(bytes)
                 }
                 if result["truncated"] as? Bool == true {
-                    appendOutput("\n[Earlier terminal output was dropped to keep memory bounded.]\n")
+                    terminalChannel.feed(Data("\r\n[Earlier terminal output was dropped to keep memory bounded.]\r\n".utf8))
                 }
                 if result["done"] as? Bool == true {
                     isConnected = false
                     isDone = true
-                    if let code = result["exitCode"] as? Int { appendOutput("\n[Shell exited with status \(code)]\n") }
+                    if let code = result["exitCode"] as? Int {
+                        terminalChannel.feed(Data("\r\n[Shell exited with status \(code)]\r\n".utf8))
+                    }
                     if let message = result["error"] as? String, !message.isEmpty { errorMessage = message }
                     await closeTerminal(readerSessionID)
                     return
@@ -359,59 +585,17 @@ public struct VirtualTerminalFeatureView: View {
         }
     }
 
-    private func appendOutput(_ text: String) {
-        guard !text.isEmpty else { return }
-        pendingOutput.append(text)
-        if pendingOutput.utf8.count >= 8 * 1024 {
-            flushOutput()
-            return
-        }
-        guard outputFlushTask == nil else { return }
-        outputFlushTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 33_000_000)
-            guard !Task.isCancelled else { return }
-            flushOutput()
-        }
-    }
-
-    private func flushOutput() {
-        outputFlushTask?.cancel()
-        outputFlushTask = nil
-        guard !pendingOutput.isEmpty else { return }
-        output.append(pendingOutput)
-        pendingOutput.removeAll(keepingCapacity: true)
-        if output.utf8.count > 160_000 {
-            let keep = String(output.suffix(39_990))
-            output = "[Earlier output trimmed]\n" + keep
-        }
-    }
-
-    private func clearOutput() {
-        outputFlushTask?.cancel()
-        outputFlushTask = nil
-        pendingOutput.removeAll(keepingCapacity: true)
-        output = ""
-    }
-
-    private func submitInput() {
-        guard !commandInput.isEmpty else { return }
-        let text = commandInput + "\n"
-        commandInput = ""
-        send(text)
-    }
-
     private func send(_ text: String) {
+        send(Data(text.utf8))
+    }
+
+    private func send(_ bytes: Data) {
         guard let sessionID, isConnected, let rpc = host.rpc() else { return }
-        Task {
-            do {
-                _ = try await rpc.request("terminal.write", params: ["sessionId": sessionID, "text": text], timeoutSeconds: 10)
-            } catch {
-                errorMessage = "输入未发送：\(error.localizedDescription)"
-            }
-        }
+        inputQueue.enqueue(bytes, sessionID: sessionID, rpc: rpc) { message in errorMessage = message }
     }
 
     private func restartTerminal() async {
+        inputQueue.cancel()
         if let sessionID { await closeTerminal(sessionID) }
         self.sessionID = nil
         isConnected = false
@@ -422,6 +606,7 @@ public struct VirtualTerminalFeatureView: View {
     }
 
     private func closeTerminal(_ sessionID: String) async {
+        inputQueue.cancel(sessionID: sessionID)
         guard let rpc = host.rpc() else { return }
         _ = try? await rpc.request("terminal.close", params: ["sessionId": sessionID], timeoutSeconds: 10)
         if self.sessionID == sessionID {
@@ -430,7 +615,6 @@ public struct VirtualTerminalFeatureView: View {
         }
     }
 }
-
 public struct GitWorktreeTrackerView: View {
     @ObservedObject var host: LocalAgentHost
     @State private var branch: String = "main"
