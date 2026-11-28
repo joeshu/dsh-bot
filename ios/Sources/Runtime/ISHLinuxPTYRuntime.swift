@@ -20,6 +20,7 @@ public actor ISHLinuxPTYRuntime: LinuxPTYRuntime {
     private var installedRootfsURL: URL?
     private var booted = false
     private var bootTask: Task<Void, Error>?
+    private var stopInProgress = false
 
     public init() {}
 
@@ -34,6 +35,7 @@ public actor ISHLinuxPTYRuntime: LinuxPTYRuntime {
         timeoutSeconds: UInt64 = 120
     ) async throws -> AsyncThrowingStream<ARM64GuestPTYEvent, Error> {
         _ = timeoutSeconds
+        guard !stopInProgress else { throw ARM64GuestPTYProtocolError.guestNotReady }
         guard rows >= 2, rows <= 300, columns >= 2, columns <= 500 else {
             throw ARM64GuestPTYProtocolError.invalidDimensions
         }
@@ -44,6 +46,7 @@ public actor ISHLinuxPTYRuntime: LinuxPTYRuntime {
         try Task.checkCancellation()
         try await ensureBooted()
         try Task.checkCancellation()
+        guard !stopInProgress else { throw ARM64GuestPTYProtocolError.guestNotReady }
 
         let sessionID = UUID().uuidString.lowercased()
         let pair = AsyncThrowingStream<ARM64GuestPTYEvent, Error>.makeStream(
@@ -57,8 +60,8 @@ public actor ISHLinuxPTYRuntime: LinuxPTYRuntime {
 
         if let error = bridge.openSession(
             id: sessionID,
-            rows: Int(rows),
-            columns: Int(columns),
+            rows: UInt(rows),
+            columns: UInt(columns),
             outputHandler: { [weak self] data in
                 switch continuation.yield(.output(data)) {
                 case .enqueued:
@@ -73,9 +76,10 @@ public actor ISHLinuxPTYRuntime: LinuxPTYRuntime {
                     Task { await self?.closePTY(owner: owner) }
                 }
             },
-            exitHandler: { status in
+            exitHandler: { [weak self] status in
                 _ = continuation.yield(.exited(status))
                 continuation.finish()
+                Task { await self?.reapCompleted(owner: owner, sessionID: sessionID) }
             }
         ) {
             continuation.finish(throwing: error)
@@ -104,7 +108,7 @@ public actor ISHLinuxPTYRuntime: LinuxPTYRuntime {
             throw ARM64GuestPTYProtocolError.frameTooLarge(data.count)
         }
         let bridge = self.bridge
-        let error = await withCheckedContinuation { (continuation: CheckedContinuation<NSError?, Never>) in
+        let error = await withCheckedContinuation { (continuation: CheckedContinuation<Error?, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 continuation.resume(returning: bridge.writeInput(data, sessionID: lease.id))
             }
@@ -117,26 +121,45 @@ public actor ISHLinuxPTYRuntime: LinuxPTYRuntime {
         guard rows >= 2, rows <= 300, columns >= 2, columns <= 500 else {
             throw ARM64GuestPTYProtocolError.invalidDimensions
         }
-        guard bridge.resize(id: lease.id, rows: Int(rows), columns: Int(columns)) else {
+        guard bridge.resize(id: lease.id, rows: UInt(rows), columns: UInt(columns)) else {
             throw ARM64GuestPTYProtocolError.sessionNotOpen
         }
     }
 
     public func closePTY(owner: ARM64GuestPTYOwner) async {
-        guard let lease = leases.removeValue(forKey: owner) else { return }
+        guard let lease = leases[owner] else { return }
         let bridge = self.bridge
-        _ = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+        let closed = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 continuation.resume(returning: bridge.close(id: lease.id))
             }
         }
-        lease.continuation.finish()
+        if closed, leases[owner]?.id == lease.id {
+            leases.removeValue(forKey: owner)
+            lease.continuation.finish()
+        }
     }
 
     public func stop() async {
+        guard !stopInProgress else { return }
+        stopInProgress = true
+        defer { stopInProgress = false }
         let owners = Array(leases.keys)
         for owner in owners { await closePTY(owner: owner) }
         bridge.closeAllSessions()
+    }
+
+    private func reapCompleted(owner: ARM64GuestPTYOwner, sessionID: String) async {
+        guard let lease = leases[owner], lease.id == sessionID else { return }
+        let bridge = self.bridge
+        let closed = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: bridge.close(id: sessionID))
+            }
+        }
+        guard closed, leases[owner]?.id == sessionID else { return }
+        leases.removeValue(forKey: owner)
+        lease.continuation.finish()
     }
 
     private func ensureBooted() async throws {
@@ -172,7 +195,7 @@ public actor ISHLinuxPTYRuntime: LinuxPTYRuntime {
         let workspace = LocalAgentTransport.defaultWorkspace
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         let bridge = self.bridge
-        let error = await withCheckedContinuation { (continuation: CheckedContinuation<NSError?, Never>) in
+        let error = await withCheckedContinuation { (continuation: CheckedContinuation<Error?, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 continuation.resume(returning: bridge.boot(rootPath: root.path, workspacePath: workspace.path))
             }
