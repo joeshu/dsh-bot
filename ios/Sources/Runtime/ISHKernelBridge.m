@@ -597,8 +597,10 @@ static void DSBotISHTerminateProcessGroup(int processGroupID) {
         // point iSH has reparented them to PID 1, so the original parent-chain
         // check no longer finds them. Each PTY shell owns a new session/group;
         // clean any remaining members without holding iSH's exit-hook lock.
+        // The serial setup queue prevents a new PTY from reusing the exiting
+        // shell's process-group ID before cleanup finishes.
         if (processGroupID > 1) {
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            dispatch_async(self.setupQueue, ^{
                 DSBotISHTerminateProcessGroup(processGroupID);
             });
         }
