@@ -11,6 +11,7 @@ public enum ARM64GuestPTYFrameType: UInt16, Equatable, Sendable {
     case error = 0x83
     case ready = 0x84
     case pong = 0x85
+    case progress = 0x86
 }
 
 public struct ARM64GuestPTYFrame: Equatable, Sendable {

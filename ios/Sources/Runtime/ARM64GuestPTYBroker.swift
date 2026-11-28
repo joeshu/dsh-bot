@@ -31,6 +31,9 @@ public actor ARM64GuestPTYBroker {
         var openContinuation: CheckedContinuation<AsyncThrowingStream<ARM64GuestPTYEvent, Error>, Error>?
         var closeContinuation: CheckedContinuation<Int32?, Error>?
         var watchdog: Task<Void, Never>?
+#if DEBUG
+        var lastProgress: String? = nil
+#endif
     }
 
     private static let maxSessions = 4
@@ -337,6 +340,17 @@ public actor ARM64GuestPTYBroker {
             } else {
                 await requestSessionClose(frame.sessionID, error: error)
             }
+        case .progress:
+#if DEBUG
+            guard record.state == .opening,
+                  frame.payload.count <= 32,
+                  let stage = String(data: frame.payload, encoding: .utf8),
+                  stage.utf8.allSatisfy({ ($0 >= 0x61 && $0 <= 0x7a) || $0 == 0x2d }) else { return }
+            record.lastProgress = stage
+            sessions[frame.sessionID] = record
+            print("DSBOT_GUEST_PTY_STAGE \(stage)")
+#endif
+            return
         default:
             break
         }
@@ -364,6 +378,13 @@ public actor ARM64GuestPTYBroker {
     private func expireSession(_ sessionID: UInt32, state expectedState: SessionState, operation: String) async {
         guard sessions[sessionID]?.state == expectedState else { return }
         if expectedState == .opening {
+#if DEBUG
+            if let stage = sessions[sessionID]?.lastProgress {
+                print("DSBOT_GUEST_PTY_TIMEOUT last-stage=\(stage)")
+            } else {
+                print("DSBOT_GUEST_PTY_TIMEOUT no-guest-stage")
+            }
+#endif
             await requestSessionClose(sessionID, error: ARM64GuestPTYProtocolError.timeout(operation))
         } else {
             await finishSession(sessionID, error: ARM64GuestPTYProtocolError.timeout(operation))

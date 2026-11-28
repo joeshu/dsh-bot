@@ -7,7 +7,8 @@
  *   host -> guest: 1 CREATE(rows:u16, cols:u16), 2 INPUT(bytes),
  *                  3 RESIZE(rows:u16, cols:u16), 4 CLOSE, 5 PING
  *   guest -> host: 0x81 OUTPUT(bytes), 0x82 EXIT(status:i32),
- *                  0x83 ERROR(UTF-8), 0x84 READY, 0x85 PONG
+ *                  0x83 ERROR(UTF-8), 0x84 READY, 0x85 PONG,
+ *                  0x86 PROGRESS(stage) during shell startup
  *
  * The UART is only the transport. Every created shell has its own kernel PTY,
  * session, unprivileged UID, working directory, resource limits, and PTY job
@@ -59,6 +60,7 @@ enum FrameType {
     FRAME_ERROR = 0x83,
     FRAME_READY = 0x84,
     FRAME_PONG = 0x85,
+    FRAME_PROGRESS = 0x86,
 };
 
 struct GuestSession {
@@ -175,6 +177,32 @@ static int send_frame(uint16_t type, uint32_t session_id, const void *payload, s
     int result = append_serial_bytes(frame, frame_length);
     free(frame);
     return result;
+}
+
+static int flush_serial_output(void) {
+    while (serial_output_pending()) {
+        ssize_t count = write(serial_fd, serial_output + serial_output_offset, serial_output_pending());
+        if (count > 0) {
+            serial_output_offset += (size_t)count;
+            if (serial_output_offset == serial_output_len) {
+                serial_output_offset = 0;
+                serial_output_len = 0;
+            }
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else if (count < 0 && errno == EAGAIN) {
+            return 0;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void send_progress(uint32_t session_id, const char *stage) {
+    if (send_frame(FRAME_PROGRESS, session_id, stage, strlen(stage)) == 0) {
+        (void)flush_serial_output();
+    }
 }
 
 static void send_error(uint32_t session_id, const char *message) {
@@ -345,6 +373,7 @@ static int create_session(uint32_t id, const unsigned char *payload, size_t leng
         send_error(id, "guest PTY session limit reached");
         return -1;
     }
+    send_progress(id, "create-received");
 
     uid_t uid = (uid_t)(50000u + (id % 10000u));
     for (size_t index = 0; index < MAX_SESSIONS; index++) {
@@ -374,6 +403,7 @@ static int create_session(uint32_t id, const unsigned char *payload, size_t leng
         send_error(id, "could not prepare the isolated guest workspace");
         return -1;
     }
+    send_progress(id, "workspace-ready");
 
     uint16_t rows = read_u16(payload);
     uint16_t columns = read_u16(payload + 2);
@@ -383,6 +413,7 @@ static int create_session(uint32_t id, const unsigned char *payload, size_t leng
     struct termios attributes;
     initialize_pty_termios(&attributes);
     int master = -1;
+    send_progress(id, "forkpty-start");
     pid_t child = forkpty(&master, NULL, &attributes, &window);
     if (child < 0) {
         (void)remove_session_directory(id);
@@ -418,6 +449,7 @@ static int create_session(uint32_t id, const unsigned char *payload, size_t leng
         execl("/bin/sh", "sh", "-i", (char *)NULL);
         child_setup_failure(127, "exec /bin/sh", errno);
     }
+    send_progress(id, "forkpty-returned");
 
     int flags = fcntl(master, F_GETFL, 0);
     if (flags < 0 || fcntl(master, F_SETFL, flags | O_NONBLOCK) < 0) {
@@ -433,6 +465,7 @@ static int create_session(uint32_t id, const unsigned char *payload, size_t leng
     slot->gid = uid;
     slot->pid = child;
     slot->master_fd = master;
+    send_progress(id, "shell-ready");
     if (send_frame(FRAME_READY, id, NULL, 0) != 0) {
         (void)kill(-child, SIGHUP);
         return -1;
@@ -634,15 +667,7 @@ int main(void) {
             return 1;
         }
         if (descriptors[0].revents & POLLOUT) {
-            size_t pending = serial_output_pending();
-            ssize_t count = write(serial_fd, serial_output + serial_output_offset, pending);
-            if (count > 0) {
-                serial_output_offset += (size_t)count;
-                if (serial_output_offset == serial_output_len) {
-                    serial_output_offset = 0;
-                    serial_output_len = 0;
-                }
-            } else if (count < 0 && errno != EAGAIN && errno != EINTR) {
+            if (flush_serial_output() != 0) {
                 log_message("DS Bot PTY agent: serial write failed\n");
                 return 1;
             }
