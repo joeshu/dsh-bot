@@ -296,10 +296,17 @@ public actor ARM64GuestPTYBroker {
         if frame.sessionID == 0 {
             switch frame.type {
             case .ready:
-                // READY is an unsolicited boot announcement. Keep waiting for
-                // the challenge PONG below so startup proves host-to-guest UART
-                // input works before the first CREATE is sent.
-                if readyChallenge == nil { markGuestReady() }
+                // The first PING can arrive while Linux is still booting and
+                // ttyAMA0 has not been opened by the agent yet. Retry only
+                // after READY so the matching PONG proves the guest consumed
+                // host-to-guest serial input before a PTY is created.
+                if let challenge = readyChallenge {
+                    do {
+                        try transmit(ARM64GuestPTYFrame(type: .ping, sessionID: 0, payload: challenge))
+                    } catch {
+                        failReadiness(error)
+                    }
+                }
             case .pong where frame.payload == readyChallenge:
                 markGuestReady()
             case .error:
