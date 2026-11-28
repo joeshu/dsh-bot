@@ -24,10 +24,12 @@ FRAME_CREATE = 1
 FRAME_INPUT = 2
 FRAME_RESIZE = 3
 FRAME_CLOSE = 4
+FRAME_PING = 5
 FRAME_OUTPUT = 0x81
 FRAME_EXIT = 0x82
 FRAME_ERROR = 0x83
 FRAME_READY = 0x84
+FRAME_PONG = 0x85
 
 SHELL_BOOT_MARKER = b"DS Bot ARM64 Linux guest (Alpine Linux, BusyBox ash)."
 PTY_BOOT_MARKER = b"DS Bot ARM64 Linux guest PTY agent booting."
@@ -282,6 +284,11 @@ def smoke_serial_shell(link: SerialLink, timeout: int) -> None:
 def smoke_guest_pty(link: SerialLink, timeout: int) -> None:
     link.wait_for_text(PTY_BOOT_MARKER, time.monotonic() + timeout)
     wait_for_frame(link, FRAME_READY, 0, timeout)
+    challenge = b"DSBOT_GUEST_PING_PONG_SMOKE"
+    link.send_frame(FRAME_PING, 0, challenge)
+    if wait_for_frame(link, FRAME_PONG, 0, timeout) != challenge:
+        raise RuntimeError("Guest PTY agent did not echo the host PING challenge as PONG")
+    print("ARM64 guest PTY agent passed the host-to-guest PING/PONG handshake.")
     session_id = 0xD5B07001
     link.send_frame(FRAME_CREATE, session_id, struct.pack(">HH", 24, 80))
     wait_for_frame(link, FRAME_READY, session_id, timeout)

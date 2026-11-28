@@ -383,7 +383,7 @@ final class NativeRuntimeTests: XCTestCase {
             exit
             """
             try await runtime.sendInput(
-                Data(workspaceScript.utf8),
+                Data((workspaceScript + "\n").utf8),
                 owner: owner
             )
             print("DSBOT_ISH_TEST_STAGE workspace-script-sent")
