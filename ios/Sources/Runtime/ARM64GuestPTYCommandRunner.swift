@@ -96,7 +96,7 @@ public actor ARM64GuestPTYCommandRunner {
         do {
             return try await withTaskCancellationHandler {
                 try await broker.sendInput(input, from: owner)
-                try await withThrowingTaskGroup(of: RaceResult.self) { group in
+                return try await withThrowingTaskGroup(of: RaceResult.self) { group in
                     let outputLimit = maxOutputBytes
                     group.addTask {
                         do {
