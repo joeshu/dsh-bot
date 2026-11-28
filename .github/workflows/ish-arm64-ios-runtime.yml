@@ -9,6 +9,13 @@ on:
       - 'scripts/verify-ish-arm64-artifact.py'
       - 'scripts/prepare-arm64-guest.py'
       - 'scripts/arm64_guest_common.py'
+      - 'ios/project.yml'
+      - 'ios/Sources/Runtime/ISH*'
+      - 'ios/Sources/Runtime/LinuxPTYRuntime.swift'
+      - 'ios/Sources/Runtime/ARM64GuestPTYCommandRunner.swift'
+      - 'ios/Sources/Runtime/ARM64GuestPTYWebTerminal.swift'
+      - 'ios/Sources/JavaScript/JavaScriptInterpreter.h'
+      - 'ios/Tests/DSBotStandaloneTests/NativeRuntimeTests.swift'
       - 'docs/architecture/dsh-nodemobile-ish-arm64-implementation.md'
       - '.github/workflows/ish-arm64-ios-runtime.yml'
   pull_request:
@@ -19,6 +26,13 @@ on:
       - 'scripts/verify-ish-arm64-artifact.py'
       - 'scripts/prepare-arm64-guest.py'
       - 'scripts/arm64_guest_common.py'
+      - 'ios/project.yml'
+      - 'ios/Sources/Runtime/ISH*'
+      - 'ios/Sources/Runtime/LinuxPTYRuntime.swift'
+      - 'ios/Sources/Runtime/ARM64GuestPTYCommandRunner.swift'
+      - 'ios/Sources/Runtime/ARM64GuestPTYWebTerminal.swift'
+      - 'ios/Sources/JavaScript/JavaScriptInterpreter.h'
+      - 'ios/Tests/DSBotStandaloneTests/NativeRuntimeTests.swift'
       - 'docs/architecture/dsh-nodemobile-ish-arm64-implementation.md'
       - '.github/workflows/ish-arm64-ios-runtime.yml'
   workflow_dispatch:
@@ -106,6 +120,48 @@ jobs:
             DSBOT_ISH_INTERNAL_INCLUDE_DIR="$RUNNER_TEMP/ish-arm64-ios/include/ish" \
             DSBOT_ISH_LIBRARY_DIR="$RUNNER_TEMP/ish-arm64-ios/libraries/simulator" \
             DSBOT_ISH_LINK_FLAGS="-lish_emu -lish -lfakefs -force_load $RUNNER_TEMP/ish-arm64-ios/libraries/simulator/libish_aot.a"
+      - name: Compile and link the iSH app for physical ARM64 iOS
+        shell: bash
+        working-directory: ios
+        env:
+          DSBOT_ISH_ROOTFS_DIR: ${{ runner.temp }}/ish-arm64-ios/rootfs
+          DSBOT_ISH_INCLUDE_DIR: ${{ runner.temp }}/ish-arm64-ios/include
+          DSBOT_ISH_INTERNAL_INCLUDE_DIR: ${{ runner.temp }}/ish-arm64-ios/include/ish
+          DSBOT_ISH_LIBRARY_DIR: ${{ runner.temp }}/ish-arm64-ios/libraries/device
+          DSBOT_ISH_LINK_FLAGS: "-lish_emu -lish -lfakefs -force_load ${{ runner.temp }}/ish-arm64-ios/libraries/device/libish_aot.a"
+          DSBOT_ISH_RUNTIME_ENABLED: "1"
+          DSBOT_ISH_SWIFT_CONDITIONS: DSBOT_ISH_RUNTIME_ENABLED
+        run: |
+          set -euo pipefail
+          xcodebuild build -project DSBotStandalone.xcodeproj -scheme DSBotStandalone \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/DSBotISHDeviceDerived" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+            ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            DSBOT_ISH_RUNTIME_ENABLED=1 \
+            DSBOT_ISH_SWIFT_CONDITIONS=DSBOT_ISH_RUNTIME_ENABLED \
+            DSBOT_ISH_INCLUDE_DIR="$RUNNER_TEMP/ish-arm64-ios/include" \
+            DSBOT_ISH_INTERNAL_INCLUDE_DIR="$RUNNER_TEMP/ish-arm64-ios/include/ish" \
+            DSBOT_ISH_LIBRARY_DIR="$RUNNER_TEMP/ish-arm64-ios/libraries/device" \
+            DSBOT_ISH_LINK_FLAGS="-lish_emu -lish -lfakefs -force_load $RUNNER_TEMP/ish-arm64-ios/libraries/device/libish_aot.a"
+          python3 - "$RUNNER_TEMP/DSBotISHDeviceDerived/Build/Products/Debug-iphoneos/DSBotStandalone.app" <<'PY'
+          import sys
+          from pathlib import Path
+
+          app = Path(sys.argv[1])
+          if not app.is_dir():
+              raise SystemExit(f"Missing iSH-linked device app: {app}")
+          total = sum(path.stat().st_size for path in app.rglob("*") if path.is_file())
+          executable = app / "DSBotStandalone"
+          print(f"iSH-linked device .app expanded bytes: {total}")
+          print(f"iSH-linked device executable bytes: {executable.stat().st_size}")
+          print(f"Bundled iSH rootfs bytes: {(app / 'DSBotISHRuntime/alpine-rootfs.zip').stat().st_size}")
+          with Path(__import__("os").environ["GITHUB_STEP_SUMMARY"]).open("a") as summary:
+              summary.write(f"\n### Optional iSH device app size\n\n")
+              summary.write(f"- Expanded app bundle: {total:,} bytes\n")
+              summary.write(f"- Executable: {executable.stat().st_size:,} bytes\n")
+              summary.write(f"- Bundled rootfs ZIP: {(app / 'DSBotISHRuntime/alpine-rootfs.zip').stat().st_size:,} bytes\n")
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: dsbot-ish-arm64-ios-${{ github.sha }}
@@ -113,3 +169,36 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
+      - name: Boot iSH on Simulator and execute a shell command over PTY
+        timeout-minutes: 15
+        shell: bash
+        working-directory: ios
+        env:
+          DSBOT_ISH_ROOTFS_DIR: ${{ runner.temp }}/ish-arm64-ios/rootfs
+          DSBOT_ISH_INCLUDE_DIR: ${{ runner.temp }}/ish-arm64-ios/include
+          DSBOT_ISH_INTERNAL_INCLUDE_DIR: ${{ runner.temp }}/ish-arm64-ios/include/ish
+          DSBOT_ISH_LIBRARY_DIR: ${{ runner.temp }}/ish-arm64-ios/libraries/simulator
+          DSBOT_ISH_LINK_FLAGS: "-lish_emu -lish -lfakefs -force_load ${{ runner.temp }}/ish-arm64-ios/libraries/simulator/libish_aot.a"
+          DSBOT_ISH_RUNTIME_ENABLED: "1"
+          DSBOT_ISH_SWIFT_CONDITIONS: DSBOT_ISH_RUNTIME_ENABLED
+        run: |
+          set -euo pipefail
+          SIM_ID="$(xcrun simctl list devices available -j | python3 -c 'import json,sys; devices=json.load(sys.stdin)["devices"]; print(next(d["udid"] for r, items in sorted(devices.items(), reverse=True) if ".iOS-" in r for d in items if d["name"].startswith("iPhone")))')"
+          xcodebuild test -project DSBotStandalone.xcodeproj -scheme DSBotStandalone \
+            -destination "platform=iOS Simulator,id=$SIM_ID,arch=arm64" \
+            -only-testing:DSBotStandaloneTests/NativeRuntimeTests/testEmbeddedISHGuestRunsShellOverRealPTYInSimulator \
+            -parallel-testing-enabled NO -resultBundlePath "$RUNNER_TEMP/DSBotISHRuntimeTests.xcresult" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            DSBOT_ISH_RUNTIME_ENABLED=1 \
+            DSBOT_ISH_SWIFT_CONDITIONS=DSBOT_ISH_RUNTIME_ENABLED \
+            DSBOT_ISH_INCLUDE_DIR="$RUNNER_TEMP/ish-arm64-ios/include" \
+            DSBOT_ISH_INTERNAL_INCLUDE_DIR="$RUNNER_TEMP/ish-arm64-ios/include/ish" \
+            DSBOT_ISH_LIBRARY_DIR="$RUNNER_TEMP/ish-arm64-ios/libraries/simulator" \
+            DSBOT_ISH_LINK_FLAGS="-lish_emu -lish -lfakefs -force_load $RUNNER_TEMP/ish-arm64-ios/libraries/simulator/libish_aot.a"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dsbot-ish-simulator-test-results
+          path: ${{ runner.temp }}/DSBotISHRuntimeTests.xcresult
+          if-no-files-found: ignore
+          retention-days: 30

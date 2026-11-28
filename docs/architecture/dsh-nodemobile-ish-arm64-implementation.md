@@ -4,7 +4,7 @@
 
 The repository now builds source-pinned iSH ARM64 libraries and converts a SHA-256-pinned Alpine 3.23.8 aarch64 minirootfs into iSH fakefs (`data/` plus `meta.db`). CI builds the host-native `fakefsify` converter from the same locked iSH source revision, packages the rootfs in the existing `alpine-rootfs.zip` layout, and records installed packages, license fields, source commit links, SQLite integrity, archive size, and hashes. It also checks the OpenMinis revision, the iSH ARM64 revision, all three iSH submodule revisions, and the upstream build script digest, then packages device and Simulator static libraries, headers, resources, source archives, licenses, and SHA-256 sums. The iSH license bundle records GPLv3, GPLv2 for later contributions, and the iOS addendum.
 
-This artifact is a build foundation. It is not yet linked into `DSBotStandalone`; the application still uses its existing QEMU-backed guest route. The CI artifact's Alpine files are a rootfs candidate, not an app install or an on-demand package installer. Do not describe the iSH runtime as active until the native engine bridge and the acceptance gates below pass. The existing release gate remains in force during this migration.
+The app now has an opt-in iSH ARM64 Objective-C engine bridge, a Swift PTY runtime adapter, a verified persistent fakefs installer, and a build path that embeds the pinned rootfs and links the iSH static libraries. iSH remains behind `DSBOT_ISH_RUNTIME_ENABLED`; release/default builds continue to select QEMU. The iSH Simulator link gate is being resolved, and no iSH boot or device acceptance run has passed yet. The CI rootfs is still a build candidate until those runtime gates pass; there is no on-demand APK installer or tool-selection UI.
 
 The verified CI build reports a 4,129,738-byte fakefs ZIP that expands to 8,747,296 bytes, plus 16 base packages. Device static-library archives total 1,094,488 bytes and Simulator archives total 1,097,848 bytes; these are archive sizes before app linking and dead stripping. The AOT archive is an empty 720-byte placeholder because the pinned build has no AOT images configured. The complete CI artifact is 214,189,226 bytes because it also carries source archives, headers, licenses, and build provenance; that is not an app bundle estimate. With the current bundle-and-copy design, the rootfs alone adds about 4.13 MB to the app resources and 8.75 MB to persistent Application Support after first launch. The final IPA delta and linked-library size remain unmeasured.
 
@@ -16,9 +16,9 @@ The verified CI build reports a 4,129,738-byte fakefs ZIP that expands to 8,747,
 | Web terminal | QEMU ARM64 Alpine `ash` PTY; interactive input, resize, exit status, session cleanup, and bounded output. |
 | DSH subprocess `spawnTerminal` | Only `/bin/sh` or `/bin/ash` is accepted, with the bundled Alpine shell profile. |
 | DSH subprocess `spawn(argv)` | Deliberately rejected with `SUBPROCESS_PTY_UNAVAILABLE`; ordinary pipe-backed child processes are not implemented on iOS yet. |
-| iSH ARM64 | Source-pinned device/Simulator libraries build and verify in CI; no iSH code is linked or selected at runtime. |
+| iSH ARM64 | Optional build embeds pinned rootfs and links the engine; QEMU remains default, and iSH runtime boot is unverified. |
 
-At the pinned OpenMinis revision, the app-level integration lives in `src/ios/iSH/ISHKernel` and `ISHShellExecutor`, alongside the iSH kernel libraries. It includes fakefs boot and bind-mount hooks, a PTY path, and argv-based execution with pipe output and exit notifications. Those Objective-C sources and their app dependencies are not part of the current DSH target or the static-library artifact. Port the minimum required host glue behind DSH's runtime contract; do not import OpenMinis UI or native offload handlers as a bundle.
+The app bridge currently ports fakefs boot and one shared `/workspace` bind mount, Alpine PID 1/reaping, and bounded shell PTYs. The OpenMinis UI, native offload handlers, and argv-based pipe process API are not imported. DSH `spawn(argv)` still reports `SUBPROCESS_PTY_UNAVAILABLE`; its pipe-backed process contract remains a separate implementation step.
 
 Run the build on macOS with Xcode and the iOS SDKs. It builds the iOS libraries and host `fakefsify`, fetches the pinned minirootfs, converts and packages the fakefs image, then verifies the combined artifact:
 
@@ -50,7 +50,7 @@ The iSH process shares the app's address space. It does not sandbox malicious Ja
 
 ## Migration steps and gates
 
-### 1. Engine build, rootfs candidate, and source provenance — implemented; app packaging pending
+### 1. Engine build, rootfs candidate, provenance, and opt-in app link — implemented; latest bridge link gate pending
 
 - Locked OpenMinis and iSH revisions are in `scripts/ish-arm64-sources.lock.json`.
 - `scripts/build-ish-arm64-ios.sh` creates device and Simulator libraries from source.
@@ -59,43 +59,43 @@ The iSH process shares the app's address space. It does not sandbox malicious Ja
 - `scripts/package-ish-arm64-ios.py` emits the rootfs package inventory and notices, iSH source archives, hashes, component sizes, and a report that explicitly says the artifact is not linked into the app.
 - `scripts/verify-ish-arm64-artifact.py` gates publication on locked commits, source archives, notices, checksums, library byte totals and ARM64 slices, rootfs ZIP paths/CRC, SQLite integrity, package inventory, and component sizes.
 - `.github/workflows/ish-arm64-ios-runtime.yml` performs the macOS build on relevant pushes and pull requests.
-- The verified build on commit `12f0fcf` completed successfully in [GitHub Actions run 46143457296](https://github.com/joeshu/dsh-bot/actions/runs/46143457296). It confirms library slices, source locks, Alpine package inventory and licenses, ZIP paths/CRC, SQLite integrity, and hashes. This verifies the build artifact only; it does not link or boot iSH in the app.
+- The source/library/rootfs checks passed in [GitHub Actions run 46148391012](https://github.com/joeshu/dsh-bot/actions/runs/46148391012), but its app link step exposed that the bridge selected the legacy x86 header fallback. Commit `c87c6e5` now explicitly selects `GUEST_ARM64`; its link gate is pending. Ordinary QEMU IPA and iOS Simulator checks passed in [GitHub Actions run 46147702305](https://github.com/joeshu/dsh-bot/actions/runs/46147702305). Neither result is an iSH runtime boot test.
 
-### 2. Native engine lifecycle — rootfs persistence staged; engine lifecycle next
+### 2. Native engine lifecycle — bridge and durable rootfs install implemented; acceptance pending
 
 `ISHRootfsStore` now provides the persistent install half: it verifies the bundled ZIP hash, ZIP paths and CRCs, Alpine layout, SQLite integrity and path count, extracts to a same-volume staging directory, then atomically moves it into Application Support. It refuses to replace an existing rootfs when the bundled image changes, so package/user state cannot be silently erased. `ios/project.yml` can embed the CI rootfs by setting `DSBOT_ISH_ROOTFS_DIR` to the artifact's `rootfs/` directory. This store is not called by the selected QEMU runtime yet.
 
-Next port the pinned OpenMinis kernel boot and fakefs setup behind a small Objective-C/C bridge and Swift `LinuxRuntime` actor. Boot one engine lazily per App process and keep it mounted until process exit. Start it from the persistent store above; never replace or unmount the rootfs while the engine is live. Startup must be idempotent, serialized, cancellable for the waiter, and recoverable on the next cold launch after an interrupted upgrade.
+`ISHLinuxPTYRuntime` boots the bridge lazily, serializes/coalesces concurrent startup, and uses `ISHRootfsStore` to install and validate the pinned image. The Objective-C bridge mounts fakefs, binds the app-owned DSH workspace, sets a fixed guest anonymous-page cap, starts Alpine init as PID 1, and creates owner-issued PTYs. The runtime and bridge are compiled only when explicitly enabled. The remaining work is to pass the iSH link gate, then add a Simulator boot/shell/relaunch check and verify lifecycle cleanup before considering device rollout. The installer refuses rootfs replacement on version changes; a separately designed, recoverable migration/reset flow is still needed.
 
-The bridge must install signal handling that preserves Node/V8 handlers, stop sharing iSH's process-global current working directory with Node, and expose memory/FD/thread diagnostics. Do not enable native offload until its global `chdir`/abort behavior is removed or serialized with explicit invocation context.
+The bridge calls `become_first_process()`, which installs a process-global `SIGUSR1` handler and ignores `SIGPIPE`; coexistence with Node/V8 is unverified and is a release blocker. It also has a process-global guest cwd. DSH stays host-side, but this must be audited before concurrent native execution is allowed. Add memory/FD/thread diagnostics and verify no host callback or plugin code runs under iSH locks. Do not enable native offload until its global `chdir`/abort behavior is removed or serialized with explicit invocation context.
 
 **Gate:** cold boot, warm command, shutdown/relaunch recovery, and signal tests pass in an ARM64 Simulator build; no `XCTSkip` path can turn a required iSH runtime test into a pass.
 
-### 3. Authenticated process and PTY sessions
+### 3. Authenticated process and PTY sessions — Bot/Web PTY route implemented; generic spawn pending
 
-Port the upstream process and PTY primitives separately. Preserve DSH's `SubprocessRuntime` contract: synchronous `spawn(argv)` returns a pipe-backed process handle; `spawnTerminal` creates a real PTY; both preserve argv boundaries, cwd, env, exit status, signals, and cancellation. Keep the existing RPC names as compatibility adapters while moving their implementation behind `LinuxRuntime`.
+Bot `terminal_exec` and the Web terminal now use the backend-neutral `LinuxPTYRuntime` contract, with QEMU as default and opt-in iSH behind the same lease API. The iSH bridge caps sessions at four and bounds input/output. Preserve DSH's full `SubprocessRuntime` contract in the next step: synchronous `spawn(argv)` must return a pipe-backed process handle, while `spawnTerminal` creates a real PTY; both preserve argv boundaries, cwd, env, exit status, signals, and cancellation. Keep the existing RPC names as compatibility adapters while moving their implementation behind `LinuxRuntime`.
 
 Each execution receives a host-issued lease bound to project, owner session, tool call, worker generation, and permissions. Interactive sessions and one-shot commands have separate IDs and cleanup. Maintain the four-PTY cap, bound output buffers, and make concurrent Web reads independent so a later read cannot replace an earlier waiter.
 
 **Gate:** shell metacharacters in argv stay literal; PTY echo, resize, foreground signals, exit codes, timeout and close are checked in Simulator; cancellation cannot leave a live process or lease.
 
-### 4. Persistent fakefs and project routing
+### 4. Persistent fakefs and project routing — durable base and default workspace mounted; project isolation pending
 
-Use iSH `fs_context` only as an opaque project route. The host resolver maps it to an already authorized project root and rejects unknown contexts. Implement both forward and reverse path hooks. Denied paths must fail closed rather than fall through to a global bind mount. Prevent `..`, symlink, hard-link, descriptor, and cross-project escapes. Bind project directories from the app sandbox; do not expose Keychain, databases, or the DSH plugin directory.
+The bridge currently bind-mounts only the app-owned `dsh-home` directory at guest `/workspace`; this preserves a common Bot/Web/native workspace, but it is not multi-project isolation. Introduce a host-owned project resolver and stable project IDs before exposing multiple project roots. Use iSH `fs_context` only as opaque routing metadata. Denied paths must fail closed rather than fall through to a global bind mount. Prevent `..`, symlink, hard-link, descriptor, and cross-project escapes. Do not expose Keychain, databases, or the DSH plugin directory.
 
 Host workspace writes and edits use atomic replacement and a revision/CAS check. Shell writes keep normal Linux semantics. Both paths emit file-change events for UI refresh and persistence.
 
 **Gate:** the same file written from DSH tool, bot shell, Web terminal, and native UI is visible to each; two projects cannot read or modify each other's files; restart preserves both projects and fakefs metadata.
 
-### 5. Offline rootfs and on-demand tools — base image candidate exists; install flow pending
+### 5. Offline rootfs and on-demand tools — minimal Alpine base is bundled by opt-in build; installer/UI pending
 
-Keep the CI-generated Alpine fakefs as an immutable base candidate. The current app does not install it and has no package selector yet. When runtime wiring is implemented, start with the base BusyBox tools and show install suggestions for missing commands. Optional packages such as `bash`, `jq`, `ripgrep`, and `git` must be user-selected or explicitly requested. A host-side installer should fetch APKs, verify Alpine signatures and hashes, resolve dependency closure, then commit the package transaction into fakefs. Guest network remains disabled by default. Never automatically rerun a command after a failed package install because it may have partially executed.
+Keep the CI-generated Alpine fakefs as the immutable base candidate. The opt-in app build embeds it and `ISHRootfsStore` installs it; there is no package selector yet. Start with the base BusyBox tools and show install suggestions for missing commands. Optional packages such as `bash`, `jq`, `ripgrep`, and `git` must be user-selected or explicitly requested. A host-side installer should fetch APKs, verify Alpine signatures and hashes, resolve dependency closure, then commit the package transaction into fakefs. Guest network remains disabled by default. Never automatically rerun a command after a failed package install because it may have partially executed.
 
 Keep the model API online requirement separate from local guest/tool availability. The shell, rootfs, and previously installed tools continue to work offline.
 
 ### 6. Performance and release promotion
 
-Use one shared `MemoryGovernor` for Node, WebAssembly, and iSH. Initial caps: four PTYs, two heavy tasks, eight Linux processes per task tree, 32 global Linux processes. Tune from device measurements. Keep AOT off until the image ABI and engine build ID match exactly; initially evaluate musl, BusyBox, and zlib with a 30 MiB uncompressed budget. Measure actual app bundle growth, AOT hit rate, boot latency, command latency, memory peak, and process/thread/FD cleanup.
+Use one shared `MemoryGovernor` for Node, WebAssembly, and iSH. Current iSH limits are four PTYs and a fixed 256 MiB anonymous-page cap; they are not coordinated with `MemoryGovernor` and are not device-tuned. Start with eight Linux processes per task tree and 32 global Linux processes after process execution exists. Keep AOT off until the image ABI and engine build ID match exactly; the current archive is a placeholder. Initially evaluate musl, BusyBox, and zlib with a 30 MiB uncompressed budget. Measure actual app bundle growth, AOT hit rate, boot latency, command latency, memory peak, and process/thread/FD cleanup.
 
 Targets for the first device baseline: engine ready p95 ≤3 s after rootfs install; warm `/bin/true` p95 ≤200 ms; PTY echo p95 ≤100 ms; selected AOT suite ≥15% overall improvement. These are targets, not measured results.
 

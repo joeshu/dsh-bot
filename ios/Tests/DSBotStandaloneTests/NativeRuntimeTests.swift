@@ -314,6 +314,69 @@ final class NativeRuntimeTests: XCTestCase {
         }
     }
 
+#if DSBOT_ISH_RUNTIME_ENABLED
+    func testEmbeddedISHGuestRunsShellOverRealPTYInSimulator() async throws {
+        let appBundle = try XCTUnwrap(Bundle(identifier: "io.github.dsbot.ios.standalone"))
+        let rootfsArchive = appBundle.bundleURL
+            .appendingPathComponent("DSBotISHRuntime/alpine-rootfs.zip")
+        let manifest = appBundle.bundleURL
+            .appendingPathComponent("DSBotISHRuntime/rootfs-manifest.json")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rootfsArchive.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: manifest.path))
+
+        let runtime = ISHLinuxPTYRuntime()
+        let owner = try XCTUnwrap(ARM64GuestPTYOwner(
+            kind: .native,
+            sessionID: "ish-simulator-\(UUID().uuidString.lowercased())"
+        ))
+        do {
+            try await runtime.validateBundledResources()
+            let stream = try await runtime.openPTY(
+                owner: owner,
+                rows: 24,
+                columns: 80,
+                timeoutSeconds: 60
+            )
+            try await runtime.sendInput(
+                Data("stty -echo\nprintf '%s\\n' 'DSBOT_ISH_ARM64_PTY_OK'\nexit\n".utf8),
+                owner: owner
+            )
+
+            let result = try await withThrowingTaskGroup(of: (Data, Int32).self) { group in
+                group.addTask {
+                    var output = Data()
+                    for try await event in stream {
+                        switch event {
+                        case .output(let bytes):
+                            output.append(bytes)
+                        case .exited(let status):
+                            return (output, status)
+                        }
+                    }
+                    throw ARM64GuestPTYProtocolError.transportClosed
+                }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: 60_000_000_000)
+                    throw ARM64GuestPTYProtocolError.timeout("iSH Simulator shell")
+                }
+                guard let first = try await group.next() else {
+                    throw ARM64GuestPTYProtocolError.transportClosed
+                }
+                group.cancelAll()
+                return first
+            }
+            XCTAssertTrue(String(decoding: result.0, as: UTF8.self).contains("DSBOT_ISH_ARM64_PTY_OK"))
+            XCTAssertEqual(result.1, 0)
+            await runtime.closePTY(owner: owner)
+            await runtime.stop()
+        } catch {
+            await runtime.closePTY(owner: owner)
+            await runtime.stop()
+            throw error
+        }
+    }
+#endif
+
     func testModelSelectionAndEndpointBinding() throws {
         let official = try ModelProvider("https://API.DeepSeek.COM:443/v1/")
         let custom = try ModelProvider("https://example.test/gateway/v1/")
