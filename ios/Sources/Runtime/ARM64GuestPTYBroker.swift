@@ -276,6 +276,11 @@ public actor ARM64GuestPTYBroker {
         guard !isClosed else { return }
         do {
             for frame in try decoder.push(bytes) {
+#if DEBUG
+                if frame.type != .output {
+                    print("DSBOT_GUEST_PTY_RX type=\(frame.type.rawValue) payloadBytes=\(frame.payload.count)")
+                }
+#endif
                 await handle(frame)
             }
         } catch {
@@ -291,7 +296,10 @@ public actor ARM64GuestPTYBroker {
         if frame.sessionID == 0 {
             switch frame.type {
             case .ready:
-                markGuestReady()
+                // READY is an unsolicited boot announcement. Keep waiting for
+                // the challenge PONG below so startup proves host-to-guest UART
+                // input works before the first CREATE is sent.
+                if readyChallenge == nil { markGuestReady() }
             case .pong where frame.payload == readyChallenge:
                 markGuestReady()
             case .error:
@@ -469,6 +477,11 @@ public actor ARM64GuestPTYBroker {
 
     private func transmit(_ frame: ARM64GuestPTYFrame) throws {
         guard !isClosed else { throw ARM64GuestPTYProtocolError.transportClosed }
+#if DEBUG
+        if frame.type != .input {
+            print("DSBOT_GUEST_PTY_TX type=\(frame.type.rawValue) payloadBytes=\(frame.payload.count)")
+        }
+#endif
         try transport.send(ARM64GuestPTYCodec.encode(frame))
     }
 

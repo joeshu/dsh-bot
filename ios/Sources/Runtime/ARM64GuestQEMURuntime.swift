@@ -219,9 +219,18 @@ public actor ARM64GuestQEMURuntime {
                     try Self.requestQEMUQuit(fileDescriptor: qmpFileDescriptor)
                 }.value
             }
-            if !state.exited {
-                await qemuTask.value
+            let exitDeadline = Date().addingTimeInterval(8)
+            while !threadState.result().exited, Date() < exitDeadline {
+                try? await Task.sleep(nanoseconds: 20_000_000)
             }
+            guard threadState.result().exited else {
+                // Never wait indefinitely for a wedged emulator. Keep its
+                // framework loaded and the instance marked unusable; unloading
+                // QEMU while its main loop is live would leave invalid code.
+                print("DSBOT_QEMU_SHUTDOWN_TIMEOUT emulator remains loaded until app exit")
+                return
+            }
+            await qemuTask.value
             return
         }
         qemuTask = nil
@@ -388,7 +397,7 @@ public actor ARM64GuestQEMURuntime {
     }
 
     private static func requestQEMUQuit(fileDescriptor descriptor: Int32) throws {
-        var timeout = timeval(tv_sec: 5, tv_usec: 0)
+        var timeout = timeval(tv_sec: 2, tv_usec: 0)
         _ = setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         _ = setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         _ = try readLine(from: descriptor) // QMP greeting
