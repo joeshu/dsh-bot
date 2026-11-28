@@ -18,7 +18,7 @@
   "hostIntegrationPatches": [
     {
       "path": "ish-safe-workspace.patch",
-      "sha256": "8cfd925e66886983204989dc2d5921a95048eef2b7ef052e92f4592fb2b71744",
+      "sha256": "cd5e187393b554f606570855fe3fd7cead0f537f86ebd177027e3819684735c5",
       "purpose": "Reject bind-mounted workspace symlinks and route iSH host wakeups over SIGUSR2"
     }
   ],

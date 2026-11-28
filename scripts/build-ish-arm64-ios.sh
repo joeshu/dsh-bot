@@ -70,7 +70,7 @@ for record in integration_patches:
     if actual != record["sha256"]:
         raise SystemExit(f"iSH integration patch hash mismatch: {record['path']}")
     subprocess.run(
-        ["patch", "--batch", "--forward", "-p1", "-d", str(engine)],
+        ["patch", "--fuzz=0", "--batch", "--forward", "-p1", "-d", str(engine)],
         input=patch_bytes,
         check=True,
     )
