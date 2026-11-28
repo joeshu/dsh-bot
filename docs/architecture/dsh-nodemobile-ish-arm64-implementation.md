@@ -62,7 +62,9 @@ The iSH process shares the app's address space. It does not sandbox malicious Ja
 
 ### 2. Native engine lifecycle — next
 
-Port the pinned OpenMinis kernel boot and fakefs setup behind a small Objective-C/C bridge and Swift `LinuxRuntime` actor. Boot one engine lazily per App process and keep it mounted until process exit. Persist fakefs metadata and the Alpine filesystem under Application Support; never replace or unmount the rootfs while the engine is live. Startup must be idempotent, serialized, cancellable for the waiter, and recoverable on the next cold launch after an interrupted upgrade.
+`ISHRootfsStore` now provides the persistent install half: it verifies the bundled ZIP hash, ZIP paths and CRCs, Alpine layout, SQLite integrity and path count, extracts to a same-volume staging directory, then atomically moves it into Application Support. It refuses to replace an existing rootfs when the bundled image changes, so package/user state cannot be silently erased. `ios/project.yml` can embed the CI rootfs by setting `DSBOT_ISH_ROOTFS_DIR` to the artifact's `rootfs/` directory. This store is not called by the selected QEMU runtime yet.
+
+Next port the pinned OpenMinis kernel boot and fakefs setup behind a small Objective-C/C bridge and Swift `LinuxRuntime` actor. Boot one engine lazily per App process and keep it mounted until process exit. Start it from the persistent store above; never replace or unmount the rootfs while the engine is live. Startup must be idempotent, serialized, cancellable for the waiter, and recoverable on the next cold launch after an interrupted upgrade.
 
 The bridge must install signal handling that preserves Node/V8 handlers, stop sharing iSH's process-global current working directory with Node, and expose memory/FD/thread diagnostics. Do not enable native offload until its global `chdir`/abort behavior is removed or serialized with explicit invocation context.
 

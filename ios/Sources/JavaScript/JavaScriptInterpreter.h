@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <NodeMobile/NodeMobile.h>
+#include "../Runtime/ISHRawDeflate.h"
 
 typedef struct {
     char *value;
