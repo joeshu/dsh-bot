@@ -2,7 +2,7 @@
 
 > **当前终端方向（2026-11-28）**：下文记录的是已完成的 QEMU ARM64 终端基线及其历史体积测量；产品目标现已切换为 DSH × NodeMobile × iSH ARM64：NodeMobile 留在 iOS 宿主，iSH 负责本地 ARM64 Linux syscall/fakefs，持久项目目录由 Bot、Web 和原生终端共享。QEMU 代码和发布门禁暂时保留，直到 iSH 生命周期、真 PTY/pipe subprocess、fakefs 项目路由、恢复与 Simulator/设备验收通过。iSH 源码固定版本、构建产物与分步门禁见[实施记录](architecture/dsh-nodemobile-ish-arm64-implementation.md)。
 
-目前只完成了 iSH 源码锁定、iPhoneOS/Simulator 静态库构建和报告；这不是 iSH 已接入 App，也不能作为 iSH 的最终 IPA 增量或性能结果。
+当前已接入 opt-in iSH ARM64 bridge、持久 fakefs 安装、`/workspace` 项目目录路由和 owner-bound PTY；锁定源码、rootfs、Simulator 与物理 ARM64 链接门禁通过。run `46173812946` 的 Simulator 用例完成资源校验、拒绝宿主 symlink 并打开 PTY，随后因字符级输出突发触发 `outputBackpressure`；byte-coalescing 修复等待重跑。默认仍用 QEMU，直到 iSH PTY/生命周期、Node coexistence 和设备验收通过。
 
 参考目标：`Fei2411/DS-Bot`、DSH 原版 Web 和 DSH `0.2.2-rc.5` Host 契约。该清单区分已接通的能力、仅适合前台运行的能力，以及需要真正 iOS 执行后端的桌面功能。
 
@@ -81,9 +81,9 @@ DSH `dsh-api-remote-access` 只约束 Typert Gateway Remote API。它能在 `ses
 6. **P2 Web 插件写管理**：Web 页面保持只读，直到原生宿主授权/审查/回滚接口闭环。
 7. **P1 ARM64 Linux 终端**：Bot 逐条审批、Alpine ARM64 kernel/initramfs/PTY agent 构建与宿主 QEMU TCG 测试均已完成。历史修复记录保留如下：Linux 6.18 devtmpfs 覆盖顺序曾让 `/dev/pts` 丢失；之后改为先挂载 devtmpfs 再创建 devpts 挂载点。guest 的 `setgroups` 曾因 `CONFIG_MULTIUSER` 关闭返回 `ENOSYS`，启用 `MULTIUSER` 后宿主 smoke 才通过。较早 Actions 已实际验证命令输入/输出、作业控制、resize、Ctrl-C、两个 UID 隔离工作区、磁盘配额与关闭（[Actions run 46078199087](https://github.com/joeshu/dsh-bot/actions/runs/46078199087)）。该记录只是宿主 TCG 验收。
 
-   独立 **ARM64 iOS TCI Runtime** 构建已验证版本固定与 framework 源码 SHA-256（[Actions run 46078199087](https://github.com/joeshu/dsh-bot/actions/runs/46078199087)）。当前候选流水线把 `aarch64-softmmu` Framework 和 ARM64 guest 资源放进 iOS Simulator 和 unsigned IPA，检查报告摘要、Mach-O 架构/平台、guest 镜像 digest、依赖清单、签名状态与完整资源清单。实现层已接上 Swift 单实例 QEMU TCI runtime、串口 frame codec / owner broker、Bot `terminal_exec`、DSH Web Terminal Controller、原生交互页和关闭/取消/内存压力回收。目标候选构建尚待 GitHub Actions 实际编译验收；不能把本机 Swift 未编译当作通过。历史整包 281,601,943 bytes，Framework payload 90,667,840 bytes（86.47 MiB）；guest 引导包约 13.93 MiB，二者合计 100.38 MiB 未压缩。IPA 压缩增量需以本次 QEMU workflow 的归档报告为准。
+   独立 **ARM64 iOS TCI Runtime** 构建已验证版本固定与 framework 源码 SHA-256（[Actions run 46078199087](https://github.com/joeshu/dsh-bot/actions/runs/46078199087)）。当前候选流水线把 `aarch64-softmmu` Framework 和 ARM64 guest 资源放进 iOS Simulator 和 unsigned IPA，检查报告摘要、Mach-O 架构/平台、guest 镜像 digest、依赖清单、签名状态与完整资源清单。实现层已接上 Swift 单实例 QEMU TCI runtime、串口 frame codec / owner broker、Bot `terminal_exec`、DSH Web Terminal Controller、原生交互页和关闭/取消/内存压力回收。QEMU 与 iSH 的 Simulator/设备 ARM64 链接均已有 CI 通过记录。iSH PTY 仍因输出事件队列压力失败，Swift 字节合并修复正在等待 CI；QEMU 的 Simulator broker 在 guest `READY` 后未收到 challenge `PONG`，当前改用私有短路径 Unix socket 等待复验。历史整包 281,601,943 bytes，Framework payload 90,667,840 bytes（86.47 MiB）；guest 引导包约 13.93 MiB，二者合计 100.38 MiB 未压缩。IPA 压缩增量需以本次 QEMU workflow 的归档报告为准。
 
-   下一道发布门禁是 GitHub QEMU workflow：iOS Simulator 内 `dlopen`/`qemu_init`、串口连接、shell PTY 交互、Bot command runner、Web/native 终端、resize、取消、并发 owner、关机及 unsigned IPA 校验全部通过。该候选构建不代替 iPhone 实机签名测试。后续工程项依序是：(a) 配额、原子替换与加密/清理策略的持久 ext4 磁盘及启动恢复；(b) 仅把用户授权的宿主 `files/` 通过带身份校验的文件代理暴露给 guest，保持 iOS QEMU 不含 9P/virtfs；(c) 基于签名 APK catalog 的手动勾选与按需拉取工具安装。
+   当前发布门禁是 GitHub iSH 与 QEMU Simulator workflow：iSH 需通过 shell 输出、退出状态、后台进程清理与 Node coexistence；QEMU 需通过 guest PING/PONG、shell PTY 交互、resize、取消、并发 owner 和关机。两条门禁都通过后再比较 signed/unsigned IPA 体积、实机速度与内存。该候选构建不代替 iPhone 实机签名测试。后续工程项依序是：(a) 配额、原子替换与加密/清理策略的持久 ext4 磁盘及启动恢复；(b) 仅把用户授权的宿主 `files/` 通过带身份校验的文件代理暴露给 guest，保持 iOS QEMU 不含 9P/virtfs；(c) 基于签名 APK catalog 的手动勾选与按需拉取工具安装。
 
 ### ARM64 终端体积与工具策略估算
 

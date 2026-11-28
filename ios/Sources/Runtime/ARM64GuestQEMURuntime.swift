@@ -7,6 +7,9 @@ public enum ARM64GuestQEMURuntimeError: Error, LocalizedError {
     case qemuLoadFailed(String)
     case qemuEntryPointMissing(String)
     case qemuInitFailed(Int32)
+    case qemuInitTimedOut
+    case socketPathTooLong
+    case socketConnectionTimedOut(String)
     case qemuExited
 
     public var errorDescription: String? {
@@ -21,6 +24,12 @@ public enum ARM64GuestQEMURuntimeError: Error, LocalizedError {
             return "The ARM64 iOS QEMU runtime is missing \(name)."
         case .qemuInitFailed(let status):
             return "QEMU initialization failed with status \(status)."
+        case .qemuInitTimedOut:
+            return "QEMU did not finish initialization before the startup deadline."
+        case .socketPathTooLong:
+            return "The private QEMU Unix socket path exceeds the platform limit."
+        case .socketConnectionTimedOut(let name):
+            return "QEMU did not open its private \(name) Unix socket before the startup deadline."
         case .qemuExited:
             return "The ARM64 guest runtime exited. Start the terminal again to launch a fresh guest."
         }
@@ -29,7 +38,7 @@ public enum ARM64GuestQEMURuntimeError: Error, LocalizedError {
 
 /// Owns one in-process QEMU TCI instance and the authenticated serial broker.
 /// QEMU is launched lazily and stays alive for this app process; no guest process,
-/// localhost port, or network-backed serial endpoint is created by the host.
+/// TCP port or network-backed serial endpoint is created by the host.
 public actor ARM64GuestQEMURuntime {
     public static let shared = ARM64GuestQEMURuntime()
 
@@ -84,6 +93,7 @@ public actor ARM64GuestQEMURuntime {
     private var serialTransport: ARM64GuestUnixSocketTransport?
     private var ptyBroker: ARM64GuestPTYBroker?
     private var qmpFileDescriptor: Int32?
+    private var socketDirectoryURL: URL?
     private var hasLaunchedQEMU = false
     private let bundle: Bundle
 
@@ -206,7 +216,7 @@ public actor ARM64GuestQEMURuntime {
         serialTransport?.close()
         serialTransport = nil
 
-        if let qemuTask, let qmpFileDescriptor, let threadState, !threadState.result().exited {
+        if let qemuTask, let threadState {
             let initializationDeadline = Date().addingTimeInterval(5)
             while threadState.result().initializationStatus == nil,
                   !threadState.result().exited,
@@ -214,7 +224,8 @@ public actor ARM64GuestQEMURuntime {
                 try? await Task.sleep(nanoseconds: 20_000_000)
             }
             let state = threadState.result()
-            if state.initializationStatus == 0 && !state.exited {
+            if state.initializationStatus == 0 && !state.exited,
+               let qmpFileDescriptor {
                 try? await Task.detached(priority: .utility) {
                     try Self.requestQEMUQuit(fileDescriptor: qmpFileDescriptor)
                 }.value
@@ -236,6 +247,11 @@ public actor ARM64GuestQEMURuntime {
         qemuTask = nil
         threadState = nil
         qemuFunctions = nil
+        if let qmpFileDescriptor {
+            _ = Darwin.close(qmpFileDescriptor)
+            self.qmpFileDescriptor = nil
+        }
+        removeSocketDirectory()
         if let qemuHandle {
             dlclose(qemuHandle)
             self.qemuHandle = nil
@@ -294,18 +310,13 @@ public actor ARM64GuestQEMURuntime {
         qemuFunctions = qemu
         try Task.checkCancellation()
 
-        let serialSockets = try Self.makeSocketPair()
-        let qmpSockets: (host: Int32, qemu: Int32)
-        do {
-            qmpSockets = try Self.makeSocketPair()
-        } catch {
-            _ = Darwin.close(serialSockets.host)
-            _ = Darwin.close(serialSockets.qemu)
-            throw error
+        let socketDirectory = try Self.makePrivateSocketDirectory()
+        socketDirectoryURL = socketDirectory
+        let serialSocketPath = socketDirectory.appendingPathComponent("s", isDirectory: false).path
+        let qmpSocketPath = socketDirectory.appendingPathComponent("q", isDirectory: false).path
+        guard Self.isValidUnixSocketPath(serialSocketPath), Self.isValidUnixSocketPath(qmpSocketPath) else {
+            throw ARM64GuestQEMURuntimeError.socketPathTooLong
         }
-        let transport = ARM64GuestUnixSocketTransport(fileDescriptor: serialSockets.host)
-        serialTransport = transport
-        qmpFileDescriptor = qmpSockets.host
 
         // TCI is single-threaded; one guest CPU avoids software-emulation
         // scheduling overhead for this shell-focused workload.
@@ -321,10 +332,8 @@ public actor ARM64GuestQEMURuntime {
             "-append", "earlycon=pl011,mmio32,0x09000000 console=ttyAMA0,115200 loglevel=4 rdinit=/init panic=0",
             "-display", "none",
             "-monitor", "none",
-            "-chardev", "socket,id=guest-serial,fd=\(serialSockets.qemu)",
-            "-serial", "chardev:guest-serial",
-            "-chardev", "socket,id=guest-qmp,fd=\(qmpSockets.qemu)",
-            "-mon", "chardev=guest-qmp,mode=control",
+            "-serial", "unix:\(serialSocketPath),server=on,wait=off",
+            "-qmp", "unix:\(qmpSocketPath),server=on,wait=off",
             "-nic", "none",
             "-no-user-config",
             "-no-shutdown",
@@ -354,6 +363,27 @@ public actor ARM64GuestQEMURuntime {
             await self?.qemuDidExit()
         }
 
+        let initializationDeadline = Date().addingTimeInterval(10)
+        while threadState?.result().initializationStatus == nil,
+              threadState?.result().exited == false,
+              Date() < initializationDeadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        guard let initialization = threadState?.result() else {
+            throw ARM64GuestQEMURuntimeError.qemuExited
+        }
+        guard let status = initialization.initializationStatus else {
+            throw ARM64GuestQEMURuntimeError.qemuInitTimedOut
+        }
+        guard status == 0 else {
+            throw ARM64GuestQEMURuntimeError.qemuInitFailed(status)
+        }
+        let qmpDescriptor = try await Self.connectUnixSocket(at: qmpSocketPath, label: "QMP")
+        qmpFileDescriptor = qmpDescriptor
+        let serialDescriptor = try await Self.connectUnixSocket(at: serialSocketPath, label: "serial")
+        let transport = ARM64GuestUnixSocketTransport(fileDescriptor: serialDescriptor)
+        serialTransport = transport
+
         let broker = ARM64GuestPTYBroker(transport: transport)
         await broker.start()
         try await broker.waitUntilReady(timeoutSeconds: 120)
@@ -371,6 +401,7 @@ public actor ARM64GuestQEMURuntime {
             _ = Darwin.close(qmpFileDescriptor)
             self.qmpFileDescriptor = nil
         }
+        removeSocketDirectory()
         qemuTask = nil
         startupTask = nil
         startupGeneration = nil
@@ -383,17 +414,76 @@ public actor ARM64GuestQEMURuntime {
         }
     }
 
-    private static func makeSocketPair() throws -> (host: Int32, qemu: Int32) {
-        var descriptors: [Int32] = [-1, -1]
-        let result = descriptors.withUnsafeMutableBufferPointer { buffer in
-            Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, buffer.baseAddress)
-        }
-        guard result == 0 else { throw posixError(errno) }
-        for descriptor in descriptors {
+    private static func makePrivateSocketDirectory() throws -> URL {
+#if targetEnvironment(simulator)
+        let parent = URL(fileURLWithPath: "/tmp", isDirectory: true)
+#else
+        let parent = FileManager.default.temporaryDirectory
+#endif
+        let token = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12)).lowercased()
+        let directory = parent.appendingPathComponent("q\(token)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        return directory
+    }
+
+    private static func isValidUnixSocketPath(_ path: String) -> Bool {
+        let address = sockaddr_un()
+        return path.utf8.count < MemoryLayout.size(ofValue: address.sun_path)
+    }
+
+    private static func connectUnixSocket(at path: String, label: String) async throws -> Int32 {
+        let deadline = Date().addingTimeInterval(5)
+        var lastError = ENOENT
+        let pathBytes = Array(path.utf8) + [0]
+
+        while Date() < deadline {
+            let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+            guard descriptor >= 0 else { throw posixError(errno) }
             var noSignal: Int32 = 1
             _ = setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
+
+            var address = sockaddr_un()
+            address.sun_family = sa_family_t(AF_UNIX)
+            let copied = withUnsafeMutableBytes(of: &address.sun_path) { destination in
+                guard pathBytes.count <= destination.count else { return false }
+                for (index, byte) in pathBytes.enumerated() {
+                    destination[index] = byte
+                }
+                return true
+            }
+            guard copied else {
+                _ = Darwin.close(descriptor)
+                throw ARM64GuestQEMURuntimeError.socketPathTooLong
+            }
+
+            let socketLength = socklen_t(
+                MemoryLayout<UInt8>.size + MemoryLayout<sa_family_t>.size + path.utf8.count
+            )
+            address.sun_len = UInt8(socketLength)
+            let result = withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.connect(descriptor, $0, socketLength)
+                }
+            }
+            if result == 0 { return descriptor }
+            lastError = errno
+            _ = Darwin.close(descriptor)
+            guard lastError == ENOENT || lastError == ECONNREFUSED || lastError == EINTR else {
+                throw posixError(lastError)
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
         }
-        return (descriptors[0], descriptors[1])
+        throw ARM64GuestQEMURuntimeError.socketConnectionTimedOut(label)
+    }
+
+    private func removeSocketDirectory() {
+        guard let socketDirectoryURL else { return }
+        try? FileManager.default.removeItem(at: socketDirectoryURL)
+        self.socketDirectoryURL = nil
     }
 
     private static func requestQEMUQuit(fileDescriptor descriptor: Int32) throws {

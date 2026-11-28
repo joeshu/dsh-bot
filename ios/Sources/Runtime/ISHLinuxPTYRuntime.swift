@@ -3,6 +3,142 @@ import Foundation
 
 extension ISHKernelBridge: @unchecked Sendable {}
 
+/// Coalesces the character-sized writes produced by a pasted shell command
+/// into bounded output frames before they reach AsyncThrowingStream.
+private final class ISHPTYOutputBuffer: @unchecked Sendable {
+    private static let maxPendingBytes = 256 * 1024
+    private static let maxChunkBytes = 8 * 1024
+
+    private let lock = NSLock()
+    private let queue = DispatchQueue(label: "io.github.dsbot.ish-pty-output", qos: .userInitiated)
+    private let continuation: AsyncThrowingStream<ARM64GuestPTYEvent, Error>.Continuation
+    private let onBackpressure: @Sendable () -> Void
+    private var pending = Data()
+    private var flushScheduled = false
+    private var closed = false
+    private var backpressureReported = false
+
+    init(
+        continuation: AsyncThrowingStream<ARM64GuestPTYEvent, Error>.Continuation,
+        onBackpressure: @escaping @Sendable () -> Void
+    ) {
+        self.continuation = continuation
+        self.onBackpressure = onBackpressure
+    }
+
+    func append(_ data: Data) {
+        guard !data.isEmpty else { return }
+        lock.lock()
+        guard !closed else { lock.unlock(); return }
+        guard data.count <= Self.maxPendingBytes - pending.count else {
+            lock.unlock()
+            failBackpressure()
+            return
+        }
+        pending.append(data)
+        let shouldScheduleFlush = !flushScheduled
+        flushScheduled = true
+        lock.unlock()
+
+        if shouldScheduleFlush {
+            queue.asyncAfter(deadline: .now() + .milliseconds(2)) { [weak self] in
+                self?.flushOneChunk()
+            }
+        }
+    }
+
+    func finish(status: Int32? = nil, error: Error? = nil) {
+        lock.lock()
+        guard !closed else { lock.unlock(); return }
+        closed = true
+        lock.unlock()
+
+        queue.async { [self] in
+            while let chunk = takeChunk() {
+                guard yieldOutput(chunk) else { return }
+            }
+            if let status {
+                switch continuation.yield(.exited(status)) {
+                case .enqueued:
+                    break
+                case .dropped:
+                    failBackpressure()
+                    return
+                case .terminated:
+                    return
+                @unknown default:
+                    failBackpressure()
+                    return
+                }
+            }
+            if let error {
+                continuation.finish(throwing: error)
+            } else {
+                continuation.finish()
+            }
+        }
+    }
+
+    private func flushOneChunk() {
+        guard let chunk = takeChunk() else { return }
+        guard yieldOutput(chunk) else { return }
+        lock.lock()
+        let hasPending = !pending.isEmpty
+        if !hasPending { flushScheduled = false }
+        lock.unlock()
+        if hasPending {
+            queue.asyncAfter(deadline: .now() + .milliseconds(2)) { [weak self] in
+                self?.flushOneChunk()
+            }
+        }
+    }
+
+    private func takeChunk() -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !pending.isEmpty else {
+            flushScheduled = false
+            return nil
+        }
+        let count = min(pending.count, Self.maxChunkBytes)
+        let chunk = Data(pending.prefix(count))
+        pending.removeFirst(count)
+        return chunk
+    }
+
+    private func yieldOutput(_ data: Data) -> Bool {
+        switch continuation.yield(.output(data)) {
+        case .enqueued:
+            return true
+        case .dropped:
+            failBackpressure()
+            return false
+        case .terminated:
+            lock.lock()
+            closed = true
+            pending.removeAll(keepingCapacity: false)
+            flushScheduled = false
+            lock.unlock()
+            return false
+        @unknown default:
+            failBackpressure()
+            return false
+        }
+    }
+
+    private func failBackpressure() {
+        lock.lock()
+        let shouldNotify = !backpressureReported
+        backpressureReported = true
+        closed = true
+        pending.removeAll(keepingCapacity: false)
+        flushScheduled = false
+        lock.unlock()
+        continuation.finish(throwing: ARM64GuestPTYProtocolError.outputBackpressure)
+        if shouldNotify { onBackpressure() }
+    }
+}
+
 /// iSH host actor behind the same DSH Bot and Web PTY contract used by QEMU.
 /// The rootfs is installed once and mounted for the app lifetime; each owner
 /// receives a host-generated PTY lease and cannot supply a host path.
@@ -11,7 +147,7 @@ public actor ISHLinuxPTYRuntime: LinuxPTYRuntime {
 
     private struct Lease {
         let id: String
-        let continuation: AsyncThrowingStream<ARM64GuestPTYEvent, Error>.Continuation
+        let outputBuffer: ISHPTYOutputBuffer
     }
 
     private let bridge = ISHKernelBridge.shared()
@@ -49,9 +185,15 @@ public actor ISHLinuxPTYRuntime: LinuxPTYRuntime {
 
         let sessionID = UUID().uuidString.lowercased()
         let pair = AsyncThrowingStream<ARM64GuestPTYEvent, Error>.makeStream(
-            bufferingPolicy: .bufferingOldest(128)
+            // 256 KiB of pending bytes are emitted as at most 32 chunks;
+            // reserve one additional event for the exit status even when
+            // the consumer is briefly suspended during process teardown.
+            bufferingPolicy: .bufferingOldest(64)
         )
         let continuation = pair.continuation
+        let outputBuffer = ISHPTYOutputBuffer(continuation: continuation) { [weak self] in
+            Task { await self?.closePTY(owner: owner) }
+        }
         continuation.onTermination = { [weak self] termination in
             guard case .cancelled = termination else { return }
             Task { await self?.closePTY(owner: owner) }
@@ -61,27 +203,15 @@ public actor ISHLinuxPTYRuntime: LinuxPTYRuntime {
             id: sessionID,
             rows: UInt(rows),
             columns: UInt(columns),
-            outputHandler: { [weak self] data in
-                switch continuation.yield(.output(data)) {
-                case .enqueued:
-                    break
-                case .dropped:
-                    continuation.finish(throwing: ARM64GuestPTYProtocolError.outputBackpressure)
-                    Task { await self?.closePTY(owner: owner) }
-                case .terminated:
-                    break
-                @unknown default:
-                    continuation.finish(throwing: ARM64GuestPTYProtocolError.outputBackpressure)
-                    Task { await self?.closePTY(owner: owner) }
-                }
+            outputHandler: { data in
+                outputBuffer.append(data)
             },
             exitHandler: { [weak self] status in
-                _ = continuation.yield(.exited(status))
-                continuation.finish()
+                outputBuffer.finish(status: status)
                 Task { await self?.reapCompleted(owner: owner, sessionID: sessionID) }
             }
         ) {
-            continuation.finish(throwing: error)
+            outputBuffer.finish(error: error)
             throw error
         }
         do {
@@ -93,11 +223,11 @@ public actor ISHLinuxPTYRuntime: LinuxPTYRuntime {
                     closeContinuation.resume(returning: bridge.close(id: sessionID))
                 }
             }
-            continuation.finish(throwing: error)
+            outputBuffer.finish(error: error)
             throw error
         }
 
-        leases[owner] = Lease(id: sessionID, continuation: continuation)
+        leases[owner] = Lease(id: sessionID, outputBuffer: outputBuffer)
         return pair.stream
     }
 
@@ -135,7 +265,7 @@ public actor ISHLinuxPTYRuntime: LinuxPTYRuntime {
         }
         if closed, leases[owner]?.id == lease.id {
             leases.removeValue(forKey: owner)
-            lease.continuation.finish()
+            lease.outputBuffer.finish()
         }
     }
 
@@ -158,7 +288,7 @@ public actor ISHLinuxPTYRuntime: LinuxPTYRuntime {
         }
         guard closed, leases[owner]?.id == sessionID else { return }
         leases.removeValue(forKey: owner)
-        lease.continuation.finish()
+        lease.outputBuffer.finish()
     }
 
     private func ensureBooted(timeoutSeconds: UInt64) async throws {
