@@ -13,11 +13,10 @@ public actor ARM64GuestPTYWebTerminal {
         var outputWasTruncated = false
         var exitCode: Int32?
         var error: String?
-        var readWaiter: CheckedContinuation<Void, Never>?
-        var holdsRuntimeLease = false
+        var readWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     }
 
-    private let runtime: ARM64GuestQEMURuntime
+    private let runtime: any LinuxPTYRuntime
     private let maxSessions = 4
     private let maxBufferedOutputBytes = 256 * 1024
     private let maxReadBytes = 32 * 1024
@@ -25,7 +24,7 @@ public actor ARM64GuestPTYWebTerminal {
     private var requestSessions: [String: String] = [:]
     private var sessions: [String: Session] = [:]
 
-    public init(runtime: ARM64GuestQEMURuntime = .shared) {
+    public init(runtime: any LinuxPTYRuntime = LinuxPTYRuntimeRegistry.shared) {
         self.runtime = runtime
     }
 
@@ -79,21 +78,17 @@ public actor ARM64GuestPTYWebTerminal {
         guard !input.isEmpty, input.count <= ARM64GuestPTYCodec.maxPayloadBytes else {
             throw ARM64GuestPTYProtocolError.frameTooLarge(input.count)
         }
-        guard let broker = await runtime.brokerIfStarted() else {
-            throw ARM64GuestPTYProtocolError.transportClosed
-        }
-        try await broker.sendInput(input, from: session.owner)
+        try await runtime.sendInput(input, owner: session.owner)
     }
 
     public func resize(rows: UInt16, columns: UInt16, sessionID: String) async throws {
         guard rows >= 2, rows <= 300, columns >= 2, columns <= 500 else {
             throw ARM64GuestPTYProtocolError.invalidDimensions
         }
-        guard let session = authorizedSession(sessionID), session.exitCode == nil, session.error == nil,
-              let broker = await runtime.brokerIfStarted() else {
+        guard let session = authorizedSession(sessionID), session.exitCode == nil, session.error == nil else {
             throw ARM64GuestPTYProtocolError.sessionNotOpen
         }
-        try await broker.resize(owner: session.owner, rows: rows, columns: columns)
+        try await runtime.resize(owner: session.owner, rows: rows, columns: columns)
     }
 
     public func read(sessionID: String) async throws -> [String: Any] {
@@ -107,11 +102,12 @@ public actor ARM64GuestPTYWebTerminal {
                     continuation.resume()
                     return
                 }
-                current.readWaiter = continuation
+                let waiterID = UUID()
+                current.readWaiters[waiterID] = continuation
                 sessions[sessionID] = current
                 Task { [weak self] in
                     do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { return }
-                    await self?.wakeReader(for: sessionID)
+                    await self?.wakeReader(for: sessionID, waiterID: waiterID)
                 }
             }
         }
@@ -138,11 +134,8 @@ public actor ARM64GuestPTYWebTerminal {
         requestSessions = requestSessions.filter { $0.value != sessionID }
         openingTasks.removeValue(forKey: sessionID)?.cancel()
         session.reader?.cancel()
-        session.readWaiter?.resume()
-        if let broker = await runtime.brokerIfStarted() {
-            try? await broker.close(owner: session.owner)
-        }
-        if session.holdsRuntimeLease { await runtime.releasePTYLease() }
+        session.readWaiters.values.forEach { $0.resume() }
+        await runtime.closePTY(owner: session.owner)
     }
 
     public func closeAll() async {
@@ -160,16 +153,14 @@ public actor ARM64GuestPTYWebTerminal {
     ) async throws -> String {
         try Task.checkCancellation()
         guard sessions[id] != nil else { throw CancellationError() }
-        let broker = try await runtime.acquirePTYLease()
         do {
             try Task.checkCancellation()
             guard sessions[id] != nil else { throw CancellationError() }
-            let stream = try await broker.open(owner: owner, rows: rows, columns: columns, timeoutSeconds: 120)
+            let stream = try await runtime.openPTY(owner: owner, rows: rows, columns: columns, timeoutSeconds: 120)
             guard var session = sessions[id] else {
-                try? await broker.close(owner: owner)
+                await runtime.closePTY(owner: owner)
                 throw CancellationError()
             }
-            session.holdsRuntimeLease = true
             session.reader = Task { [weak self] in
                 do {
                     for try await event in stream {
@@ -182,7 +173,6 @@ public actor ARM64GuestPTYWebTerminal {
             sessions[id] = session
             return id
         } catch {
-            await runtime.releasePTYLease()
             throw error
         }
     }
@@ -205,24 +195,23 @@ public actor ARM64GuestPTYWebTerminal {
         case .exited(let status):
             session.exitCode = status
         }
-        let waiter = session.readWaiter
-        session.readWaiter = nil
+        let waiters = Array(session.readWaiters.values)
+        session.readWaiters.removeAll()
         sessions[id] = session
-        waiter?.resume()
+        waiters.forEach { $0.resume() }
     }
 
     private func receive(error: Error, for id: String) {
         guard var session = sessions[id] else { return }
         session.error = String(error.localizedDescription.prefix(512))
-        let waiter = session.readWaiter
-        session.readWaiter = nil
+        let waiters = Array(session.readWaiters.values)
+        session.readWaiters.removeAll()
         sessions[id] = session
-        waiter?.resume()
+        waiters.forEach { $0.resume() }
     }
 
-    private func wakeReader(for id: String) {
-        guard var session = sessions[id], let waiter = session.readWaiter else { return }
-        session.readWaiter = nil
+    private func wakeReader(for id: String, waiterID: UUID) {
+        guard var session = sessions[id], let waiter = session.readWaiters.removeValue(forKey: waiterID) else { return }
         sessions[id] = session
         waiter.resume()
     }

@@ -1,0 +1,50 @@
+name: iSH ARM64 iOS Engine
+
+on:
+  push:
+    paths:
+      - 'scripts/ish-arm64-sources.lock.json'
+      - 'scripts/build-ish-arm64-ios.sh'
+      - 'scripts/package-ish-arm64-ios.py'
+      - 'docs/architecture/dsh-nodemobile-ish-arm64-implementation.md'
+      - '.github/workflows/ish-arm64-ios-runtime.yml'
+  pull_request:
+    paths:
+      - 'scripts/ish-arm64-sources.lock.json'
+      - 'scripts/build-ish-arm64-ios.sh'
+      - 'scripts/package-ish-arm64-ios.py'
+      - 'docs/architecture/dsh-nodemobile-ish-arm64-implementation.md'
+      - '.github/workflows/ish-arm64-ios-runtime.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ish-arm64-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-engine:
+    runs-on: macos-26
+    timeout-minutes: 180
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned-build prerequisites
+        run: |
+          brew install meson ninja llvm libarchive
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+      - name: Build device and simulator iSH libraries
+        run: bash scripts/build-ish-arm64-ios.sh
+        env:
+          DSBOT_ISH_OUT_DIR: ${{ runner.temp }}/ish-arm64-ios
+          DSBOT_ISH_BUILD_ROOT: ${{ runner.temp }}/ish-arm64-build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsbot-ish-arm64-ios-${{ github.sha }}
+          path: ${{ runner.temp }}/ish-arm64-ios/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0

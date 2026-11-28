@@ -1728,7 +1728,7 @@ public final class LocalAgentHost: ObservableObject {
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     await ARM64GuestPTYWebTerminal.shared.closeAll()
-                    await ARM64GuestQEMURuntime.shared.stop()
+                    await LinuxPTYRuntimeRegistry.shared.stop()
                     self.effectiveWebSearchSendOriginalQuestion = false
                     self.resolveRuntimeReadiness(.channelClosed)
                     guard self.state == .ready else { return }
@@ -1795,7 +1795,7 @@ public final class LocalAgentHost: ObservableObject {
                 Task { @MainActor in
                     self.trimMemoryCachesForPressure()
                     await ARM64GuestPTYWebTerminal.shared.closeAll()
-                    await ARM64GuestQEMURuntime.shared.stop()
+                    await LinuxPTYRuntimeRegistry.shared.stop()
                     if !self.activeTurnsBySession.isEmpty {
                         self.lastStreamError = "系统内存紧张，已安全暂停当前生成以保护进度。"
                         for sId in Array(self.activeTurnsBySession.keys) {
@@ -2864,7 +2864,7 @@ public final class LocalAgentHost: ObservableObject {
                 throw ARM64GuestPTYProtocolError.invalidDimensions
             }
             try await MainActor.run { try self.requireTerminalMemoryAdmission() }
-            try await ARM64GuestQEMURuntime.shared.validateBundledResources()
+            try await LinuxPTYRuntimeRegistry.shared.validateBundledResources()
             let sessionID = try await ARM64GuestPTYWebTerminal.shared.open(
                 ownerSessionID: ownerSessionID,
                 requestID: params["requestId"] as? String,
@@ -2916,7 +2916,7 @@ public final class LocalAgentHost: ObservableObject {
                 try await MainActor.run {
                     try self.requireTerminalMemoryAdmission()
                 }
-                try await ARM64GuestQEMURuntime.shared.validateBundledResources()
+                try await LinuxPTYRuntimeRegistry.shared.validateBundledResources()
             }
             var arguments = params["args"] as? [String: Any] ?? [:]
             if name == "web_search" {

@@ -48,12 +48,12 @@ public actor ARM64GuestPTYCommandRunner {
         case timeout
     }
 
-    private let runtime: ARM64GuestQEMURuntime
+    private let runtime: any LinuxPTYRuntime
     private let maxOutputBytes = 32 * 1024
     private var activeOwners: [TurnKey: Set<ARM64GuestPTYOwner>] = [:]
     private var cancelledTurns: Set<TurnKey> = []
 
-    public init(runtime: ARM64GuestQEMURuntime = .shared) {
+    public init(runtime: any LinuxPTYRuntime = LinuxPTYRuntimeRegistry.shared) {
         self.runtime = runtime
     }
 
@@ -78,12 +78,10 @@ public actor ARM64GuestPTYCommandRunner {
             }
         }
 
-        let broker = try await runtime.acquirePTYLease()
-        defer { Task { await runtime.releasePTYLease() } }
         guard !cancelledTurns.contains(key) else { throw CancellationError() }
-        let stream = try await broker.open(owner: owner, rows: 24, columns: 80, timeoutSeconds: 120)
+        let stream = try await runtime.openPTY(owner: owner, rows: 24, columns: 80, timeoutSeconds: 120)
         guard !cancelledTurns.contains(key) else {
-            try? await broker.close(owner: owner)
+            await runtime.closePTY(owner: owner)
             throw CancellationError()
         }
 
@@ -95,7 +93,7 @@ public actor ARM64GuestPTYCommandRunner {
 
         do {
             return try await withTaskCancellationHandler {
-                try await broker.sendInput(input, from: owner)
+                try await runtime.sendInput(input, owner: owner)
                 return try await withThrowingTaskGroup(of: RaceResult.self) { group in
                     let outputLimit = maxOutputBytes
                     group.addTask {
@@ -116,25 +114,26 @@ public actor ARM64GuestPTYCommandRunner {
                     let first = try await group.next() ?? .timeout
                     group.cancelAll()
                     if Task.isCancelled {
-                        try? await broker.close(owner: owner)
+                        await runtime.closePTY(owner: owner)
                         throw CancellationError()
                     }
                     switch first {
                     case .completed(.success(let result)):
+                        await runtime.closePTY(owner: owner)
                         return result
                     case .completed(.failure(let error)):
-                        try? await broker.close(owner: owner)
+                        await runtime.closePTY(owner: owner)
                         throw error
                     case .timeout:
-                        try? await broker.close(owner: owner)
+                        await runtime.closePTY(owner: owner)
                         throw ARM64GuestPTYProtocolError.timeout("command execution")
                     }
                 }
             } onCancel: {
-                Task { try? await broker.close(owner: owner) }
+                Task { await runtime.closePTY(owner: owner) }
             }
         } catch {
-            try? await broker.close(owner: owner)
+            await runtime.closePTY(owner: owner)
             throw error
         }
     }
@@ -143,8 +142,7 @@ public actor ARM64GuestPTYCommandRunner {
         let key = TurnKey(sessionID: sessionID, turnID: turnID)
         cancelledTurns.insert(key)
         let owners = activeOwners[key] ?? []
-        guard !owners.isEmpty, let broker = await runtime.brokerIfStarted() else { return }
-        for owner in owners { try? await broker.close(owner: owner) }
+        for owner in owners { await runtime.closePTY(owner: owner) }
     }
 
     private static func makeOwner(sessionID: String) throws -> ARM64GuestPTYOwner {

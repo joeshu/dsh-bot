@@ -200,7 +200,8 @@ final class NativeRuntimeTests: XCTestCase {
 
         let runtime = ARM64GuestQEMURuntime(bundle: appBundle)
         do {
-            let commandRunner = ARM64GuestPTYCommandRunner(runtime: runtime)
+            let linuxRuntime = QEMULinuxPTYRuntime(runtime: runtime)
+            let commandRunner = ARM64GuestPTYCommandRunner(runtime: linuxRuntime)
             print("DSBOT_QEMU_TEST_STAGE command-runner-open")
             let commandResult = try await commandRunner.execute(
                 command: "printf '%s\\n' 'DSBOT_IOS_COMMAND_RUNNER_OK'; false",
@@ -224,7 +225,7 @@ final class NativeRuntimeTests: XCTestCase {
                 XCTAssertEqual(error, .timeout("command execution"))
             }
 
-            let webTerminal = ARM64GuestPTYWebTerminal(runtime: runtime)
+            let webTerminal = ARM64GuestPTYWebTerminal(runtime: linuxRuntime)
             print("DSBOT_QEMU_TEST_STAGE web-terminal-open")
             let webSession = try await webTerminal.open(rows: 24, columns: 80)
             print("DSBOT_QEMU_TEST_STAGE web-terminal-ready")

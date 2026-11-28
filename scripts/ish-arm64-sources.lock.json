@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "distribution": {
+    "repository": "https://github.com/OpenMinis/OpenMinis.git",
+    "commit": "1a71df0f381cefde80bf912b723de6f9831bc177",
+    "buildScript": "deps/build_ish.sh",
+    "buildScriptSha256": "4b2aaf1572205f951f1373ee1236e26c1a8cbae1634d0c60b0fc03e102719756"
+  },
+  "engine": {
+    "repository": "https://github.com/OpenMinis/ish-arm64.git",
+    "commit": "0fd17a135e78b7a0cf08a4f5831217bbb76ed22f",
+    "submodules": {
+      "deps/libapps": "b8cacae35e5b11d64bb736a053921c16ca7faf9e",
+      "deps/libarchive": "fc6563f5130d8a7ee1fc27c0e55baef35119f26c",
+      "deps/linux": "8ec9bf17f89c6dba818f3ed2427de4223e78644a"
+    }
+  },
+  "license": {
+    "terms": "GPLv3; see LICENSE.IOS",
+    "requiredFiles": ["LICENSE.md", "LICENSE.IOS"],
+    "notice": "Include the corresponding source archives and build scripts with every redistributed binary derived from iSH."
+  }
+}
