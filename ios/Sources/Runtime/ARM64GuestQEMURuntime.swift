@@ -8,8 +8,6 @@ public enum ARM64GuestQEMURuntimeError: Error, LocalizedError {
     case qemuEntryPointMissing(String)
     case qemuInitFailed(Int32)
     case qemuExited
-    case socketPathTooLong
-    case socketConnectionFailed(String)
     case qmpShutdownFailed(String)
 
     public var errorDescription: String? {
@@ -26,10 +24,6 @@ public enum ARM64GuestQEMURuntimeError: Error, LocalizedError {
             return "QEMU initialization failed with status \(status)."
         case .qemuExited:
             return "The ARM64 guest runtime exited. Start the terminal again to launch a fresh guest."
-        case .socketPathTooLong:
-            return "The private guest socket path exceeds the iOS Unix socket limit."
-        case .socketConnectionFailed(let message):
-            return "Could not connect to the ARM64 guest serial socket: \(message)"
         case .qmpShutdownFailed(let message):
             return "Could not stop the ARM64 guest runtime cleanly: \(message)"
         }
@@ -91,8 +85,7 @@ public actor ARM64GuestQEMURuntime {
     private var threadState: ThreadState?
     private var serialTransport: ARM64GuestUnixSocketTransport?
     private var ptyBroker: ARM64GuestPTYBroker?
-    private var serialSocketPath: String?
-    private var qmpSocketPath: String?
+    private var qmpFileDescriptor: Int32?
     private var hasLaunchedQEMU = false
     private let bundle: Bundle
 
@@ -215,10 +208,10 @@ public actor ARM64GuestQEMURuntime {
         serialTransport?.close()
         serialTransport = nil
 
-        if let qmpSocketPath, let qemuTask, threadState?.result().exited == false {
+        if let qmpFileDescriptor, let qemuTask, threadState?.result().exited == false {
             do {
                 try await Task.detached(priority: .utility) {
-                    try Self.requestQEMUQuit(socketPath: qmpSocketPath)
+                    try Self.requestQEMUQuit(fileDescriptor: qmpFileDescriptor)
                 }.value
                 await qemuTask.value
             } catch {
@@ -232,10 +225,10 @@ public actor ARM64GuestQEMURuntime {
             dlclose(qemuHandle)
             self.qemuHandle = nil
         }
-        if let serialSocketPath { _ = Darwin.unlink(serialSocketPath) }
-        if let qmpSocketPath { _ = Darwin.unlink(qmpSocketPath) }
-        serialSocketPath = nil
-        qmpSocketPath = nil
+        if let qmpFileDescriptor {
+            _ = Darwin.close(qmpFileDescriptor)
+            self.qmpFileDescriptor = nil
+        }
     }
 
     private func scheduleIdleShutdown() {
@@ -289,17 +282,18 @@ public actor ARM64GuestQEMURuntime {
         )
         try Task.checkCancellation()
 
-        let socketRoot = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-        let serialPath = socketRoot.appendingPathComponent("dsbot-\(UUID().uuidString.prefix(8))-s.sock").path
-        let qmpPath = socketRoot.appendingPathComponent("dsbot-\(UUID().uuidString.prefix(8))-m.sock").path
-        guard serialPath.utf8.count < MemoryLayout<sockaddr_un>.size - 2,
-              qmpPath.utf8.count < MemoryLayout<sockaddr_un>.size - 2 else {
-            throw ARM64GuestQEMURuntimeError.socketPathTooLong
+        let serialSockets = try Self.makeSocketPair()
+        let qmpSockets: (host: Int32, qemu: Int32)
+        do {
+            qmpSockets = try Self.makeSocketPair()
+        } catch {
+            _ = Darwin.close(serialSockets.host)
+            _ = Darwin.close(serialSockets.qemu)
+            throw error
         }
-        _ = Darwin.unlink(serialPath)
-        _ = Darwin.unlink(qmpPath)
-        serialSocketPath = serialPath
-        qmpSocketPath = qmpPath
+        let transport = ARM64GuestUnixSocketTransport(fileDescriptor: serialSockets.host)
+        serialTransport = transport
+        qmpFileDescriptor = qmpSockets.host
 
         let arguments = [
             "dsbot-qemu",
@@ -313,8 +307,10 @@ public actor ARM64GuestQEMURuntime {
             "-append", "earlycon=pl011,mmio32,0x09000000 console=ttyAMA0,115200 loglevel=4 rdinit=/init panic=0",
             "-display", "none",
             "-monitor", "none",
-            "-qmp", "unix:\(qmpPath),server=on,wait=off",
-            "-serial", "unix:\(serialPath),server=on,wait=off",
+            "-chardev", "socket,id=guest-serial,fd=\(serialSockets.qemu)",
+            "-serial", "chardev:guest-serial",
+            "-chardev", "socket,id=guest-qmp,fd=\(qmpSockets.qemu)",
+            "-mon", "chardev=guest-qmp,mode=control",
             "-nic", "none",
             "-no-user-config",
             "-no-shutdown",
@@ -344,16 +340,7 @@ public actor ARM64GuestQEMURuntime {
             await self?.qemuDidExit()
         }
 
-        let fileDescriptor = try await Task.detached(priority: .userInitiated) {
-            try Self.connectToQEMUSerial(path: serialPath, state: state, timeoutSeconds: 30)
-        }.value
-        guard !Task.isCancelled else {
-            _ = Darwin.close(fileDescriptor)
-            throw CancellationError()
-        }
-        let transport = ARM64GuestUnixSocketTransport(fileDescriptor: fileDescriptor)
         let broker = ARM64GuestPTYBroker(transport: transport)
-        serialTransport = transport
         await broker.start()
         try await broker.waitUntilReady(timeoutSeconds: 120)
         return broker
@@ -371,52 +358,30 @@ public actor ARM64GuestQEMURuntime {
         startupGeneration = nil
         hasLaunchedQEMU = false
         threadState = nil
+        if let qmpFileDescriptor {
+            _ = Darwin.close(qmpFileDescriptor)
+            self.qmpFileDescriptor = nil
+        }
         if let qemuHandle {
             dlclose(qemuHandle)
             self.qemuHandle = nil
         }
-        if let serialSocketPath { _ = Darwin.unlink(serialSocketPath) }
-        if let qmpSocketPath { _ = Darwin.unlink(qmpSocketPath) }
-        serialSocketPath = nil
-        qmpSocketPath = nil
     }
 
-    private static func connectToQEMUSerial(path: String, state: ThreadState, timeoutSeconds: TimeInterval) throws -> Int32 {
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
-        var lastError = ECONNREFUSED
-        while Date() < deadline {
-            let result = state.result()
-            if result.exited {
-                if let status = result.initializationStatus, status != 0 {
-                    throw ARM64GuestQEMURuntimeError.qemuInitFailed(status)
-                }
-                throw ARM64GuestQEMURuntimeError.qemuExited
-            }
-            let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-            guard descriptor >= 0 else { throw posixError(errno) }
+    private static func makeSocketPair() throws -> (host: Int32, qemu: Int32) {
+        var descriptors: [Int32] = [-1, -1]
+        let result = descriptors.withUnsafeMutableBufferPointer { buffer in
+            Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, buffer.baseAddress)
+        }
+        guard result == 0 else { throw posixError(errno) }
+        for descriptor in descriptors {
             var noSignal: Int32 = 1
             _ = setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
-            var address = makeUnixAddress(path)
-            let connected = withUnsafePointer(to: &address) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-                }
-            }
-            if connected == 0 { return descriptor }
-            lastError = errno
-            _ = Darwin.close(descriptor)
-            if ![ENOENT, ECONNREFUSED, EINTR, EAGAIN].contains(lastError) {
-                throw posixError(lastError)
-            }
-            Thread.sleep(forTimeInterval: 0.05)
         }
-        let detail = String(cString: strerror(lastError))
-        throw ARM64GuestQEMURuntimeError.socketConnectionFailed(detail)
+        return (descriptors[0], descriptors[1])
     }
 
-    private static func requestQEMUQuit(socketPath: String) throws {
-        let descriptor = try connectToQMP(path: socketPath, timeoutSeconds: 3)
-        defer { _ = Darwin.close(descriptor) }
+    private static func requestQEMUQuit(fileDescriptor descriptor: Int32) throws {
         var timeout = timeval(tv_sec: 2, tv_usec: 0)
         _ = setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         _ = setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
@@ -425,26 +390,6 @@ public actor ARM64GuestQEMURuntime {
         _ = try readLine(from: descriptor)
         try writeAll(descriptor, Data("{\"execute\":\"quit\",\"id\":2}\r\n".utf8))
         _ = try readLine(from: descriptor)
-    }
-
-    private static func connectToQMP(path: String, timeoutSeconds: TimeInterval) throws -> Int32 {
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
-        while Date() < deadline {
-            let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-            guard descriptor >= 0 else { throw posixError(errno) }
-            var address = makeUnixAddress(path)
-            let connected = withUnsafePointer(to: &address) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-                }
-            }
-            if connected == 0 { return descriptor }
-            let code = errno
-            _ = Darwin.close(descriptor)
-            if code != ENOENT && code != ECONNREFUSED && code != EINTR { throw posixError(code) }
-            Thread.sleep(forTimeInterval: 0.05)
-        }
-        throw ARM64GuestQEMURuntimeError.qmpShutdownFailed("QMP socket did not accept a connection")
     }
 
     private static func readLine(from descriptor: Int32) throws -> Data {
@@ -475,20 +420,6 @@ public actor ARM64GuestQEMURuntime {
                 else { throw posixError(count < 0 ? errno : EPIPE) }
             }
         }
-    }
-
-    private static func makeUnixAddress(_ path: String) -> sockaddr_un {
-        var address = sockaddr_un()
-        address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
-        address.sun_family = sa_family_t(AF_UNIX)
-        let pathBytes = path.utf8CString
-        withUnsafeMutableBytes(of: &address.sun_path) { buffer in
-            buffer.initializeMemory(as: UInt8.self, repeating: 0)
-            for index in 0..<min(pathBytes.count, buffer.count) {
-                buffer[index] = UInt8(bitPattern: pathBytes[index])
-            }
-        }
-        return address
     }
 
     private static func posixError(_ code: Int32) -> POSIXError {
