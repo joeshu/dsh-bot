@@ -314,11 +314,11 @@ def smoke_guest_pty(link: SerialLink, timeout: int) -> None:
     link.send_frame(
         FRAME_INPUT,
         session_id,
-        b"printf '%s\\n' " + shell_marker(suspend_ready) + b"; sleep 30\n",
+        b"( sleep 1; printf '%s\\n' " + shell_marker(suspend_ready) + b" ) & sleep 30\n",
     )
     output_until_marker(link, session_id, suspend_ready, timeout)
     link.send_frame(FRAME_INPUT, session_id, b"\x1a")
-    time.sleep(0.1)
+    time.sleep(0.5)
     link.send_frame(
         FRAME_INPUT,
         session_id,
@@ -332,7 +332,8 @@ def smoke_guest_pty(link: SerialLink, timeout: int) -> None:
         link, session_id, (suspend_marker, suspend_failure), timeout
     )
     if suspend_marker not in suspend_output:
-        raise RuntimeError("Ctrl-Z did not suspend the foreground guest process")
+        tail = bytes(suspend_output[-2048:]).decode("utf-8", "replace")
+        raise RuntimeError(f"Ctrl-Z did not suspend the foreground guest process; PTY output: {tail!r}")
 
     link.send_frame(FRAME_RESIZE, session_id, struct.pack(">HH", 42, 100))
     resize_marker = b"DS_BOT_GUEST_PTY_RESIZE_OK"
