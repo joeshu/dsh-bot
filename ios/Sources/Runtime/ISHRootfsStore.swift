@@ -506,10 +506,13 @@ private struct ISHRootfsZIPExtractor {
     }
 
     private static func safeTarget(_ path: String, under root: URL) throws -> URL {
-        guard isSafeRelativePath(path) else {
+        // ZIP directory entries end in `/`; normalize exactly that final
+        // separator before validating path components and constructing a URL.
+        let relativePath = path.hasSuffix("/") ? String(path.dropLast()) : path
+        guard isSafeRelativePath(relativePath) else {
             throw ISHRootfsStoreError.invalidArchive("unsafe extraction path")
         }
-        let target = root.appendingPathComponent(path).standardizedFileURL
+        let target = root.appendingPathComponent(relativePath).standardizedFileURL
         let rootPath = root.standardizedFileURL.path + "/"
         guard target.path.hasPrefix(rootPath) else {
             throw ISHRootfsStoreError.invalidArchive("extraction path escaped staging directory")
