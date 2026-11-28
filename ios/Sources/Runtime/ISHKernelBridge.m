@@ -226,7 +226,15 @@ static void DSBotISHTerminateProcessSession(int processSessionID) {
     self = [super init];
     if (self) {
         _condition = [[NSCondition alloc] init];
-        _setupQueue = dispatch_queue_create("io.github.dsbot.ish.session-setup", DISPATCH_QUEUE_SERIAL);
+        dispatch_queue_attr_t setupQueueAttributes = dispatch_queue_attr_make_with_qos_class(
+            DISPATCH_QUEUE_SERIAL,
+            QOS_CLASS_USER_INITIATED,
+            0
+        );
+        _setupQueue = dispatch_queue_create(
+            "io.github.dsbot.ish.session-setup",
+            setupQueueAttributes
+        );
         _sessionsByID = [NSMutableDictionary dictionary];
         _sessionsByTTY = [NSMutableDictionary dictionary];
         _state = 0;
@@ -425,80 +433,94 @@ static void DSBotISHTerminateProcessSession(int processSessionID) {
             return;
         }
 
-        int result = become_new_init_child();
-        if (result < 0) {
-            openError = [self error:11 message:[NSString stringWithFormat:@"Could not create an iSH session task (%d).", result]];
+        // iSH keeps the caller's current guest task in thread-local storage.
+        // This serial queue is a host thread, so explicitly root each guest
+        // task setup at PID 1 and restore the prior host-thread value after it.
+        struct task *savedCurrent = current;
+        struct task *initTask = pid_get_task(1);
+        if (initTask == NULL) {
+            openError = [self error:11 message:@"The iSH init task is unavailable for PTY creation."];
             return;
         }
-        struct tty *tty = pty_open_fake(&dsbot_ish_pty_driver);
-        if (IS_ERR(tty)) {
-            openError = [self error:12 message:@"Could not allocate an iSH PTY."];
-            return;
-        }
-        tty_set_winsize(tty, (struct winsize_){.row = (word_t)rows, .col = (word_t)columns});
+        current = initTask;
+        @try {
+            int result = become_new_init_child();
+            if (result < 0) {
+                openError = [self error:11 message:[NSString stringWithFormat:@"Could not create an iSH session task (%d).", result]];
+                return;
+            }
+            struct tty *tty = pty_open_fake(&dsbot_ish_pty_driver);
+            if (IS_ERR(tty)) {
+                openError = [self error:12 message:@"Could not allocate an iSH PTY."];
+                return;
+            }
+            tty_set_winsize(tty, (struct winsize_){.row = (word_t)rows, .col = (word_t)columns});
 
-        struct fd *workspace = generic_open("/workspace", O_RDONLY_, 0);
-        if (IS_ERR(workspace)) {
-            lock(&ttys_lock);
-            tty_release(tty);
-            unlock(&ttys_lock);
-            openError = [self error:13 message:@"The DSH workspace is unavailable in iSH."];
-            return;
-        }
-        fs_chdir(current->fs, workspace);
-        NSString *stdioPath = [NSString stringWithFormat:@"/dev/pts/%d", tty->num];
-        result = create_stdio(stdioPath.fileSystemRepresentation, TTY_PSEUDO_SLAVE_MAJOR, tty->num);
-        if (result < 0) {
-            lock(&ttys_lock);
-            tty_release(tty);
-            unlock(&ttys_lock);
-            openError = [self error:14 message:[NSString stringWithFormat:@"Could not connect iSH PTY stdio (%d).", result]];
-            return;
-        }
+            struct fd *workspace = generic_open("/workspace", O_RDONLY_, 0);
+            if (IS_ERR(workspace)) {
+                lock(&ttys_lock);
+                tty_release(tty);
+                unlock(&ttys_lock);
+                openError = [self error:13 message:@"The DSH workspace is unavailable in iSH."];
+                return;
+            }
+            fs_chdir(current->fs, workspace);
+            NSString *stdioPath = [NSString stringWithFormat:@"/dev/pts/%d", tty->num];
+            result = create_stdio(stdioPath.fileSystemRepresentation, TTY_PSEUDO_SLAVE_MAJOR, tty->num);
+            if (result < 0) {
+                lock(&ttys_lock);
+                tty_release(tty);
+                unlock(&ttys_lock);
+                openError = [self error:14 message:[NSString stringWithFormat:@"Could not connect iSH PTY stdio (%d).", result]];
+                return;
+            }
 
-        DSBOTISHSession *session = [[DSBOTISHSession alloc] init];
-        session.identifier = sessionID;
-        session.outputHandler = outputHandler;
-        session.exitHandler = exitHandler;
-        session.tty = tty;
-        [self.condition lock];
-        self.sessionsByID[sessionID] = session;
-        self.sessionsByTTY[@(tty->num)] = session;
-        [self.condition unlock];
-
-        const char argv[] = "/bin/ash\0-i\0\0";
-        const char envp[] =
-            "TERM=xterm-256color\0HOME=/root\0PWD=/workspace\0"
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin\0"
-            "LANG=C.UTF-8\0ENV=/etc/profile\0\0";
-        result = do_execve("/bin/ash", 2, argv, envp);
-        if (result < 0) {
+            DSBOTISHSession *session = [[DSBOTISHSession alloc] init];
+            session.identifier = sessionID;
+            session.outputHandler = outputHandler;
+            session.exitHandler = exitHandler;
+            session.tty = tty;
             [self.condition lock];
-            [self.sessionsByID removeObjectForKey:sessionID];
-            [self.sessionsByTTY removeObjectForKey:@(tty->num)];
+            self.sessionsByID[sessionID] = session;
+            self.sessionsByTTY[@(tty->num)] = session;
             [self.condition unlock];
-            lock(&ttys_lock);
-            tty_release(tty);
-            unlock(&ttys_lock);
-            openError = [self error:15 message:[NSString stringWithFormat:@"Could not exec /bin/ash in iSH (%d).", result]];
-            return;
+
+            const char argv[] = "/bin/ash\0-i\0\0";
+            const char envp[] =
+                "TERM=xterm-256color\0HOME=/root\0PWD=/workspace\0"
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin\0"
+                "LANG=C.UTF-8\0ENV=/etc/profile\0\0";
+            result = do_execve("/bin/ash", 2, argv, envp);
+            if (result < 0) {
+                [self.condition lock];
+                [self.sessionsByID removeObjectForKey:sessionID];
+                [self.sessionsByTTY removeObjectForKey:@(tty->num)];
+                [self.condition unlock];
+                lock(&ttys_lock);
+                tty_release(tty);
+                unlock(&ttys_lock);
+                openError = [self error:15 message:[NSString stringWithFormat:@"Could not exec /bin/ash in iSH (%d).", result]];
+                return;
+            }
+            session.processID = current->pid;
+            session.processGroupID = current->group->pgid;
+            session.processSessionID = current->group->sid;
+            result = task_start(current);
+            if (result < 0) {
+                [self.condition lock];
+                [self.sessionsByID removeObjectForKey:sessionID];
+                [self.sessionsByTTY removeObjectForKey:@(tty->num)];
+                [self.condition unlock];
+                lock(&ttys_lock);
+                tty_release(tty);
+                unlock(&ttys_lock);
+                openError = [self error:16 message:[NSString stringWithFormat:@"Could not start iSH session task (%d).", result]];
+                return;
+            }
+            opened = YES;
+        } @finally {
+            current = savedCurrent;
         }
-        session.processID = current->pid;
-        session.processGroupID = current->group->pgid;
-        session.processSessionID = current->group->sid;
-        result = task_start(current);
-        if (result < 0) {
-            [self.condition lock];
-            [self.sessionsByID removeObjectForKey:sessionID];
-            [self.sessionsByTTY removeObjectForKey:@(tty->num)];
-            [self.condition unlock];
-            lock(&ttys_lock);
-            tty_release(tty);
-            unlock(&ttys_lock);
-            openError = [self error:16 message:[NSString stringWithFormat:@"Could not start iSH session task (%d).", result]];
-            return;
-        }
-        opened = YES;
     });
     return opened ? nil : openError;
 }

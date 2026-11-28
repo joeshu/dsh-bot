@@ -331,6 +331,7 @@ final class NativeRuntimeTests: XCTestCase {
         ))
         do {
             try await runtime.validateBundledResources()
+            print("DSBOT_ISH_TEST_STAGE resources-validated")
             let projectDirectory = LocalAgentTransport.defaultWorkspace
                 .appendingPathComponent("files", isDirectory: true)
             try FileManager.default.createDirectory(at: projectDirectory, withIntermediateDirectories: true)
@@ -357,6 +358,7 @@ final class NativeRuntimeTests: XCTestCase {
                 guard case .guestRejected(let message) = error else { throw error }
                 XCTAssertTrue(message.contains("symbolic link"))
             }
+            print("DSBOT_ISH_TEST_STAGE host-symlink-rejected")
             try FileManager.default.removeItem(at: forgedLink)
 
             let stream = try await runtime.openPTY(
@@ -365,6 +367,7 @@ final class NativeRuntimeTests: XCTestCase {
                 columns: 80,
                 timeoutSeconds: 60
             )
+            print("DSBOT_ISH_TEST_STAGE pty-opened")
             let workspaceProbe = "dsbot-project-\(UUID().uuidString.lowercased())"
             let workspaceScript = """
             stty -echo
@@ -383,8 +386,10 @@ final class NativeRuntimeTests: XCTestCase {
                 Data(workspaceScript.utf8),
                 owner: owner
             )
+            print("DSBOT_ISH_TEST_STAGE workspace-script-sent")
 
             let result = try await Self.collectISHPTY(stream, timeoutSeconds: 60)
+            print("DSBOT_ISH_TEST_STAGE workspace-script-exited-\(result.1)")
             XCTAssertTrue(String(decoding: result.0, as: UTF8.self).contains("DSBOT_ISH_ARM64_PTY_OK"))
             let workspaceOutput = String(decoding: result.0, as: UTF8.self)
             XCTAssertTrue(workspaceOutput.contains("DSBOT_ISH_WORKSPACE_SAFE"))
@@ -398,11 +403,14 @@ final class NativeRuntimeTests: XCTestCase {
                 sessionID: "ish-background-\(UUID().uuidString.lowercased())"
             ))
             let backgroundStream = try await runtime.openPTY(owner: backgroundOwner)
+            print("DSBOT_ISH_TEST_STAGE background-pty-opened")
             try await runtime.sendInput(
                 Data("stty -echo\ntrap '' HUP\nsleep 60 &\nprintf 'DSBOT_ISH_BACKGROUND_PID:%s\\n' \"$!\"\nexit\nexit\n".utf8),
                 owner: backgroundOwner
             )
+            print("DSBOT_ISH_TEST_STAGE background-script-sent")
             let backgroundResult = try await Self.collectISHPTY(backgroundStream, timeoutSeconds: 60)
+            print("DSBOT_ISH_TEST_STAGE background-script-exited-\(backgroundResult.1)")
             XCTAssertEqual(backgroundResult.1, 0)
             let backgroundText = String(decoding: backgroundResult.0, as: UTF8.self)
             let pidLine = try XCTUnwrap(backgroundText.split(whereSeparator: \.isNewline)
@@ -416,9 +424,11 @@ final class NativeRuntimeTests: XCTestCase {
                 sessionID: "ish-background-check-\(UUID().uuidString.lowercased())"
             ))
             let verifierStream = try await runtime.openPTY(owner: verifierOwner)
+            print("DSBOT_ISH_TEST_STAGE verifier-pty-opened")
             let reapScript = "stty -echo\ni=0\nwhile [ -e /proc/\(guestPID) ] && [ \"$i\" -lt 4 ]; do sleep 1; i=$((i + 1)); done\nif [ -e /proc/\(guestPID) ]; then echo DSBOT_ISH_BACKGROUND_LEAK; exit 1; fi\necho DSBOT_ISH_BACKGROUND_REAPED\nexit\n"
             try await runtime.sendInput(Data(reapScript.utf8), owner: verifierOwner)
             let verifierResult = try await Self.collectISHPTY(verifierStream, timeoutSeconds: 20)
+            print("DSBOT_ISH_TEST_STAGE background-reap-verified")
             XCTAssertTrue(String(decoding: verifierResult.0, as: UTF8.self).contains("DSBOT_ISH_BACKGROUND_REAPED"))
             XCTAssertEqual(verifierResult.1, 0)
             await runtime.closePTY(owner: verifierOwner)

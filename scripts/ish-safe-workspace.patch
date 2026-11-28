@@ -16,3 +16,133 @@
      /* fakefs's symlink model stores the target in a regular file plus an
       * S_IFLNK mode bit in meta.db. Hook-routed paths bypass meta.db, so
       * that representation can't round-trip. Reject the request rather
+
+--- a/kernel/init.c
++++ b/kernel/init.c
+@@ -24,10 +24,10 @@
+ static void establish_signal_handlers() {
+-    extern void sigusr1_handler(int sig);
++    extern void ish_host_wakeup_handler(int sig);
+     struct sigaction sigact;
+-    sigact.sa_handler = sigusr1_handler;
++    sigact.sa_handler = ish_host_wakeup_handler;
+     sigact.sa_flags = 0;
+     sigemptyset(&sigact.sa_mask);
+-    sigaddset(&sigact.sa_mask, SIGUSR1);
+-    sigaction(SIGUSR1, &sigact, NULL);
++    sigaddset(&sigact.sa_mask, SIGUSR2);
++    sigaction(SIGUSR2, &sigact, NULL);
+     signal(SIGPIPE, SIG_IGN);
+ }
+
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -74,2 +74,2 @@
+     if (task != current) {
+-        pthread_kill(task->thread, SIGUSR1);
++        pthread_kill(task->thread, SIGUSR2);
+
+--- a/fs/sockrestart.c
++++ b/fs/sockrestart.c
+@@ -116,7 +116,7 @@
+     struct task *task;
+     list_for_each_entry(&listen_tasks, task, sockrestart.listen) {
+         task->sockrestart.punt = true;
+-        pthread_kill(task->thread, SIGUSR1);
++        pthread_kill(task->thread, SIGUSR2);
+     }
+     unlock(&sockrestart_lock);
+ }
+
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -342,7 +342,7 @@
+                         still_alive++;
+                         cpu_poke(&task->cpu);
+                         if (task->thread)
+-                            pthread_kill(task->thread, SIGUSR1);
++                            pthread_kill(task->thread, SIGUSR2);
+                     }
+                 }
+                 unlock(&group->lock);
+
+--- a/util/sync.c
++++ b/util/sync.c
+@@ -106,4 +106,5 @@
+-void sigusr1_handler() {
++void ish_host_wakeup_handler(int sig) {
++    (void)sig;
+     if (should_unwind) {
+         should_unwind = false;
+         siglongjmp(unwind_buf, 1);
+@@ -116,4 +117,4 @@
+ #if 0
+-    sigset_t sigusr1;
+-    sigemptyset(&sigusr1);
+-    sigaddset(&sigusr1, SIGUSR1);
++    sigset_t sigusr2;
++    sigemptyset(&sigusr2);
++    sigaddset(&sigusr2, SIGUSR2);
+
+--- a/util/timer.c
++++ b/util/timer.c
+@@ -22,6 +22,6 @@
+     timer->active = false;
+     if (timer->thread_running) {
+         timer->dead = true;
+-        pthread_kill(timer->thread, SIGUSR1);
++        pthread_kill(timer->thread, SIGUSR2);
+         unlock(&timer->lock);
+     } else {
+@@ -71,6 +71,6 @@
+     timer->active = !timespec_is_zero(spec.value);
+     if (timer->thread_running) {
+-        pthread_kill(timer->thread, SIGUSR1);
++        pthread_kill(timer->thread, SIGUSR2);
+     } else if (timer->active) {
+         timer->thread_running = true;
+         pthread_create(&timer->thread, NULL, timer_thread, timer);
+
+--- a/fs/sock.c
++++ b/fs/sock.c
+@@ -1733,7 +1733,7 @@
+ //
+ // The original realfs_read/realfs_write does `while (errno == EINTR) retry`,
+-// which swallows the SIGUSR1 wake iSH uses to deliver guest signals into
++// which swallows the SIGUSR2 wake iSH uses to deliver guest signals into
+ // blocked host syscalls. Combined with iOS occasionally deferring signal
+ // delivery (thread suspension on backgrounding), this causes indefinite
+ // hangs on any blocking socket read/write (git HTTPS, nc, telnet, etc.).
+
+--- a/fs/poll.c
++++ b/fs/poll.c
+@@ -494,7 +494,7 @@
+         struct real_poll_event e[4];
+         // Use a bounded timeout to avoid indefinite blocks. Guest signal
+-        // delivery via SIGUSR1 wakes kevent, but if the signal arrives
++        // delivery via SIGUSR2 wakes kevent, but if the signal arrives
+         // between our pending check and kevent entry, we'd block forever.
+         // A 5-second cap ensures we re-check signals periodically.
+         // Cap all waits to 1 second to avoid macOS condvar issues.
+
+--- a/kernel/task.c
++++ b/kernel/task.c
+@@ -206,7 +206,7 @@
+     while (true) {
+         // Check for group exit before entering JIT — this catches threads
+         // returning from blocking host syscalls (futex, nanosleep, etc.)
+-        // that were interrupted by SIGUSR1 from do_exit_group.
++        // that were interrupted by SIGUSR2 from do_exit_group.
+         // Also bail if our task struct was destroyed (current zeroed or NULLed).
+         struct task *self = current;
+         if (self == NULL || self->group == NULL) {
+
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -159,5 +159,5 @@
+     current->exiting = true;
+     // release the sighand (may already be NULL if another thread in the group
+-    // exited concurrently and released it, e.g. after safety-valve SIGUSR1)
++    // exited concurrently and released it, e.g. after safety-valve SIGUSR2)
+     if (current->sighand != NULL) {
+         sighand_release(current->sighand);
