@@ -472,6 +472,33 @@ def write_guest(
     return manifest
 
 
+def write_minirootfs_source(minirootfs: pathlib.Path, output: pathlib.Path) -> dict[str, object]:
+    """Publish the exact pinned Alpine input for the iSH fakefs conversion."""
+    output.mkdir(parents=True, exist_ok=True)
+    copied = output / ARTIFACTS["minirootfs"]["filename"]
+    shutil.copyfile(minirootfs, copied)
+    manifest: dict[str, object] = {
+        "schemaVersion": 1,
+        "purpose": "pinned Alpine source for iSH ARM64 fakefs conversion",
+        "distribution": "Alpine Linux",
+        "version": ALPINE_VERSION,
+        "architecture": "aarch64",
+        "upstream": {
+            "url": ARTIFACTS["minirootfs"]["url"],
+            "sha256": ARTIFACTS["minirootfs"]["sha256"],
+        },
+        "file": {
+            "path": copied.name,
+            "bytes": copied.stat().st_size,
+            "sha256": sha256_file(copied),
+        },
+    }
+    (output / "source-manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    return manifest
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=pathlib.Path, required=True, help="Directory for the guest image files")
@@ -489,6 +516,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kernel", type=pathlib.Path, help="Optional custom guest kernel image")
     parser.add_argument("--kernel-config", type=pathlib.Path, help="Config matching --kernel")
     parser.add_argument("--kernel-manifest", type=pathlib.Path, help="Build manifest matching --kernel")
+    parser.add_argument(
+        "--minirootfs-only",
+        action="store_true",
+        help="Publish the pinned Alpine minirootfs source without downloading a guest kernel",
+    )
     return parser.parse_args()
 
 
@@ -497,6 +529,10 @@ def main() -> int:
     cache = args.cache.resolve()
     output = args.output.resolve()
     minirootfs = download_artifact("minirootfs", cache)
+    if args.minirootfs_only:
+        manifest = write_minirootfs_source(minirootfs, output)
+        print(json.dumps(manifest, ensure_ascii=False, indent=2))
+        return 0
     custom_kernel_inputs = any((args.kernel, args.kernel_config, args.kernel_manifest))
     if custom_kernel_inputs and not all((args.kernel, args.kernel_config, args.kernel_manifest)):
         raise RuntimeError("--kernel, --kernel-config, and --kernel-manifest must be provided together")

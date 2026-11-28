@@ -2,11 +2,11 @@
 
 ## Current implementation status
 
-The repository now has a source-pinned iSH ARM64 library build and artifact report. The build checks the OpenMinis revision, the iSH ARM64 revision, all three iSH submodule revisions, and the upstream build script digest. It packages device and Simulator static libraries, headers, resources, iSH/OpenMinis license files, corresponding source archives, and SHA-256 sums. The iSH license bundle records GPLv3, GPLv2 for later contributions, and the iOS addendum.
+The repository now builds source-pinned iSH ARM64 libraries and converts a SHA-256-pinned Alpine 3.23.8 aarch64 minirootfs into iSH fakefs (`data/` plus `meta.db`). CI builds the host-native `fakefsify` converter from the same locked iSH source revision, packages the rootfs in the existing `alpine-rootfs.zip` layout, and records installed packages, license fields, source commit links, SQLite integrity, archive size, and hashes. It also checks the OpenMinis revision, the iSH ARM64 revision, all three iSH submodule revisions, and the upstream build script digest, then packages device and Simulator static libraries, headers, resources, source archives, licenses, and SHA-256 sums. The iSH license bundle records GPLv3, GPLv2 for later contributions, and the iOS addendum.
 
-This artifact is a build foundation. It is not yet linked into `DSBotStandalone`; the application still uses its existing QEMU-backed guest route. Do not describe the iSH runtime as active until the native engine bridge and the acceptance gates below pass. The existing release gate remains in force during this migration.
+This artifact is a build foundation. It is not yet linked into `DSBotStandalone`; the application still uses its existing QEMU-backed guest route. The CI artifact's Alpine files are a rootfs candidate, not an app install or an on-demand package installer. Do not describe the iSH runtime as active until the native engine bridge and the acceptance gates below pass. The existing release gate remains in force during this migration.
 
-The first verified build reports 1,094,488 bytes of device static libraries and 1,097,848 bytes for Simulator. These are archive sizes before app linking and dead stripping. The AOT archive is an empty 720-byte placeholder because the pinned build has no AOT images configured. Neither the final IPA delta nor a rootfs bundle size has been measured.
+The first verified library build reports 1,094,488 bytes of device static libraries and 1,097,848 bytes for Simulator. These are archive sizes before app linking and dead stripping. The AOT archive is an empty 720-byte placeholder because the pinned build has no AOT images configured. A new CI build will report the fakefs ZIP and expanded rootfs sizes; neither the final IPA delta nor the on-device persistent copy size has been measured.
 
 ## Current user-visible capability
 
@@ -20,7 +20,7 @@ The first verified build reports 1,094,488 bytes of device static libraries and 
 
 At the pinned OpenMinis revision, the app-level integration lives in `src/ios/iSH/ISHKernel` and `ISHShellExecutor`, alongside the iSH kernel libraries. It includes fakefs boot and bind-mount hooks, a PTY path, and argv-based execution with pipe output and exit notifications. Those Objective-C sources and their app dependencies are not part of the current DSH target or the static-library artifact. Port the minimum required host glue behind DSH's runtime contract; do not import OpenMinis UI or native offload handlers as a bundle.
 
-Run the build on macOS with Xcode and the iOS SDKs:
+Run the build on macOS with Xcode and the iOS SDKs. It builds the iOS libraries and host `fakefsify`, fetches the pinned minirootfs, converts and packages the fakefs image, then verifies the combined artifact:
 
 ```sh
 bash scripts/build-ish-arm64-ios.sh
@@ -50,12 +50,14 @@ The iSH process shares the app's address space. It does not sandbox malicious Ja
 
 ## Migration steps and gates
 
-### 1. Engine build and source provenance — implemented
+### 1. Engine build, rootfs candidate, and source provenance — implemented; app packaging pending
 
 - Locked OpenMinis and iSH revisions are in `scripts/ish-arm64-sources.lock.json`.
 - `scripts/build-ish-arm64-ios.sh` creates device and Simulator libraries from source.
-- `scripts/package-ish-arm64-ios.py` emits the source archives, notices, hashes, component sizes, and a report that explicitly says the artifact is not linked into the app.
-- `scripts/verify-ish-arm64-artifact.py` gates publication on locked commits, full source archives, required licenses, checksums, library byte totals, and ARM64 slices.
+- `scripts/prepare-arm64-guest.py --minirootfs-only` downloads only the hash-pinned Alpine minirootfs, avoiding a QEMU kernel download for the iSH build.
+- `scripts/build-ish-arm64-ios.sh` builds host-native `fakefsify` from the locked iSH revision and converts the pinned source to the `alpine-rootfs.zip` layout consumed by the existing rootfs installer.
+- `scripts/package-ish-arm64-ios.py` emits the rootfs package inventory and notices, iSH source archives, hashes, component sizes, and a report that explicitly says the artifact is not linked into the app.
+- `scripts/verify-ish-arm64-artifact.py` gates publication on locked commits, source archives, notices, checksums, library byte totals and ARM64 slices, rootfs ZIP paths/CRC, SQLite integrity, package inventory, and component sizes.
 - `.github/workflows/ish-arm64-ios-runtime.yml` performs the macOS build on relevant pushes and pull requests.
 
 ### 2. Native engine lifecycle — next
@@ -82,9 +84,9 @@ Host workspace writes and edits use atomic replacement and a revision/CAS check.
 
 **Gate:** the same file written from DSH tool, bot shell, Web terminal, and native UI is visible to each; two projects cannot read or modify each other's files; restart preserves both projects and fakefs metadata.
 
-### 5. Offline rootfs and on-demand tools
+### 5. Offline rootfs and on-demand tools — base image candidate exists; install flow pending
 
-Ship only the minimal guest base. Start with BusyBox tools; show install suggestions for missing commands. Optional packages such as `bash`, `jq`, `ripgrep`, and `git` are user-selected or explicitly requested. Host downloads and verifies APK signatures/hashes and dependency closure before installing into fakefs. Guest network remains disabled by default. Never automatically rerun a command after a failed package install because it may have partially executed.
+Keep the CI-generated Alpine fakefs as an immutable base candidate. The current app does not install it and has no package selector yet. When runtime wiring is implemented, start with the base BusyBox tools and show install suggestions for missing commands. Optional packages such as `bash`, `jq`, `ripgrep`, and `git` must be user-selected or explicitly requested. A host-side installer should fetch APKs, verify Alpine signatures and hashes, resolve dependency closure, then commit the package transaction into fakefs. Guest network remains disabled by default. Never automatically rerun a command after a failed package install because it may have partially executed.
 
 Keep the model API online requirement separate from local guest/tool availability. The shell, rootfs, and previously installed tools continue to work offline.
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build the source-pinned OpenMinis iSH ARM64 engine for iPhoneOS and Simulator.
-# This produces engine libraries only; app integration is intentionally gated
-# until the native task, PTY, fakefs routing, and recovery contracts are wired.
+# Build source-pinned OpenMinis iSH ARM64 libraries and a pinned Alpine fakefs
+# rootfs for iPhoneOS and Simulator. The app runtime remains separately gated
+# until lifecycle, PTY, project routing, and recovery are wired.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -68,8 +68,28 @@ PY
 
 OPENMINIS="$BUILD_ROOT/OpenMinis"
 "$OPENMINIS/deps/build_ish.sh" release --all
+
+# fakefsify is a host tool. Build it natively from the same pinned iSH source;
+# do not use a separately downloaded or developer-local converter.
+FAKEFSIFY_BUILD="$BUILD_ROOT/ish-fakefsify-native"
+rm -rf "$FAKEFSIFY_BUILD"
+meson setup "$FAKEFSIFY_BUILD" "$OPENMINIS/deps/ish" \
+  --buildtype=release -Dlog="" -Dkernel=ish -Dengine=asbestos -Dguest_arch=arm64
+ninja -C "$FAKEFSIFY_BUILD" tools/fakefsify
+
+# Reuse the verified Alpine pin shared with the Linux guest-image builder.
+MINIROOTFS_SOURCE="$BUILD_ROOT/alpine-minirootfs-source"
+python3 "$ROOT/scripts/prepare-arm64-guest.py" \
+  --minirootfs-only \
+  --output "$MINIROOTFS_SOURCE" \
+  --cache "$BUILD_ROOT/alpine-cache"
+MINIROOTFS_FILENAME="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["file"]["path"])' \
+  "$MINIROOTFS_SOURCE/source-manifest.json")"
+
 python3 "$ROOT/scripts/package-ish-arm64-ios.py" \
   --lock "$LOCK" \
   --distribution-root "$OPENMINIS" \
+  --guest-minirootfs "$MINIROOTFS_SOURCE/$MINIROOTFS_FILENAME" \
+  --fakefsify "$FAKEFSIFY_BUILD/tools/fakefsify" \
   --output "$OUT"
-echo "Built source-pinned iSH ARM64 library artifact: $OUT"
+echo "Built source-pinned iSH ARM64 libraries and Alpine fakefs rootfs: $OUT"

@@ -7,6 +7,7 @@ on:
       - 'scripts/build-ish-arm64-ios.sh'
       - 'scripts/package-ish-arm64-ios.py'
       - 'scripts/verify-ish-arm64-artifact.py'
+      - 'scripts/prepare-arm64-guest.py'
       - 'docs/architecture/dsh-nodemobile-ish-arm64-implementation.md'
       - '.github/workflows/ish-arm64-ios-runtime.yml'
   pull_request:
@@ -15,6 +16,7 @@ on:
       - 'scripts/build-ish-arm64-ios.sh'
       - 'scripts/package-ish-arm64-ios.py'
       - 'scripts/verify-ish-arm64-artifact.py'
+      - 'scripts/prepare-arm64-guest.py'
       - 'docs/architecture/dsh-nodemobile-ish-arm64-implementation.md'
       - '.github/workflows/ish-arm64-ios-runtime.yml'
   workflow_dispatch:
@@ -39,12 +41,12 @@ jobs:
           brew install meson ninja llvm lld libarchive
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
-      - name: Build device and simulator iSH libraries
+      - name: Build iSH libraries and pinned Alpine fakefs rootfs
         run: bash scripts/build-ish-arm64-ios.sh
         env:
           DSBOT_ISH_OUT_DIR: ${{ runner.temp }}/ish-arm64-ios
           DSBOT_ISH_BUILD_ROOT: ${{ runner.temp }}/ish-arm64-build
-      - name: Verify library architectures, locked source, licenses, and hashes
+      - name: Verify iSH libraries, Alpine fakefs, locked source, notices, and hashes
         run: python3 scripts/verify-ish-arm64-artifact.py "$RUNNER_TEMP/ish-arm64-ios"
       - name: Publish component sizes to the workflow summary
         run: tee -a "$GITHUB_STEP_SUMMARY" < "$RUNNER_TEMP/ish-arm64-ios/build-report.md"
