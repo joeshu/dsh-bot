@@ -1,5 +1,9 @@
 # DSH iOS 功能补齐清单
 
+> **当前终端方向（2026-11-28）**：下文记录的是已完成的 QEMU ARM64 终端基线及其历史体积测量；产品目标现已切换为 DSH × NodeMobile × iSH ARM64：NodeMobile 留在 iOS 宿主，iSH 负责本地 ARM64 Linux syscall/fakefs，持久项目目录由 Bot、Web 和原生终端共享。QEMU 代码和发布门禁暂时保留，直到 iSH 生命周期、真 PTY/pipe subprocess、fakefs 项目路由、恢复与 Simulator/设备验收通过。iSH 源码固定版本、构建产物与分步门禁见[实施记录](architecture/dsh-nodemobile-ish-arm64-implementation.md)。
+
+目前只完成了 iSH 源码锁定、iPhoneOS/Simulator 静态库构建和报告；这不是 iSH 已接入 App，也不能作为 iSH 的最终 IPA 增量或性能结果。
+
 参考目标：`Fei2411/DS-Bot`、DSH 原版 Web 和 DSH `0.2.2-rc.5` Host 契约。该清单区分已接通的能力、仅适合前台运行的能力，以及需要真正 iOS 执行后端的桌面功能。
 
 ## 已落地
