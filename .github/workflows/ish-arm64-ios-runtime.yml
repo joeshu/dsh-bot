@@ -34,8 +34,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install pinned-build prerequisites
         run: |
-          brew install meson ninja llvm libarchive
+          brew install meson ninja llvm lld libarchive
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
       - name: Build device and simulator iSH libraries
         run: bash scripts/build-ish-arm64-ios.sh
         env:
