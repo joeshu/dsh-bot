@@ -342,37 +342,74 @@ final class NativeRuntimeTests: XCTestCase {
                 owner: owner
             )
 
-            let result = try await withThrowingTaskGroup(of: (Data, Int32).self) { group in
-                group.addTask {
-                    var output = Data()
-                    for try await event in stream {
-                        switch event {
-                        case .output(let bytes):
-                            output.append(bytes)
-                        case .exited(let status):
-                            return (output, status)
-                        }
-                    }
-                    throw ARM64GuestPTYProtocolError.transportClosed
-                }
-                group.addTask {
-                    try await Task.sleep(nanoseconds: 60_000_000_000)
-                    throw ARM64GuestPTYProtocolError.timeout("iSH Simulator shell")
-                }
-                guard let first = try await group.next() else {
-                    throw ARM64GuestPTYProtocolError.transportClosed
-                }
-                group.cancelAll()
-                return first
-            }
+            let result = try await Self.collectISHPTY(stream, timeoutSeconds: 60)
             XCTAssertTrue(String(decoding: result.0, as: UTF8.self).contains("DSBOT_ISH_ARM64_PTY_OK"))
             XCTAssertEqual(result.1, 0)
             await runtime.closePTY(owner: owner)
+
+            let backgroundOwner = try XCTUnwrap(ARM64GuestPTYOwner(
+                kind: .native,
+                sessionID: "ish-background-\(UUID().uuidString.lowercased())"
+            ))
+            let backgroundStream = try await runtime.openPTY(owner: backgroundOwner)
+            try await runtime.sendInput(
+                Data("stty -echo\ntrap '' HUP\nsleep 60 &\nprintf 'DSBOT_ISH_BACKGROUND_PID:%s\\n' \"$!\"\nexit\nexit\n".utf8),
+                owner: backgroundOwner
+            )
+            let backgroundResult = try await Self.collectISHPTY(backgroundStream, timeoutSeconds: 60)
+            XCTAssertEqual(backgroundResult.1, 0)
+            let backgroundText = String(decoding: backgroundResult.0, as: UTF8.self)
+            let pidLine = try XCTUnwrap(backgroundText.split(whereSeparator: \.isNewline)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { $0.hasPrefix("DSBOT_ISH_BACKGROUND_PID:") })
+            let guestPID = try XCTUnwrap(Int(pidLine.dropFirst("DSBOT_ISH_BACKGROUND_PID:".count)))
+            await runtime.closePTY(owner: backgroundOwner)
+
+            let verifierOwner = try XCTUnwrap(ARM64GuestPTYOwner(
+                kind: .native,
+                sessionID: "ish-background-check-\(UUID().uuidString.lowercased())"
+            ))
+            let verifierStream = try await runtime.openPTY(owner: verifierOwner)
+            let reapScript = "stty -echo\ni=0\nwhile [ -e /proc/\(guestPID) ] && [ \"$i\" -lt 4 ]; do sleep 1; i=$((i + 1)); done\nif [ -e /proc/\(guestPID) ]; then echo DSBOT_ISH_BACKGROUND_LEAK; exit 1; fi\necho DSBOT_ISH_BACKGROUND_REAPED\nexit\n"
+            try await runtime.sendInput(Data(reapScript.utf8), owner: verifierOwner)
+            let verifierResult = try await Self.collectISHPTY(verifierStream, timeoutSeconds: 20)
+            XCTAssertTrue(String(decoding: verifierResult.0, as: UTF8.self).contains("DSBOT_ISH_BACKGROUND_REAPED"))
+            XCTAssertEqual(verifierResult.1, 0)
+            await runtime.closePTY(owner: verifierOwner)
             await runtime.stop()
         } catch {
             await runtime.closePTY(owner: owner)
             await runtime.stop()
             throw error
+        }
+    }
+
+    private static func collectISHPTY(
+        _ stream: AsyncThrowingStream<ARM64GuestPTYEvent, Error>,
+        timeoutSeconds: UInt64
+    ) async throws -> (Data, Int32) {
+        try await withThrowingTaskGroup(of: (Data, Int32).self) { group in
+            group.addTask {
+                var output = Data()
+                for try await event in stream {
+                    switch event {
+                    case .output(let bytes):
+                        output.append(bytes)
+                    case .exited(let status):
+                        return (output, status)
+                    }
+                }
+                throw ARM64GuestPTYProtocolError.transportClosed
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: min(timeoutSeconds, 120) * 1_000_000_000)
+                throw ARM64GuestPTYProtocolError.timeout("iSH Simulator shell")
+            }
+            guard let result = try await group.next() else {
+                throw ARM64GuestPTYProtocolError.transportClosed
+            }
+            group.cancelAll()
+            return result
         }
     }
 #endif

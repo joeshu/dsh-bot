@@ -141,6 +141,49 @@ static void DSBotISHSignalTree(int processID, int signal, struct task *expectedR
     unlock(&pids_lock);
 }
 
+static BOOL DSBotISHHasLiveProcessGroup(int processGroupID) {
+    if (processGroupID <= 1) return NO;
+    BOOL found = NO;
+    lock(&pids_lock);
+    for (int pid = 2; pid < MAX_PID; pid++) {
+        struct task *task = pid_get_task((dword_t)pid);
+        if (task != NULL && !task->exiting && !task->zombie &&
+            task->group != NULL && task->group->pgid == processGroupID) {
+            found = YES;
+            break;
+        }
+    }
+    unlock(&pids_lock);
+    return found;
+}
+
+static void DSBotISHSignalProcessGroup(int processGroupID, int signal) {
+    if (processGroupID <= 1) return;
+    struct siginfo_ info = SIGINFO_NIL;
+    lock(&pids_lock);
+    for (int pid = 2; pid < MAX_PID; pid++) {
+        struct task *task = pid_get_task((dword_t)pid);
+        if (task != NULL && !task->exiting && !task->zombie &&
+            task->group != NULL && task->group->pgid == processGroupID) {
+            send_signal(task, signal, info);
+        }
+    }
+    unlock(&pids_lock);
+}
+
+static void DSBotISHTerminateProcessGroup(int processGroupID) {
+    DSBotISHSignalProcessGroup(processGroupID, SIGTERM_);
+    for (int attempt = 0; attempt < 50; attempt++) {
+        if (!DSBotISHHasLiveProcessGroup(processGroupID)) return;
+        usleep(10000);
+    }
+    DSBotISHSignalProcessGroup(processGroupID, SIGKILL_);
+    for (int attempt = 0; attempt < 100; attempt++) {
+        if (!DSBotISHHasLiveProcessGroup(processGroupID)) return;
+        usleep(10000);
+    }
+}
+
 @implementation ISHKernelBridge
 
 + (instancetype)shared {
@@ -529,7 +572,7 @@ static void DSBotISHSignalTree(int processID, int signal, struct task *expectedR
 
 - (void)deliverOutput:(NSData *)data ttyNumber:(int)ttyNumber {
     [self.condition lock];
-    DSBotISHSession *session = self.sessionsByTTY[@(ttyNumber)];
+    DSBOTISHSession *session = self.sessionsByTTY[@(ttyNumber)];
     DSBotISHOutputHandler handler = session.outputHandler;
     [self.condition unlock];
     if (handler != nil) handler(data);
@@ -544,11 +587,21 @@ static void DSBotISHSignalTree(int processID, int signal, struct task *expectedR
     if (session != nil && !session.exited) {
         session.exited = YES;
         session.exitStatus = status;
+        int processGroupID = session.processGroupID;
         DSBotISHExitHandler handler = session.exitHandler;
         [self.condition broadcast];
         BOOL shouldFinalize = session.closing && session.activeOperations == 0;
         [self.condition unlock];
         if (handler != nil) handler((int32_t)status);
+        // The shell can exit while leaving background jobs behind. At this
+        // point iSH has reparented them to PID 1, so the original parent-chain
+        // check no longer finds them. Each PTY shell owns a new session/group;
+        // clean any remaining members without holding iSH's exit-hook lock.
+        if (processGroupID > 1) {
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                DSBotISHTerminateProcessGroup(processGroupID);
+            });
+        }
         if (shouldFinalize) dispatch_async(self.setupQueue, ^{ [self finalizeSession:session]; });
         return;
     }
