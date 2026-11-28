@@ -324,7 +324,6 @@ final class NativeRuntimeTests: XCTestCase {
     }
 
 #if DSBOT_ISH_RUNTIME_ENABLED
-    @MainActor
     func testEmbeddedISHGuestRunsShellOverRealPTYInSimulator() async throws {
         let appBundle = try XCTUnwrap(Bundle(identifier: "io.github.dsbot.ios.standalone"))
         let rootfsArchive = appBundle.bundleURL
@@ -446,13 +445,14 @@ final class NativeRuntimeTests: XCTestCase {
             XCTAssertEqual(verifierResult.1, 0)
             await runtime.closePTY(owner: verifierOwner)
 
-            let host = LocalAgentHost.shared
-            if host.state == .idle { await host.boot() }
+            let host = await MainActor.run { LocalAgentHost.shared }
+            if await MainActor.run(body: { host.state == .idle }) { await host.boot() }
             let hostDeadline = Date().addingTimeInterval(60)
-            while host.state == .starting && Date() < hostDeadline {
+            while await MainActor.run(body: { host.state == .starting }) && Date() < hostDeadline {
                 try await Task.sleep(nanoseconds: 100_000_000)
             }
-            guard host.state == .ready, let channel = host.rpc() else {
+            guard await MainActor.run(body: { host.state == .ready }),
+                  let channel = await MainActor.run(body: { host.rpc() }) else {
                 throw IPCFrameError.remoteError(
                     code: -32000,
                     message: "The DSH NodeMobile runtime did not stay ready alongside the iSH guest."
