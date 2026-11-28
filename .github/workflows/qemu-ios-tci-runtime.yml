@@ -302,6 +302,7 @@ jobs:
           "$DSBOT_XCODEGEN" generate --spec project.yml
 
       - name: Boot the in-process QEMU guest in iOS Simulator and run a PTY shell
+        timeout-minutes: 15
         shell: bash
         working-directory: ios
         env:

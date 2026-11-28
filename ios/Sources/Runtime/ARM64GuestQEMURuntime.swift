@@ -304,7 +304,7 @@ public actor ARM64GuestQEMURuntime {
             "-cpu", "max",
             "-m", "384M",
             "-smp", "2",
-            "-accel", "tcg,thread=multi",
+            "-accel", "tcg,thread=single",
             "-kernel", kernel.path,
             "-initrd", initramfs.path,
             "-append", "earlycon=pl011,mmio32,0x09000000 console=ttyAMA0,115200 loglevel=4 rdinit=/init panic=0",

@@ -201,6 +201,7 @@ final class NativeRuntimeTests: XCTestCase {
         let runtime = ARM64GuestQEMURuntime(bundle: appBundle)
         do {
             let commandRunner = ARM64GuestPTYCommandRunner(runtime: runtime)
+            print("DSBOT_QEMU_TEST_STAGE command-runner-open")
             let commandResult = try await commandRunner.execute(
                 command: "printf '%s\\n' 'DSBOT_IOS_COMMAND_RUNNER_OK'; false",
                 sessionID: "ios:simulator-command-\(UUID().uuidString.lowercased())",
@@ -209,6 +210,7 @@ final class NativeRuntimeTests: XCTestCase {
             )
             XCTAssertTrue(commandResult.output.contains("DSBOT_IOS_COMMAND_RUNNER_OK"))
             XCTAssertEqual(commandResult.exitCode, 1, "The PTY command runner must preserve the shell exit status.")
+            print("DSBOT_QEMU_TEST_STAGE command-runner-complete")
 
             do {
                 _ = try await commandRunner.execute(
@@ -223,7 +225,9 @@ final class NativeRuntimeTests: XCTestCase {
             }
 
             let webTerminal = ARM64GuestPTYWebTerminal(runtime: runtime)
+            print("DSBOT_QEMU_TEST_STAGE web-terminal-open")
             let webSession = try await webTerminal.open(rows: 24, columns: 80)
+            print("DSBOT_QEMU_TEST_STAGE web-terminal-ready")
             try await webTerminal.resize(rows: 32, columns: 100, sessionID: webSession)
             try await webTerminal.write(
                 "printf '%s\\n' 'DSBOT_WEB_INTERACTIVE_PTY_OK'\n",
@@ -264,7 +268,9 @@ final class NativeRuntimeTests: XCTestCase {
                 kind: .native,
                 sessionID: "simulator-\(UUID().uuidString.lowercased())"
             ))
+            print("DSBOT_QEMU_TEST_STAGE broker-open")
             let stream = try await broker.open(owner: owner, rows: 24, columns: 80, timeoutSeconds: 120)
+            print("DSBOT_QEMU_TEST_STAGE broker-ready")
             try await broker.sendInput(
                 Data("printf '%s\\n' 'DSBOT_IOS_GUEST_PTY_OK'; exit\n".utf8),
                 from: owner
