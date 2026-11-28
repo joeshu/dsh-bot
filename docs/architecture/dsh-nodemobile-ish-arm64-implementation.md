@@ -6,7 +6,7 @@ The repository now builds source-pinned iSH ARM64 libraries and converts a SHA-2
 
 This artifact is a build foundation. It is not yet linked into `DSBotStandalone`; the application still uses its existing QEMU-backed guest route. The CI artifact's Alpine files are a rootfs candidate, not an app install or an on-demand package installer. Do not describe the iSH runtime as active until the native engine bridge and the acceptance gates below pass. The existing release gate remains in force during this migration.
 
-The first verified library build reports 1,094,488 bytes of device static libraries and 1,097,848 bytes for Simulator. These are archive sizes before app linking and dead stripping. The AOT archive is an empty 720-byte placeholder because the pinned build has no AOT images configured. A new CI build will report the fakefs ZIP and expanded rootfs sizes; neither the final IPA delta nor the on-device persistent copy size has been measured.
+The verified CI build reports a 4,129,738-byte fakefs ZIP that expands to 8,747,296 bytes, plus 16 base packages. Device static-library archives total 1,094,488 bytes and Simulator archives total 1,097,848 bytes; these are archive sizes before app linking and dead stripping. The AOT archive is an empty 720-byte placeholder because the pinned build has no AOT images configured. The complete CI artifact is 214,189,226 bytes because it also carries source archives, headers, licenses, and build provenance; that is not an app bundle estimate. With the current bundle-and-copy design, the rootfs alone adds about 4.13 MB to the app resources and 8.75 MB to persistent Application Support after first launch. The final IPA delta and linked-library size remain unmeasured.
 
 ## Current user-visible capability
 
@@ -59,8 +59,9 @@ The iSH process shares the app's address space. It does not sandbox malicious Ja
 - `scripts/package-ish-arm64-ios.py` emits the rootfs package inventory and notices, iSH source archives, hashes, component sizes, and a report that explicitly says the artifact is not linked into the app.
 - `scripts/verify-ish-arm64-artifact.py` gates publication on locked commits, source archives, notices, checksums, library byte totals and ARM64 slices, rootfs ZIP paths/CRC, SQLite integrity, package inventory, and component sizes.
 - `.github/workflows/ish-arm64-ios-runtime.yml` performs the macOS build on relevant pushes and pull requests.
+- The verified build on commit `12f0fcf` completed successfully in [GitHub Actions run 46143457296](https://github.com/joeshu/dsh-bot/actions/runs/46143457296). It confirms library slices, source locks, Alpine package inventory and licenses, ZIP paths/CRC, SQLite integrity, and hashes. This verifies the build artifact only; it does not link or boot iSH in the app.
 
-### 2. Native engine lifecycle — next
+### 2. Native engine lifecycle — rootfs persistence staged; engine lifecycle next
 
 `ISHRootfsStore` now provides the persistent install half: it verifies the bundled ZIP hash, ZIP paths and CRCs, Alpine layout, SQLite integrity and path count, extracts to a same-volume staging directory, then atomically moves it into Application Support. It refuses to replace an existing rootfs when the bundled image changes, so package/user state cannot be silently erased. `ios/project.yml` can embed the CI rootfs by setting `DSBOT_ISH_ROOTFS_DIR` to the artifact's `rootfs/` directory. This store is not called by the selected QEMU runtime yet.
 
