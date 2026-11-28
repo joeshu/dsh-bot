@@ -6,6 +6,20 @@ The repository now has a source-pinned iSH ARM64 library build and artifact repo
 
 This artifact is a build foundation. It is not yet linked into `DSBotStandalone`; the application still uses its existing QEMU-backed guest route. Do not describe the iSH runtime as active until the native engine bridge and the acceptance gates below pass. The existing release gate remains in force during this migration.
 
+The first verified build reports 1,094,488 bytes of device static libraries and 1,097,848 bytes for Simulator. These are archive sizes before app linking and dead stripping. The AOT archive is an empty 720-byte placeholder because the pinned build has no AOT images configured. Neither the final IPA delta nor a rootfs bundle size has been measured.
+
+## Current user-visible capability
+
+| Surface | Current backend and behavior |
+|---|---|
+| Bot `terminal_exec` | QEMU ARM64 Alpine PTY; shell text runs in a fresh owner-scoped session with timeout and output limits. |
+| Web terminal | QEMU ARM64 Alpine `ash` PTY; interactive input, resize, exit status, session cleanup, and bounded output. |
+| DSH subprocess `spawnTerminal` | Only `/bin/sh` or `/bin/ash` is accepted, with the bundled Alpine shell profile. |
+| DSH subprocess `spawn(argv)` | Deliberately rejected with `SUBPROCESS_PTY_UNAVAILABLE`; ordinary pipe-backed child processes are not implemented on iOS yet. |
+| iSH ARM64 | Source-pinned device/Simulator libraries build and verify in CI; no iSH code is linked or selected at runtime. |
+
+At the pinned OpenMinis revision, the app-level integration lives in `src/ios/iSH/ISHKernel` and `ISHShellExecutor`, alongside the iSH kernel libraries. It includes fakefs boot and bind-mount hooks, a PTY path, and argv-based execution with pipe output and exit notifications. Those Objective-C sources and their app dependencies are not part of the current DSH target or the static-library artifact. Port the minimum required host glue behind DSH's runtime contract; do not import OpenMinis UI or native offload handlers as a bundle.
+
 Run the build on macOS with Xcode and the iOS SDKs:
 
 ```sh
@@ -46,7 +60,7 @@ The iSH process shares the app's address space. It does not sandbox malicious Ja
 
 ### 2. Native engine lifecycle — next
 
-Add an Objective-C/C bridge and Swift `LinuxRuntime` actor. Boot one engine lazily per App process and keep it mounted until process exit. Persist fakefs metadata and the Alpine filesystem under Application Support; never replace or unmount the rootfs while the engine is live. Startup must be idempotent, serialized, cancellable for the waiter, and recoverable on the next cold launch after an interrupted upgrade.
+Port the pinned OpenMinis kernel boot and fakefs setup behind a small Objective-C/C bridge and Swift `LinuxRuntime` actor. Boot one engine lazily per App process and keep it mounted until process exit. Persist fakefs metadata and the Alpine filesystem under Application Support; never replace or unmount the rootfs while the engine is live. Startup must be idempotent, serialized, cancellable for the waiter, and recoverable on the next cold launch after an interrupted upgrade.
 
 The bridge must install signal handling that preserves Node/V8 handlers, stop sharing iSH's process-global current working directory with Node, and expose memory/FD/thread diagnostics. Do not enable native offload until its global `chdir`/abort behavior is removed or serialized with explicit invocation context.
 
@@ -54,7 +68,7 @@ The bridge must install signal handling that preserves Node/V8 handlers, stop sh
 
 ### 3. Authenticated process and PTY sessions
 
-Preserve DSH's `SubprocessRuntime` contract: synchronous `spawn(argv)` returns a pipe-backed process handle; `spawnTerminal` creates a real PTY; both preserve argv boundaries, cwd, env, exit status, signals, and cancellation. Keep the existing RPC names as compatibility adapters while moving their implementation behind `LinuxRuntime`.
+Port the upstream process and PTY primitives separately. Preserve DSH's `SubprocessRuntime` contract: synchronous `spawn(argv)` returns a pipe-backed process handle; `spawnTerminal` creates a real PTY; both preserve argv boundaries, cwd, env, exit status, signals, and cancellation. Keep the existing RPC names as compatibility adapters while moving their implementation behind `LinuxRuntime`.
 
 Each execution receives a host-issued lease bound to project, owner session, tool call, worker generation, and permissions. Interactive sessions and one-shot commands have separate IDs and cleanup. Maintain the four-PTY cap, bound output buffers, and make concurrent Web reads independent so a later read cannot replace an earlier waiter.
 
