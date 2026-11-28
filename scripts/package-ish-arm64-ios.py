@@ -162,14 +162,29 @@ def package_fakefs_rootfs(minirootfs, fakefsify, output):
             if not (data / required).is_file():
                 raise RuntimeError(f"fakefs image is missing required base path: {required}")
 
-        connection = sqlite3.connect(f"file:{metadata}?mode=ro", uri=True)
+        # fakefsify initializes SQLite in WAL mode. Checkpoint and close it as
+        # a single-file database before zipping: a first-install image must not
+        # depend on a sidecar WAL/SHM file. iSH switches to WAL again on mount.
+        connection = sqlite3.connect(metadata)
         try:
+            checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if checkpoint and checkpoint[0] != 0:
+                raise RuntimeError("fakefs metadata database could not checkpoint its WAL")
+            journal_mode = connection.execute("PRAGMA journal_mode=DELETE").fetchone()
+            if not journal_mode or journal_mode[0].lower() != "delete":
+                raise RuntimeError("fakefs metadata database could not switch to single-file mode")
             integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
             if integrity != "ok":
                 raise RuntimeError(f"fakefs metadata database integrity check failed: {integrity}")
             fakefs_path_count = connection.execute("SELECT count(*) FROM paths").fetchone()[0]
         finally:
             connection.close()
+        for suffix in ("-wal", "-shm"):
+            transient = Path(str(metadata) + suffix)
+            if transient.exists():
+                if suffix == "-wal" and transient.stat().st_size != 0:
+                    raise RuntimeError("fakefs metadata WAL remains non-empty after checkpoint")
+                transient.unlink()
 
         image_path = artifact_dir / "alpine-rootfs.zip"
         file_records, expanded_bytes = write_fakefs_zip(fakefs, image_path)
