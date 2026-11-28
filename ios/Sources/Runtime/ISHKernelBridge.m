@@ -23,11 +23,13 @@
 #import <signal.h>
 #import <stdlib.h>
 #import <string.h>
+#import <sys/socket.h>
 #import <sys/stat.h>
 #import <sys/un.h>
 #import <time.h>
 #import <unistd.h>
 #import <limits.h>
+#import <TargetConditionals.h>
 
 static NSString *const DSBotISHBridgeErrorDomain = @"io.github.dsbot.ish-runtime";
 static const NSUInteger DSBOT_ISH_MAX_SESSIONS = 4;
@@ -70,6 +72,22 @@ static struct tty_driver_ops dsbot_ish_tty_ops;
 static struct tty_driver dsbot_ish_console_driver;
 static struct tty_driver dsbot_ish_pty_driver;
 extern const char *sock_tmp_prefix;
+
+static BOOL DSBotISHCanBindUnixSocketAtPrefix(NSString *prefix) {
+    NSString *probePath = [prefix stringByAppendingString:@"probe"];
+    const char *path = probePath.fileSystemRepresentation;
+    if (path == NULL || strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return NO;
+
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    strlcpy(address.sun_path, path, sizeof(address.sun_path));
+    int descriptor = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (descriptor < 0) return NO;
+    BOOL bound = bind(descriptor, (struct sockaddr *)&address, SUN_LEN(&address)) == 0;
+    if (bound) unlink(path);
+    close(descriptor);
+    return bound;
+}
 
 static void *DSBotISHBootThread(void *context) {
     ISHKernelBridge *bridge = (__bridge_transfer ISHKernelBridge *)context;
@@ -327,12 +345,27 @@ static void DSBotISHTerminateProcessSession(int processSessionID) {
         if (error) *error = [self error:8 message:@"Could not bind the authorized DSH workspace into iSH."];
         return;
     }
-    NSString *socketPrefix = [[NSTemporaryDirectory() stringByStandardizingPath] stringByAppendingPathComponent:@"dsh-uds-"];
+#if TARGET_OS_SIMULATOR
+    // Simulator container paths contain the host, CoreSimulator device, and
+    // app UUIDs; they can exceed sockaddr_un.sun_path before iSH appends its
+    // PID and socket ID. OpenMinis uses a short /tmp prefix on Simulator too.
+    NSString *socketPrefix = [NSString stringWithFormat:@"/tmp/dsbot-uds-%@-",
+        [[[NSUUID UUID] UUIDString].lowercaseString substringToIndex:8]];
+#else
+    // On device, NSTemporaryDirectory is inside this app's sandbox and short
+    // enough for Darwin's pathname Unix-domain socket limit.
+    NSString *socketPrefix = [[NSTemporaryDirectory() stringByStandardizingPath]
+        stringByAppendingPathComponent:@"dsh-uds-"];
+#endif
     size_t socketCapacity = sizeof(((struct sockaddr_un *)0)->sun_path);
     const char *socketPrefixBytes = socketPrefix.fileSystemRepresentation;
     // Leave room for a maximum pid, separator, and uint32 socket id.
     if (socketPrefixBytes == NULL || strlen(socketPrefixBytes) + 17 >= socketCapacity) {
         if (error) *error = [self error:21 message:@"The app temporary path is too long for iSH Unix-domain sockets."];
+        return;
+    }
+    if (!DSBotISHCanBindUnixSocketAtPrefix(socketPrefix)) {
+        if (error) *error = [self error:26 message:@"The app cannot create iSH Unix-domain sockets at its selected temporary path."];
         return;
     }
     sock_tmp_prefix = strdup(socketPrefixBytes);
