@@ -4,7 +4,7 @@ import argparse
 import gzip
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import sqlite3
 import stat
 import shutil
