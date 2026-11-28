@@ -44,7 +44,7 @@ def verify_qemu_artifact(artifact: Path, output_frameworks: Path, expected_platf
         if not binary.is_file() or sha256(binary) != record.get("sha256"):
             raise SystemExit(f"Staged framework does not match its build report: {expected_platform}/{name}")
     qemu_record = next((item for item in records if item.get("name") == "qemu-aarch64-softmmu"), None)
-    required_symbols = {"qemu_init", "qemu_main_loop", "qemu_cleanup", "qemu_system_shutdown_request"}
+    required_symbols = {"qemu_init", "qemu_main_loop", "qemu_cleanup"}
     if not qemu_record or set(report.get("inProcessEntryPoints", {}).get("verified", [])) != required_symbols:
         raise SystemExit(f"QEMU artifact lacks the required in-process entry points: {expected_platform}")
     return {"report": report, "record": qemu_record}
@@ -100,7 +100,7 @@ def main() -> None:
     qemu_device_binary = device_frameworks / "qemu-aarch64-softmmu.framework" / "qemu-aarch64-softmmu"
     qemu_simulator_binary = simulator_frameworks / "qemu-aarch64-softmmu.framework" / "qemu-aarch64-softmmu"
     if set(qemu_report.get("inProcessEntryPoints", {}).get("verified", [])) != {
-        "qemu_init", "qemu_main_loop", "qemu_cleanup", "qemu_system_shutdown_request"
+        "qemu_init", "qemu_main_loop", "qemu_cleanup"
     }:
         raise SystemExit("QEMU build report is missing a required in-process entry point")
 

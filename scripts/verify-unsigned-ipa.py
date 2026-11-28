@@ -143,7 +143,7 @@ def verify_guest_runtime(archive, prefix, names):
             and qemu_report.get("accelerator") == "TCG threaded interpreter"
             and qemu_report.get("hvf") is False,
             "Embedded QEMU must use the pinned in-process ARM64 TCG guest target")
-    entry_points = {"qemu_init", "qemu_main_loop", "qemu_cleanup", "qemu_system_shutdown_request"}
+    entry_points = {"qemu_init", "qemu_main_loop", "qemu_cleanup"}
     require(set(build_report.get("inProcessEntryPoints", {}).get("verified", [])) == entry_points,
             "Embedded QEMU build is missing verified in-process entry points")
     require(simulator_report.get("platform") == "iOS Simulator"

@@ -32,7 +32,6 @@ public enum ARM64GuestQEMURuntimeError: Error, LocalizedError {
 /// localhost port, or network-backed serial endpoint is created by the host.
 public actor ARM64GuestQEMURuntime {
     public static let shared = ARM64GuestQEMURuntime()
-    private static let hostQMPQuitCause: Int32 = 2
 
     private typealias QEMUInit = @convention(c) (
         Int32,
@@ -41,13 +40,11 @@ public actor ARM64GuestQEMURuntime {
     ) -> Int32
     private typealias QEMUMainLoop = @convention(c) () -> Void
     private typealias QEMUCleanup = @convention(c) () -> Void
-    private typealias QEMUSystemShutdownRequest = @convention(c) (Int32) -> Void
 
     private struct QEMUFunctions: @unchecked Sendable {
         let initialize: QEMUInit
         let mainLoop: QEMUMainLoop
         let cleanup: QEMUCleanup
-        let requestShutdown: QEMUSystemShutdownRequest
     }
 
     private final class ThreadState: @unchecked Sendable {
@@ -86,6 +83,7 @@ public actor ARM64GuestQEMURuntime {
     private var threadState: ThreadState?
     private var serialTransport: ARM64GuestUnixSocketTransport?
     private var ptyBroker: ARM64GuestPTYBroker?
+    private var qmpFileDescriptor: Int32?
     private var hasLaunchedQEMU = false
     private let bundle: Bundle
 
@@ -208,10 +206,7 @@ public actor ARM64GuestQEMURuntime {
         serialTransport?.close()
         serialTransport = nil
 
-        if let qemuTask, let qemuFunctions, let threadState, !threadState.result().exited {
-            // QEMU's exported shutdown request is the same host quit path used by
-            // QMP (SHUTDOWN_CAUSE_HOST_QMP_QUIT == 2), without a timeout-prone
-            // control socket.
+        if let qemuTask, let qmpFileDescriptor, let threadState, !threadState.result().exited {
             let initializationDeadline = Date().addingTimeInterval(5)
             while threadState.result().initializationStatus == nil,
                   !threadState.result().exited,
@@ -220,7 +215,9 @@ public actor ARM64GuestQEMURuntime {
             }
             let state = threadState.result()
             if state.initializationStatus == 0 && !state.exited {
-                qemuFunctions.requestShutdown(Self.hostQMPQuitCause)
+                try? await Task.detached(priority: .utility) {
+                    try Self.requestQEMUQuit(fileDescriptor: qmpFileDescriptor)
+                }.value
             }
             if !state.exited {
                 await qemuTask.value
@@ -283,15 +280,23 @@ public actor ARM64GuestQEMURuntime {
         let qemu = QEMUFunctions(
             initialize: try symbol("qemu_init", as: QEMUInit.self),
             mainLoop: try symbol("qemu_main_loop", as: QEMUMainLoop.self),
-            cleanup: try symbol("qemu_cleanup", as: QEMUCleanup.self),
-            requestShutdown: try symbol("qemu_system_shutdown_request", as: QEMUSystemShutdownRequest.self)
+            cleanup: try symbol("qemu_cleanup", as: QEMUCleanup.self)
         )
         qemuFunctions = qemu
         try Task.checkCancellation()
 
         let serialSockets = try Self.makeSocketPair()
+        let qmpSockets: (host: Int32, qemu: Int32)
+        do {
+            qmpSockets = try Self.makeSocketPair()
+        } catch {
+            _ = Darwin.close(serialSockets.host)
+            _ = Darwin.close(serialSockets.qemu)
+            throw error
+        }
         let transport = ARM64GuestUnixSocketTransport(fileDescriptor: serialSockets.host)
         serialTransport = transport
+        qmpFileDescriptor = qmpSockets.host
 
         let arguments = [
             "dsbot-qemu",
@@ -307,6 +312,8 @@ public actor ARM64GuestQEMURuntime {
             "-monitor", "none",
             "-chardev", "socket,id=guest-serial,fd=\(serialSockets.qemu)",
             "-serial", "chardev:guest-serial",
+            "-chardev", "socket,id=guest-qmp,fd=\(qmpSockets.qemu)",
+            "-mon", "chardev=guest-qmp,mode=control",
             "-nic", "none",
             "-no-user-config",
             "-no-shutdown",
@@ -349,6 +356,10 @@ public actor ARM64GuestQEMURuntime {
         }
         serialTransport?.close()
         serialTransport = nil
+        if let qmpFileDescriptor {
+            _ = Darwin.close(qmpFileDescriptor)
+            self.qmpFileDescriptor = nil
+        }
         qemuTask = nil
         startupTask = nil
         startupGeneration = nil
@@ -372,6 +383,46 @@ public actor ARM64GuestQEMURuntime {
             _ = setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
         }
         return (descriptors[0], descriptors[1])
+    }
+
+    private static func requestQEMUQuit(fileDescriptor descriptor: Int32) throws {
+        var timeout = timeval(tv_sec: 5, tv_usec: 0)
+        _ = setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        _ = setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        _ = try readLine(from: descriptor) // QMP greeting
+        try writeAll(descriptor, Data("{\"execute\":\"qmp_capabilities\",\"id\":1}\r\n".utf8))
+        _ = try readLine(from: descriptor)
+        try writeAll(descriptor, Data("{\"execute\":\"quit\",\"id\":2}\r\n".utf8))
+    }
+
+    private static func readLine(from descriptor: Int32) throws -> Data {
+        var output = Data()
+        var byte: UInt8 = 0
+        while output.count < 8192 {
+            let count = Darwin.recv(descriptor, &byte, 1, 0)
+            if count == 1 {
+                output.append(byte)
+                if byte == 0x0a { return output }
+            } else if count < 0 && errno == EINTR {
+                continue
+            } else {
+                throw posixError(count < 0 ? errno : ECONNRESET)
+            }
+        }
+        throw posixError(EMSGSIZE)
+    }
+
+    private static func writeAll(_ descriptor: Int32, _ data: Data) throws {
+        try data.withUnsafeBytes { bytes in
+            guard let base = bytes.baseAddress else { return }
+            var offset = 0
+            while offset < bytes.count {
+                let count = Darwin.send(descriptor, base.advanced(by: offset), bytes.count - offset, 0)
+                if count > 0 { offset += count }
+                else if count < 0 && errno == EINTR { continue }
+                else { throw posixError(count < 0 ? errno : EPIPE) }
+            }
+        }
     }
 
     private static func posixError(_ code: Int32) -> POSIXError {

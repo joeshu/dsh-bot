@@ -209,7 +209,7 @@ class IPARegressionTests(unittest.TestCase):
                 "toolchain": {"sdk": "iphoneos", "minimumIos": "15.0"},
                 "qemu": {"guestTarget": "aarch64-softmmu", "accelerator": "TCG threaded interpreter", "hvf": False},
                 "source": {"qemuSourceSha256": source_sha},
-                "inProcessEntryPoints": {"verified": ["qemu_cleanup", "qemu_init", "qemu_main_loop", "qemu_system_shutdown_request"]},
+                "inProcessEntryPoints": {"verified": ["qemu_cleanup", "qemu_init", "qemu_main_loop"]},
                 "frameworks": [{"name": core_name, "path": core_path, "sha256": device_sha,
                                  "strippedBytes": len(device_binary), "architectures": ["arm64"]}],
                 "sizes": {"frameworkPayloadBytes": 4096},
@@ -219,7 +219,7 @@ class IPARegressionTests(unittest.TestCase):
                 "toolchain": {"sdk": "iphonesimulator", "minimumIos": "15.0"},
                 "qemu": {"guestTarget": "aarch64-softmmu", "accelerator": "TCG threaded interpreter"},
                 "source": {"qemuSourceSha256": source_sha},
-                "inProcessEntryPoints": {"verified": ["qemu_cleanup", "qemu_init", "qemu_main_loop", "qemu_system_shutdown_request"]},
+                "inProcessEntryPoints": {"verified": ["qemu_cleanup", "qemu_init", "qemu_main_loop"]},
                 "frameworks": [{"name": core_name, "path": core_path, "sha256": simulator_sha,
                                  "strippedBytes": len(simulator_binary), "architectures": ["arm64"]}],
                 "sizes": {"frameworkPayloadBytes": 4096},
@@ -242,7 +242,7 @@ class IPARegressionTests(unittest.TestCase):
                          "accelerator": "TCG threaded interpreter", "framework": core_name,
                          "deviceSHA256": "b" * 64 if guest_bad_hash else device_sha,
                          "simulatorSHA256": simulator_sha, "frameworkPayloadBytes": 4096,
-                         "inProcessEntryPoints": ["qemu_cleanup", "qemu_init", "qemu_main_loop", "qemu_system_shutdown_request"],
+                         "inProcessEntryPoints": ["qemu_cleanup", "qemu_init", "qemu_main_loop"],
                          "sourceArchiveSha256": source_sha},
             }
             guest_root = "Payload/DSBotStandalone.app/DSBotGuestRuntime/"
