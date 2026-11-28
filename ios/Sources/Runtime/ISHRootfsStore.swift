@@ -366,7 +366,7 @@ private struct ISHRootfsZIPExtractor {
                         source.baseAddress?.assumingMemoryBound(to: UInt8.self),
                         compressed.count,
                         destination.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                        inflated.count
+                        destination.count
                     )
                 }
             }

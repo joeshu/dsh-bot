@@ -10,7 +10,7 @@ typedef void (^DSBotISHExitHandler)(int32_t status);
 /// owner-issued PTY sessions. It does not expose iOS host paths to guest input.
 @interface ISHKernelBridge : NSObject
 
-+ (instancetype)shared NS_SWIFT_NAME(shared);
++ (instancetype)shared;
 
 - (nullable NSError *)bootWithRootPath:(NSString *)rootPath
                          workspacePath:(NSString *)workspacePath

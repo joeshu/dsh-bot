@@ -14,7 +14,7 @@ public actor ISHLinuxPTYRuntime: LinuxPTYRuntime {
         let continuation: AsyncThrowingStream<ARM64GuestPTYEvent, Error>.Continuation
     }
 
-    private let bridge = ISHKernelBridge.shared
+    private let bridge = ISHKernelBridge.shared()
     private var leases: [ARM64GuestPTYOwner: Lease] = [:]
     private var openingOwners: Set<ARM64GuestPTYOwner> = []
     private var installedRootfsURL: URL?

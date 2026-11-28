@@ -82,7 +82,8 @@ jobs:
           echo "DSBOT_XCODEGEN=$XCODEGEN" >> "$GITHUB_ENV"
       - name: Generate the optional iSH-linked app project
         working-directory: ios
-        run: "$DSBOT_XCODEGEN" generate --spec project.yml
+        run: |
+          "$DSBOT_XCODEGEN" generate --spec project.yml
       - name: Compile and link DSBotStandalone with iSH ARM64 on Simulator
         working-directory: ios
         env:
