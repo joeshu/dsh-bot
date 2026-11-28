@@ -76,7 +76,7 @@ mkdir -p /proc /sys /dev /run /tmp /root /home/dsbot || {
     echo 'DS Bot guest boot error: could not create runtime directories.'
     exit 1
 }
-mount -t proc -o nosuid,nodev,noexec proc /proc 2>/dev/null || {
+mount -t proc -o nosuid,nodev,noexec,hidepid=2 proc /proc 2>/dev/null || {
     echo 'DS Bot guest boot error: could not mount /proc.'
     exit 1
 }

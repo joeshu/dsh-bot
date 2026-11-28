@@ -44,6 +44,31 @@
     - id: ios-native-tools
       name: '@dsbot/dsh-ios-host/native-tools'
 
+    # Web terminal subprocess operations are admitted only as ARM64 guest PTYs;
+    # the iOS provider deliberately does not implement arbitrary host spawns.
+    - id: ios-subprocess
+      name: '@dsbot/dsh-ios-host/ios-subprocess'
+
+    # DSH's Web Terminal Controller uses the same restricted subprocess seam
+    # and launches only a full interactive shell inside the ARM64 guest.
+    - id: ios-terminal-controller
+      name: '@deepseek-ai/dsh-api-terminal-controller'
+      config:
+        shell:
+          path: /bin/sh
+          name: Alpine ash (ARM64 Linux guest)
+          args:
+            - -i
+        shellCandidates: []
+        maxTerminals: 4
+        maxAgentTerminals: 1
+        maxCols: 500
+        maxRows: 300
+        scrollback: 4096
+        maxBufferedBytes: 262144
+        maxInputBytes: 65536
+        unattendedTimeoutMs: 1800000
+
     - id: ios-approval
       name: '@dsbot/dsh-ios-host/approval'
 

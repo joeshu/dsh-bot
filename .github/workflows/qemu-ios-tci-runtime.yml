@@ -16,9 +16,15 @@ on:
       - scripts/qemu-ios-tci-sources.sha256
       - scripts/smoke-arm64-guest-boot.py
       - scripts/stage-ios-guest-runtime.py
+      - scripts/verify-unsigned-ipa.py
+      - scripts/prepare-dsh-runtime.py
+      - scripts/tests/**
+      - kernel/runtime/**
+      - kernel/test/**
+      - ios/Sources/**
+      - ios/Tests/**
       - ios/project.yml
-      - ios/Sources/Runtime/ARM64GuestQEMURuntime.swift
-      - ios/Tests/DSBotStandaloneTests/NativeRuntimeTests.swift
+      - .github/workflows/ios-ipa-release.yml
 
 permissions:
   contents: read
@@ -260,6 +266,7 @@ jobs:
           unzip -q xcodegen.zip -d "$RUNNER_TEMP/xcodegen"
           XCODEGEN="$(find "$RUNNER_TEMP/xcodegen" -type f -path '*/bin/xcodegen' -print -quit)"
           test -n "$XCODEGEN"
+          dirname "$XCODEGEN" >> "$GITHUB_PATH"
           echo "DSBOT_XCODEGEN=$XCODEGEN" >> "$GITHUB_ENV"
 
       - name: Generate the iOS Simulator project with the guest runtime staged
@@ -284,6 +291,34 @@ jobs:
             -parallel-testing-enabled NO -resultBundlePath "$RUNNER_TEMP/DSBotQEMUGuestTests.xcresult" \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO ENABLE_USER_SCRIPT_SANDBOXING=NO \
             DSBOT_GUEST_RUNTIME_DIR="$RUNNER_TEMP/dsbot-ios-guest-runtime"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.3
+
+      - name: Pin npm for the iOS runtime lockfile
+        run: npm install --global npm@11.9.0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build and verify the terminal-capable unsigned IPA
+        shell: bash
+        env:
+          DSBOT_GUEST_RUNTIME_DIR: ${{ runner.temp }}/dsbot-ios-guest-runtime
+          DSBOT_OUT_DIR: ${{ runner.temp }}/dsbot-native-ios-candidate
+          DSBOT_REPOSITORY: ${{ github.repository }}
+          DSBOT_COMMIT: ${{ github.sha }}
+        run: bash scripts/build-unsigned-ipa.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsbot-native-ios-candidate
+          path: ${{ runner.temp }}/dsbot-native-ios-candidate/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
 
       - uses: actions/upload-artifact@v4
         with:

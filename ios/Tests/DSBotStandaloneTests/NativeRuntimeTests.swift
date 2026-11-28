@@ -59,6 +59,16 @@ final class NativeRuntimeTests: XCTestCase {
         }
     }
 
+    func testARM64GuestPTYCommandPolicyAllowsShellSyntaxAndRejectsHiddenControls() throws {
+        let command = "printf '%s\\n' 'shell'; false\nprintf 'second line\\n'"
+        XCTAssertEqual(try ARM64GuestPTYCommandPolicy.validate(command), command)
+        XCTAssertThrowsError(try ARM64GuestPTYCommandPolicy.validate(" \n "))
+        XCTAssertThrowsError(try ARM64GuestPTYCommandPolicy.validate("echo\tunsafe"))
+        XCTAssertThrowsError(try ARM64GuestPTYCommandPolicy.validate("echo \u{202e}unsafe"))
+        XCTAssertThrowsError(try ARM64GuestPTYCommandPolicy.validate(String(repeating: "x", count: 8_001)))
+        XCTAssertThrowsError(try ARM64GuestPTYCommandPolicy.validate(String(repeating: "x", count: 3_501)))
+    }
+
     func testARM64GuestPTYSessionDirectoryBindsIDsToOneOwner() async throws {
         let bot = try XCTUnwrap(ARM64GuestPTYOwner(kind: .bot, sessionID: "ios:main:thread-1"))
         let web = try XCTUnwrap(ARM64GuestPTYOwner(kind: .web, sessionID: "ios:main:thread-1"))
@@ -190,6 +200,65 @@ final class NativeRuntimeTests: XCTestCase {
 
         let runtime = ARM64GuestQEMURuntime(bundle: appBundle)
         do {
+            let commandRunner = ARM64GuestPTYCommandRunner(runtime: runtime)
+            let commandResult = try await commandRunner.execute(
+                command: "printf '%s\\n' 'DSBOT_IOS_COMMAND_RUNNER_OK'; false",
+                sessionID: "ios:simulator-command-\(UUID().uuidString.lowercased())",
+                turnID: UUID().uuidString.lowercased(),
+                timeoutSeconds: 30
+            )
+            XCTAssertTrue(commandResult.output.contains("DSBOT_IOS_COMMAND_RUNNER_OK"))
+            XCTAssertEqual(commandResult.exitCode, 1, "The PTY command runner must preserve the shell exit status.")
+
+            do {
+                _ = try await commandRunner.execute(
+                    command: "sleep 30",
+                    sessionID: "ios:simulator-timeout-\(UUID().uuidString.lowercased())",
+                    turnID: UUID().uuidString.lowercased(),
+                    timeoutSeconds: 1
+                )
+                XCTFail("A command that exceeds its deadline must be terminated.")
+            } catch let error as ARM64GuestPTYProtocolError {
+                XCTAssertEqual(error, .timeout("command execution"))
+            }
+
+            let webTerminal = ARM64GuestPTYWebTerminal(runtime: runtime)
+            let webSession = try await webTerminal.open(rows: 24, columns: 80)
+            try await webTerminal.resize(rows: 32, columns: 100, sessionID: webSession)
+            try await webTerminal.write(
+                "printf '%s\\n' 'DSBOT_WEB_INTERACTIVE_PTY_OK'\n",
+                sessionID: webSession
+            )
+            var webOutput = Data()
+            var webExitCode: Int?
+            for _ in 0..<100 {
+                let chunk = try await webTerminal.read(sessionID: webSession)
+                if let encoded = chunk["output"] as? String, let bytes = Data(base64Encoded: encoded) {
+                    webOutput.append(bytes)
+                }
+                if chunk["done"] as? Bool == true {
+                    webExitCode = chunk["exitCode"] as? Int
+                    break
+                }
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+            XCTAssertTrue(String(decoding: webOutput, as: UTF8.self).contains("DSBOT_WEB_INTERACTIVE_PTY_OK"))
+            XCTAssertEqual(webExitCode, nil, "The interactive shell should remain open after a command.")
+            try await webTerminal.write("exit\n", sessionID: webSession)
+            for _ in 0..<100 {
+                let chunk = try await webTerminal.read(sessionID: webSession)
+                if let encoded = chunk["output"] as? String, let bytes = Data(base64Encoded: encoded) {
+                    webOutput.append(bytes)
+                }
+                if chunk["done"] as? Bool == true {
+                    webExitCode = chunk["exitCode"] as? Int
+                    break
+                }
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+            XCTAssertEqual(webExitCode, 0, "The interactive guest shell should close cleanly on exit.")
+            await webTerminal.close(sessionID: webSession)
+
             let broker = try await runtime.start()
             let owner = try XCTUnwrap(ARM64GuestPTYOwner(
                 kind: .native,

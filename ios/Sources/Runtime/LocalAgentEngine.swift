@@ -2,6 +2,8 @@ import Foundation
 
 typealias LocalPythonRunHandler = @Sendable (String, String, String) async throws -> String
 typealias LocalPythonCancelHandler = @Sendable (String, String) async -> Void
+typealias LocalTerminalRunHandler = @Sendable (String, String, String) async throws -> String
+typealias LocalTerminalCancelHandler = @Sendable (String, String) async -> Void
 
 /// Disk-persisted native tool state.
 actor LocalAgentStore {
@@ -325,9 +327,10 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
     }
 
     func executeNativeTool(name: String, arguments: [String: Any], botId: String, turnId: String, isGroup: Bool,
-                           pythonRunner: LocalPythonRunHandler? = nil) async throws -> [String: Any] {
+                           pythonRunner: LocalPythonRunHandler? = nil,
+                           terminalRunner: LocalTerminalRunHandler? = nil) async throws -> [String: Any] {
         guard ["js_eval", "python_exec", "device_status", "memory_save", "group_todo_add", "web_fetch", "web_search", "remote_mcp_list", "remote_mcp_call",
-               "workspace_list", "workspace_read", "workspace_write", "workspace_search", "workspace_edit"].contains(name) else {
+               "workspace_list", "workspace_read", "workspace_write", "workspace_search", "workspace_edit", "terminal_exec"].contains(name) else {
             throw IPCFrameError.remoteError(code: -32601, message: "Unsupported DSH native tool: \(name)")
         }
         guard let data = try? JSONSerialization.data(withJSONObject: arguments),
@@ -339,13 +342,17 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
         call.function.name = name
         call.function.arguments = encoded
         let output = try await execute(call, sessionId: botId, turnId: turnId, isGroup: isGroup,
-                                       structuredWeb: name == "web_fetch", pythonRunner: pythonRunner)
+                                       structuredWeb: name == "web_fetch", pythonRunner: pythonRunner,
+                                       terminalRunner: terminalRunner)
         return ["output": output]
     }
 
-    func cancelNativeTool(botId: String, turnId: String, pythonCanceller: LocalPythonCancelHandler? = nil) async {
+    func cancelNativeTool(botId: String, turnId: String,
+                          pythonCanceller: LocalPythonCancelHandler? = nil,
+                          terminalCanceller: LocalTerminalCancelHandler? = nil) async {
         await approvals.cancel(sessionId: botId, turnId: turnId)
         await pythonCanceller?(botId, turnId)
+        await terminalCanceller?(botId, turnId)
     }
 
     public func write(_ data: Data) {
@@ -676,7 +683,8 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
     }
 
     private func execute(_ call: ProviderMessage.ToolCall, sessionId: String, turnId: String, isGroup: Bool,
-                         structuredWeb: Bool = false, pythonRunner: LocalPythonRunHandler? = nil) async throws -> String {
+                         structuredWeb: Bool = false, pythonRunner: LocalPythonRunHandler? = nil,
+                         terminalRunner: LocalTerminalRunHandler? = nil) async throws -> String {
         let name = call.function.name
         guard let args = try JSONSerialization.jsonObject(with: Data(call.function.arguments.utf8)) as? [String: Any] else {
             return "Invalid tool arguments."
@@ -700,6 +708,12 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
                 return "Python 代码不能为空、不能包含 NUL，且最多 16,000 个字符。"
             }
             summary = "本机离线 Python 3.13 + NumPy（需批准；代码留在本机）\n每次在全新 WebAssembly Worker 中运行，45 秒上限、256 MiB Python 内存上限、32,000 字符输出上限。无宿主文件、网络、进程或 MCP 绑定。\n完整代码（\(code.count) 字符）：\n\(code)"
+        case "terminal_exec":
+            let command = args["command"] as? String ?? ""
+            do { _ = try ARM64GuestPTYCommandPolicy.validate(command) }
+            catch { return error.localizedDescription }
+            guard terminalRunner != nil else { return "ARM64 Linux guest terminal is not connected." }
+            summary = "在隔离的 ARM64 Linux PTY 中执行（每次命令单独审批；guest 网络关闭）：\n\(command)"
         case "memory_save":
             guard !text("title").isEmpty, !text("content").isEmpty else { return "Memory title and content are required." }
         case "group_todo_add":
@@ -822,6 +836,9 @@ public final class LocalAgentTransport: IPCByteTransport, @unchecked Sendable {
             case "python_exec":
                 guard let pythonRunner else { return "本机 Python 运行时尚未连接。请重启 DSH 运行时后重试。" }
                 return try await pythonRunner(args["code"] as? String ?? "", sessionId, turnId)
+            case "terminal_exec":
+                guard let terminalRunner else { return "ARM64 Linux guest terminal is not connected." }
+                return try await terminalRunner(args["command"] as? String ?? "", sessionId, turnId)
             case "web_search": return "approved"
             case "web_fetch":
                 guard let address else { return "Invalid URL." }

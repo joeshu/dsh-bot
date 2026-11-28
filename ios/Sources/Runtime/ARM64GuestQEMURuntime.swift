@@ -25,7 +25,7 @@ public enum ARM64GuestQEMURuntimeError: Error, LocalizedError {
         case .qemuInitFailed(let status):
             return "QEMU initialization failed with status \(status)."
         case .qemuExited:
-            return "The ARM64 guest runtime exited. Restart the app before opening another guest."
+            return "The ARM64 guest runtime exited. Start the terminal again to launch a fresh guest."
         case .socketPathTooLong:
             return "The private guest socket path exceeds the iOS Unix socket limit."
         case .socketConnectionFailed(let message):
@@ -81,7 +81,12 @@ public actor ARM64GuestQEMURuntime {
     }
 
     private var startupTask: Task<ARM64GuestPTYBroker, Error>?
+    private var startupGeneration: UUID?
     private var qemuTask: Task<Void, Never>?
+    private var shutdownTask: Task<Void, Never>?
+    private var idleShutdownTask: Task<Void, Never>?
+    private var idleShutdownGeneration: UUID?
+    private var ptyLeaseCount = 0
     private var qemuHandle: UnsafeMutableRawPointer?
     private var threadState: ThreadState?
     private var serialTransport: ARM64GuestUnixSocketTransport?
@@ -94,45 +99,131 @@ public actor ARM64GuestQEMURuntime {
     public init(bundle: Bundle = .main) { self.bundle = bundle }
 
     public func start() async throws -> ARM64GuestPTYBroker {
+        while let shutdownTask { await shutdownTask.value }
         if let ptyBroker {
             try await ptyBroker.waitUntilReady(timeoutSeconds: 1)
             return ptyBroker
         }
-        if let startupTask { return try await startupTask.value }
+        if let startupTask, let generation = startupGeneration {
+            return try await awaitStartup(startupTask, generation: generation)
+        }
         guard !hasLaunchedQEMU else { throw ARM64GuestQEMURuntimeError.qemuExited }
 
+        let generation = UUID()
         let task = Task { try await self.createRuntime() }
         startupTask = task
+        startupGeneration = generation
+        return try await awaitStartup(task, generation: generation)
+    }
+
+    private func awaitStartup(
+        _ task: Task<ARM64GuestPTYBroker, Error>,
+        generation: UUID
+    ) async throws -> ARM64GuestPTYBroker {
+        let broker: ARM64GuestPTYBroker
         do {
-            let broker = try await task.value
-            ptyBroker = broker
-            startupTask = nil
-            return broker
+            broker = try await task.value
         } catch {
-            startupTask = nil
-            await stop()
+            if startupGeneration == generation {
+                await stop()
+            }
             throw error
         }
+        if startupGeneration != generation {
+            // Another waiter may have committed the same shared startup first.
+            // Only an explicit stop/exit invalidates the result in that case.
+            guard ptyBroker === broker else {
+                await broker.stop()
+                throw CancellationError()
+            }
+        } else {
+            ptyBroker = broker
+            startupTask = nil
+            startupGeneration = nil
+        }
+        // Cancellation belongs to the waiter. The shared guest remains available
+        // for other owners that joined the same startup operation.
+        if Task.isCancelled { throw CancellationError() }
+        return broker
     }
 
     public func brokerIfStarted() -> ARM64GuestPTYBroker? { ptyBroker }
 
-    public func stop() async {
-        if let startupTask {
-            startupTask.cancel()
-            self.startupTask = nil
+    /// Keep the shared guest alive while a caller has an active or opening PTY.
+    public func acquirePTYLease() async throws -> ARM64GuestPTYBroker {
+        while let shutdownTask { await shutdownTask.value }
+        idleShutdownTask?.cancel()
+        idleShutdownTask = nil
+        idleShutdownGeneration = nil
+        ptyLeaseCount += 1
+        do {
+            return try await start()
+        } catch {
+            ptyLeaseCount = max(0, ptyLeaseCount - 1)
+            if ptyLeaseCount == 0 { scheduleIdleShutdown() }
+            throw error
         }
+    }
+
+    public func releasePTYLease() {
+        guard ptyLeaseCount > 0 else { return }
+        ptyLeaseCount -= 1
+        if ptyLeaseCount == 0 { scheduleIdleShutdown() }
+    }
+
+    public func validateBundledResources() throws {
+        let guestDirectory = bundle.bundleURL.appendingPathComponent("DSBotGuestRuntime", isDirectory: true)
+        let kernel = guestDirectory.appendingPathComponent("vmlinuz-virt")
+        let initramfs = guestDirectory.appendingPathComponent("rootfs.cpio.gz")
+        guard FileManager.default.fileExists(atPath: kernel.path),
+              FileManager.default.fileExists(atPath: initramfs.path) else {
+            throw ARM64GuestQEMURuntimeError.guestRuntimeNotBundled
+        }
+        let qemuBinary = bundle.bundleURL
+            .appendingPathComponent("Frameworks", isDirectory: true)
+            .appendingPathComponent("qemu-aarch64-softmmu.framework", isDirectory: true)
+            .appendingPathComponent("qemu-aarch64-softmmu")
+        guard FileManager.default.fileExists(atPath: qemuBinary.path) else {
+            throw ARM64GuestQEMURuntimeError.qemuFrameworkNotBundled
+        }
+    }
+
+    public func stop() async {
+        if let shutdownTask {
+            await shutdownTask.value
+            return
+        }
+        let task = Task { await self.performStop() }
+        shutdownTask = task
+        await task.value
+    }
+
+    private func performStop() async {
+        defer { shutdownTask = nil }
+        idleShutdownTask?.cancel()
+        idleShutdownTask = nil
+        idleShutdownGeneration = nil
+        ptyLeaseCount = 0
+        let pendingStartup = startupTask
+        pendingStartup?.cancel()
+        startupTask = nil
+        startupGeneration = nil
         if let ptyBroker {
-            await ptyBroker.stop()
             self.ptyBroker = nil
+            await ptyBroker.stop()
         }
         serialTransport?.close()
         serialTransport = nil
 
-        if let qmpSocketPath, qemuTask != nil, threadState?.result().exited == false {
-            _ = try? await Task.detached(priority: .utility) {
-                try Self.requestQEMUQuit(socketPath: qmpSocketPath)
-            }.value
+        if let qmpSocketPath, let qemuTask, threadState?.result().exited == false {
+            do {
+                try await Task.detached(priority: .utility) {
+                    try Self.requestQEMUQuit(socketPath: qmpSocketPath)
+                }.value
+                await qemuTask.value
+            } catch {
+                return
+            }
             return
         }
         qemuTask = nil
@@ -147,14 +238,30 @@ public actor ARM64GuestQEMURuntime {
         qmpSocketPath = nil
     }
 
+    private func scheduleIdleShutdown() {
+        guard ptyLeaseCount == 0, ptyBroker != nil, shutdownTask == nil else { return }
+        idleShutdownTask?.cancel()
+        let generation = UUID()
+        idleShutdownGeneration = generation
+        idleShutdownTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 30_000_000_000) } catch { return }
+            await self?.stopIfIdle(generation: generation)
+        }
+    }
+
+    private func stopIfIdle(generation: UUID) async {
+        guard idleShutdownGeneration == generation, ptyLeaseCount == 0 else { return }
+        idleShutdownTask = nil
+        idleShutdownGeneration = nil
+        await stop()
+    }
+
     private func createRuntime() async throws -> ARM64GuestPTYBroker {
+        try Task.checkCancellation()
+        try validateBundledResources()
         let guestDirectory = bundle.bundleURL.appendingPathComponent("DSBotGuestRuntime", isDirectory: true)
         let kernel = guestDirectory.appendingPathComponent("vmlinuz-virt")
         let initramfs = guestDirectory.appendingPathComponent("rootfs.cpio.gz")
-        guard FileManager.default.fileExists(atPath: kernel.path),
-              FileManager.default.fileExists(atPath: initramfs.path) else {
-            throw ARM64GuestQEMURuntimeError.guestRuntimeNotBundled
-        }
 
         let qemuFramework = bundle.bundleURL
             .appendingPathComponent("Frameworks", isDirectory: true)
@@ -180,6 +287,7 @@ public actor ARM64GuestQEMURuntime {
             mainLoop: try symbol("qemu_main_loop", as: QEMUMainLoop.self),
             cleanup: try symbol("qemu_cleanup", as: QEMUCleanup.self)
         )
+        try Task.checkCancellation()
 
         let socketRoot = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
         let serialPath = socketRoot.appendingPathComponent("dsbot-\(UUID().uuidString.prefix(8))-s.sock").path
@@ -239,6 +347,10 @@ public actor ARM64GuestQEMURuntime {
         let fileDescriptor = try await Task.detached(priority: .userInitiated) {
             try Self.connectToQEMUSerial(path: serialPath, state: state, timeoutSeconds: 30)
         }.value
+        guard !Task.isCancelled else {
+            _ = Darwin.close(fileDescriptor)
+            throw CancellationError()
+        }
         let transport = ARM64GuestUnixSocketTransport(fileDescriptor: fileDescriptor)
         let broker = ARM64GuestPTYBroker(transport: transport)
         serialTransport = transport
@@ -255,6 +367,9 @@ public actor ARM64GuestQEMURuntime {
         serialTransport?.close()
         serialTransport = nil
         qemuTask = nil
+        startupTask = nil
+        startupGeneration = nil
+        hasLaunchedQEMU = false
         threadState = nil
         if let qemuHandle {
             dlclose(qemuHandle)

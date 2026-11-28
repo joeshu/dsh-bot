@@ -92,9 +92,9 @@ public struct ExperimentalFeaturesView: View {
                     featureRow(
                         icon: "terminal.fill",
                         color: .green,
-                        title: "持久虚拟命令台",
-                        subtitle: "受限命令解释器；不是 Linux Shell/PTY。保留 cwd 与环境变量，支持工作区命令、Node、离线 Python 与 Git 状态。",
-                        badge: "虚拟解释器",
+                        title: "ARM64 Linux Shell / PTY",
+                        subtitle: "真实 Alpine ash 与内核 PTY，支持持续交互输入、Ctrl-C、作业控制和随界面调整终端尺寸；guest 离线隔离。",
+                        badge: "真实 PTY",
                         status: "打开命令台"
                     )
                 }
@@ -167,169 +167,235 @@ public struct ExperimentalFeaturesView: View {
     }
 }
 
-private struct TerminalLineEntry: Identifiable {
-    let id = UUID()
-    let isCommand: Bool
-    let text: String
-    let isError: Bool
-}
-
 public struct VirtualTerminalFeatureView: View {
     @ObservedObject var host: LocalAgentHost
-    @State private var cwd: String = "/workspace"
-    @State private var commandInput: String = ""
-    @State private var lines: [TerminalLineEntry] = [
-        TerminalLineEntry(
-            isCommand: false,
-            text: "DS Bot iOS 沙盒虚拟命令台（Node + Pyodide 3.13 + Virtual Git）\n这不是 Linux Shell/PTY；只支持 help 列出的命令，文件操作限制在 /workspace (files/) 内。Bot 每条命令都需单独审批。",
-            isError: false
-        )
-    ]
-    @State private var isRunning = false
+    @State private var commandInput = ""
+    @State private var output = "ARM64 Alpine Linux shell · real PTY\nType help to see the BusyBox commands available in this offline guest.\n"
+    @State private var sessionID: String?
+    @State private var isConnecting = false
+    @State private var isConnected = false
+    @State private var isDone = false
+    @State private var errorMessage = ""
+    @State private var rows = 24
+    @State private var columns = 80
 
-    private let quickCommands = ["help", "pwd", "ls -la", "git status", "git diff", "uname -a", "python -c \"import numpy as np; print(np.arange(6))\""]
+    private let quickCommands = ["help", "uname -a", "pwd", "ls -la", "env | sort"]
 
     public var body: some View {
-        VStack(spacing: 0) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    DSStatusBadge("cwd: \(cwd)", color: DSTheme.success)
-                    ForEach(quickCommands, id: \.self) { cmd in
-                        Button {
-                            commandInput = cmd
-                            Task { await runCommand(cmd) }
-                        } label: {
-                            Text(cmd)
+        GeometryReader { geometry in
+            VStack(spacing: 0) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        DSStatusBadge("ARM64 Linux · PTY", color: DSTheme.success)
+                        DSStatusBadge(statusText, color: isConnected ? DSTheme.success : .orange)
+                        ForEach(quickCommands, id: \.self) { command in
+                            Button(command) { send(command + "\n") }
                                 .font(.caption2.monospaced())
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 5)
                                 .background(Color(.secondarySystemFill))
                                 .clipShape(Capsule())
+                                .buttonStyle(.plain)
+                                .disabled(!isConnected)
                         }
-                        .buttonStyle(.plain)
-                        .disabled(isRunning)
                     }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                }
+                .background(Color(.secondarySystemBackground))
+
+                Divider()
+
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        Text(output)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(Color.white.opacity(0.92))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(12)
+                            .id("terminal-output")
+                    }
+                    .background(Color(red: 0.07, green: 0.08, blue: 0.10))
+                    .onChange(of: output) { _ in
+                        withAnimation { proxy.scrollTo("terminal-output", anchor: .bottom) }
+                    }
+                }
+
+                if !errorMessage.isEmpty {
+                    Text(errorMessage)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                }
+
+                Divider()
+
+                HStack(spacing: 8) {
+                    Text("$ ")
+                        .font(.system(.body, design: .monospaced).weight(.bold))
+                        .foregroundStyle(.green)
+                    TextField("Shell input (Enter sends; Ctrl-C interrupts)", text: $commandInput)
+                        .font(.system(.subheadline, design: .monospaced))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .submitLabel(.send)
+                        .onSubmit { submitInput() }
+                    Button("Ctrl-C") { send("\u{03}") }
+                        .font(.caption.monospaced())
+                        .disabled(!isConnected)
+                    Button {
+                        submitInput()
+                    } label: {
+                        Image(systemName: "arrow.up.circle.fill").font(.title3)
+                    }
+                    .disabled(!isConnected || commandInput.isEmpty)
                 }
                 .padding(.horizontal, 12)
-                .padding(.vertical, 8)
+                .padding(.vertical, 10)
+                .background(Color(.secondarySystemBackground))
             }
-            .background(Color(.secondarySystemBackground))
-
-            Divider()
-
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 8) {
-                        ForEach(lines) { item in
-                            Text(item.text)
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundStyle(item.isCommand ? Color.green : (item.isError ? Color.red : Color.white.opacity(0.92)))
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .id(item.id)
-                        }
-                    }
-                    .padding(12)
-                }
-                .background(Color(red: 0.07, green: 0.08, blue: 0.10))
-                .onChange(of: lines.count) { _ in
-                    if let last = lines.last {
-                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
-                    }
-                }
-            }
-
-            Divider()
-
-            HStack(spacing: 8) {
-                Text("$")
-                    .font(.system(.body, design: .monospaced).weight(.bold))
-                    .foregroundStyle(.green)
-                TextField("输入命令（如 ls -la, git status, python -c ...）", text: $commandInput)
-                    .font(.system(.subheadline, design: .monospaced))
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .submitLabel(.send)
-                    .onSubmit {
-                        let cmd = commandInput
-                        Task { await runCommand(cmd) }
-                    }
-                Button {
-                    let cmd = commandInput
-                    Task { await runCommand(cmd) }
-                } label: {
-                    if isRunning {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.title3)
-                    }
-                }
-                .disabled(isRunning || commandInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .background(Color(.secondarySystemBackground))
+            .onAppear { updateSize(geometry.size) }
+            .onChange(of: geometry.size) { newSize in updateSize(newSize) }
         }
-        .navigationTitle("虚拟命令台")
+        .navigationTitle("ARM64 Linux 终端")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
-                Button("清屏") {
-                    lines.removeAll()
-                }
-                Button("重置") {
-                    Task { await resetTerminal() }
-                }
+                Button("清屏") { output = "" }
+                Button("重启 Shell") { Task { await restartTerminal() } }
             }
         }
         .task {
-            await refreshState()
+            await connectTerminal()
+            await readOutputLoop()
+        }
+        .onDisappear {
+            if let sessionID { Task { await closeTerminal(sessionID) } }
         }
     }
 
-    private func refreshState() async {
-        guard let rpc = host.rpc() else { return }
-        if let res = try? await rpc.request("terminal.state", params: ["sessionId": "ios-ui"], timeoutSeconds: 10),
-           let dir = res["cwd"] as? String {
-            cwd = dir
+    private var statusText: String {
+        if isConnecting { return "启动中" }
+        if isConnected { return "已连接 · \(rows)×\(columns)" }
+        if isDone { return "Shell 已退出" }
+        return "未连接"
+    }
+
+    private func updateSize(_ size: CGSize) {
+        let nextColumns = min(160, max(40, Int(size.width / 8)))
+        let nextRows = min(80, max(12, Int(size.height / 18)))
+        guard nextColumns != columns || nextRows != rows else { return }
+        columns = nextColumns
+        rows = nextRows
+        guard let sessionID, isConnected, let rpc = host.rpc() else { return }
+        Task {
+            _ = try? await rpc.request("terminal.resize", params: [
+                "sessionId": sessionID, "rows": nextRows, "columns": nextColumns,
+            ], timeoutSeconds: 10)
         }
     }
 
-    private func resetTerminal() async {
-        guard let rpc = host.rpc() else { return }
-        if let res = try? await rpc.request("terminal.reset", params: ["sessionId": "ios-ui"], timeoutSeconds: 10),
-           let dir = res["cwd"] as? String {
-            cwd = dir
-        }
-        lines = [TerminalLineEntry(isCommand: false, text: "已重置虚拟终端会话（cwd: \(cwd)）。", isError: false)]
-    }
-
-    private func runCommand(_ raw: String) async {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        commandInput = ""
-        if trimmed == "clear" {
-            lines.removeAll()
-            return
-        }
-        lines.append(TerminalLineEntry(isCommand: true, text: "\(cwd) $ \(trimmed)", isError: false))
+    private func connectTerminal() async {
+        guard sessionID == nil, !isConnecting else { return }
         guard let rpc = host.rpc() else {
-            lines.append(TerminalLineEntry(isCommand: false, text: "DSH 运行时尚未就绪。", isError: true))
+            errorMessage = "DSH 运行时尚未就绪。"
             return
         }
-        isRunning = true
-        defer { isRunning = false }
+        isConnecting = true
+        defer { isConnecting = false }
         do {
-            let res = try await rpc.request("terminal.exec", params: ["sessionId": "ios-ui", "command": trimmed], timeoutSeconds: 60)
-            if let dir = res["cwd"] as? String { cwd = dir }
-            let exitCode = res["exitCode"] as? Int ?? 0
-            let output = res["output"] as? String ?? ""
-            if !output.isEmpty {
-                lines.append(TerminalLineEntry(isCommand: false, text: output, isError: exitCode != 0))
+            let result = try await rpc.request("terminal.open", params: ["rows": rows, "columns": columns], timeoutSeconds: 120)
+            guard let id = result["sessionId"] as? String else { throw IPCFrameError.invalidJSON }
+            if Task.isCancelled {
+                _ = try? await rpc.request("terminal.close", params: ["sessionId": id], timeoutSeconds: 10)
+                return
             }
+            sessionID = id
+            isConnected = true
+            isDone = false
+            errorMessage = ""
         } catch {
-            lines.append(TerminalLineEntry(isCommand: false, text: "执行失败：\(error.localizedDescription)", isError: true))
+            errorMessage = "ARM64 guest 启动失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func readOutputLoop() async {
+        guard let readerSessionID = sessionID else { return }
+        while !Task.isCancelled, sessionID == readerSessionID, isConnected, let rpc = host.rpc() {
+            do {
+                let result = try await rpc.request("terminal.read", params: ["sessionId": readerSessionID], timeoutSeconds: 10)
+                guard sessionID == readerSessionID else { return }
+                if let encoded = result["output"] as? String,
+                   let bytes = Data(base64Encoded: encoded), !bytes.isEmpty {
+                    appendOutput(String(decoding: bytes, as: UTF8.self))
+                }
+                if result["truncated"] as? Bool == true {
+                    appendOutput("\n[Earlier terminal output was dropped to keep memory bounded.]\n")
+                }
+                if result["done"] as? Bool == true {
+                    isConnected = false
+                    isDone = true
+                    if let code = result["exitCode"] as? Int { appendOutput("\n[Shell exited with status \(code)]\n") }
+                    if let message = result["error"] as? String, !message.isEmpty { errorMessage = message }
+                    await closeTerminal(readerSessionID)
+                    return
+                }
+            } catch {
+                guard sessionID == readerSessionID else { return }
+                errorMessage = "终端连接中断：\(error.localizedDescription)"
+                isConnected = false
+                isDone = true
+                await closeTerminal(readerSessionID)
+                return
+            }
+        }
+    }
+
+    private func appendOutput(_ text: String) {
+        output.append(text)
+        if output.utf8.count > 160_000 {
+            let keep = String(output.suffix(120_000))
+            output = "[Earlier output trimmed]\n" + keep
+        }
+    }
+
+    private func submitInput() {
+        guard !commandInput.isEmpty else { return }
+        let text = commandInput + "\n"
+        commandInput = ""
+        send(text)
+    }
+
+    private func send(_ text: String) {
+        guard let sessionID, isConnected, let rpc = host.rpc() else { return }
+        Task {
+            do {
+                _ = try await rpc.request("terminal.write", params: ["sessionId": sessionID, "text": text], timeoutSeconds: 10)
+            } catch {
+                errorMessage = "输入未发送：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func restartTerminal() async {
+        if let sessionID { await closeTerminal(sessionID) }
+        self.sessionID = nil
+        isConnected = false
+        isDone = false
+        errorMessage = ""
+        await connectTerminal()
+        await readOutputLoop()
+    }
+
+    private func closeTerminal(_ sessionID: String) async {
+        guard let rpc = host.rpc() else { return }
+        _ = try? await rpc.request("terminal.close", params: ["sessionId": sessionID], timeoutSeconds: 10)
+        if self.sessionID == sessionID {
+            self.sessionID = nil
+            isConnected = false
         }
     }
 }

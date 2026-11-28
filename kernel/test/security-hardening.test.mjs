@@ -9,6 +9,8 @@ import {
   parseEchoRedirection,
   splitTerminalSegments,
 } from '../runtime/ios-host-package/virtual-terminal-policy.mjs'
+import { configureIOSHost } from '../runtime/ios-host-package/index.mjs'
+import { IOSGuestPTYSubprocess } from '../runtime/ios-host-package/ios-subprocess.mjs'
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '../..')
 const runtimeFile = (name) => readFileSync(join(repoRoot, 'kernel/runtime', name), 'utf8')
@@ -54,6 +56,63 @@ test('runtime hardening fails closed without native QuickJS and blocks unsupport
 test('iOS runtime staging includes the imported virtual terminal policy module', () => {
   const staging = readFileSync(join(repoRoot, 'scripts/prepare-dsh-runtime.py'), 'utf8')
   assert.match(staging, /"ios-host-package\/virtual-terminal-policy\.mjs": SOURCE \/ "ios-host-package" \/ "virtual-terminal-policy\.mjs"/)
+})
+
+test('iOS Web PTYs use the ARM64 guest bridge and do not expose host subprocesses', () => {
+  const provider = runtimeFile('ios-host-package/ios-subprocess.mjs')
+  const profile = runtimeFile('ios-profile-package/cordis.patch.yml')
+  const host = readFileSync(join(repoRoot, 'ios/Sources/Runtime/LocalAgentHost.swift'), 'utf8')
+  assert.match(provider, /extends SubprocessRuntime/)
+  assert.match(provider, /native\.web_terminal\.open/)
+  assert.match(provider, /native\.web_terminal\.write/)
+  assert.doesNotMatch(provider, /node:child_process|spawnSync|execSync/)
+  assert.match(profile, /name: '@dsbot\/dsh-ios-host\/ios-subprocess'/)
+  assert.match(host, /ARM64GuestPTYWebTerminal\.shared\.open/)
+  assert.match(host, /native\.web_terminal\.close/)
+  assert.match(host, /authorizedWebTerminalSessionID/)
+  assert.match(host, /native\.web_terminal\.cancel_open/)
+  assert.match(readFileSync(join(repoRoot, 'kernel/runtime/dsh-ios-entry.mjs'), 'utf8'), /'ios-subprocess'/)
+  assert.match(runtimeFile('dsh-ios-entry.mjs'), /web_terminal\.resolve_owner/)
+  assert.match(host, /web_terminal\.resolve_owner/)
+})
+
+test('iOS subprocess provider restricts execution to a guest shell and forwards PTY controls', async () => {
+  const provider = Object.create(IOSGuestPTYSubprocess.prototype)
+  assert.equal(await provider.resolveExecutable('/bin/sh'), '/bin/sh')
+  assert.equal(await provider.resolveExecutable('ash'), '/bin/ash')
+  assert.deepEqual(await provider.terminalEnvironment(), { platform: 'posix', defaultShell: '/bin/sh' })
+  assert.throws(() => provider.spawn({}), (error) => error.code === 'SUBPROCESS_PTY_UNAVAILABLE')
+  await assert.rejects(
+    provider.spawnTerminal({ argv: ['/bin/bash'], rows: 24, cols: 80, env: { DSH_SESSION_ID: 'session-abc' } }),
+    (error) => error.code === 'SUBPROCESS_PTY_UNAVAILABLE',
+  )
+
+  const requestLog = []
+  let releaseRead
+  const sessionId = '4c8982f4-975f-4a52-88dd-24b8895f67af'
+  configureIOSHost({
+    workspace: '/tmp/dsbot-provider-contract',
+    runtime: {},
+    rpc: {
+      async request(method, params) {
+        requestLog.push({ method, params })
+        if (method === 'native.web_terminal.open') return { sessionId }
+        if (method === 'native.web_terminal.read') return new Promise((resolve) => { releaseRead = resolve })
+        return { accepted: true }
+      },
+    },
+  })
+  const terminal = await provider.spawnTerminal({
+    argv: ['/bin/sh', '-i'], rows: 24, cols: 80,
+    env: { DSH_SESSION_ID: 'session-public-1' },
+  })
+  await terminal.signalForeground('SIGINT')
+  await terminal.signalForeground('SIGTSTP')
+  await terminal.signalForeground('SIGHUP')
+  assert.deepEqual(requestLog.filter(({ method }) => method === 'native.web_terminal.write').map(({ params }) => params.text), ['\u0003', '\u001a'])
+  assert.equal(requestLog.filter(({ method }) => method === 'native.web_terminal.close').length, 1)
+  assert.equal((await terminal.done).signal, 'SIGHUP')
+  releaseRead?.({ output: '', done: true, exitCode: 0 })
 })
 
 test('session listing uses indexed scopes, bounded pagination, and excludes private web roots', () => {

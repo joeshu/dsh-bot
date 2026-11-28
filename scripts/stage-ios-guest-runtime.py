@@ -107,6 +107,8 @@ def main() -> None:
     manifest = {
         "schema": 1,
         "architecture": "arm64",
+        "qemuBuildReportSha256": sha256(guest_output / "qemu-build-report.json"),
+        "qemuSimulatorBuildReportSha256": sha256(guest_output / "qemu-simulator-build-report.json"),
         "guestKernelVersion": guest_manifest.get("kernelVersion"),
         "guestFiles": {
             name: {"bytes": (guest_output / name).stat().st_size, "sha256": sha256(guest_output / name)}

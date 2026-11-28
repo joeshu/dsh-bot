@@ -89,6 +89,130 @@ PYTHON_RUNTIME_ARTIFACT_SHA256 = {
 }
 
 
+def verify_guest_runtime(archive, prefix, names):
+    root = prefix + "DSBotGuestRuntime/"
+    entries = [name for name in names if name.startswith(root)]
+    if not entries:
+        return None, set()
+    runtime_path = root + "runtime-manifest.json"
+    build_report_path = root + "qemu-build-report.json"
+    guest_notice_path = root + "THIRD-PARTY-NOTICES.txt"
+    qemu_notice_path = root + "THIRD-PARTY-NOTICES-QEMU.md"
+    required = [runtime_path, build_report_path, guest_notice_path, qemu_notice_path,
+                root + "vmlinuz-virt", root + "rootfs.cpio.gz", root + "manifest.json",
+                root + "qemu-simulator-build-report.json"]
+    for name in required:
+        require(name in names and archive.getinfo(name).file_size > 0,
+                f"Incomplete embedded ARM64 guest runtime: {name}")
+
+    manifest = json.loads(archive.read(runtime_path))
+    guest_manifest = json.loads(archive.read(root + "manifest.json"))
+    build_report_bytes = archive.read(build_report_path)
+    build_report = json.loads(build_report_bytes)
+    simulator_report_bytes = archive.read(root + "qemu-simulator-build-report.json")
+    simulator_report = json.loads(simulator_report_bytes)
+    require(manifest.get("schema") == 1 and manifest.get("architecture") == "arm64",
+            "Unexpected ARM64 guest runtime manifest")
+    require(hashlib.sha256(build_report_bytes).hexdigest() == manifest.get("qemuBuildReportSha256"),
+            "Embedded QEMU build report digest mismatch")
+    require(hashlib.sha256(simulator_report_bytes).hexdigest() == manifest.get("qemuSimulatorBuildReportSha256"),
+            "Embedded Simulator QEMU build report digest mismatch")
+    guest_files = manifest.get("guestFiles", {})
+    for filename in ("vmlinuz-virt", "rootfs.cpio.gz"):
+        data = archive.read(root + filename)
+        record = guest_files.get(filename, {})
+        require(isinstance(record.get("bytes"), int) and record["bytes"] == len(data)
+                and re.fullmatch(r"[a-f0-9]{64}", record.get("sha256", ""))
+                and hashlib.sha256(data).hexdigest() == record["sha256"],
+                f"Embedded ARM64 guest image digest or size mismatch: {filename}")
+        source_record = guest_manifest.get("files", {}).get(filename, {})
+        require(source_record.get("sha256") == record.get("sha256")
+                and source_record.get("bytes") == record.get("bytes"),
+                f"Guest image does not match its source manifest: {filename}")
+    require(archive.read(guest_notice_path).strip(), "The ARM64 guest license notice is empty")
+    require(b"QEMU" in archive.read(qemu_notice_path).upper(), "The QEMU license notice is missing")
+
+    require(build_report.get("platform") == "iOS device",
+            "Embedded QEMU frameworks must be built for iPhoneOS")
+    toolchain = build_report.get("toolchain", {})
+    require(toolchain.get("sdk") == "iphoneos" and toolchain.get("minimumIos") == "15.0",
+            "Unexpected embedded QEMU SDK or deployment target")
+    qemu_report = build_report.get("qemu", {})
+    source_hash = build_report.get("source", {}).get("qemuSourceSha256")
+    require(qemu_report.get("guestTarget") == "aarch64-softmmu"
+            and qemu_report.get("accelerator") == "TCG threaded interpreter"
+            and qemu_report.get("hvf") is False,
+            "Embedded QEMU must use the pinned in-process ARM64 TCG guest target")
+    entry_points = {"qemu_init", "qemu_main_loop", "qemu_cleanup"}
+    require(set(build_report.get("inProcessEntryPoints", {}).get("verified", [])) == entry_points,
+            "Embedded QEMU build is missing verified in-process entry points")
+    require(simulator_report.get("platform") == "iOS Simulator"
+            and simulator_report.get("qemu", {}).get("guestTarget") == "aarch64-softmmu"
+            and simulator_report.get("qemu", {}).get("accelerator") == "TCG threaded interpreter"
+            and simulator_report.get("toolchain", {}).get("sdk") == "iphonesimulator"
+            and simulator_report.get("toolchain", {}).get("minimumIos") == "15.0"
+            and simulator_report.get("source", {}).get("qemuSourceSha256") == source_hash
+            and set(simulator_report.get("inProcessEntryPoints", {}).get("verified", [])) == entry_points,
+            "Embedded Simulator QEMU report does not match the device build")
+
+    frameworks = build_report.get("frameworks")
+    require(isinstance(frameworks, list) and frameworks, "Embedded QEMU build report has no framework inventory")
+    framework_names = set()
+    qemu_cores = []
+    for record in frameworks:
+        name = record.get("name") if isinstance(record, dict) else None
+        require(isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+-]*", name)
+                and name not in framework_names and name != "NodeMobile",
+                "Embedded QEMU build report contains an invalid or duplicate framework")
+        framework_names.add(name)
+        expected_path = f"runtime/Frameworks/{name}.framework/{name}"
+        require(record.get("path") == expected_path,
+                f"Unexpected embedded QEMU framework path: {name}")
+        embedded_path = prefix + f"Frameworks/{name}.framework/{name}"
+        require(embedded_path in names, f"Missing embedded QEMU framework binary: {name}")
+        binary = archive.read(embedded_path)
+        require(record.get("architectures") == ["arm64"]
+                and record.get("strippedBytes") == len(binary)
+                and re.fullmatch(r"[a-f0-9]{64}", record.get("sha256", ""))
+                and hashlib.sha256(binary).hexdigest() == record["sha256"],
+                f"Embedded QEMU framework does not match its audited report: {name}")
+        verify_macho(binary, "15.0", file_type=6, platform=2, label=f"QEMU framework {name}")
+        if "aarch64-softmmu" in name:
+            qemu_cores.append((name, record))
+    require(len(qemu_cores) == 1, "Expected exactly one embedded QEMU ARM64 softmmu framework")
+    core_name, core = qemu_cores[0]
+
+    simulator_cores = [record for record in simulator_report.get("frameworks", [])
+                       if isinstance(record, dict) and "aarch64-softmmu" in str(record.get("name", ""))]
+    require(len(simulator_cores) == 1 and simulator_cores[0].get("architectures") == ["arm64"]
+            and re.fullmatch(r"[a-f0-9]{64}", simulator_cores[0].get("sha256", "")),
+            "Embedded Simulator report is missing the audited ARM64 QEMU framework")
+    runtime_qemu = manifest.get("qemu", {})
+    require(runtime_qemu.get("framework") == core_name
+            and runtime_qemu.get("deviceSHA256") == core.get("sha256")
+            and runtime_qemu.get("simulatorSHA256") == simulator_cores[0].get("sha256")
+            and runtime_qemu.get("sourceArchiveSha256") == source_hash
+            and re.fullmatch(r"[a-f0-9]{64}", source_hash or "")
+            and runtime_qemu.get("guestTarget") == "aarch64-softmmu"
+            and runtime_qemu.get("accelerator") == "TCG threaded interpreter"
+            and runtime_qemu.get("inProcessEntryPoints") == sorted(entry_points),
+            "ARM64 guest runtime manifest does not match the audited QEMU build")
+    require(isinstance(runtime_qemu.get("frameworkPayloadBytes"), int)
+            and runtime_qemu["frameworkPayloadBytes"] > 0,
+            "Invalid embedded QEMU framework payload size")
+    return {
+        "architecture": "arm64",
+        "guestKernelVersion": manifest.get("guestKernelVersion"),
+        "frameworks": len(framework_names),
+        "frameworkPayloadBytes": runtime_qemu["frameworkPayloadBytes"],
+        "guestImageBytes": sum(guest_files[name]["bytes"] for name in ("vmlinuz-virt", "rootfs.cpio.gz")),
+        "frameworkNames": sorted(framework_names),
+        "qemuVersion": runtime_qemu.get("version"),
+        "guestTarget": "aarch64-softmmu",
+        "accelerator": "TCG threaded interpreter",
+    }, framework_names
+
+
 def verify_runtime(archive, prefix, names):
     runtime_path = prefix + "DSHRuntime/runtime-manifest.json"
     package_path = prefix + "DSHRuntime/package.json"
@@ -107,16 +231,17 @@ def verify_runtime(archive, prefix, names):
     ios_profile_package = prefix + "DSHRuntime/node_modules/@dsbot/dsh-ios-profile/package.json"
     ios_profile_patch = prefix + "DSHRuntime/node_modules/@dsbot/dsh-ios-profile/cordis.patch.yml"
     ios_host_package = prefix + "DSHRuntime/node_modules/@dsbot/dsh-ios-host/package.json"
+    subprocess_package = prefix + "DSHRuntime/node_modules/@deepseek-ai/dsh-subprocess/package.json"
     ios_host_files = [prefix + "DSHRuntime/node_modules/@dsbot/dsh-ios-host/" + name
                       for name in ["index.mjs", "credentials.mjs", "session-persistence.mjs", "native-tools.mjs",
                                    "approval.mjs", "ios-python-tool.mjs", "python-execution.mjs", "python-worker.mjs",
                                    "python-worker-gate.mjs", "ios-python-jobs.mjs", "ios-ptc-runtime.mjs", "ios-ptc-python-worker.mjs",
-                                   "ios-ptc-executor.mjs"]]
+                                   "ios-ptc-executor.mjs", "ios-subprocess.mjs"]]
     framework_root = prefix + "Frameworks/NodeMobile.framework/"
     framework_binary_path = framework_root + "NodeMobile"
     for required in [runtime_path, package_path, lock_path, notices_path, supervisor_path, entry_path, plugin_manager_path,
                      compat_adapter_path, persistence_path, protocol_path, profile_boot_entry, profile_boot_impl, profile_boot_license,
-                     app_boot_path, ios_profile_package, ios_profile_patch, ios_host_package, framework_binary_path,
+                     app_boot_path, ios_profile_package, ios_profile_patch, ios_host_package, subprocess_package, framework_binary_path,
                      framework_root + "Info.plist", prefix + "NodeMobile-LICENSE.txt"]:
         require(required in names and archive.getinfo(required).file_size > 0, f"Missing embedded runtime component: {required}")
     host_source = Path(__file__).resolve().parent.parent / "kernel" / "runtime" / "ios-host-package"
@@ -165,6 +290,7 @@ def verify_runtime(archive, prefix, names):
     for name in [b"@deepseek-ai/dsh-agent", b"@deepseek-ai/dsh-agent-loop", b"@deepseek-ai/dsh-session",
                  b"@deepseek-ai/dsh-session-projection", b"@deepseek-ai/dsh-llm-deepseek-api-key",
                  b"@dsbot/dsh-ios-host/native-tools", b"@dsbot/dsh-ios-host/session-persistence",
+                 b"@dsbot/dsh-ios-host/ios-subprocess",
                  b"@dsbot/dsh-ios-host/ios-ptc-runtime", b"@dsbot/dsh-ios-host/ios-ptc-executor",
                  b"@deepseek-ai/dsh-jobs-local", b"@deepseek-ai/dsh-tool-jobs",
                  b"ptc-python", b"tool/ptc-dispatch"]:
@@ -177,9 +303,13 @@ def verify_runtime(archive, prefix, names):
     host_manifest = json.loads(archive.read(ios_host_package))
     require(host_manifest.get("name") == "@dsbot/dsh-ios-host", "Missing the app-owned iOS adapter plugin package")
     host_dependencies = host_manifest.get("dependencies", {})
-    require(host_dependencies.get("@deepseek-ai/dsh-ptc-runtime") == "0.2.2-rc.5"
+    require(host_dependencies.get("@deepseek-ai/dsh-subprocess") == "0.2.2-rc.5"
+            and host_dependencies.get("@deepseek-ai/dsh-ptc-runtime") == "0.2.2-rc.5"
             and host_dependencies.get("@deepseek-ai/dsh-tool-executor-ptc") == "0.2.2-rc.5",
             "The iOS PTC adapter must use the exact pinned DSH PTC runtime and executor")
+    subprocess_manifest = json.loads(archive.read(subprocess_package))
+    require(subprocess_manifest.get("version") == "0.2.2-rc.5",
+            "The iOS guest PTY provider requires the exact pinned DSH subprocess service")
     jobs = manifest.get("backgroundJobs", {})
     require(jobs == {
         "registry": "@deepseek-ai/dsh-jobs-local@0.2.2-rc.5",
@@ -318,6 +448,7 @@ def verify_runtime(archive, prefix, names):
     require({"DSH SQLite SessionPersistence backed by node:sqlite",
              "iOS Keychain credentials provider",
              "DSH native tools bridged to iOS capabilities",
+             "DSH Web terminal controller routed exclusively to isolated ARM64 Linux guest PTYs",
              "offline Pyodide Python and NumPy in a bounded, cancellable Worker",
              "DSH PTC Python provider with full-source approval and bounded nested-tool bridge",
              "DSH process-local Jobs registry with session-owned offline Python producer and native output controls",
@@ -364,9 +495,18 @@ def verify_runtime(archive, prefix, names):
     require(framework_info.get("MinimumOSVersion") == "14.0", "Unexpected NodeMobile deployment target")
     verify_macho(binary, "14.0", file_type=6, platform=2, label="NodeMobile dynamic library")
 
+    guest_runtime, guest_framework_names = verify_guest_runtime(archive, prefix, names)
+    if guest_runtime is not None:
+        manifest = {**manifest, "guestRuntime": guest_runtime}
     framework_entries = {name for name in names if "/Frameworks/" in name and name != prefix + "Frameworks/"}
-    require(framework_entries and all("/Frameworks/NodeMobile.framework/" in name for name in framework_entries),
-            "Only the NodeMobile.framework may be embedded")
+    allowed_frameworks = {"NodeMobile", *guest_framework_names}
+    require(bool(framework_entries), "The IPA is missing the required NodeMobile.framework")
+    for name in framework_entries:
+        relative = name.split(prefix + "Frameworks/", 1)[-1]
+        framework_name = relative.split("/", 1)[0]
+        require(framework_name.endswith(".framework")
+                and framework_name.removesuffix(".framework") in allowed_frameworks,
+                f"Unexpected embedded framework component: {name}")
     pinned_python_wasm = prefix + "DSHRuntime/python-runtime/pyodide.asm.wasm"
     for name in names:
         if name.endswith((".node", ".dylib", ".so", ".wasm")):
@@ -396,7 +536,8 @@ def inspect(path):
             if "Frameworks" in parts:
                 framework_index = parts.index("Frameworks")
                 framework_dir = entry.is_dir() and name.rstrip("/").endswith("/Frameworks")
-                require(framework_dir or (len(parts) > framework_index + 1 and parts[framework_index + 1] == "NodeMobile.framework"),
+                require(framework_dir or (len(parts) > framework_index + 1
+                        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+-]*\.framework", parts[framework_index + 1]) is not None),
                         f"Unexpected framework component: {name}")
         require(archive.testzip() is None, "ZIP CRC verification failed")
         app_roots = {PurePosixPath(name).parts[1] for name in names if len(PurePosixPath(name).parts) > 1}
@@ -440,6 +581,8 @@ def inspect(path):
     component_sizes = {
         "appExecutable": component_size(lambda name: name == prefix + executable),
         "nodeMobileFramework": component_size(lambda name: "/Frameworks/NodeMobile.framework/" in name),
+        "qemuFrameworks": component_size(lambda name: "/Frameworks/" in name and "/Frameworks/NodeMobile.framework/" not in name),
+        "guestRuntime": component_size(lambda name: "/DSBotGuestRuntime/" in name),
         "dshRuntime": component_size(lambda name: "/DSHRuntime/" in name),
         "assets": component_size(lambda name: name == prefix + "Assets.car"),
     }
@@ -452,6 +595,7 @@ def inspect(path):
         "version": version, "build": build, "minOSVersion": min_os, "platform": "iPhoneOS", "architecture": "arm64",
         "file": path.name, "size": path.stat().st_size, "sha256": digest, "privacy": privacy,
         "runtime": runtime,
+        "guestRuntime": runtime.get("guestRuntime"),
         "releaseEligible": release_eligible,
         "releaseBlockers": release_blockers,
         "requiredDeviceAcceptance": "Physical iPhone install, upgrade, chat, cancellation, approval, and rejection validation.",
@@ -471,7 +615,7 @@ def source(report, repo, ref):
             "bundleIdentifier": report["bundleIdentifier"],
             "developerName": "DS Bot Standalone Contributors",
             "subtitle": "内嵌 DSH 0.2.2-rc.5 候选",
-            "localizedDescription": f"内嵌 Node.js 与 DeepSeek Harness Core 0.2.2-rc.5，包含事件日志会话存储和原生 iOS 工具桥。{node_release_status}",
+            "localizedDescription": f"内嵌 Node.js 与 DeepSeek Harness Core 0.2.2-rc.5，包含事件日志会话存储和原生 iOS 工具桥。{('支持 ARM64 Linux Shell/PTy' if report.get('guestRuntime') else '未内嵌 ARM64 Linux 客体终端')}。{node_release_status}",
             "iconURL": f"https://raw.githubusercontent.com/{repo}/{ref}/ios/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
             "tintColor": "#2563EB",
             "versions": [{

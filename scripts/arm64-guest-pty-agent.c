@@ -245,6 +245,45 @@ static int ensure_directory(const char *path, mode_t mode) {
     return -1;
 }
 
+static int remove_tree_entry_at(int parent_fd, const char *name, unsigned int depth) {
+    if (depth > 128) return -1;
+    struct stat details;
+    if (fstatat(parent_fd, name, &details, AT_SYMLINK_NOFOLLOW) != 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    if (!S_ISDIR(details.st_mode)) return unlinkat(parent_fd, name, 0);
+
+    int child_fd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (child_fd < 0) return -1;
+    DIR *children = fdopendir(child_fd);
+    if (!children) {
+        close(child_fd);
+        return -1;
+    }
+    int result = 0;
+    struct dirent *entry;
+    while ((entry = readdir(children)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        if (remove_tree_entry_at(dirfd(children), entry->d_name, depth + 1) != 0) result = -1;
+    }
+    if (closedir(children) != 0) result = -1;
+    if (result != 0) return -1;
+    return unlinkat(parent_fd, name, AT_REMOVEDIR);
+}
+
+static int remove_session_directory(uint32_t id) {
+    int base_fd = open("/home/dsbot/.sessions", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (base_fd < 0) return errno == ENOENT ? 0 : -1;
+    char name[9];
+    if (snprintf(name, sizeof(name), "%08x", id) >= (int)sizeof(name)) {
+        close(base_fd);
+        return -1;
+    }
+    int result = remove_tree_entry_at(base_fd, name, 0);
+    close(base_fd);
+    return result;
+}
+
 static int set_limit(int resource, rlim_t value) {
     struct rlimit limit = {.rlim_cur = value, .rlim_max = value};
     return setrlimit(resource, &limit);
@@ -264,6 +303,9 @@ static void initialize_pty_termios(struct termios *attributes) {
     attributes->c_lflag |= ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN;
     attributes->c_cc[VINTR] = 3;
     attributes->c_cc[VQUIT] = 28;
+#ifdef VSUSP
+    attributes->c_cc[VSUSP] = 26;
+#endif
     attributes->c_cc[VERASE] = 127;
     attributes->c_cc[VKILL] = 21;
     attributes->c_cc[VEOF] = 4;
@@ -318,13 +360,17 @@ static int create_session(uint32_t id, const unsigned char *payload, size_t leng
     if (ensure_directory("/home/dsbot", 0755) != 0
         || ensure_directory(base, 0755) != 0
         || snprintf(directory, sizeof(directory), "%s/%08x", base, id) >= (int)sizeof(directory)
-        || ensure_directory(directory, 0700) != 0
-        || chown(directory, uid, uid) != 0
+        || mkdir(directory, 0700) != 0) {
+        send_error(id, "could not create a fresh isolated guest workspace");
+        return -1;
+    }
+    if (chown(directory, uid, uid) != 0
         || chmod(directory, 0700) != 0
         || snprintf(temporary_directory, sizeof(temporary_directory), "%s/tmp", directory) >= (int)sizeof(temporary_directory)
         || ensure_directory(temporary_directory, 0700) != 0
         || chown(temporary_directory, uid, uid) != 0
         || chmod(temporary_directory, 0700) != 0) {
+        (void)remove_session_directory(id);
         send_error(id, "could not prepare the isolated guest workspace");
         return -1;
     }
@@ -339,6 +385,7 @@ static int create_session(uint32_t id, const unsigned char *payload, size_t leng
     int master = -1;
     pid_t child = forkpty(&master, NULL, &attributes, &window);
     if (child < 0) {
+        (void)remove_session_directory(id);
         send_error(id, "forkpty failed while creating the guest shell");
         return -1;
     }
@@ -376,6 +423,7 @@ static int create_session(uint32_t id, const unsigned char *payload, size_t leng
     if (flags < 0 || fcntl(master, F_SETFL, flags | O_NONBLOCK) < 0) {
         (void)kill(-child, SIGHUP);
         close(master);
+        (void)remove_session_directory(id);
         send_error(id, "could not configure nonblocking guest PTY output");
         return -1;
     }
@@ -483,6 +531,7 @@ static void reap_children(void) {
 }
 
 static void finish_session(struct GuestSession *session) {
+    uint32_t session_id = session->id;
     int32_t exit_status = 0;
     if (WIFEXITED(session->wait_status)) exit_status = WEXITSTATUS(session->wait_status);
     else if (WIFSIGNALED(session->wait_status)) exit_status = 128 + WTERMSIG(session->wait_status);
@@ -492,6 +541,9 @@ static void finish_session(struct GuestSession *session) {
     (void)send_frame(FRAME_EXIT, session->id, status_bytes, sizeof(status_bytes));
     close(session->master_fd);
     free(session->input);
+    if (remove_session_directory(session_id) != 0) {
+        log_message("DS Bot PTY agent: could not remove the completed session workspace\n");
+    }
     memset(session, 0, sizeof(*session));
     session->master_fd = -1;
 }

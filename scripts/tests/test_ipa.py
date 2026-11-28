@@ -80,7 +80,8 @@ class IPARegressionTests(unittest.TestCase):
         ipa.PYTHON_RUNTIME_ARTIFACT_SHA256 = PYTHON_ARTIFACT_HASHES
         self.addCleanup(setattr, ipa, "PYTHON_RUNTIME_ARTIFACT_SHA256", original_artifacts)
 
-    def make_ipa(self, *, platform=2, signature=False, executable=True, extra=None, sharing=False):
+    def make_ipa(self, *, platform=2, signature=False, executable=True, extra=None, sharing=False,
+                 guest_runtime=False, guest_bad_hash=False):
         node_load = dylib_command(0xC, "@rpath/NodeMobile.framework/NodeMobile")
         app_commands = struct.pack("<6I", 0x32, 24, platform, 0x100400, 0x1A0500, 0) + node_load
         if signature:
@@ -152,6 +153,7 @@ class IPARegressionTests(unittest.TestCase):
             "iosHostAdapters": ["DSH SQLite SessionPersistence backed by node:sqlite",
                                 "iOS Keychain credentials provider",
                                 "DSH native tools bridged to iOS capabilities",
+                                "DSH Web terminal controller routed exclusively to isolated ARM64 Linux guest PTYs",
                                 "offline Pyodide Python and NumPy in a bounded, cancellable Worker",
                                 "DSH PTC Python provider with full-source approval and bounded nested-tool bridge",
                                 "DSH process-local Jobs registry with session-owned offline Python producer and native output controls",
@@ -193,6 +195,68 @@ class IPARegressionTests(unittest.TestCase):
             "ITSAppUsesNonExemptEncryption": False, "NSFaceIDUsageDescription": "Unlock private conversations.",
             "NSLocalNetworkUsageDescription": "Connect to a local service.",
         }
+        guest_assets = {}
+        if guest_runtime:
+            device_binary = macho(6, 2, 0x000F0000)
+            simulator_binary = macho(6, 7, 0x000F0000)
+            core_name = "qemu-aarch64-softmmu"
+            core_path = f"runtime/Frameworks/{core_name}.framework/{core_name}"
+            device_sha = hashlib.sha256(device_binary).hexdigest()
+            simulator_sha = hashlib.sha256(simulator_binary).hexdigest()
+            source_sha = "a" * 64
+            device_report = {
+                "platform": "iOS device",
+                "toolchain": {"sdk": "iphoneos", "minimumIos": "15.0"},
+                "qemu": {"guestTarget": "aarch64-softmmu", "accelerator": "TCG threaded interpreter", "hvf": False},
+                "source": {"qemuSourceSha256": source_sha},
+                "inProcessEntryPoints": {"verified": ["qemu_cleanup", "qemu_init", "qemu_main_loop"]},
+                "frameworks": [{"name": core_name, "path": core_path, "sha256": device_sha,
+                                 "strippedBytes": len(device_binary), "architectures": ["arm64"]}],
+                "sizes": {"frameworkPayloadBytes": 4096},
+            }
+            simulator_report = {
+                "platform": "iOS Simulator",
+                "toolchain": {"sdk": "iphonesimulator", "minimumIos": "15.0"},
+                "qemu": {"guestTarget": "aarch64-softmmu", "accelerator": "TCG threaded interpreter"},
+                "source": {"qemuSourceSha256": source_sha},
+                "inProcessEntryPoints": {"verified": ["qemu_cleanup", "qemu_init", "qemu_main_loop"]},
+                "frameworks": [{"name": core_name, "path": core_path, "sha256": simulator_sha,
+                                 "strippedBytes": len(simulator_binary), "architectures": ["arm64"]}],
+                "sizes": {"frameworkPayloadBytes": 4096},
+            }
+            kernel = b"guest kernel fixture"
+            rootfs = b"guest rootfs fixture"
+            guest_files = {
+                "vmlinuz-virt": {"bytes": len(kernel), "sha256": hashlib.sha256(kernel).hexdigest()},
+                "rootfs.cpio.gz": {"bytes": len(rootfs), "sha256": hashlib.sha256(rootfs).hexdigest()},
+            }
+            device_report_bytes = json.dumps(device_report, sort_keys=True).encode()
+            simulator_report_bytes = json.dumps(simulator_report, sort_keys=True).encode()
+            guest_manifest = {"kernelVersion": "6.18.60", "files": guest_files}
+            guest_runtime_manifest = {
+                "schema": 1, "architecture": "arm64", "guestKernelVersion": "6.18.60",
+                "qemuBuildReportSha256": hashlib.sha256(device_report_bytes).hexdigest(),
+                "qemuSimulatorBuildReportSha256": hashlib.sha256(simulator_report_bytes).hexdigest(),
+                "guestFiles": guest_files,
+                "qemu": {"version": "10.0.12-utm", "guestTarget": "aarch64-softmmu",
+                         "accelerator": "TCG threaded interpreter", "framework": core_name,
+                         "deviceSHA256": "b" * 64 if guest_bad_hash else device_sha,
+                         "simulatorSHA256": simulator_sha, "frameworkPayloadBytes": 4096,
+                         "inProcessEntryPoints": ["qemu_cleanup", "qemu_init", "qemu_main_loop"],
+                         "sourceArchiveSha256": source_sha},
+            }
+            guest_root = "Payload/DSBotStandalone.app/DSBotGuestRuntime/"
+            guest_assets = {
+                guest_root + "runtime-manifest.json": json.dumps(guest_runtime_manifest).encode(),
+                guest_root + "qemu-build-report.json": device_report_bytes,
+                guest_root + "qemu-simulator-build-report.json": simulator_report_bytes,
+                guest_root + "manifest.json": json.dumps(guest_manifest).encode(),
+                guest_root + "vmlinuz-virt": kernel,
+                guest_root + "rootfs.cpio.gz": rootfs,
+                guest_root + "THIRD-PARTY-NOTICES.txt": b"Alpine Linux guest license notices",
+                guest_root + "THIRD-PARTY-NOTICES-QEMU.md": b"QEMU license notices",
+                "Payload/DSBotStandalone.app/Frameworks/" + core_name + ".framework/" + core_name: device_binary,
+            }
         base = "Payload/DSBotStandalone.app/"
         framework = base + "Frameworks/NodeMobile.framework/"
         with ZipFile(self.path, "w") as archive:
@@ -224,12 +288,15 @@ class IPARegressionTests(unittest.TestCase):
                 "name": "@dsbot/dsh-ios-profile", "dsh": {"bundle": {"patch": "./cordis.patch.yml"}},
             }).encode())
             archive.writestr(base + "DSHRuntime/node_modules/@dsbot/dsh-ios-profile/cordis.patch.yml",
-                             b"@deepseek-ai/dsh-agent @deepseek-ai/dsh-agent-loop @deepseek-ai/dsh-session @deepseek-ai/dsh-session-projection @deepseek-ai/dsh-llm-deepseek-api-key @deepseek-ai/dsh-web-app @deepseek-ai/dsh-jobs-local @deepseek-ai/dsh-tool-jobs @dsbot/dsh-ios-host/native-tools @dsbot/dsh-ios-host/session-persistence @dsbot/dsh-ios-host/ios-ptc-runtime @dsbot/dsh-ios-host/ios-ptc-executor ptc-python tool/ptc-dispatch")
+                             b"@deepseek-ai/dsh-agent @deepseek-ai/dsh-agent-loop @deepseek-ai/dsh-session @deepseek-ai/dsh-session-projection @deepseek-ai/dsh-llm-deepseek-api-key @deepseek-ai/dsh-web-app @deepseek-ai/dsh-jobs-local @deepseek-ai/dsh-tool-jobs @dsbot/dsh-ios-host/native-tools @dsbot/dsh-ios-host/session-persistence @dsbot/dsh-ios-host/ios-subprocess @dsbot/dsh-ios-host/ios-ptc-runtime @dsbot/dsh-ios-host/ios-ptc-executor ptc-python tool/ptc-dispatch")
             archive.writestr(base + "DSHRuntime/node_modules/@dsbot/dsh-ios-host/package.json",
                              json.dumps({"name": "@dsbot/dsh-ios-host", "dependencies": {
                                  "@deepseek-ai/dsh-ptc-runtime": "0.2.2-rc.5",
+                                 "@deepseek-ai/dsh-subprocess": "0.2.2-rc.5",
                                  "@deepseek-ai/dsh-tool-executor-ptc": "0.2.2-rc.5",
                              }}).encode())
+            archive.writestr(base + "DSHRuntime/node_modules/@deepseek-ai/dsh-subprocess/package.json",
+                             json.dumps({"version": "0.2.2-rc.5"}).encode())
             for name in ["index.mjs", "credentials.mjs", "session-persistence.mjs", "native-tools.mjs",
                          "approval.mjs", "ios-python-tool.mjs", "python-execution.mjs", "python-worker.mjs",
                          "python-worker-gate.mjs", "ios-python-jobs.mjs", "ios-ptc-runtime.mjs", "ios-ptc-python-worker.mjs", "ios-ptc-executor.mjs"] + sorted(
@@ -247,6 +314,8 @@ class IPARegressionTests(unittest.TestCase):
             archive.writestr(framework + "Info.plist", plistlib.dumps({
                 "CFBundlePackageType": "FMWK", "CFBundleExecutable": "NodeMobile", "MinimumOSVersion": "14.0",
             }))
+            for name, data in guest_assets.items():
+                archive.writestr(name, data)
             if extra:
                 archive.writestr(base + extra, b"unexpected")
 
@@ -262,6 +331,19 @@ class IPARegressionTests(unittest.TestCase):
         self.assertEqual(version["releaseEligible"], report["releaseEligible"])
         self.assertEqual(app["appPermissions"]["privacy"], report["privacy"])
         self.assertTrue(app["iconURL"].endswith("/AppIcon.png"))
+
+    def test_accepts_audited_arm64_guest_terminal_runtime(self):
+        self.make_ipa(guest_runtime=True)
+        report = ipa.inspect(self.path)
+        self.assertEqual(report["guestRuntime"]["architecture"], "arm64")
+        self.assertEqual(report["guestRuntime"]["guestTarget"], "aarch64-softmmu")
+        self.assertGreater(report["componentSizes"]["qemuFrameworks"]["uncompressedBytes"], 0)
+        self.assertGreater(report["componentSizes"]["guestRuntime"]["uncompressedBytes"], 0)
+
+    def test_rejects_guest_runtime_framework_digest_mismatch(self):
+        self.make_ipa(guest_runtime=True, guest_bad_hash=True)
+        with self.assertRaisesRegex(ValueError, "manifest does not match the audited QEMU build"):
+            ipa.inspect(self.path)
 
     def test_rejects_bad_release_inputs(self):
         for fields, message in [

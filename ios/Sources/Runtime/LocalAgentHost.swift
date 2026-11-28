@@ -1727,6 +1727,8 @@ public final class LocalAgentHost: ObservableObject {
             await rpc.onClose { [weak self] in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
+                    await ARM64GuestPTYWebTerminal.shared.closeAll()
+                    await ARM64GuestQEMURuntime.shared.stop()
                     self.effectiveWebSearchSendOriginalQuestion = false
                     self.resolveRuntimeReadiness(.channelClosed)
                     guard self.state == .ready else { return }
@@ -1734,9 +1736,16 @@ public final class LocalAgentHost: ObservableObject {
                         let sId = ctx.sessionId
                         let tId = ctx.turnId
                         Task {
-                            await self.workspaceCapabilities.cancelNativeTool(botId: sId, turnId: tId) { botId, turnId in
-                                _ = try? await rpc.request("python.cancel", params: ["botId": botId, "turnId": turnId], timeoutSeconds: 5)
-                            }
+                            await self.workspaceCapabilities.cancelNativeTool(
+                                botId: sId,
+                                turnId: tId,
+                                pythonCanceller: { botId, turnId in
+                                    _ = try? await rpc.request("python.cancel", params: ["botId": botId, "turnId": turnId], timeoutSeconds: 5)
+                                },
+                                terminalCanceller: { botId, turnId in
+                                    await ARM64GuestPTYCommandRunner.shared.cancel(sessionID: botId, turnID: turnId)
+                                }
+                            )
                         }
                     }
                     self.pendingApprovals.removeAll()
@@ -1785,6 +1794,8 @@ public final class LocalAgentHost: ObservableObject {
                 guard let self else { return }
                 Task { @MainActor in
                     self.trimMemoryCachesForPressure()
+                    await ARM64GuestPTYWebTerminal.shared.closeAll()
+                    await ARM64GuestQEMURuntime.shared.stop()
                     if !self.activeTurnsBySession.isEmpty {
                         self.lastStreamError = "系统内存紧张，已安全暂停当前生成以保护进度。"
                         for sId in Array(self.activeTurnsBySession.keys) {
@@ -2828,12 +2839,87 @@ public final class LocalAgentHost: ObservableObject {
             let ws = await MainActor.run { self.workspace }
             return try await AgentBrowserController.shared.handleAction(action, args: args, workspace: ws)
         }
+        await rpc.registerHandler(method: "native.web_terminal.open") { [weak self] params in
+            guard let self else { throw IPCFrameError.channelClosed }
+            let rows = (params["rows"] as? NSNumber)?.intValue ?? 24
+            let columns = (params["columns"] as? NSNumber)?.intValue ?? 80
+            let requestedOwner = params["ownerSessionId"] as? String ?? "main"
+            if requestedOwner.hasPrefix("session-") {
+                let authorization = try await rpc.request(
+                    "web_terminal.resolve_owner",
+                    params: ["sessionId": requestedOwner],
+                    timeoutSeconds: 10
+                )
+                guard authorization["ownerSessionId"] as? String == requestedOwner else {
+                    throw IPCFrameError.remoteError(
+                        code: -32000,
+                        message: "Web PTY owner session could not be authenticated."
+                    )
+                }
+            }
+            let ownerSessionID = try await MainActor.run {
+                try self.authorizedWebTerminalSessionID(requestedOwner)
+            }
+            guard (2...300).contains(rows), (2...500).contains(columns) else {
+                throw ARM64GuestPTYProtocolError.invalidDimensions
+            }
+            try await MainActor.run { try self.requireTerminalMemoryAdmission() }
+            try await ARM64GuestQEMURuntime.shared.validateBundledResources()
+            let sessionID = try await ARM64GuestPTYWebTerminal.shared.open(
+                ownerSessionID: ownerSessionID,
+                requestID: params["requestId"] as? String,
+                rows: UInt16(rows),
+                columns: UInt16(columns)
+            )
+            return ["sessionId": sessionID]
+        }
+        await rpc.registerHandler(method: "native.web_terminal.cancel_open") { params in
+            guard let requestID = params["requestId"] as? String else { throw IPCFrameError.invalidJSON }
+            await ARM64GuestPTYWebTerminal.shared.cancelOpen(requestID: requestID)
+            return ["cancelled": true]
+        }
+        await rpc.registerHandler(method: "native.web_terminal.read") { params in
+            guard let sessionID = params["sessionId"] as? String else { throw IPCFrameError.invalidJSON }
+            return try await ARM64GuestPTYWebTerminal.shared.read(sessionID: sessionID)
+        }
+        await rpc.registerHandler(method: "native.web_terminal.write") { params in
+            guard let sessionID = params["sessionId"] as? String,
+                  let text = params["text"] as? String else { throw IPCFrameError.invalidJSON }
+            try await ARM64GuestPTYWebTerminal.shared.write(text, sessionID: sessionID)
+            return ["accepted": true]
+        }
+        await rpc.registerHandler(method: "native.web_terminal.resize") { params in
+            guard let sessionID = params["sessionId"] as? String else { throw IPCFrameError.invalidJSON }
+            let rows = (params["rows"] as? NSNumber)?.intValue ?? 0
+            let columns = (params["columns"] as? NSNumber)?.intValue ?? 0
+            guard (2...300).contains(rows), (2...500).contains(columns) else {
+                throw ARM64GuestPTYProtocolError.invalidDimensions
+            }
+            try await ARM64GuestPTYWebTerminal.shared.resize(
+                rows: UInt16(rows), columns: UInt16(columns), sessionID: sessionID
+            )
+            return ["resized": true]
+        }
+        await rpc.registerHandler(method: "native.web_terminal.close") { params in
+            guard let sessionID = params["sessionId"] as? String else { throw IPCFrameError.invalidJSON }
+            await ARM64GuestPTYWebTerminal.shared.close(sessionID: sessionID)
+            return ["closed": true]
+        }
         await rpc.registerHandler(method: "native.tool.execute") { [weak self] params in
             guard let self, let name = params["name"] as? String else { throw IPCFrameError.invalidJSON }
+            let botId = params["botId"] as? String ?? "main"
+            let turnId = params["turnId"] as? String ?? ""
+            if name == "terminal_exec" {
+                _ = try await MainActor.run {
+                    try self.authorizedTerminalSessionID(botId: botId, turnId: turnId)
+                }
+                try await MainActor.run {
+                    try self.requireTerminalMemoryAdmission()
+                }
+                try await ARM64GuestQEMURuntime.shared.validateBundledResources()
+            }
             var arguments = params["args"] as? [String: Any] ?? [:]
             if name == "web_search" {
-                let botId = params["botId"] as? String ?? ""
-                let turnId = params["turnId"] as? String ?? ""
                 let originalQuestion: String? = try await MainActor.run {
                     let targetBot = self.resolveAddress(botId).flatMap { self.bot(for: $0) }
                     let botUsesOfficial = (try? ModelProvider(self.effectiveApiBaseURL(for: targetBot)).isDeepSeek) == true
@@ -2858,8 +2944,8 @@ public final class LocalAgentHost: ObservableObject {
             return try await self.workspaceCapabilities.executeNativeTool(
                 name: name,
                 arguments: arguments,
-                botId: params["botId"] as? String ?? "main",
-                turnId: params["turnId"] as? String ?? "",
+                botId: botId,
+                turnId: turnId,
                 isGroup: params["isGroup"] as? Bool ?? false,
                 pythonRunner: { code, botId, turnId in
                     let admitted = await MainActor.run { MemoryGovernor.shared.canAdmitHeavyWork() }
@@ -2873,6 +2959,22 @@ public final class LocalAgentHost: ObservableObject {
                         "botId": botId, "turnId": turnId, "code": code,
                     ], timeoutSeconds: 60)
                     return result["output"] as? String ?? ""
+                },
+                terminalRunner: { command, botId, turnId in
+                    let sessionID = try await MainActor.run {
+                        try self.authorizedTerminalSessionID(botId: botId, turnId: turnId)
+                    }
+                    try await MainActor.run {
+                        try self.requireTerminalMemoryAdmission()
+                    }
+                    let result = try await ARM64GuestPTYCommandRunner.shared.execute(
+                        command: command,
+                        sessionID: sessionID,
+                        turnID: turnId,
+                        timeoutSeconds: 90
+                    )
+                    let truncation = result.truncated ? "\n[输出已截断，最多显示 32 KiB]" : ""
+                    return "[exit \(result.exitCode)]\n\(result.output)\(truncation)"
                 }
             )
         }
@@ -2883,6 +2985,9 @@ public final class LocalAgentHost: ObservableObject {
                 turnId: params["turnId"] as? String ?? "",
                 pythonCanceller: { botId, turnId in
                     _ = try? await rpc.request("python.cancel", params: ["botId": botId, "turnId": turnId], timeoutSeconds: 5)
+                },
+                terminalCanceller: { botId, turnId in
+                    await ARM64GuestPTYCommandRunner.shared.cancel(sessionID: botId, turnID: turnId)
                 }
             )
             return ["cancelled": true]
@@ -2897,6 +3002,51 @@ public final class LocalAgentHost: ObservableObject {
         let scalars = Array(normalized.unicodeScalars.prefix(128))
         let context = String(String.UnicodeScalarView(scalars))
         return context.isEmpty ? nil : context
+    }
+
+    private func authorizedTerminalSessionID(botId: String, turnId: String) throws -> String {
+        guard let address = resolveAddress(botId),
+              address.canonicalSessionId == botId,
+              let context = activeTurnsBySession[botId],
+              context.turnId == turnId,
+              !context.sentCancellation,
+              let bot = bot(for: address),
+              !bot.isPrivate,
+              bot.permissionMode != "readOnly" else {
+            throw IPCFrameError.remoteError(
+                code: -32000,
+                message: "当前 Bot 会话无权启动 Linux PTY（只读和私密会话不可用，且必须属于当前活动回合）。"
+            )
+        }
+        return address.canonicalSessionId
+    }
+
+    private func authorizedWebTerminalSessionID(_ ownerSessionID: String) throws -> String {
+        if ownerSessionID.range(of: #"^session-[A-Za-z0-9_-]{1,120}$"#, options: .regularExpression) != nil {
+            return ownerSessionID
+        }
+        let botId = ownerSessionID.hasPrefix("ios:") ? String(ownerSessionID.dropFirst(4)) : ownerSessionID
+        guard let address = resolveAddress(botId),
+              address.canonicalSessionId == botId,
+              let bot = bot(for: address),
+              !bot.isPrivate else {
+            throw IPCFrameError.remoteError(
+                code: -32000,
+                message: "此 Web 终端会话无权启动 ARM64 Linux PTY（私密或未知会话不可用）。"
+            )
+        }
+        return address.canonicalSessionId
+    }
+
+    private func requireTerminalMemoryAdmission() throws {
+        let memory = MemoryGovernor.shared.refreshSnapshot()
+        guard memory.tier != .critical,
+              memory.availableMB == 0 || memory.availableMB >= 512 else {
+            throw IPCFrameError.remoteError(
+                code: -32000,
+                message: "当前可用内存不足以安全启动 ARM64 Linux guest（需要至少约 512 MiB 可用空间）；请关闭其他应用后重试。"
+            )
+        }
     }
 
     private func loadPersistedWorkspace() throws {

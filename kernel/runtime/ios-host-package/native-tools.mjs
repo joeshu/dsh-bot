@@ -317,7 +317,7 @@ function apply(context) {
     const botId = id.startsWith('ios:') ? id.slice(4) : id
     const result = await rpc.request('native.tool.execute', {
       name, args, botId, sessionId: botId, turnId: active.turnId, isGroup: active.isGroup,
-    }, 120_000, exec.signal)
+    }, name === 'terminal_exec' ? 180_000 : 120_000, exec.signal)
     return { output: String(result.output ?? '') }
   }
   const output = { type: 'object', properties: { output: { type: 'string' } }, additionalProperties: false }
@@ -418,18 +418,12 @@ function apply(context) {
     }),
     defineTool({
       ...common, name: 'terminal_exec',
-      description: 'Run one command in the persistent iOS sandboxed virtual command interpreter rooted at files/. This is not a Linux shell or PTY. Retains cwd, env, and command history. Supports only pwd, cd, ls, ll, cat, head, tail, mkdir, touch, cp, mv, rm, find, grep, wc, echo, env, export, date, uname, whoami, node -e, python -c, and git status/diff/log. Every Bot command requires its own user approval, including in autoReview mode.',
+      description: 'Run one command in an isolated ARM64 Alpine Linux shell backed by a real guest PTY. Each command requires a separate user approval, including in autoReview mode. The guest has no network access and cannot directly access iOS app files.',
       parameters: {
-        command: { type: 'string', required: true, description: 'One command for the limited sandboxed virtual command interpreter. It is not a shell command and requires one-time user approval.' },
+        command: { type: 'string', required: true, description: 'A POSIX shell command, up to 8,000 characters / 32 KiB, with each line at most 3.5 KiB. It runs in a fresh unprivileged ARM64 Linux PTY and requires one-time user approval.' },
       },
-      timeoutMs: 70_000,
-      async execute(args, exec) {
-        const { runtime } = iosHost()
-        if (typeof runtime.executeVirtualTerminal !== 'function') {
-          throw new Error('The iOS Sandboxed Virtual Terminal is not initialized.')
-        }
-        return await runtime.executeVirtualTerminal(args, exec)
-      },
+      timeoutMs: 180_000,
+      execute: (args, exec) => bridge('terminal_exec', args, exec),
     }),
     defineTool({
       ...common, name: 'git_workspace',

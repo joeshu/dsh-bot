@@ -334,8 +334,8 @@ public struct ToolsHubTabView: View {
                         toolRow(
                             icon: "terminal.fill",
                             color: .teal,
-                            title: "沙盒虚拟命令台",
-                            subtitle: "在 /workspace 使用受限解释器运行 Node、Python 和目录命令；当前不是 Linux shell/PTY"
+                            title: "ARM64 Linux Shell / PTY",
+                            subtitle: "交互式 Alpine Linux 客体终端；每个终端隔离运行，退出后清理临时目录"
                         )
                     }
 

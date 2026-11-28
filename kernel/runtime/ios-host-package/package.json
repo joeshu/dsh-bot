@@ -19,10 +19,12 @@
     "./ios-ptc-runtime": "./ios-ptc-runtime.mjs",
     "./ios-ptc-executor": "./ios-ptc-executor.mjs",
     "./ios-directory-picker-browse": "./ios-directory-picker-browse.mjs",
-    "./ios-attachment-store": "./ios-attachment-store.mjs"
+    "./ios-attachment-store": "./ios-attachment-store.mjs",
+    "./ios-subprocess": "./ios-subprocess.mjs"
   },
   "dependencies": {
     "@deepseek-ai/dsh-credentials": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-subprocess": "0.2.2-rc.5",
     "@deepseek-ai/dsh-session-persistence": "0.2.2-rc.5",
     "@deepseek-ai/dsh-ptc-runtime": "0.2.2-rc.5",
     "@deepseek-ai/dsh-tool-executor-ptc": "0.2.2-rc.5",

@@ -91,6 +91,37 @@ def parse_source_lock(lock_path: Path) -> list[tuple[str, str]]:
     return sources
 
 
+def load_source_reference(reference: Path) -> tuple[dict[str, object], str, str]:
+    report_path = reference / "build-report.json"
+    if not report_path.is_file():
+        raise SystemExit(f"Source reference build report is missing: {report_path}")
+    reference_report = json.loads(report_path.read_text(encoding="utf-8"))
+    if reference_report.get("platform") != "iOS device":
+        raise SystemExit("Source reference must be the paired iOS device QEMU artifact")
+    source_records = reference_report.get("source")
+    if not isinstance(source_records, dict) or not source_records:
+        raise SystemExit("Source reference build report has no pinned source record")
+    if source_records.get("utmCommit") != UTM_COMMIT:
+        raise SystemExit("Source reference UTM commit does not match the pinned build helper")
+    if source_records.get("qemuSourceSha256") != QEMU_TARBALL_SHA256:
+        raise SystemExit("Source reference QEMU archive hash does not match the pinned source")
+    utm_source_sha256 = source_records.get("utmSourceSha256")
+    if not isinstance(utm_source_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", utm_source_sha256):
+        raise SystemExit("Source reference does not contain a valid UTM source archive hash")
+    notice_path = reference / "THIRD-PARTY-NOTICES.md"
+    if not notice_path.is_file():
+        raise SystemExit(f"Source reference third-party notices are missing: {notice_path}")
+    notice = notice_path.read_text(encoding="utf-8")
+    notice = notice.replace(
+        "This is a separate research build artifact. It is not yet linked into the app.",
+        "This iOS Simulator artifact is paired with the iOS device QEMU artifact for testing.",
+    ).replace(
+        "this artifact's `source/` directory",
+        "the paired `qemu-ios-tci-aarch64` artifact's `source/` directory",
+    )
+    return source_records, utm_source_sha256, notice
+
+
 def meson_options(qemu_build_dir: Path) -> dict[str, object]:
     path = qemu_build_dir / "meson-info" / "intro-buildoptions.json"
     if not path.is_file():
@@ -366,18 +397,7 @@ def main() -> None:
 
     if args.source_reference:
         reference = args.source_reference.resolve()
-        reference_report = json.loads((reference / "build-report.json").read_text(encoding="utf-8"))
-        source_records = reference_report.get("source")
-        if not isinstance(source_records, dict) or not source_records:
-            raise SystemExit("Source reference build report has no pinned source record")
-        notice = (reference / "THIRD-PARTY-NOTICES.md").read_text(encoding="utf-8")
-        notice = notice.replace(
-            "This is a separate research build artifact. It is not yet linked into the app.",
-            "This iOS Simulator artifact is paired with the iOS device QEMU artifact for testing.",
-        ).replace(
-            "this artifact's `source/` directory",
-            "the paired `qemu-ios-tci-aarch64` artifact's `source/` directory",
-        )
+        source_records, utm_source_sha256, notice = load_source_reference(reference)
         (output / "THIRD-PARTY-NOTICES.md").write_text(notice, encoding="utf-8")
         (output / "SOURCE-ARTIFACT.txt").write_text(
             "Matching QEMU source archives and UTM patches are published in the paired "
@@ -473,8 +493,11 @@ def main() -> None:
     linkage_audit = runtime_dependency_audit(framework_records, runtime_frameworks)
 
     qemu_tar = build_dir / "qemu-10.0.12-utm.tar.xz"
-    if sha256(qemu_tar) != QEMU_TARBALL_SHA256:
+    qemu_source_sha256 = sha256(qemu_tar)
+    if qemu_source_sha256 != QEMU_TARBALL_SHA256:
         raise SystemExit("QEMU source archive no longer matches its pinned SHA-256")
+    if args.source_reference and source_records.get("qemuSourceSha256") != qemu_source_sha256:
+        raise SystemExit("Simulator QEMU source archive differs from the paired device build")
     xcode = run(["xcodebuild", "-version"])
     sdk_version = run(["xcrun", "--sdk", args.sdk, "--show-sdk-version"])
     patch_files = [
@@ -485,8 +508,11 @@ def main() -> None:
         upstream / "patches" / "qemu-10.0.12-utm.patch",
     ]
     source_records.update({
-        "qemuSourceSha256": sha256(qemu_tar),
-        "utmSourceSha256": sha256(output / "source" / "utmapp-utm-v5.0.9-2.tar"),
+        "qemuSourceSha256": qemu_source_sha256,
+        "utmSourceSha256": (
+            utm_source_sha256 if args.source_reference
+            else sha256(output / "source" / "utmapp-utm-v5.0.9-2.tar")
+        ),
         "patches": [
             {"filename": patch.name, "sha256": sha256(patch)} for patch in patch_files
         ],

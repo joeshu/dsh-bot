@@ -18,6 +18,7 @@ import {
 } from '@dsbot/dsh-ios-host/ios-python-tool'
 import { mountIOSPythonJobTool } from '@dsbot/dsh-ios-host/ios-python-jobs'
 import { mountIOSScheduleTools, iosSchedulePublicTask, iosScheduleTaskVisible } from '@dsbot/dsh-ios-host/ios-schedule-tools'
+import { isIOSPrivateSessionId } from '@dsbot/dsh-ios-host/private-session-access'
 import { SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { IPCRpcEndpoint } from './ipc-protocol.mjs'
@@ -1295,6 +1296,7 @@ async function boot() {
     ['@dsbot/dsh-ios-host/credentials', 'dsbot-ios-keychain-credentials'],
     ['@dsbot/dsh-ios-host/session-persistence', 'dsbot-ios-sqlite-session-persistence'],
     ['@dsbot/dsh-ios-host/native-tools', 'dsbot-ios-native-tools'],
+    ['@dsbot/dsh-ios-host/ios-subprocess', 'dsbot-ios-arm64-guest-subprocess'],
     ['@dsbot/dsh-ios-host/sandbox-fs', 'dsbot-ios-sandbox-fs'],
     ['@dsbot/dsh-ios-host/approval', 'dsbot-ios-approval'],
     ['@dsbot/dsh-ios-host/fs-search', 'dsbot-ios-fs-search'],
@@ -1324,7 +1326,8 @@ async function boot() {
     'command-feedback', 'message-feedback', 'session-log-export', 'session-query-sqlite', 'attachments',
     'agent-preset-registry', 'agent-preset-standard', 'agent-preset-creator', 'agent-preset-minimal', 'cordis-host-runner', 'cordis-inspect-providers', 'user-questions',
     'webserver', 'web-runtime', 'modules', 'connection', 'ios-private-session-access',
-    'ios-keychain-credentials', 'ios-session-persistence', 'ios-native-tools']
+    'ios-keychain-credentials', 'ios-session-persistence', 'ios-native-tools', 'ios-subprocess',
+    'ios-terminal-controller']
   const inactive = requiredRows.filter((id) => mountedRows.get(id)?.state !== 2)
   if (inactive.length) throw new Error(`Required iOS DSH profile rows are inactive: ${inactive.join(', ')}`)
   const presetFailures = (await ctx.agentPresets.list())
@@ -2419,6 +2422,34 @@ rpc.handle('web.sessions.list', async () => {
       lastMessagePreview: item.lastMessagePreview ?? '',
     }))
   return { sessions }
+})
+
+rpc.handle('web_terminal.resolve_owner', async ({ sessionId } = {}) => {
+  if (typeof sessionId !== 'string' || !/^session-[A-Za-z0-9_-]{1,120}$/.test(sessionId)) {
+    throw new TypeError('Invalid Web terminal owner session')
+  }
+  const seen = new Set()
+  let cursor = sessionId
+  for (let depth = 0; cursor && depth < 32; depth += 1) {
+    if (seen.has(cursor) || isIOSPrivateSessionId(cursor)) {
+      throw new Error('Web terminal owner is unavailable')
+    }
+    seen.add(cursor)
+    const live = ctx.sessions?.get?.(cursor)
+    const header = live?.header?.id === cursor
+      ? live.header
+      : (await runtime.persistence.stat(cursor))?.header
+    if (!header || header.id !== cursor || header.origin === 'subagent') {
+      throw new Error('Web terminal owner is unavailable')
+    }
+    const parent = header.parentSession
+    if (parent === undefined || parent === null || parent === '') {
+      return { ownerSessionId: sessionId }
+    }
+    if (typeof parent !== 'string') throw new Error('Web terminal owner is unavailable')
+    cursor = parent
+  }
+  throw new Error('Web terminal owner is unavailable')
 })
 
 function resolveAnyHistorySessionId(raw) {
@@ -4270,6 +4301,34 @@ runtime.executeGitWorkspaceTool = async (args, exec) => {
 
 rpc.handle('terminal.exec', async ({ sessionId = 'default', command }) => {
   return await executeVirtualTerminalCommand(sessionId, command)
+})
+
+// The app's Web/Workbench terminal UI uses a persistent ARM64 Linux guest PTY.
+// The native host owns the guest session and authenticates every operation by
+// its opaque host-created session ID; this bridge never exposes a UART socket.
+rpc.handle('terminal.open', async ({ rows = 24, columns = 80 } = {}) => {
+  const { rpc: hostRPC } = iosHost()
+  return await hostRPC.request('native.web_terminal.open', { ownerSessionId: 'main', rows, columns }, 120_000)
+})
+
+rpc.handle('terminal.read', async ({ sessionId }) => {
+  const { rpc: hostRPC } = iosHost()
+  return await hostRPC.request('native.web_terminal.read', { sessionId }, 10_000)
+})
+
+rpc.handle('terminal.write', async ({ sessionId, text }) => {
+  const { rpc: hostRPC } = iosHost()
+  return await hostRPC.request('native.web_terminal.write', { sessionId, text }, 10_000)
+})
+
+rpc.handle('terminal.resize', async ({ sessionId, rows, columns }) => {
+  const { rpc: hostRPC } = iosHost()
+  return await hostRPC.request('native.web_terminal.resize', { sessionId, rows, columns }, 10_000)
+})
+
+rpc.handle('terminal.close', async ({ sessionId }) => {
+  const { rpc: hostRPC } = iosHost()
+  return await hostRPC.request('native.web_terminal.close', { sessionId }, 10_000)
 })
 
 rpc.handle('terminal.state', async ({ sessionId = 'default' } = {}) => {

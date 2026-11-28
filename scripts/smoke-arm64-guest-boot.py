@@ -287,7 +287,11 @@ def smoke_guest_pty(link: SerialLink, timeout: int) -> None:
     wait_for_frame(link, FRAME_READY, session_id, timeout)
 
     input_marker = b"DS_BOT_GUEST_PTY_INPUT_OK"
-    link.send_frame(FRAME_INPUT, session_id, marker_command(input_marker))
+    link.send_frame(
+        FRAME_INPUT,
+        session_id,
+        b"printf '%s' 'PRIVATE_SESSION_FILE' > private.txt; " + marker_command(input_marker),
+    )
     output_until_marker(link, session_id, input_marker, timeout)
 
     job_control_marker = b"DS_BOT_GUEST_PTY_JOB_CONTROL_OK"
@@ -303,6 +307,32 @@ def smoke_guest_pty(link: SerialLink, timeout: int) -> None:
     )
     if job_control_marker not in job_control_output:
         raise RuntimeError("Guest shell did not enable PTY job control")
+
+    suspend_ready = b"DS_BOT_GUEST_PTY_SUSPEND_READY"
+    suspend_marker = b"DS_BOT_GUEST_PTY_SUSPEND_OK"
+    suspend_failure = b"DS_BOT_GUEST_PTY_SUSPEND_FAIL"
+    link.send_frame(
+        FRAME_INPUT,
+        session_id,
+        b"printf '%s\\n' " + shell_marker(suspend_ready) + b"; sleep 30\n",
+    )
+    output_until_marker(link, session_id, suspend_ready, timeout)
+    link.send_frame(FRAME_INPUT, session_id, b"\x1a")
+    time.sleep(0.1)
+    link.send_frame(
+        FRAME_INPUT,
+        session_id,
+        b"if jobs -p | grep -q .; then printf '%s\\n' "
+        + shell_marker(suspend_marker)
+        + b"; else printf '%s\\n' "
+        + shell_marker(suspend_failure)
+        + b"; fi\n",
+    )
+    suspend_output = output_until_markers(
+        link, session_id, (suspend_marker, suspend_failure), timeout
+    )
+    if suspend_marker not in suspend_output:
+        raise RuntimeError("Ctrl-Z did not suspend the foreground guest process")
 
     link.send_frame(FRAME_RESIZE, session_id, struct.pack(">HH", 42, 100))
     resize_marker = b"DS_BOT_GUEST_PTY_RESIZE_OK"
@@ -322,7 +352,27 @@ def smoke_guest_pty(link: SerialLink, timeout: int) -> None:
     payload = wait_for_frame(link, FRAME_EXIT, session_id, timeout)
     if len(payload) != 4:
         raise RuntimeError("Guest PTY agent returned an invalid exit status frame")
-    print("ARM64 guest PTY passed input/output, job control, resize, interrupt, and close checks.")
+
+    # A reused host session ID must get a fresh, empty guest workspace. This
+    # proves closed one-shot Bot PTYs do not leave files behind or leak them to
+    # a later command that receives the same guest directory name.
+    link.send_frame(FRAME_CREATE, session_id, struct.pack(">HH", 24, 80))
+    wait_for_frame(link, FRAME_READY, session_id, timeout)
+    clean_marker = b"DS_BOT_GUEST_PTY_WORKSPACE_CLEAN_OK"
+    leaked_marker = b"DS_BOT_GUEST_PTY_WORKSPACE_LEAK"
+    clean_check = (
+        b"if test ! -e private.txt; then printf '%s\\n' " + shell_marker(clean_marker)
+        + b"; else printf '%s\\n' " + shell_marker(leaked_marker) + b"; fi\n"
+    )
+    link.send_frame(FRAME_INPUT, session_id, clean_check)
+    clean_output = output_until_markers(link, session_id, (clean_marker, leaked_marker), timeout)
+    if clean_marker not in clean_output:
+        raise RuntimeError("A later guest PTY session could read files from the closed session")
+    link.send_frame(FRAME_CLOSE, session_id)
+    payload = wait_for_frame(link, FRAME_EXIT, session_id, timeout)
+    if len(payload) != 4:
+        raise RuntimeError("Guest PTY agent returned an invalid cleanup-session exit frame")
+    print("ARM64 guest PTY passed input/output, job control, resize, interrupt, workspace cleanup, and close checks.")
 
 
 def smoke_guest_pty_isolation(link: SerialLink, timeout: int) -> None:
