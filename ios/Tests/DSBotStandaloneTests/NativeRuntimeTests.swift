@@ -372,14 +372,14 @@ final class NativeRuntimeTests: XCTestCase {
             let workspaceScript = """
             stty -echo
             printf '%s\\n' 'shared project file' > '/workspace/\(workspaceProbe)'
-            if [ -e '/workspace/\(privateSentinel.lastPathComponent)' ]; then echo DSBOT_PRIVATE_DATA_EXPOSED; exit 1; fi
+            if [ -e '/workspace/\(privateSentinel.lastPathComponent)' ]; then echo DSBOT_PRIVATE_'DATA_EXPOSED'; exit 1; fi
             if ln -s /Library/Application\\ Support/DSBot /workspace/DSBOT_SYMLINK_ESCAPE 2>/dev/null; then
-              echo DSBOT_SYMLINK_ESCAPE_ALLOWED
+              echo DSBOT_SYMLINK_'ESCAPE_ALLOWED'
               exit 1
             fi
             rm -f '/workspace/\(workspaceProbe)'
-            printf '%s\\n' 'DSBOT_ISH_WORKSPACE_SAFE'
-            printf '%s\\n' 'DSBOT_ISH_ARM64_PTY_OK'
+            printf '%s\\n' DSBOT_ISH_WORKSPACE_'SAFE'
+            printf '%s\\n' DSBOT_ISH_ARM64_'PTY_OK'
             exit
             """
             try await runtime.sendInput(
@@ -405,7 +405,7 @@ final class NativeRuntimeTests: XCTestCase {
             let backgroundStream = try await runtime.openPTY(owner: backgroundOwner)
             print("DSBOT_ISH_TEST_STAGE background-pty-opened")
             try await runtime.sendInput(
-                Data("stty -echo\ntrap '' HUP\nsleep 60 &\nprintf 'DSBOT_ISH_BACKGROUND_PID:%s\\n' \"$!\"\nexit\nexit\n".utf8),
+                Data("stty -echo\ntrap '' HUP\nsleep 60 &\nprintf '%s' DSBOT_ISH_BACKGROUND_; printf 'PID:%s\\n' \"$!\"\nexit\nexit\n".utf8),
                 owner: backgroundOwner
             )
             print("DSBOT_ISH_TEST_STAGE background-script-sent")
