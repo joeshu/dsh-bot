@@ -171,6 +171,8 @@ public struct VirtualTerminalFeatureView: View {
     @ObservedObject var host: LocalAgentHost
     @State private var commandInput = ""
     @State private var output = "ARM64 Alpine Linux shell · real PTY\nType help to see the BusyBox commands available in this offline guest.\n"
+    @State private var pendingOutput = ""
+    @State private var outputFlushTask: Task<Void, Never>?
     @State private var sessionID: String?
     @State private var isConnecting = false
     @State private var isConnected = false
@@ -218,7 +220,7 @@ public struct VirtualTerminalFeatureView: View {
                     }
                     .background(Color(red: 0.07, green: 0.08, blue: 0.10))
                     .onChange(of: output) { _ in
-                        withAnimation { proxy.scrollTo("terminal-output", anchor: .bottom) }
+                        proxy.scrollTo("terminal-output", anchor: .bottom)
                     }
                 }
 
@@ -264,7 +266,7 @@ public struct VirtualTerminalFeatureView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
-                Button("清屏") { output = "" }
+                Button("清屏") { clearOutput() }
                 Button("重启 Shell") { Task { await restartTerminal() } }
             }
         }
@@ -273,6 +275,9 @@ public struct VirtualTerminalFeatureView: View {
             await readOutputLoop()
         }
         .onDisappear {
+            outputFlushTask?.cancel()
+            outputFlushTask = nil
+            pendingOutput.removeAll(keepingCapacity: false)
             if let sessionID { Task { await closeTerminal(sessionID) } }
         }
     }
@@ -355,11 +360,37 @@ public struct VirtualTerminalFeatureView: View {
     }
 
     private func appendOutput(_ text: String) {
-        output.append(text)
+        guard !text.isEmpty else { return }
+        pendingOutput.append(text)
+        if pendingOutput.utf8.count >= 8 * 1024 {
+            flushOutput()
+            return
+        }
+        guard outputFlushTask == nil else { return }
+        outputFlushTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 33_000_000)
+            guard !Task.isCancelled else { return }
+            flushOutput()
+        }
+    }
+
+    private func flushOutput() {
+        outputFlushTask?.cancel()
+        outputFlushTask = nil
+        guard !pendingOutput.isEmpty else { return }
+        output.append(pendingOutput)
+        pendingOutput.removeAll(keepingCapacity: true)
         if output.utf8.count > 160_000 {
-            let keep = String(output.suffix(120_000))
+            let keep = String(output.suffix(39_990))
             output = "[Earlier output trimmed]\n" + keep
         }
+    }
+
+    private func clearOutput() {
+        outputFlushTask?.cancel()
+        outputFlushTask = nil
+        pendingOutput.removeAll(keepingCapacity: true)
+        output = ""
     }
 
     private func submitInput() {
