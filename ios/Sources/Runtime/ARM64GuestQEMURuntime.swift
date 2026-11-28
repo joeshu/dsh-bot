@@ -298,12 +298,14 @@ public actor ARM64GuestQEMURuntime {
         serialTransport = transport
         qmpFileDescriptor = qmpSockets.host
 
+        // TCI is single-threaded; one guest CPU avoids software-emulation
+        // scheduling overhead for this shell-focused workload.
         let arguments = [
             "dsbot-qemu",
             "-machine", "virt,gic-version=2",
             "-cpu", "max",
             "-m", "384M",
-            "-smp", "2",
+            "-smp", "1",
             "-accel", "tcg,thread=single",
             "-kernel", kernel.path,
             "-initrd", initramfs.path,
